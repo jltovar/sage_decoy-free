@@ -43,6 +43,7 @@ pub enum PrecursorId {
 }
 
 #[derive(Copy, Clone, Debug, Deserialize, Serialize)]
+#[serde(default)]
 pub struct LfqSettings {
     pub peak_scoring: PeakScoringStrategy,
     pub integration: IntegrationStrategy,
@@ -50,6 +51,7 @@ pub struct LfqSettings {
     pub ppm_tolerance: f32,
     pub mobility_pct_tolerance: f32,
     pub combine_charge_states: bool,
+    pub peptide_q_value: f32,
 }
 
 impl Default for LfqSettings {
@@ -61,6 +63,7 @@ impl Default for LfqSettings {
             ppm_tolerance: 5.0,
             mobility_pct_tolerance: 1.0,
             combine_charge_states: true,
+            peptide_q_value: 0.01,
         }
     }
 }
@@ -107,7 +110,7 @@ pub fn build_feature_map(
             } else {
                 // For standard target-decoy, we can use a much stricter filter,
                 // selecting only high-confidence target peptides for quantification.
-                feat.peptide_q <= 0.01 && feat.label == 1
+                feat.peptide_q <= settings.peptide_q_value && feat.label == 1
             }
         })
         .for_each(|feat| {
