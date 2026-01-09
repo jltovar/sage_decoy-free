@@ -82,7 +82,7 @@ pub struct LfqOptions {
     pub ppm_tolerance: Option<f32>,
     pub mobility_pct_tolerance: Option<f32>,
     pub combine_charge_states: Option<bool>,
-    pub peptide_q_value: f32
+    pub peptide_q_value: Option<f32>,
 }
 
 impl From<LfqOptions> for LfqSettings {
