@@ -61,10 +61,10 @@ impl RetentionModel {
     /// Attempt to fit a linear regression model: peptide sequence ~ retention time
     pub fn fit(db: &IndexedDatabase, training_set: &[Feature]) -> Option<Self> {
         // The logging block can be removed for the final version if you wish
-		log::trace!("RetentionModel::fit received training_set (first 5 q-values):");
-		for feat in training_set.iter().take(5) {
-			log::trace!("  - PSM {}: spectrum_q = {}", feat.psm_id, feat.spectrum_q);
-		}
+        log::trace!("RetentionModel::fit received training_set (first 5 q-values):");
+        for feat in training_set.iter().take(5) {
+            log::trace!("  - PSM {}: spectrum_q = {}", feat.psm_id, feat.spectrum_q);
+        }
         // 1. Detect the mode by inspecting the data.
         let decoy_free = !training_set.iter().any(|f| f.label == -1);
 
@@ -86,16 +86,16 @@ impl RetentionModel {
             })
             .map(|psm| psm.aligned_rt as f64)
             .collect::<Vec<f64>>();
-            
+
         // ADD THIS CHECK
-		if rt.len() < 10 {
-			log::warn!(
-				"Not enough high-quality PSMs ({}) to train the retention time model.",
-				rt.len()
-			);
-			return None;
-		}
-		// END ADDITION
+        if rt.len() < 10 {
+            log::warn!(
+                "Not enough high-quality PSMs ({}) to train the retention time model.",
+                rt.len()
+            );
+            return None;
+        }
+        // END ADDITION
 
         let rt_mean = rt.iter().sum::<f64>() / rt.len() as f64;
         let rt_var = rt.iter().map(|rt| (rt - rt_mean).powi(2)).sum::<f64>();

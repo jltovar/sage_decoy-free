@@ -11,6 +11,7 @@ use sage_core::fasta::Fasta;
 use sage_core::ion_series::Kind;
 use sage_core::lfq::{Peak, PrecursorId};
 use sage_core::mass::Tolerance;
+use sage_core::ml::linear_discriminant::score_psms;
 use sage_core::peptide::Peptide;
 use sage_core::scoring::Fragments;
 use sage_core::scoring::{Feature, Scorer};
@@ -19,7 +20,6 @@ use sage_core::tmt::TmtQuant;
 use std::collections::HashMap;
 use std::collections::HashSet;
 use std::time::Instant;
-use sage_core::ml::linear_discriminant::score_psms;
 
 pub struct Runner {
     pub database: IndexedDatabase,
@@ -83,83 +83,85 @@ impl FromIterator<RawSpectrum> for RawSpectrumAccumulator {
 
 impl Runner {
     pub fn new(parameters: Search, parallel: usize) -> anyhow::Result<Self> {
-		let mut parameters = parameters.clone();
-		let start = Instant::now();
+        let mut parameters = parameters.clone();
+        let start = Instant::now();
 
-		let fasta = sage_cloudpath::util::read_fasta(
-			&parameters.database.fasta,
-			&parameters.database.decoy_tag,
-			false,
-		)
-		.with_context(|| {
-			format!(
-				"Failed to build database from `{}`",
-				parameters.database.fasta
-			)
-		})?;
+        let fasta = sage_cloudpath::util::read_fasta(
+            &parameters.database.fasta,
+            &parameters.database.decoy_tag,
+            false,
+        )
+        .with_context(|| {
+            format!(
+                "Failed to build database from `{}`",
+                parameters.database.fasta
+            )
+        })?;
 
-		let decoy_free_mode = if !parameters.database.generate_decoys && parameters.database.decoy_tag.is_empty() {
-			log::info!("Decoy-free mode activated. No decoys will be generated or used.");
-			if parameters.report_psms < 10 {
-				log::warn!(
+        let decoy_free_mode = if !parameters.database.generate_decoys
+            && parameters.database.decoy_tag.is_empty()
+        {
+            log::info!("Decoy-free mode activated. No decoys will be generated or used.");
+            if parameters.report_psms < 10 {
+                log::warn!(
 					"Parameter `report_psms` was {} but decoy-free mode requires at least 10. Forcing `report_psms` to 10.",
 					parameters.report_psms
 				);
-				parameters.report_psms = 10;
-			}
-			true
-		} else {
-			false
-		};
+                parameters.report_psms = 10;
+            }
+            true
+        } else {
+            false
+        };
 
-		let database = match parameters.database.prefilter {
-			false => {
-				let fasta_for_build = sage_cloudpath::util::read_fasta(
-					&parameters.database.fasta,
-					&parameters.database.decoy_tag,
-					parameters.database.generate_decoys,
-				)?;
-				parameters.database.clone().build(fasta_for_build)
-			},
-			true => {
-				parameters
-					.database
-					.auto_calculate_prefilter_chunk_size(&fasta);
-				if parameters.database.prefilter_chunk_size >= fasta.targets.len() {
-					parameters.database.clone().build(fasta)
-				} else {
-					info!(
-						"using {} db chunks of size {}",
-						(fasta.targets.len() + parameters.database.prefilter_chunk_size - 1)
-							/ parameters.database.prefilter_chunk_size,
-						parameters.database.prefilter_chunk_size,
-					);
-					let mini_runner = Self {
-						database: IndexedDatabase::default(),
-						parameters: parameters.clone(),
-						start,
-						decoy_free_mode,
-					};
-					let peptides = mini_runner.prefilter_peptides(parallel, fasta);
-					parameters.database.clone().build_from_peptides(peptides)
-				}
-			}
-		};
+        let database = match parameters.database.prefilter {
+            false => {
+                let fasta_for_build = sage_cloudpath::util::read_fasta(
+                    &parameters.database.fasta,
+                    &parameters.database.decoy_tag,
+                    parameters.database.generate_decoys,
+                )?;
+                parameters.database.clone().build(fasta_for_build)
+            }
+            true => {
+                parameters
+                    .database
+                    .auto_calculate_prefilter_chunk_size(&fasta);
+                if parameters.database.prefilter_chunk_size >= fasta.targets.len() {
+                    parameters.database.clone().build(fasta)
+                } else {
+                    info!(
+                        "using {} db chunks of size {}",
+                        (fasta.targets.len() + parameters.database.prefilter_chunk_size - 1)
+                            / parameters.database.prefilter_chunk_size,
+                        parameters.database.prefilter_chunk_size,
+                    );
+                    let mini_runner = Self {
+                        database: IndexedDatabase::default(),
+                        parameters: parameters.clone(),
+                        start,
+                        decoy_free_mode,
+                    };
+                    let peptides = mini_runner.prefilter_peptides(parallel, fasta);
+                    parameters.database.clone().build_from_peptides(peptides)
+                }
+            }
+        };
 
-		info!(
-			"generated {} fragments, {} peptides in {:#?}",
-			database.fragments.len(),
-			database.peptides.len(),
-			(start.elapsed())
-		);
-		
-		Ok(Self {
-			database,
-			parameters,
-			start,
-			decoy_free_mode,
-		})
-	}
+        info!(
+            "generated {} fragments, {} peptides in {:#?}",
+            database.fragments.len(),
+            database.peptides.len(),
+            (start.elapsed())
+        );
+
+        Ok(Self {
+            database,
+            parameters,
+            start,
+            decoy_free_mode,
+        })
+    }
 
     pub fn prefilter_peptides(self, parallel: usize, fasta: Fasta) -> Vec<Peptide> {
         let spectra: Option<(
@@ -266,27 +268,37 @@ impl Runner {
     }
 
     // This is the unified final FDR function.
-	fn spectrum_fdr(&self, features: &mut [Feature]) -> usize {
-		if score_psms(features, self.parameters.precursor_tol, self.decoy_free_mode).is_none() {
-			log::warn!("linear model fitting failed, using heuristic score");
-			features.par_iter_mut().for_each(|feat| {
-				feat.discriminant_score = (-feat.poisson as f32).ln_1p() + feat.longest_y_pct / 3.0
-			});
-			features.par_sort_unstable_by(|a, b| b.discriminant_score.total_cmp(&a.discriminant_score));
-			return sage_core::ml::qvalue::spectrum_q_value(features);
-		}
-		
-		features.sort_unstable_by(|a, b| a.discriminant_score.total_cmp(&b.discriminant_score));
-		
-		let mut min_pep: f32 = 1.0;
-		for feat in features.iter_mut().rev() {
-			let pep = 10.0f32.powf(feat.posterior_error);
-			min_pep = min_pep.min(pep);
-			feat.spectrum_q = min_pep;
-		}
-		
-		features.iter().filter(|f| f.rank == 1 && f.spectrum_q <= 0.01).count()
-	}
+    fn spectrum_fdr(&self, features: &mut [Feature]) -> usize {
+        if score_psms(
+            features,
+            self.parameters.precursor_tol,
+            self.decoy_free_mode,
+        )
+        .is_none()
+        {
+            log::warn!("linear model fitting failed, using heuristic score");
+            features.par_iter_mut().for_each(|feat| {
+                feat.discriminant_score = (-feat.poisson as f32).ln_1p() + feat.longest_y_pct / 3.0
+            });
+            features
+                .par_sort_unstable_by(|a, b| b.discriminant_score.total_cmp(&a.discriminant_score));
+            return sage_core::ml::qvalue::spectrum_q_value(features);
+        }
+
+        features.sort_unstable_by(|a, b| a.discriminant_score.total_cmp(&b.discriminant_score));
+
+        let mut min_pep: f32 = 1.0;
+        for feat in features.iter_mut().rev() {
+            let pep = 10.0f32.powf(feat.posterior_error);
+            min_pep = min_pep.min(pep);
+            feat.spectrum_q = min_pep;
+        }
+
+        features
+            .iter()
+            .filter(|f| f.rank == 1 && f.spectrum_q <= 0.01)
+            .count()
+    }
 
     fn make_path<S: AsRef<str>>(&self, file_name: S) -> CloudPath {
         let mut path = self.parameters.output_directory.clone();
@@ -488,135 +500,181 @@ impl Runner {
             .collect::<SageResults>()
     }
 
-	pub fn run(mut self, parallel: usize, parquet: bool) -> anyhow::Result<telemetry::Telemetry> {
-		let scorer = Scorer {
-			db: &self.database,
-			precursor_tol: self.parameters.precursor_tol,
-			fragment_tol: self.parameters.fragment_tol,
-			min_matched_peaks: self.parameters.min_matched_peaks,
-			min_isotope_err: self.parameters.isotope_errors.0,
-			max_isotope_err: self.parameters.isotope_errors.1,
-			min_precursor_charge: self.parameters.precursor_charge.0,
-			max_precursor_charge: self.parameters.precursor_charge.1,
-			override_precursor_charge: self.parameters.override_precursor_charge,
-			max_fragment_charge: self.parameters.max_fragment_charge,
-			chimera: self.parameters.chimera,
-			report_psms: self.parameters.report_psms,
-			wide_window: self.parameters.wide_window,
-			annotate_matches: self.parameters.annotate_matches,
-			score_type: self.parameters.score_type,
-		};
+    pub fn run(mut self, parallel: usize, parquet: bool) -> anyhow::Result<telemetry::Telemetry> {
+        let scorer = Scorer {
+            db: &self.database,
+            precursor_tol: self.parameters.precursor_tol,
+            fragment_tol: self.parameters.fragment_tol,
+            min_matched_peaks: self.parameters.min_matched_peaks,
+            min_isotope_err: self.parameters.isotope_errors.0,
+            max_isotope_err: self.parameters.isotope_errors.1,
+            min_precursor_charge: self.parameters.precursor_charge.0,
+            max_precursor_charge: self.parameters.precursor_charge.1,
+            override_precursor_charge: self.parameters.override_precursor_charge,
+            max_fragment_charge: self.parameters.max_fragment_charge,
+            chimera: self.parameters.chimera,
+            report_psms: self.parameters.report_psms,
+            wide_window: self.parameters.wide_window,
+            annotate_matches: self.parameters.annotate_matches,
+            score_type: self.parameters.score_type,
+        };
 
-		let mut outputs = self.batch_files(&scorer, parallel);
-		
-		// ======================== DECOY-FREE CODE BLOCK ========================
-		// In decoy-free mode, force all labels to 1 (target).
-		// This is necessary because the default scoring logic incorrectly marks
-		// all peptides as decoys (-1) when the decoy_tag is empty.
-		if self.decoy_free_mode {
-			log::info!("Decoy-free mode: setting all PSM labels to 1.");
-			outputs.features.par_iter_mut().for_each(|feat| {
-				feat.label = 1;
-			});
-		}
-		// =====================================================================
-		
-		// We need to define these outside the if/else so they can be used by the file writer
-		let alignments;
-		let areas;
+        let mut outputs = self.batch_files(&scorer, parallel);
 
-		if self.decoy_free_mode {
-			// DECOY-FREE WORKFLOW
-			outputs.features = sage_core::decoy_free_fdr::calculate_q_values(&outputs.features);
-			let q_spectrum = outputs.features.iter().filter(|f| f.spectrum_q <= 0.01).count();
-			log::info!("discovered {} target peptide-spectrum matches at 1% FDR", q_spectrum);
+        // ======================== DECOY-FREE CODE BLOCK ========================
+        // In decoy-free mode, force all labels to 1 (target).
+        // This is necessary because the default scoring logic incorrectly marks
+        // all peptides as decoys (-1) when the decoy_tag is empty.
+        if self.decoy_free_mode {
+            log::info!("Decoy-free mode: setting all PSM labels to 1.");
+            outputs.features.par_iter_mut().for_each(|feat| {
+                feat.label = 1;
+            });
+        }
+        // =====================================================================
 
-			let q_peptide = sage_core::decoy_free_fdr::calculate_peptide_q(&mut outputs.features, &self.database);
-			let q_protein = sage_core::decoy_free_fdr::calculate_protein_q(&mut outputs.features, &self.database);
-			log::info!("discovered {} target peptides at 1% FDR", q_peptide);
-			log::info!("discovered {} target proteins at 1% FDR", q_protein);
-			
-			alignments = if self.parameters.predict_rt {
+        // We need to define these outside the if/else so they can be used by the file writer
+        let alignments;
+        let areas;
+
+        if self.decoy_free_mode {
+            // DECOY-FREE WORKFLOW
+            outputs.features = sage_core::decoy_free_fdr::calculate_q_values(&outputs.features);
+            let q_spectrum = outputs
+                .features
+                .iter()
+                .filter(|f| f.spectrum_q <= 0.01)
+                .count();
+            log::info!(
+                "discovered {} target peptide-spectrum matches at 1% FDR",
+                q_spectrum
+            );
+
+            let q_peptide = sage_core::decoy_free_fdr::calculate_peptide_q(
+                &mut outputs.features,
+                &self.database,
+            );
+            let q_protein = sage_core::decoy_free_fdr::calculate_protein_q(
+                &mut outputs.features,
+                &self.database,
+            );
+            log::info!("discovered {} target peptides at 1% FDR", q_peptide);
+            log::info!("discovered {} target proteins at 1% FDR", q_protein);
+
+            alignments = if self.parameters.predict_rt {
                 // These functions now infer the mode and do not need the flag.
-				let local_alignments = sage_core::ml::retention_alignment::global_alignment(&mut outputs.features, self.parameters.mzml_paths.len(), self.decoy_free_mode);
-				let _ = sage_core::ml::retention_model::predict(&self.database, &mut outputs.features);
-				let _ = sage_core::ml::mobility_model::predict(&self.database, &mut outputs.features, self.decoy_free_mode);
-				Some(local_alignments)
-			} else {
-				None
-			};
+                let local_alignments = sage_core::ml::retention_alignment::global_alignment(
+                    &mut outputs.features,
+                    self.parameters.mzml_paths.len(),
+                    self.decoy_free_mode,
+                );
+                let _ =
+                    sage_core::ml::retention_model::predict(&self.database, &mut outputs.features);
+                let _ = sage_core::ml::mobility_model::predict(
+                    &self.database,
+                    &mut outputs.features,
+                    self.decoy_free_mode,
+                );
+                Some(local_alignments)
+            } else {
+                None
+            };
 
-			areas = alignments.as_ref().and_then(|alignments_ref| {
-				if self.parameters.quant.lfq {
+            areas = alignments.as_ref().and_then(|alignments_ref| {
+                if self.parameters.quant.lfq {
                     // This function also infers the mode now.
-					let mut areas_map = sage_core::lfq::build_feature_map(self.parameters.quant.lfq_settings, self.parameters.precursor_charge, &outputs.features, self.decoy_free_mode)
-						.quantify(&self.database, &outputs.ms1, alignments_ref);
-					let q_precursor = sage_core::decoy_free_fdr::decoy_free_precursor(&mut areas_map);
-					log::info!("discovered {} target MS1 peaks at 5% FDR", q_precursor);
-					Some(areas_map)
-				} else {
-					None
-				}
-			});
-
-		} else {
-			// TARGET-DECOY WORKFLOW
-			alignments = if self.parameters.predict_rt {
-				outputs.features.par_sort_unstable_by(|a, b| a.poisson.total_cmp(&b.poisson));
-				sage_core::ml::qvalue::spectrum_q_value(&mut outputs.features);
+                    let mut areas_map = sage_core::lfq::build_feature_map(
+                        self.parameters.quant.lfq_settings,
+                        self.parameters.precursor_charge,
+                        &outputs.features,
+                        self.decoy_free_mode,
+                    )
+                    .quantify(&self.database, &outputs.ms1, alignments_ref);
+                    let q_precursor =
+                        sage_core::decoy_free_fdr::decoy_free_precursor(&mut areas_map);
+                    log::info!("discovered {} target MS1 peaks at 5% FDR", q_precursor);
+                    Some(areas_map)
+                } else {
+                    None
+                }
+            });
+        } else {
+            // TARGET-DECOY WORKFLOW
+            alignments = if self.parameters.predict_rt {
+                outputs
+                    .features
+                    .par_sort_unstable_by(|a, b| a.poisson.total_cmp(&b.poisson));
+                sage_core::ml::qvalue::spectrum_q_value(&mut outputs.features);
 
                 // These functions now infer the mode and do not need the flag.
-				let local_alignments = sage_core::ml::retention_alignment::global_alignment(&mut outputs.features, self.parameters.mzml_paths.len(), self.decoy_free_mode);
-				let _ = sage_core::ml::retention_model::predict(&self.database, &mut outputs.features);
-				let _ = sage_core::ml::mobility_model::predict(&self.database, &mut outputs.features, self.decoy_free_mode);
-				Some(local_alignments)
-			} else {
-				None
-			};
+                let local_alignments = sage_core::ml::retention_alignment::global_alignment(
+                    &mut outputs.features,
+                    self.parameters.mzml_paths.len(),
+                    self.decoy_free_mode,
+                );
+                let _ =
+                    sage_core::ml::retention_model::predict(&self.database, &mut outputs.features);
+                let _ = sage_core::ml::mobility_model::predict(
+                    &self.database,
+                    &mut outputs.features,
+                    self.decoy_free_mode,
+                );
+                Some(local_alignments)
+            } else {
+                None
+            };
 
-			let q_spectrum = self.spectrum_fdr(&mut outputs.features);
-			log::info!("discovered {} target peptide-spectrum matches at 1% FDR", q_spectrum);
+            let q_spectrum = self.spectrum_fdr(&mut outputs.features);
+            log::info!(
+                "discovered {} target peptide-spectrum matches at 1% FDR",
+                q_spectrum
+            );
 
-			let q_peptide = sage_core::fdr::picked_peptide(&self.database, &mut outputs.features);
-			let q_protein = sage_core::fdr::picked_protein(&self.database, &mut outputs.features);
-			log::info!("discovered {} target peptides at 1% FDR", q_peptide);
-			log::info!("discovered {} target proteins at 1% FDR", q_protein);
+            let q_peptide = sage_core::fdr::picked_peptide(&self.database, &mut outputs.features);
+            let q_protein = sage_core::fdr::picked_protein(&self.database, &mut outputs.features);
+            log::info!("discovered {} target peptides at 1% FDR", q_peptide);
+            log::info!("discovered {} target proteins at 1% FDR", q_protein);
 
-			areas = alignments.as_ref().and_then(|alignments_ref| {
-				if self.parameters.quant.lfq {
+            areas = alignments.as_ref().and_then(|alignments_ref| {
+                if self.parameters.quant.lfq {
                     // This function also infers the mode now.
-					let mut areas_map = sage_core::lfq::build_feature_map(self.parameters.quant.lfq_settings, self.parameters.precursor_charge, &outputs.features, self.decoy_free_mode)
-						.quantify(&self.database, &outputs.ms1, alignments_ref);
-					let q_precursor = sage_core::fdr::picked_precursor(&mut areas_map);
-					log::info!("discovered {} target MS1 peaks at 5% FDR", q_precursor);
-					Some(areas_map)
-				} else {
-					None
-				}
-			});
-		}
+                    let mut areas_map = sage_core::lfq::build_feature_map(
+                        self.parameters.quant.lfq_settings,
+                        self.parameters.precursor_charge,
+                        &outputs.features,
+                        self.decoy_free_mode,
+                    )
+                    .quantify(&self.database, &outputs.ms1, alignments_ref);
+                    let q_precursor = sage_core::fdr::picked_precursor(&mut areas_map);
+                    log::info!("discovered {} target MS1 peaks at 5% FDR", q_precursor);
+                    Some(areas_map)
+                } else {
+                    None
+                }
+            });
+        }
 
-		// ADD THE FILENAMES BLOCK HERE
-		let filenames = self
-			.parameters
-			.mzml_paths
-			.iter()
-			.map(|s| {
-				s.parse::<CloudPath>()
-					.ok()
-					.and_then(|c| c.filename().map(|s| s.to_string()))
-					.unwrap_or_else(|| s.clone())
-			})
-			.collect::<Vec<_>>();
-		
-		// ADD THE LOGGING BLOCK HERE
-		log::trace!("Runner view of q-values (first 5):");
-		for feat in outputs.features.iter().take(5) {
-			log::trace!("  - PSM {}: spectrum_q = {}", feat.psm_id, feat.spectrum_q);
-		}
-		// END LOGGING BLOCK
+        // ADD THE FILENAMES BLOCK HERE
+        let filenames = self
+            .parameters
+            .mzml_paths
+            .iter()
+            .map(|s| {
+                s.parse::<CloudPath>()
+                    .ok()
+                    .and_then(|c| c.filename().map(|s| s.to_string()))
+                    .unwrap_or_else(|| s.clone())
+            })
+            .collect::<Vec<_>>();
 
-		log::trace!("writing outputs");
+        // ADD THE LOGGING BLOCK HERE
+        log::trace!("Runner view of q-values (first 5):");
+        for feat in outputs.features.iter().take(5) {
+            log::trace!("  - PSM {}: spectrum_q = {}", feat.psm_id, feat.spectrum_q);
+        }
+        // END LOGGING BLOCK
+
+        log::trace!("writing outputs");
 
         // Write either a single parquet file, or multiple tsv files
         if parquet {
@@ -701,94 +759,94 @@ impl Runner {
         Ok(telemetry)
     }
     pub fn serialize_feature(&self, feature: &Feature, filenames: &[String]) -> csv::ByteRecord {
-		let mut record = csv::ByteRecord::new();
+        let mut record = csv::ByteRecord::new();
 
-		record.push_field(itoa::Buffer::new().format(feature.psm_id).as_bytes());
+        record.push_field(itoa::Buffer::new().format(feature.psm_id).as_bytes());
 
-		let peptide = &self.database[feature.peptide_idx];
-		record.push_field(peptide.to_string().as_bytes());
-		record.push_field(
-			peptide
-				.proteins(&self.database.decoy_tag, self.database.generate_decoys)
-				.as_bytes(),
-		);
-		record.push_field(
-			itoa::Buffer::new()
-				.format(peptide.proteins.len())
-				.as_bytes(),
-		);
-		record.push_field(filenames[feature.file_id].as_bytes());
-		record.push_field(feature.spec_id.as_bytes());
-		record.push_field(itoa::Buffer::new().format(feature.rank).as_bytes());
-		record.push_field(itoa::Buffer::new().format(feature.label).as_bytes());
-		record.push_field(ryu::Buffer::new().format(feature.expmass).as_bytes());
-		record.push_field(ryu::Buffer::new().format(feature.calcmass).as_bytes());
-		record.push_field(itoa::Buffer::new().format(feature.charge).as_bytes());
-		record.push_field(itoa::Buffer::new().format(feature.peptide_len).as_bytes());
-		record.push_field(
-			itoa::Buffer::new()
-				.format(feature.missed_cleavages)
-				.as_bytes(),
-		);
-		record.push_field(
-			itoa::Buffer::new()
-				.format(peptide.semi_enzymatic as u8)
-				.as_bytes(),
-		);
-		record.push_field(ryu::Buffer::new().format(feature.isotope_error).as_bytes());
-		record.push_field(ryu::Buffer::new().format(feature.delta_mass).as_bytes());
-		record.push_field(ryu::Buffer::new().format(feature.average_ppm).as_bytes());
-		record.push_field(ryu::Buffer::new().format(feature.hyperscore).as_bytes());
-		record.push_field(ryu::Buffer::new().format(feature.delta_next).as_bytes());
-		record.push_field(ryu::Buffer::new().format(feature.delta_best).as_bytes());
-		record.push_field(ryu::Buffer::new().format(feature.rt).as_bytes());
-		record.push_field(ryu::Buffer::new().format(feature.aligned_rt).as_bytes());
-		record.push_field(ryu::Buffer::new().format(feature.predicted_rt).as_bytes());
-		record.push_field(ryu::Buffer::new().format(feature.delta_rt_model).as_bytes());
-		record.push_field(ryu::Buffer::new().format(feature.ims).as_bytes());
-		record.push_field(ryu::Buffer::new().format(feature.predicted_ims).as_bytes());
-		record.push_field(
-			ryu::Buffer::new()
-				.format(feature.delta_ims_model)
-				.as_bytes(),
-		);
-		record.push_field(itoa::Buffer::new().format(feature.matched_peaks).as_bytes());
-		record.push_field(itoa::Buffer::new().format(feature.longest_b).as_bytes());
-		record.push_field(itoa::Buffer::new().format(feature.longest_y).as_bytes());
-		record.push_field(ryu::Buffer::new().format(feature.longest_y_pct).as_bytes());
-		record.push_field(
-			ryu::Buffer::new()
-				.format(feature.matched_intensity_pct)
-				.as_bytes(),
-		);
-		record.push_field(
-			itoa::Buffer::new()
-				.format(feature.scored_candidates)
-				.as_bytes(),
-		);
+        let peptide = &self.database[feature.peptide_idx];
+        record.push_field(peptide.to_string().as_bytes());
+        record.push_field(
+            peptide
+                .proteins(&self.database.decoy_tag, self.database.generate_decoys)
+                .as_bytes(),
+        );
+        record.push_field(
+            itoa::Buffer::new()
+                .format(peptide.proteins.len())
+                .as_bytes(),
+        );
+        record.push_field(filenames[feature.file_id].as_bytes());
+        record.push_field(feature.spec_id.as_bytes());
+        record.push_field(itoa::Buffer::new().format(feature.rank).as_bytes());
+        record.push_field(itoa::Buffer::new().format(feature.label).as_bytes());
+        record.push_field(ryu::Buffer::new().format(feature.expmass).as_bytes());
+        record.push_field(ryu::Buffer::new().format(feature.calcmass).as_bytes());
+        record.push_field(itoa::Buffer::new().format(feature.charge).as_bytes());
+        record.push_field(itoa::Buffer::new().format(feature.peptide_len).as_bytes());
+        record.push_field(
+            itoa::Buffer::new()
+                .format(feature.missed_cleavages)
+                .as_bytes(),
+        );
+        record.push_field(
+            itoa::Buffer::new()
+                .format(peptide.semi_enzymatic as u8)
+                .as_bytes(),
+        );
+        record.push_field(ryu::Buffer::new().format(feature.isotope_error).as_bytes());
+        record.push_field(ryu::Buffer::new().format(feature.delta_mass).as_bytes());
+        record.push_field(ryu::Buffer::new().format(feature.average_ppm).as_bytes());
+        record.push_field(ryu::Buffer::new().format(feature.hyperscore).as_bytes());
+        record.push_field(ryu::Buffer::new().format(feature.delta_next).as_bytes());
+        record.push_field(ryu::Buffer::new().format(feature.delta_best).as_bytes());
+        record.push_field(ryu::Buffer::new().format(feature.rt).as_bytes());
+        record.push_field(ryu::Buffer::new().format(feature.aligned_rt).as_bytes());
+        record.push_field(ryu::Buffer::new().format(feature.predicted_rt).as_bytes());
+        record.push_field(ryu::Buffer::new().format(feature.delta_rt_model).as_bytes());
+        record.push_field(ryu::Buffer::new().format(feature.ims).as_bytes());
+        record.push_field(ryu::Buffer::new().format(feature.predicted_ims).as_bytes());
+        record.push_field(
+            ryu::Buffer::new()
+                .format(feature.delta_ims_model)
+                .as_bytes(),
+        );
+        record.push_field(itoa::Buffer::new().format(feature.matched_peaks).as_bytes());
+        record.push_field(itoa::Buffer::new().format(feature.longest_b).as_bytes());
+        record.push_field(itoa::Buffer::new().format(feature.longest_y).as_bytes());
+        record.push_field(ryu::Buffer::new().format(feature.longest_y_pct).as_bytes());
+        record.push_field(
+            ryu::Buffer::new()
+                .format(feature.matched_intensity_pct)
+                .as_bytes(),
+        );
+        record.push_field(
+            itoa::Buffer::new()
+                .format(feature.scored_candidates)
+                .as_bytes(),
+        );
 
-		record.push_field(ryu::Buffer::new().format(feature.poisson).as_bytes());
+        record.push_field(ryu::Buffer::new().format(feature.poisson).as_bytes());
 
-		let raw_p = 10f64.powf(feature.poisson);
-		record.push_field(ryu::Buffer::new().format(raw_p).as_bytes());
+        let raw_p = 10f64.powf(feature.poisson);
+        record.push_field(ryu::Buffer::new().format(raw_p).as_bytes());
 
-		record.push_field(
-			ryu::Buffer::new()
-				.format(feature.discriminant_score)
-				.as_bytes(),
-		);
-		record.push_field(
-			ryu::Buffer::new()
-				.format(feature.posterior_error)
-				.as_bytes(),
-		);
-		record.push_field(ryu::Buffer::new().format(feature.spectrum_q).as_bytes());
-		record.push_field(ryu::Buffer::new().format(feature.peptide_q).as_bytes());
-		record.push_field(ryu::Buffer::new().format(feature.protein_q).as_bytes());
-		record.push_field(ryu::Buffer::new().format(feature.ms2_intensity).as_bytes());
+        record.push_field(
+            ryu::Buffer::new()
+                .format(feature.discriminant_score)
+                .as_bytes(),
+        );
+        record.push_field(
+            ryu::Buffer::new()
+                .format(feature.posterior_error)
+                .as_bytes(),
+        );
+        record.push_field(ryu::Buffer::new().format(feature.spectrum_q).as_bytes());
+        record.push_field(ryu::Buffer::new().format(feature.peptide_q).as_bytes());
+        record.push_field(ryu::Buffer::new().format(feature.protein_q).as_bytes());
+        record.push_field(ryu::Buffer::new().format(feature.ms2_intensity).as_bytes());
 
-		record
-	}
+        record
+    }
 
     pub fn serialize_fragments(
         &self,
@@ -884,7 +942,7 @@ impl Runner {
             "matched_intensity_pct",
             "scored_candidates",
             "poisson",
-			"spectrum_p_value",
+            "spectrum_p_value",
             "sage_discriminant_score",
             "posterior_error",
             "spectrum_q",

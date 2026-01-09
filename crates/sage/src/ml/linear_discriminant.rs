@@ -123,7 +123,11 @@ impl LinearDiscriminantAnalysis {
 }
 
 // Add the `decoy_free: bool` flag to the function signature
-pub fn score_psms(scores: &mut [Feature], precursor_tol: Tolerance, decoy_free: bool) -> Option<()> {
+pub fn score_psms(
+    scores: &mut [Feature],
+    precursor_tol: Tolerance,
+    decoy_free: bool,
+) -> Option<()> {
     log::trace!("fitting linear discriminant model...");
 
     // Conditionally define what a "decoy" is based on the mode

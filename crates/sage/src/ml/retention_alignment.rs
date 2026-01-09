@@ -42,7 +42,10 @@ fn max_rt_by_file(features: &[Feature], n_files: usize) -> Vec<f64> {
 /// Return a map from PeptideIx to a map from File ID to average RT of the parent
 /// PeptideIX
 // Add the `decoy_free: bool` flag to the function signature
-fn mean_rt_by_file(features: &[Feature], decoy_free: bool) -> FnvDashMap<PeptideIx, HashMap<usize, f64>> {
+fn mean_rt_by_file(
+    features: &[Feature],
+    decoy_free: bool,
+) -> FnvDashMap<PeptideIx, HashMap<usize, f64>> {
     let rts: FnvDashMap<PeptideIx, HashMap<usize, f64>> = DashMap::default();
     features
         .par_iter()
@@ -66,7 +69,11 @@ fn mean_rt_by_file(features: &[Feature], decoy_free: bool) -> FnvDashMap<Peptide
 }
 
 // Add the `decoy_free: bool` flag to the function signature
-fn rt_matrix(features: &[Feature], max_rt: &[f64], decoy_free: bool) -> (HashMap<PeptideIx, f64>, Matrix) {
+fn rt_matrix(
+    features: &[Feature],
+    max_rt: &[f64],
+    decoy_free: bool,
+) -> (HashMap<PeptideIx, f64>, Matrix) {
     // Pass the flag down
     let mean_rt = mean_rt_by_file(features, decoy_free);
 
@@ -103,7 +110,11 @@ pub struct Alignment {
 }
 
 // Add the `decoy_free: bool` flag to the function signature
-pub fn global_alignment(features: &mut [Feature], n_files: usize, decoy_free: bool) -> Vec<Alignment> {
+pub fn global_alignment(
+    features: &mut [Feature],
+    n_files: usize,
+    decoy_free: bool,
+) -> Vec<Alignment> {
     let max_rt = max_rt_by_file(features, n_files);
     // Pass the flag down
     let (_, rt) = rt_matrix(features, &max_rt, decoy_free);

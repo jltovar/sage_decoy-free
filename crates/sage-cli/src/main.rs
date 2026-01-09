@@ -1,13 +1,12 @@
 use clap::{value_parser, Arg, Command, ValueHint};
+use rayon::ThreadPoolBuilder;
 use sage_cli::input::Input;
-use sage_cli::runner::Runner;
-use rayon::ThreadPoolBuilder;   // ← add this to increase stack size to fix stack overflow
+use sage_cli::runner::Runner; // ← add this to increase stack size to fix stack overflow
 
 fn main() -> anyhow::Result<()> {
-
     // ── enlarge Rayon worker-thread stacks ───────────────────────────
     ThreadPoolBuilder::new()
-        .stack_size(64 * 1024 * 1024)   // 64 MiB per worker thread
+        .stack_size(64 * 1024 * 1024) // 64 MiB per worker thread
         .build_global()
         .expect("configure Rayon pool");
 
