@@ -99,22 +99,18 @@ pub fn build_feature_map(
     decoy_free: bool,
 ) -> FeatureMap {
     let map: DashMap<PeptideIx, PrecursorRange, fnv::FnvBuildHasher> = DashMap::default();
+
+    // 1. Filter and insert Targets
     features
         .iter()
         .filter(|feat| {
-            // This is the conditional filter for building the LFQ feature map
             if decoy_free {
-                // For decoy-free, we must include all top-ranked peptides to ensure
-                // that artificial decoys can be generated for the null model.
                 feat.rank == 1
             } else {
-                // For standard target-decoy, we can use a much stricter filter,
-                // selecting only high-confidence target peptides for quantification.
                 feat.peptide_q <= settings.peptide_q_value && feat.label == 1
             }
         })
         .for_each(|feat| {
-            // `features` is sorted by confidence, so just take the first entry
             if !map.contains_key(&feat.peptide_idx) {
                 let (mobility_lo, mobility_hi) = Tolerance::Pct(
                     -settings.mobility_pct_tolerance,
@@ -126,7 +122,7 @@ pub fn build_feature_map(
                     PrecursorRange {
                         rt: feat.aligned_rt,
                         mass_lo: feat.calcmass,
-                        mass_hi: 0.0,
+                        mass_hi: 0.0, // This is ignored during lookup generation
                         peptide: feat.peptide_idx,
                         charge: feat.charge,
                         isotope: 0,
@@ -139,7 +135,7 @@ pub fn build_feature_map(
             }
         });
 
-    // Cartesian product of (observed RT ranges, mass) with charge and isotopes
+    // 2. Expand into (Target) and optionally (Shadow/Decoy) ranges
     let mut ranges = map
         .into_par_iter()
         .flat_map_iter(|(_, range)| {
@@ -150,6 +146,7 @@ pub fn build_feature_map(
                         Tolerance::Ppm(-settings.ppm_tolerance, settings.ppm_tolerance)
                             .bounds(mass);
 
+                    // A. The Real Target
                     let fwd = PrecursorRange {
                         mass_lo,
                         mass_hi,
@@ -159,16 +156,36 @@ pub fn build_feature_map(
                         ..range
                     };
 
-                    let (mass_lo, mass_hi) =
-                        Tolerance::Ppm(-settings.ppm_tolerance, settings.ppm_tolerance)
-                            .bounds(mass + 11.06);
+                    // B. The Decoy / Shadow
+                    let rev = if decoy_free {
+                        // --- SHADOW TRACE LOGIC ---
+                        // Shift by +5.0013 Da (approx 5 neutrons but non-integer to avoid overlaps)
+                        // This creates a "Ghost" trace in the noise.
+                        let shift = 5.0013 / charge as f32;
+                        let (shadow_lo, shadow_hi) =
+                            Tolerance::Ppm(-settings.ppm_tolerance, settings.ppm_tolerance)
+                                .bounds(mass + shift);
 
-                    let rev = PrecursorRange {
-                        rt: (fwd.rt - RT_TOL * 2.0).max(0.0),
-                        mass_lo,
-                        mass_hi,
-                        decoy: true,
-                        ..fwd
+                        PrecursorRange {
+                            mass_lo: shadow_lo,
+                            mass_hi: shadow_hi,
+                            decoy: true, // Mark as decoy so Gumbel model picks it up
+                            ..fwd
+                        }
+                    } else {
+                        // --- STANDARD TARGET-DECOY LOGIC ---
+                        // Look for the peptide at a far-away RT (RT - 2 * Window)
+                        let (mass_lo, mass_hi) =
+                            Tolerance::Ppm(-settings.ppm_tolerance, settings.ppm_tolerance)
+                                .bounds(mass + 11.06); // Standard offset for standard mode
+
+                        PrecursorRange {
+                            rt: (fwd.rt - RT_TOL * 2.0).max(0.0),
+                            mass_lo,
+                            mass_hi,
+                            decoy: true,
+                            ..fwd
+                        }
                     };
 
                     [fwd, rev]

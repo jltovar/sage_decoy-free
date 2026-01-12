@@ -5,9 +5,13 @@ pub mod kde;
 pub mod linear_discriminant;
 pub mod matrix;
 pub mod mobility_model;
+pub mod msfdr; //decoy-free addition
+pub mod nokoi;
 pub mod qvalue;
 pub mod retention_alignment;
 pub mod retention_model;
+pub mod skew_normal; //decoy-free addition
+pub mod stats; //decoy-free addition //decoy-free addition
 
 #[allow(dead_code)]
 fn all_close(lhs: &[f64], rhs: &[f64], eps: f64) -> bool {

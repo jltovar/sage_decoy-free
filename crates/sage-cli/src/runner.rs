@@ -20,12 +20,14 @@ use sage_core::tmt::TmtQuant;
 use std::collections::HashMap;
 use std::collections::HashSet;
 use std::time::Instant;
+// FIXED: Import FdrMode correctly
+use sage_core::input::FdrMode;
 
 pub struct Runner {
     pub database: IndexedDatabase,
     pub parameters: Search,
-    start: Instant,
-    decoy_free_mode: bool,
+    pub start: Instant,
+    pub decoy_free_mode: bool,
 }
 
 #[derive(Default)]
@@ -98,28 +100,27 @@ impl Runner {
             )
         })?;
 
-        let decoy_free_mode = if !parameters.database.generate_decoys
-            && parameters.database.decoy_tag.is_empty()
-        {
-            log::info!("Decoy-free mode activated. No decoys will be generated or used.");
-            if parameters.report_psms < 10 {
-                log::warn!(
-					"Parameter `report_psms` was {} but decoy-free mode requires at least 10. Forcing `report_psms` to 10.",
-					parameters.report_psms
-				);
-                parameters.report_psms = 10;
-            }
-            true
-        } else {
-            false
-        };
+        let decoy_free_mode = matches!(parameters.fdr.mode, FdrMode::DecoyFree);
+
+        if decoy_free_mode && parameters.report_psms < 10 {
+            log::warn!("decoy_free mode requires report_psms >= 10; overriding to 10");
+            parameters.report_psms = 10;
+        }
+
+        let generate_decoys = parameters.database.generate_decoys;
+        if decoy_free_mode && generate_decoys {
+            log::warn!(
+                "fdr.mode=decoy_free but database.generate_decoys=true; decoys will be searched but ignored \
+                 by decoy-free FDR. For speed, set database.generate_decoys=false."
+            );
+        }
 
         let database = match parameters.database.prefilter {
             false => {
                 let fasta_for_build = sage_cloudpath::util::read_fasta(
                     &parameters.database.fasta,
                     &parameters.database.decoy_tag,
-                    parameters.database.generate_decoys,
+                    generate_decoys,
                 )?;
                 parameters.database.clone().build(fasta_for_build)
             }
@@ -521,48 +522,87 @@ impl Runner {
 
         let mut outputs = self.batch_files(&scorer, parallel);
 
-        // ======================== DECOY-FREE CODE BLOCK ========================
-        // In decoy-free mode, force all labels to 1 (target).
-        // This is necessary because the default scoring logic incorrectly marks
-        // all peptides as decoys (-1) when the decoy_tag is empty.
-        if self.decoy_free_mode {
-            log::info!("Decoy-free mode: setting all PSM labels to 1.");
-            outputs.features.par_iter_mut().for_each(|feat| {
-                feat.label = 1;
-            });
-        }
-        // =====================================================================
-
         // We need to define these outside the if/else so they can be used by the file writer
         let alignments;
         let areas;
 
         if self.decoy_free_mode {
-            // DECOY-FREE WORKFLOW
-            outputs.features = sage_core::decoy_free_fdr::calculate_q_values(&outputs.features);
+            // ======================== DECOY-FREE WORKFLOW ========================
+            debug_assert!(
+                !self.parameters.database.decoy_tag.is_empty(),
+                "decoy_free mode requires non-empty database.decoy_tag (enforced in input.rs)"
+            );
+
+            // If any decoy-labeled PSMs exist, remove them (decoy-free q-values should not mix them in).
+            let n_before = outputs.features.len();
+            outputs.features.retain(|feat| feat.label != -1);
+            let n_after = outputs.features.len();
+            let n_dropped = n_before.saturating_sub(n_after);
+            if n_dropped > 0 {
+                log::info!(
+                    "decoy_free mode: dropped {} decoy-labeled PSMs (kept {})",
+                    n_dropped,
+                    n_after
+                );
+            }
+
+            // DEBUG: Rank histogram for decoy-free FDR
+            {
+                use std::collections::BTreeMap;
+
+                let mut by_rank: BTreeMap<u32, usize> = BTreeMap::new();
+                for f in &outputs.features {
+                    *by_rank.entry(f.rank).or_insert(0) += 1;
+                }
+
+                log::info!("PSMs by rank: {:?}", by_rank);
+                log::info!("Total PSMs: {}", outputs.features.len());
+            }
+
+            // Decoy-free spectrum q-values
+            outputs.features = sage_core::decoy_free_fdr::calculate_q_values(
+                &outputs.features,
+                &self.parameters.fdr,
+            );
+
+            // 1. Spectrum FDR
             let q_spectrum = outputs
                 .features
                 .iter()
-                .filter(|f| f.spectrum_q <= 0.01)
+                .filter(|f| f.rank == 1 && f.spectrum_q <= self.parameters.fdr.peptide_fdr)
                 .count();
+
             log::info!(
-                "discovered {} target peptide-spectrum matches at 1% FDR",
-                q_spectrum
+                "discovered {} target peptide-spectrum matches at {}% FDR",
+                q_spectrum,
+                self.parameters.fdr.peptide_fdr * 100.0
             );
 
+            // 2. Pass the custom thresholds here
             let q_peptide = sage_core::decoy_free_fdr::calculate_peptide_q(
                 &mut outputs.features,
                 &self.database,
+                self.parameters.fdr.peptide_fdr,
             );
+
             let q_protein = sage_core::decoy_free_fdr::calculate_protein_q(
                 &mut outputs.features,
                 &self.database,
+                &self.parameters.fdr,
             );
-            log::info!("discovered {} target peptides at 1% FDR", q_peptide);
-            log::info!("discovered {} target proteins at 1% FDR", q_protein);
+
+            log::info!(
+                "discovered {} target peptides at {}% FDR",
+                q_peptide,
+                self.parameters.fdr.peptide_fdr * 100.0
+            );
+            log::info!(
+                "discovered {} target proteins at {}% FDR",
+                q_protein,
+                self.parameters.fdr.protein_fdr * 100.0
+            );
 
             alignments = if self.parameters.predict_rt {
-                // These functions now infer the mode and do not need the flag.
                 let local_alignments = sage_core::ml::retention_alignment::global_alignment(
                     &mut outputs.features,
                     self.parameters.mzml_paths.len(),
@@ -582,7 +622,7 @@ impl Runner {
 
             areas = alignments.as_ref().and_then(|alignments_ref| {
                 if self.parameters.quant.lfq {
-                    // This function also infers the mode now.
+                    // 1. Quantify (Build Map + Integrate)
                     let mut areas_map = sage_core::lfq::build_feature_map(
                         self.parameters.quant.lfq_settings,
                         self.parameters.precursor_charge,
@@ -590,23 +630,35 @@ impl Runner {
                         self.decoy_free_mode,
                     )
                     .quantify(&self.database, &outputs.ms1, alignments_ref);
-                    let q_precursor =
-                        sage_core::decoy_free_fdr::decoy_free_precursor(&mut areas_map);
-                    log::info!("discovered {} target MS1 peaks at 5% FDR", q_precursor);
+
+                    // 2. Compute FDR using the Shadow Traces
+                    let q_precursor = sage_core::decoy_free_fdr::decoy_free_precursor(
+                        &mut areas_map,
+                        self.parameters.fdr.precursor_fdr,
+                    );
+
+                    log::info!(
+                        "discovered {} target MS1 peaks at {}% FDR (using Shadow Traces)",
+                        q_precursor,
+                        self.parameters.fdr.precursor_fdr * 100.0
+                    );
+
                     Some(areas_map)
                 } else {
                     None
                 }
             });
+
+            // =====================================================================
         } else {
-            // TARGET-DECOY WORKFLOW
+            // ======================== TARGET-DECOY WORKFLOW ======================
+
             alignments = if self.parameters.predict_rt {
                 outputs
                     .features
                     .par_sort_unstable_by(|a, b| a.poisson.total_cmp(&b.poisson));
                 sage_core::ml::qvalue::spectrum_q_value(&mut outputs.features);
 
-                // These functions now infer the mode and do not need the flag.
                 let local_alignments = sage_core::ml::retention_alignment::global_alignment(
                     &mut outputs.features,
                     self.parameters.mzml_paths.len(),
@@ -637,7 +689,6 @@ impl Runner {
 
             areas = alignments.as_ref().and_then(|alignments_ref| {
                 if self.parameters.quant.lfq {
-                    // This function also infers the mode now.
                     let mut areas_map = sage_core::lfq::build_feature_map(
                         self.parameters.quant.lfq_settings,
                         self.parameters.precursor_charge,
@@ -652,6 +703,8 @@ impl Runner {
                     None
                 }
             });
+
+            // =====================================================================
         }
 
         // ADD THE FILENAMES BLOCK HERE
@@ -804,6 +857,7 @@ impl Runner {
         record.push_field(ryu::Buffer::new().format(feature.predicted_rt).as_bytes());
         record.push_field(ryu::Buffer::new().format(feature.delta_rt_model).as_bytes());
         record.push_field(ryu::Buffer::new().format(feature.ims).as_bytes());
+        // FIXED: Corrected field names
         record.push_field(ryu::Buffer::new().format(feature.predicted_ims).as_bytes());
         record.push_field(
             ryu::Buffer::new()
@@ -844,6 +898,25 @@ impl Runner {
         record.push_field(ryu::Buffer::new().format(feature.peptide_q).as_bytes());
         record.push_field(ryu::Buffer::new().format(feature.protein_q).as_bytes());
         record.push_field(ryu::Buffer::new().format(feature.ms2_intensity).as_bytes());
+
+        // --- PHASE 1 & 8 ADDITION: Write Decoy-Free Metrics & Debug Columns ---
+        let format_opt = |val: Option<f32>| match val {
+            Some(v) => ryu::Buffer::new().format(v).to_owned(),
+            None => "NaN".to_string(),
+        };
+
+        record.push_field(format_opt(feature.decoy_free_score).as_bytes());
+        record.push_field(format_opt(feature.decoy_free_p_value).as_bytes());
+        record.push_field(format_opt(feature.decoy_free_pep).as_bytes());
+        record.push_field(format_opt(feature.decoy_free_q_value).as_bytes());
+
+        // Debug Columns
+        record.push_field(format_opt(feature.p_moments).as_bytes());
+        record.push_field(format_opt(feature.p_mle).as_bytes());
+        record.push_field(format_opt(feature.p_lower_order).as_bytes());
+        record.push_field(format_opt(feature.p_msfdr).as_bytes());
+        record.push_field(format_opt(feature.p_nokoi).as_bytes());
+        record.push_field(format_opt(feature.q_nokoi).as_bytes());
 
         record
     }
@@ -949,6 +1022,18 @@ impl Runner {
             "peptide_q",
             "protein_q",
             "ms2_intensity",
+            // New Headers
+            "decoy_free_score",
+            "decoy_free_p_value",
+            "decoy_free_pep",
+            "decoy_free_q_value",
+            // Debug Headers
+            "p_moments",
+            "p_mle",
+            "p_lower_order",
+            "p_msfdr",
+            "p_nokoi",
+            "q_nokoi",
         ];
 
         let headers = csv::ByteRecord::from(csv_headers);
@@ -1099,6 +1184,7 @@ impl Runner {
                 .format(feature.delta_rt_model.clamp(0.001, 1.0).sqrt())
                 .as_bytes(),
         );
+        // FIXED: Corrected field names
         record.push_field(ryu::Buffer::new().format(feature.predicted_ims).as_bytes());
         record.push_field(
             ryu::Buffer::new()
@@ -1136,72 +1222,6 @@ impl Runner {
                 .as_bytes(),
         );
         record
-    }
-
-    pub fn write_pin(&self, features: &[Feature], filenames: &[String]) -> anyhow::Result<String> {
-        let path = self.make_path("results.sage.pin");
-
-        let mut wtr = csv::WriterBuilder::new()
-            .delimiter(b'\t')
-            .from_writer(vec![]);
-
-        let headers = csv::ByteRecord::from(vec![
-            "SpecId",
-            "Label",
-            "ScanNr",
-            "ExpMass",
-            "CalcMass",
-            "FileName",
-            "retentiontime",
-            "ion_mobility",
-            "rank",
-            "z=2",
-            "z=3",
-            "z=4",
-            "z=5",
-            "z=6",
-            "z=other",
-            "peptide_len",
-            "missed_cleavages",
-            "semi_enzymatic",
-            "isotope_error",
-            "ln(precursor_ppm)",
-            "fragment_ppm",
-            "ln(hyperscore)",
-            "ln(delta_next)",
-            "ln(delta_best)",
-            "aligned_rt",
-            "predicted_rt",
-            "sqrt(delta_rt_model)",
-            "predicted_mobility",
-            "sqrt(delta_mobility)",
-            "matched_peaks",
-            "longest_b",
-            "longest_y",
-            "longest_y_pct",
-            "ln(matched_intensity_pct)",
-            "scored_candidates",
-            "ln(-poisson)",
-            "posterior_error",
-            "Peptide",
-            "Proteins",
-        ]);
-
-        let re = regex::Regex::new(r"scan=(\d+)").expect("This is valid regex");
-
-        wtr.write_byte_record(&headers)?;
-        for record in features
-            .into_par_iter()
-            .map(|feat| self.serialize_pin(&re, feat, filenames))
-            .collect::<Vec<_>>()
-        {
-            wtr.write_byte_record(&record)?;
-        }
-
-        wtr.flush()?;
-        let bytes = wtr.into_inner()?;
-        path.write_bytes_sync(bytes)?;
-        Ok(path.to_string())
     }
 
     pub fn write_tmt(&self, quant: &[TmtQuant], filenames: &[String]) -> anyhow::Result<String> {
@@ -1301,6 +1321,73 @@ impl Runner {
         }
         wtr.flush()?;
 
+        let bytes = wtr.into_inner()?;
+        path.write_bytes_sync(bytes)?;
+        Ok(path.to_string())
+    }
+
+    // NEW: Ensure write_pin is included here (it was in the code above, but for completeness)
+    pub fn write_pin(&self, features: &[Feature], filenames: &[String]) -> anyhow::Result<String> {
+        let path = self.make_path("results.sage.pin");
+
+        let mut wtr = csv::WriterBuilder::new()
+            .delimiter(b'\t')
+            .from_writer(vec![]);
+
+        let headers = csv::ByteRecord::from(vec![
+            "SpecId",
+            "Label",
+            "ScanNr",
+            "ExpMass",
+            "CalcMass",
+            "FileName",
+            "retentiontime",
+            "ion_mobility",
+            "rank",
+            "z=2",
+            "z=3",
+            "z=4",
+            "z=5",
+            "z=6",
+            "z=other",
+            "peptide_len",
+            "missed_cleavages",
+            "semi_enzymatic",
+            "isotope_error",
+            "ln(precursor_ppm)",
+            "fragment_ppm",
+            "ln(hyperscore)",
+            "ln(delta_next)",
+            "ln(delta_best)",
+            "aligned_rt",
+            "predicted_rt",
+            "sqrt(delta_rt_model)",
+            "predicted_mobility",
+            "sqrt(delta_mobility)",
+            "matched_peaks",
+            "longest_b",
+            "longest_y",
+            "longest_y_pct",
+            "ln(matched_intensity_pct)",
+            "scored_candidates",
+            "ln(-poisson)",
+            "posterior_error",
+            "Peptide",
+            "Proteins",
+        ]);
+
+        let re = regex::Regex::new(r"scan=(\d+)").expect("This is valid regex");
+
+        wtr.write_byte_record(&headers)?;
+        for record in features
+            .into_par_iter()
+            .map(|feat| self.serialize_pin(&re, feat, filenames))
+            .collect::<Vec<_>>()
+        {
+            wtr.write_byte_record(&record)?;
+        }
+
+        wtr.flush()?;
         let bytes = wtr.into_inner()?;
         path.write_bytes_sync(bytes)?;
         Ok(path.to_string())

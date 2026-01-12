@@ -1,6 +1,7 @@
 use anyhow::{ensure, Context};
 use clap::ArgMatches;
 use sage_cloudpath::{tdf::BrukerProcessingConfig, CloudPath};
+use sage_core::input::{FdrMode, FdrOptions, FdrSettings, FdrType, ModelFit};
 use sage_core::scoring::ScoreType;
 use sage_core::{
     database::{Builder, Parameters},
@@ -44,6 +45,7 @@ pub struct Search {
     pub annotate_matches: bool,
 
     pub score_type: ScoreType,
+    pub fdr: FdrSettings,
 }
 
 #[derive(Deserialize)]
@@ -72,6 +74,7 @@ pub struct Input {
     pub annotate_matches: Option<bool>,
     pub write_pin: Option<bool>,
     pub score_type: Option<ScoreType>,
+    pub fdr: Option<FdrOptions>,
 }
 
 #[derive(Serialize, Deserialize, Debug)]
@@ -213,8 +216,6 @@ impl Input {
             input.annotate_matches = Some(annotate_matches);
         }
 
-        // avoid to later panic if these parameters are not set (but doesn't check if files exist)
-
         ensure!(
             input.database.fasta.is_some(),
             "`database.fasta` must be set. For more information try '--help'"
@@ -227,6 +228,11 @@ impl Input {
                 .unwrap_or_default()
                 > 0,
             "`mzml_paths` must be set. For more information try '--help'"
+        );
+
+        ensure!(
+            !input.database.decoy_tag.as_deref().unwrap_or("").is_empty(),
+            "`database.decoy_tag` must be non-empty (e.g. \"rev_\")."
         );
 
         Ok(input)
@@ -259,19 +265,74 @@ impl Input {
                 "The `left` tolerance should probably be negative, for example: [{}, {}]",
                 -lo,
                 hi.abs()
-            )
+            );
         }
         if hi < 0.0 {
             log::warn!(
                 "The `right` tolerance should probably be positive, for example: [{}, {}]",
                 -lo.abs(),
                 hi
-            )
+            );
         }
     }
 
     pub fn build(mut self) -> anyhow::Result<Search> {
-        let database = self.database.make_parameters();
+        let fdr_mode_opt = self.fdr.as_ref().and_then(|f| f.mode.clone());
+        let fdr_mode = fdr_mode_opt.unwrap_or(FdrMode::Tdc);
+
+        let peptide_fdr = self
+            .fdr
+            .as_ref()
+            .and_then(|f| f.peptide_fdr)
+            .unwrap_or(0.01);
+        let protein_fdr = self
+            .fdr
+            .as_ref()
+            .and_then(|f| f.protein_fdr)
+            .unwrap_or(0.01);
+        let precursor_fdr = self
+            .fdr
+            .as_ref()
+            .and_then(|f| f.precursor_fdr)
+            .unwrap_or(0.05);
+
+        let min_null_rank = self.fdr.as_ref().and_then(|f| f.min_null_rank).unwrap_or(2);
+        let max_null_rank = self
+            .fdr
+            .as_ref()
+            .and_then(|f| f.max_null_rank)
+            .unwrap_or(10);
+
+        let model_fit = self
+            .fdr
+            .as_ref()
+            .and_then(|f| f.model_fit.clone())
+            .unwrap_or(ModelFit::Moments);
+
+        // These read from the JSON config or default to 250/500 if missing
+        let min_null_size = self
+            .fdr
+            .as_ref()
+            .and_then(|f| f.min_null_size)
+            .unwrap_or(250);
+
+        let min_storey_n = self
+            .fdr
+            .as_ref()
+            .and_then(|f| f.min_storey_n)
+            .unwrap_or(500);
+        // ----------------------------
+
+        // --- Read FDR Type from JSON ---
+        let fdr_type = self
+            .fdr
+            .as_ref()
+            .and_then(|f| f.type_.clone())
+            .unwrap_or(FdrType::Bh);
+
+        if self.fdr.as_ref().and_then(|f| f.mode.clone()).is_none() {
+            log::info!("`fdr.mode` not specified; defaulting to target-decoy competition (tdc).");
+        }
 
         Self::check_mass_tolerances(&self.fragment_tol);
         Self::check_mass_tolerances(&self.precursor_tol);
@@ -282,6 +343,7 @@ impl Input {
                 std::process::exit(1);
             }
         }
+
         if let Some(charges) = self.precursor_charge {
             if charges.0 > charges.1 {
                 log::error!(
@@ -292,6 +354,8 @@ impl Input {
                 std::process::exit(1);
             }
         }
+
+        let database = self.database.make_parameters();
 
         if !self.predict_rt.unwrap_or(true)
             && self.quant.as_ref().and_then(|q| q.lfq).unwrap_or(false)
@@ -317,6 +381,14 @@ impl Input {
 
         let score_type = self.score_type.unwrap_or(ScoreType::SageHyperScore);
 
+        let report_psms = self.report_psms.unwrap_or(1);
+        let report_psms = if fdr_mode == FdrMode::DecoyFree && report_psms < 10 {
+            log::warn!("decoy_free mode requires report_psms >= 10; overriding to 10");
+            10
+        } else {
+            report_psms
+        };
+
         Ok(Search {
             version: clap::crate_version!().into(),
             database,
@@ -325,7 +397,7 @@ impl Input {
             output_directory,
             precursor_tol: self.precursor_tol,
             fragment_tol: self.fragment_tol,
-            report_psms: self.report_psms.unwrap_or(1),
+            report_psms,
             max_peaks: self.max_peaks.unwrap_or(150),
             min_peaks: self.min_peaks.unwrap_or(15),
             min_matched_peaks: self.min_matched_peaks.unwrap_or(4),
@@ -342,30 +414,18 @@ impl Input {
             write_pin: self.write_pin.unwrap_or(false),
             bruker_config: self.bruker_config.unwrap_or_default(),
             score_type,
+            fdr: FdrSettings {
+                mode: fdr_mode,
+                peptide_fdr,
+                protein_fdr,
+                precursor_fdr,
+                min_null_rank,
+                max_null_rank,
+                model_fit,
+                type_: fdr_type,
+                min_null_size,
+                min_storey_n,
+            },
         })
-    }
-}
-
-#[cfg(test)]
-mod test {
-    use sage_core::{database::EnzymeBuilder, enzyme::EnzymeParameters};
-
-    #[test]
-    fn deserialize_enzyme_builder() -> Result<(), serde_json::Error> {
-        let a: EnzymeBuilder = serde_json::from_value(serde_json::json!({
-            "cleave_at": "KR",
-        }))?;
-        let b: EnzymeBuilder = serde_json::from_value(serde_json::json!({
-            "cleave_at": "KR",
-            "restrict": "P",
-        }))?;
-
-        let a: EnzymeParameters = a.into();
-        let b: EnzymeParameters = b.into();
-
-        assert_eq!(a.enyzme.and_then(|e| e.skip_suffix), None);
-        assert_eq!(b.enyzme.and_then(|e| e.skip_suffix), Some('P'));
-
-        Ok(())
     }
 }

@@ -141,6 +141,36 @@ pub struct Feature {
 
     pub ms2_intensity: f32,
 
+    // --- PHASE 1 & 8 ADDITIONS: Decoy-Free Explicit Metrics ---
+    // These are Options so they can be omitted entirely from output
+    // if not in decoy-free mode, or set to None.
+    /// Decoy-free specific score (Phred-scaled PEP)
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub decoy_free_score: Option<f32>,
+    /// Decoy-free PEP (Probability of Error)
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub decoy_free_pep: Option<f32>,
+    /// Decoy-free Q-value
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub decoy_free_q_value: Option<f32>,
+    /// Decoy-free P-value
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub decoy_free_p_value: Option<f32>,
+
+    // --- ENSEMBLE TEST / DEBUG COLUMNS ---
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub p_moments: Option<f32>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub p_mle: Option<f32>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub p_lower_order: Option<f32>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub p_msfdr: Option<f32>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub p_nokoi: Option<f32>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub q_nokoi: Option<f32>,
+
     pub fragments: Option<Fragments>,
 }
 
@@ -568,6 +598,22 @@ impl<'db> Scorer<'db> {
                 delta_rt_model: 0.999,
                 delta_ims_model: 0.999,
                 ms2_intensity: score.summed_b + score.summed_y,
+
+                // Outputs - Decoy-Free defaults
+                // Initialize to None; these will be populated later in the pipeline
+                // if and only if decoy-free logic runs.
+                decoy_free_score: None,
+                decoy_free_pep: None,
+                decoy_free_q_value: None,
+                decoy_free_p_value: None,
+
+                // Ensemble Debug Columns
+                p_moments: None,
+                p_mle: None,
+                p_lower_order: None,
+                p_msfdr: None,
+                p_nokoi: None,
+                q_nokoi: None,
 
                 //Fragments
                 fragments,

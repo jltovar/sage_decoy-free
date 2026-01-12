@@ -4,6 +4,7 @@ pub mod enzyme;
 pub mod fasta;
 pub mod fdr;
 pub mod heap;
+pub mod input;
 pub mod ion_series;
 pub mod isotopes;
 pub mod lfq;

@@ -128,19 +128,29 @@ pub fn score_psms(
     precursor_tol: Tolerance,
     decoy_free: bool,
 ) -> Option<()> {
+    // PHASE 1 FIX: Output Honesty
+    // If we are in decoy-free mode, we skip the standard LDA/KDE model entirely.
+    // Standard `discriminant_score` and `posterior_error` rely on a robust
+    // target-decoy competition which doesn't exist here.
+    if decoy_free {
+        scores.par_iter_mut().for_each(|perc| {
+            // Set these to NaN to indicate "not computed by LDA"
+            // This prevents downstream tools from misinterpreting them as valid probabilities.
+            perc.discriminant_score = f32::NAN;
+            perc.posterior_error = f32::NAN;
+        });
+        return Some(());
+    }
+
     log::trace!("fitting linear discriminant model...");
 
     // Conditionally define what a "decoy" is based on the mode
     let decoys = scores
         .par_iter()
         .map(|sc| {
-            if decoy_free {
-                // In decoy-free mode, high-rank PSMs are our decoys
-                sc.rank >= 4
-            } else {
-                // In standard mode, PSMs with label -1 are decoys
-                sc.label == -1
-            }
+            // (Note: The old decoy_free check inside here is effectively dead code now
+            // because of the early return above, which is cleaner).
+            sc.label == -1
         })
         .collect::<Vec<_>>();
 

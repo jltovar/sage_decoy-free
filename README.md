@@ -1,47 +1,207 @@
 # Sage: Decoy-Free Edition (EXPERIMENTAL)
 
-**Note:** This is a fork of the original [Sage search engine by Michael Lazear](https://github.com/lazear/sage). This version includes a new feature for decoy-free analysis.
+> ⚠️ **Experimental fork.**
+> This is a research fork of the original [Sage search engine by Michael Lazear](https://github.com/lazear/sage).
+> APIs, configuration options, and statistical behavior may change as the decoy-free workflow is refined.
 
-## Decoy-Free Search Mode
+This fork adds an explicit **decoy-free false discovery rate (FDR)** workflow alongside standard target–decoy competition (TDC). Instead of relying on the assumption that "decoys behave like targets," the decoy-free mode models **noise** using several statistical theories and **signal** using regularized machine learning and robust mixture modeling.
 
-This fork implements a complete workflow for False Discovery Rate (FDR) estimation without requiring a traditional decoy database. This is achieved by building a statistical model (Gumbel distribution) from lower-scoring peptide-spectrum matches.
+The primary motivation is **increased sensitivity and statistical power** for **ultra-low-input proteomics**, including single-cell and subcellular assays, where every additional confident peptide matters.
 
-The primary benefit of this mode is increased sensitivity and statistical power for ultra-low-input proteomics experiments, such as single-cell analysis, where every identified peptide is critical.
+---
 
+## 1. Decoy-Free Search Mode: Concept
 
-## **Implementation Details:**
-- Decoy-free mode is automatically activated when the user sets `"generate_decoys": false` and the `"decoy_tag": ""` is empty in the parameters.
-- When activated, `"report_psms"` is enforced to be at least 10. This ensures a stable null distribution can be built from the high-rank PSMs required for the statistical model.
+In classic TDC, FDR is estimated by searching both **target** and **decoy** sequences and counting how often decoys "win." This works well but has limitations:
 
+- It assumes decoys mimic the null distribution perfectly.
+- It can be fragile in **small databases** or **extreme low-input** settings.
+- It ties discovery power directly to decoy design.
 
-## References
-**Modeling Lower-Order Statistics to Enable Decoy-Free FDR Estimation in Proteomics**
-Dominik Madej and Henry Lam
-Journal of Proteome Research 2023 22 (4), 1159-1171
-https://doi.org/10.1021/acs.jproteome.2c00604
-https://pubs.acs.org/doi/10.1021/acs.jproteome.2c00604
-https://github.com/dommad/pylord
- 
-**New mixture models for decoy-free false discovery rate estimation in mass spectrometry proteomics**
-Yisu Peng, Shantanu Jain, Yong Fuga Li, Michal Greguš, Alexander R. Ivanov, Olga Vitek, Predrag Radivojac
-Bioinformatics, Volume 36, Issue Supplement_2, December 2020, Pages i745–i753
-https://doi.org/10.1093/bioinformatics/btaa807
-https://academic.oup.com/bioinformatics/article/36/Supplement_2/i745/6055912
-https://github.com/shawn-peng/DecoyFree-MSFDR
+The **decoy-free mode** in this fork instead uses **lower-ranked PSMs from the target database itself** to build a null model:
 
-**A Decoy-Free Approach to the Identification of Peptides**
-Giulia Gonnelli, Michiel Stock, Jan Verwaeren, Davy Maddelein, Bernard De Baets, Lennart Martens, and Sven Degroeve
-Journal of Proteome Research 2015 14 (4), 1792-1798
-https://doi.org/10.1021/pr501164r
-https://pubs.acs.org/doi/10.1021/pr501164r
-https://bio.tools/nokoi
+- Rank 1 = candidate "signal" (best PSM per spectrum).
+- Ranks 2, 3, …, K = candidate "noise" used to estimate the null score distribution.
 
-**Decoy-free protein-level false discovery rate estimation**
-Ben Teng, Ting Huang, Zengyou He
-Bioinformatics, Volume 30, Issue 5, March 2014, Pages 675–681
-https://doi.org/10.1093/bioinformatics/btt431
-https://academic.oup.com/bioinformatics/article/30/5/675/244620
+From this null, the engine computes **p-values, q-values, and posterior error probabilities (PEPs)** without ever consulting a decoy database.
 
+---
+
+## 2. High-Level Implementation
+
+### 2.1 Augmented Ensemble Scoring
+
+To reduce dependence on any single statistical assumption, the decoy-free workflow employs a **consensus ensemble** of four distinct estimators. The final significance is derived by combining their outputs using the **Harmonic Mean P-value (HMP)**, which is robust to correlation between tests.
+
+1.  **Method of Moments (Gumbel)**
+    - Fits a Gumbel distribution to noise scores (ranks 2+) using empirical mean and variance.
+    - Fast, stable, and serves as a conservative "anchor" for the ensemble.
+
+2.  **Maximum Likelihood Estimation (MLE)**
+    - Fits Gumbel parameters via likelihood maximization.
+    - More robust to outliers in the tail of the noise distribution.
+
+3.  **Lower-Order Statistics (Madej & Lam, 2023)**
+    - Regresses score against $\ln(\text{rank})$ to exploit the theoretical decay of order statistics.
+    - Uses scores from ranks $k = 2 \dots K$ to infer the null density governing rank-1.
+
+4.  **Robust MSFDR Mixture Model (Phase 3)**
+    - A stability-hardened implementation of the Mix-Max-Score framework.
+    - Models the score distribution as a two-component mixture: **Gumbel (Null)** + **Skew-Normal (Target)**.
+    - Features **smart data-driven initialization**, **strict EM convergence checks** ($10^{-5}$ tolerance), and **safety clamps** to prevent model collapse on sparse data.
+
+> **Scientific Idea:** The engine acts as a **multi-model jury**, preventing false discoveries if one model fits poorly while boosting sensitivity when models agree.
+
+### 2.2 Nokoi 2.0 Rescoring (Lasso/FISTA)
+
+The engine includes a native implementation of **Nokoi 2.0**, an on-the-fly machine learning rescoring engine tailored for decoy-free analysis:
+
+- **Algorithm:** L1-regularized Logistic Regression (Lasso) optimized via **FISTA** (Fast Iterative Shrinkage-Thresholding Algorithm).
+- **Feature Selection:** Automatically selects relevant features (e.g., retention time alignment, ion mobility delta, intensity coverage) and zeros out noise features using L1 sparsity.
+- **Adaptive Training:** Uses **K-fold cross-validation** with **early stopping** to prevent overfitting on small datasets.
+- **Integration:** Nokoi probabilities are fed into the ensemble as an additional high-quality evidence stream.
+
+### 2.3 Phase 3.5: Isotonic Calibration (PAVA)
+
+Raw probabilities from the ensemble can sometimes be "jittery" due to local noise. This fork implements **Isotonic Regression** using the **Pool Adjacent Violators Algorithm (PAVA)**.
+
+- **Function:** Enforces monotonicity on the final P-values.
+- **Guarantee:** Ensures that a better matching score *always* results in an equal or better P-value/PEP.
+- **Result:** Smoother, more statistically valid FDR curves that respect the natural ordering of data.
+
+---
+
+### 2.4 Adaptive FDR Control & Protein Inference
+
+#### Adaptive FDR (Storey–Tibshirani)
+The fork supports two procedures for converting P-values to Q-values:
+- **`bh` (Benjamini–Hochberg):** Standard, conservative ($\pi_0 = 1$).
+- **`storey` (Storey–Tibshirani):** Estimates the fraction of true nulls ($\hat{\pi}_0$) from the P-value distribution. This increases power in high-quality datasets by "reclaiming" true positives that BH would discard.
+
+#### Protein Inference (Fisher's Method)
+Peptide-level evidence is aggregated into protein-level confidence using **Fisher's Combined Probability Test**:
+$$X = -2 \sum_{i=1}^{n} \ln(p_i)$$
+This allows proteins supported by multiple moderate-confidence peptides to be identified confidently, even if no single peptide reaches strict significance on its own.
+
+---
+
+## 3. Configuration & Usage
+
+Decoy-free mode is configured in your JSON file under the `fdr` key:
+
+### 3.1 Core Strategy (`mode`)
+
+- `"tdc"` (**Default**): Standard Target–Decoy Competition.
+- `"decoy_free"`: **Decoy-free rank-null mode.** No decoy database is required.
+
+### 3.2 Thresholds (`*_fdr`)
+
+- `peptide_fdr` (default: `0.01`): Q-value threshold for reported peptides.
+- `protein_fdr` (default: `0.01`): Q-value threshold for reported proteins.
+- `precursor_fdr` (default: `0.01`): Threshold for MS1 precursor quantification (LFQ).
+
+### 3.3 Tuning Parameters
+
+- `min_null_rank` (default: `2`): First rank used for null modeling.
+- `max_null_rank` (default: `5`): Last rank used for null modeling.
+- `min_null_size` (default: `100`): Minimum number of null scores required to attempt a fit.
+- `model_fit`:
+    - `"moments"`: Uses the Gumbel Method of Moments (fast, conservative).
+    - `"mle"`: Uses Gumbel Maximum Likelihood Estimation (robust to outliers).
+    - `"lower_order"`: Uses the Lower-Order Statistics regression (good for heavy tails).
+    - `"msfdr"`: Uses the Robust Mixture Model (Gumbel + Skew-Normal).
+    - `"ensemble"`: (Recommended) Runs Moments, MLE, Lower-Order, Robust MSFDR, and Nokoi.
+    - `"ensemble_test"`: Same as above but writes **debug columns** (`p_moments`, `p_mle`, `p_msfdr`, `p_lower_order`, `p_nokoi`, `q_nokoi`) to the output.
+- `type`:
+    - `"bh"`: Benjamini-Hochberg.
+    - `"storey"`: Storey-Tibshirani (requires `min_storey_n` samples).
+
+---
+
+## 4. Scientific Summary of This Fork
+
+In this experimental decoy-free fork, Sage is being developed into a **multi-model consensus engine** for proteomics discovery:
+
+- It **models noise** using multiple statistical frameworks:
+  - Extreme value theory (Gumbel via Moments and MLE),
+  - Rank-order theory (Lower-Order Statistics),
+  - Two-component mixtures (Robust MSFDR).
+
+- It **models signal** using:
+  - **Nokoi 2.0 (Lasso)**: Sparse, regularized machine learning.
+  - **Robust MSFDR**: Mixture modeling with Skew-Normal targets.
+
+- It **ensures validity** using:
+  - **Isotonic Calibration (PAVA)**: Enforcing monotonic probabilities.
+  - **Harmonic Mean P-values (HMP)**: Robust evidence combination.
+
+The overarching goal is a workflow that is **statistically principled**, **honest in outputs** (explicit NaNs for missing data), and **highly sensitive** for ultra-low-input regimes.
+
+---
+
+## 5. References
+
+Core decoy-free and lower-order modeling:
+
+- **Modeling Lower-Order Statistics to Enable Decoy-Free FDR Estimation in Proteomics**  
+  Dominik Madej and Henry Lam  
+  *Journal of Proteome Research* 2023, 22 (4), 1159–1171  
+  https://doi.org/10.1021/acs.jproteome.2c00604  
+  https://pubs.acs.org/doi/10.1021/acs.jproteome.2c00604  
+  https://github.com/dommad/pylord
+
+Mixture modeling (MSFDR):
+
+- **New mixture models for decoy-free false discovery rate estimation in mass spectrometry proteomics**  
+  Yisu Peng, Shantanu Jain, Yong Fuga Li, Michal Greguš, Alexander R. Ivanov,  
+  Olga Vitek, Predrag Radivojac  
+  *Bioinformatics* 2020, 36(Supplement_2), i745–i753  
+  https://doi.org/10.1093/bioinformatics/btaa807  
+  https://academic.oup.com/bioinformatics/article/36/Supplement_2/i745/6055912  
+  https://github.com/shawn-peng/DecoyFree-MSFDR
+
+Early decoy-free ideas and Nokoi:
+
+- **A Decoy-Free Approach to the Identification of Peptides**  
+  Giulia Gonnelli, Michiel Stock, Jan Verwaeren, Davy Maddelein,  
+  Bernard De Baets, Lennart Martens, Sven Degroeve  
+  *Journal of Proteome Research* 2015, 14 (4), 1792–1798  
+  https://doi.org/10.1021/pr501164r  
+  https://pubs.acs.org/doi/10.1021/pr501164r  
+  https://bio.tools/nokoi
+
+Protein-level FDR:
+
+- **Decoy-free protein-level false discovery rate estimation**  
+  Ben Teng, Ting Huang, Zengyou He  
+  *Bioinformatics* 2014, 30(5), 675–681  
+  https://doi.org/10.1093/bioinformatics/btt431  
+  https://academic.oup.com/bioinformatics/article/30/5/675/244620
+
+Classical combination and FDR methods:
+
+- **Statistical Methods for Research Workers** (Fisher’s Method)  
+  R.A. Fisher, Oliver and Boyd, Edinburgh, 1925
+
+- **The harmonic mean p-value for combining dependent tests**  
+  Daniel J. Wilson  
+  *PNAS* 2019, 116(4), 1195–1200  
+  https://doi.org/10.1073/pnas.1814092116
+
+- **Statistical significance for genomewide studies** (Storey Q-value)  
+  John D. Storey and Robert Tibshirani  
+  *PNAS* 2003, 100(16), 9440–9445  
+  https://doi.org/10.1073/pnas.1530509100
+
+---
+
+## 6. Status & Caveats
+
+- This fork is **experimental** and intended for method development and research.
+- Always inspect log messages and output columns to confirm which models were applied.
+- If opening an issue, please include your `config.json` and a log excerpt showing the active `fdr.mode`.
+
+**Happy Hunting!**
 
 ---
 
