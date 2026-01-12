@@ -225,22 +225,15 @@ impl LogisticRegression {
             return;
         }
 
-        // 1. Construct Lambda Grid (L1 focus)
-        // L1 lambdas often need to be searched in log-space
-        let base_lambda = if config.l1_lambda > 0.0 {
-            config.l1_lambda
-        } else {
-            0.001
-        };
-        // Search [0.1x, 0.5x, 1x, 2x, 5x, 10x]
-        let factors = [0.1, 0.5, 1.0, 2.0, 5.0, 10.0];
-        let mut lambdas: Vec<f64> = factors.iter().map(|f| base_lambda * f).collect();
-        lambdas.sort_by(|a, b| a.partial_cmp(b).unwrap_or(Ordering::Equal));
+        // --- CHANGE 1: Log-Spaced Lambda Grid ---
+        // Search orders of magnitude: [1e-4, 1e-3, 1e-2, 1e-1, 1.0]
+        // This is much better for finding the "sparsity sweet spot"
+        let lambdas: Vec<f64> = (0..5).map(|i| 1e-4 * 10f64.powi(i)).collect();
 
         // Use 3-fold CV for speed, or 5 if data allows
         let k_folds = if n_samples >= 100 { 5 } else { 3 };
 
-        let mut best_lambda = base_lambda;
+        let mut best_lambda = 0.001;
         let mut best_loss = f64::INFINITY;
 
         log::info!(
@@ -267,12 +260,6 @@ impl LogisticRegression {
                     }
                 }
 
-                // In Nokoi 2.0, we perform Early Stopping *inside* the CV loop.
-                // We further split the 'train_set' into 'inner_train' and 'inner_val'
-                // OR simpler: use 'val_set' for early stopping directly.
-                // Using 'val_set' for both early stopping AND scoring is slightly biased,
-                // but for this scale of data, it is an acceptable trade-off to prevent overfitting.
-
                 let mut fold_model = LogisticRegression::new(self.weights.len());
                 let final_loss =
                     fold_model.train_with_early_stopping(&train_set, &val_set, config, lambda);
@@ -281,8 +268,7 @@ impl LogisticRegression {
             }
 
             let avg_loss = total_loss / k_folds as f64;
-            // log::debug!("Lambda: {:.5}, Loss: {:.5}", lambda, avg_loss);
-
+            
             if avg_loss < best_loss {
                 best_loss = avg_loss;
                 best_lambda = lambda;
@@ -296,13 +282,7 @@ impl LogisticRegression {
         );
 
         // 3. Final Fit on All Data
-        // For final fit, we use a random 80/20 split to determine stopping point
         let split_idx = (n_samples as f64 * 0.8) as usize;
-        // Simple shuffle-like split (data is assumed somewhat random, or we just take end)
-        // PsmData is typically ordered by file/scan, so taking the end is risky if files differ.
-        // However, rescore() collects them linearly.
-        // A simple deterministic shuffle would be better, but simple split is okay for now.
-
         let (train, val) = data.split_at(split_idx);
         self.train_with_early_stopping(train, val, config, best_lambda);
 
@@ -317,7 +297,6 @@ impl LogisticRegression {
 }
 
 /// Robust Preprocessing: Median Imputation + Z-Score Standardization
-/// Explicitly handles constant features by forcing them to 0.0
 pub fn normalize_features(data: &mut [PsmData]) -> (Vec<f64>, Vec<f64>) {
     let n_samples = data.len();
     if n_samples == 0 {
@@ -330,7 +309,7 @@ pub fn normalize_features(data: &mut [PsmData]) -> (Vec<f64>, Vec<f64>) {
     let mut means = vec![0.0; n_features];
     let mut stds = vec![0.0; n_features];
 
-    // 1. Median Imputation (Handle Infs/NaNs)
+    // 1. Median Imputation
     let mut medians = vec![0.0; n_features];
     for j in 0..n_features {
         let mut vals: Vec<f64> = data
@@ -378,14 +357,7 @@ pub fn normalize_features(data: &mut [PsmData]) -> (Vec<f64>, Vec<f64>) {
     }
     for (_i, s) in stds.iter_mut().enumerate() {
         *s = (*s / n).sqrt();
-        // FEATURE SAFETY:
-        // If std is 0 (or very close), the feature is constant (e.g., missing IM).
-        // We set std to 1.0 to avoid div/0, BUT since x == mean, the result (x-mean)/1.0 will be 0.0.
-        // This effectively "hard-codes" the feature to 0.0 for the model.
         if !s.is_finite() || *s < 1e-9 {
-            if *s < 1e-9 {
-                // log::warn!("Feature #{} appears constant (std ~ 0). It will be ignored.", i + 1);
-            }
             *s = 1.0;
         }
     }
@@ -407,9 +379,9 @@ pub fn rescore(features: &[Feature], train_fdr: f32) -> Option<Vec<f64>> {
         enabled: true,
         train_fdr,
         learning_rate: 0.1,
-        epochs: 500,      // Max epochs, likely stops earlier
-        l1_lambda: 0.005, // Start with a reasonable L1
-        patience: 15,     // Patience
+        epochs: 500,
+        l1_lambda: 0.005, // Initial guess, but train_cv will explore better grid
+        patience: 15,
     };
 
     let mut training_data = Vec::new();
@@ -420,12 +392,35 @@ pub fn rescore(features: &[Feature], train_fdr: f32) -> Option<Vec<f64>> {
         .filter(|f| f.rank == 1 && f.spectrum_q <= train_fdr)
         .count();
 
-    if confident_count < 100 {
+    // --- CHANGE 2: Graceful Fallback for Low Data (<50) ---
+    // If we have fewer than 50 confident PSMs, ML training is unstable.
+    // Instead of failing, we return "probabilities" based on min-max scaled Hyperscore.
+    if confident_count < 50 {
         log::warn!(
-            "Nokoi: Insufficient confident Rank 1 PSMs ({}) for training.",
+            "Nokoi: Too few positives ({} < 50) - falling back to normalized hyperscore", 
             confident_count
         );
-        return None;
+        
+        if features.is_empty() { return None; }
+
+        let min_hs = features.iter().map(|f| f.hyperscore as f64).fold(f64::INFINITY, f64::min);
+        let max_hs = features.iter().map(|f| f.hyperscore as f64).fold(f64::NEG_INFINITY, f64::max);
+        let range = max_hs - min_hs;
+
+        if range == 0.0 {
+            // Edge case: all scores identical
+            return Some(vec![0.5; features.len()]);
+        }
+
+        let probabilities: Vec<f64> = features
+            .iter()
+            .map(|f| (f.hyperscore as f64 - min_hs) / range)
+            .collect();
+            
+        return Some(probabilities);
+    } else if confident_count < 100 {
+        // Between 50 and 100, we proceed but warn
+        log::warn!("Nokoi: Low training data ({}), model may vary.", confident_count);
     }
 
     // 1. Feature Extraction
