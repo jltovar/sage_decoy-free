@@ -9,10 +9,10 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 - **Decoy-Free Search Mode**: Complete workflow for FDR estimation without a reverse database. Enabled via `fdr.mode = "decoy_free"`.
 - **Augmented Ensemble Scoring**:A consensus scoring system that simultaneously fits three independent null models (Gumbel Moments, MLE, Lower-Order Regression) and integrates them with Robust MSFDR probabilities using Harmonic Mean P-values (HMP) for rigorous significance estimation.
 - **Nokoi 2.0 (Lasso) Rescoring**: Native implementation of L1-regularized Logistic Regression using FISTA optimization and Adaptive Early Stopping. This enables automatic feature selection and prevents overfitting on small or sparse datasets.
-- **Robust MSFDR Mixture Modeling**: A stability-hardened implementation of Skew-Normal (target) + Gumbel (null) mixture modeling. Features data-driven initialization, strict convergence checks (10 −5 delta log-likelihood), and safety clamps to prevent model collapse on low-input data.
+- **Robust MSFDR Mixture Modeling**: A stability-hardened implementation of Skew-Normal (target) + Gumbel (null) mixture modeling. Features data-driven initialization, strict convergence checks (10<sup>−5</sup> delta log-likelihood), and safety clamps to prevent model collapse on low-input data.
 - **Isotonic Calibration (PAVA)**: Implementation of the Pool Adjacent Violators Algorithm to enforce monotonicity on ensemble P-values, ensuring better scores strictly correspond to lower Posterior Error Probabilities (PEP).
 - **Lower-Order Statistics**: Implementation of rank-order regression to robustly model noise tails when parametric assumptions fail.
-- **Adaptive FDR Control**: Added Storey-Tibshirani q-value procedure (fdr.type = "storey") to estimate π0 and increase statistical power compared to Benjamini-Hochberg.
+- **Adaptive FDR Control**: Added Storey-Tibshirani q-value procedure (fdr.type = "storey") to estimate &pi;<sub>0</sub> and increase statistical power compared to Benjamini-Hochberg.
 - **Protein Inference**: Implemented **Fisher's Method** to aggregate independent peptide probabilities into a single Protein Q-value.
 - **New Output Columns**: `decoy_free_score` (Phred-scaled PEP), `decoy_free_p_value`, `decoy_free_pep`, `decoy_free_q_value`.
 - **Debug Mode**: `model_fit = "ensemble_test"` writes intermediate probability columns (`p_moments`, `p_mle`, `p_lower_order`, `p_msfdr`, `p_nokoi`, `q_nokoi`) to the output for validation.
