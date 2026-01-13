@@ -268,7 +268,7 @@ impl LogisticRegression {
             }
 
             let avg_loss = total_loss / k_folds as f64;
-            
+
             if avg_loss < best_loss {
                 best_loss = avg_loss;
                 best_lambda = lambda;
@@ -397,14 +397,22 @@ pub fn rescore(features: &[Feature], train_fdr: f32) -> Option<Vec<f64>> {
     // Instead of failing, we return "probabilities" based on min-max scaled Hyperscore.
     if confident_count < 50 {
         log::warn!(
-            "Nokoi: Too few positives ({} < 50) - falling back to normalized hyperscore", 
+            "Nokoi: Too few positives ({} < 50) - falling back to normalized hyperscore",
             confident_count
         );
-        
-        if features.is_empty() { return None; }
 
-        let min_hs = features.iter().map(|f| f.hyperscore as f64).fold(f64::INFINITY, f64::min);
-        let max_hs = features.iter().map(|f| f.hyperscore as f64).fold(f64::NEG_INFINITY, f64::max);
+        if features.is_empty() {
+            return None;
+        }
+
+        let min_hs = features
+            .iter()
+            .map(|f| f.hyperscore as f64)
+            .fold(f64::INFINITY, f64::min);
+        let max_hs = features
+            .iter()
+            .map(|f| f.hyperscore as f64)
+            .fold(f64::NEG_INFINITY, f64::max);
         let range = max_hs - min_hs;
 
         if range == 0.0 {
@@ -416,11 +424,14 @@ pub fn rescore(features: &[Feature], train_fdr: f32) -> Option<Vec<f64>> {
             .iter()
             .map(|f| (f.hyperscore as f64 - min_hs) / range)
             .collect();
-            
+
         return Some(probabilities);
     } else if confident_count < 100 {
         // Between 50 and 100, we proceed but warn
-        log::warn!("Nokoi: Low training data ({}), model may vary.", confident_count);
+        log::warn!(
+            "Nokoi: Low training data ({}), model may vary.",
+            confident_count
+        );
     }
 
     // 1. Feature Extraction
