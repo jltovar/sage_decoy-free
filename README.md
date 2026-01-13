@@ -114,7 +114,7 @@ Decoy-free mode is configured in your JSON file under the `fdr` key:
     - `"lower_order"`: Uses the Lower-Order Statistics regression (good for heavy tails).
     - `"msfdr"`: Uses the Robust Mixture Model (Gumbel + Skew-Normal).
     - `"ensemble"`: (Recommended) Runs Moments, MLE, Lower-Order, Robust MSFDR, and Nokoi.
-    - `"ensemble_test"`: Same as above but writes **debug columns** (`p_moments`, `p_mle`, `p_msfdr`, `p_lower_order`, `p_nokoi`, `q_nokoi`) to the output.
+    - `"ensemble_test"`: Same as above but writes **validation columns** (`p_moments`, `p_mle`, `p_msfdr`, `p_lower_order`, `p_nokoi`, `q_nokoi`) to the output.
 - `type`:
     - `"bh"`: Benjamini-Hochberg.
     - `"storey"`: Storey-Tibshirani (requires `min_storey_n` samples).
