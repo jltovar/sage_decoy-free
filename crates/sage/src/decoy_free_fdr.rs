@@ -33,6 +33,20 @@ fn skew_normal_pdf(x: f64, loc: f64, scale: f64, alpha: f64) -> f64 {
     (2.0 / scale) * phi * big_phi
 }
 
+/// Silverman's Rule for KDE Bandwidth (adaptive to data std and n)
+/// CRITICAL for low-input: Prevents Div/0 crashes when n < 2
+fn silverman_bw(samples: &[f64]) -> f64 {
+    let n = samples.len() as f64;
+    if n < 2.0 {
+        return 1.0; // Fallback width for single points to prevent crash
+    }
+    let sigma = stats::std_dev(samples);
+    if sigma == 0.0 {
+        return 1.0; // Fallback if all scores are identical
+    }
+    1.06 * sigma * n.powf(-0.2)
+}
+
 /// Phase 3.5: Isotonic Regression (INCREASING)
 /// Ensures P-values increase as Score quality decreases (High Score -> Low P-value)
 fn isotonic_regression_increasing(p_values: &mut [f64]) {
@@ -337,8 +351,9 @@ pub fn calculate_q_values(psms: &[Feature], settings: &FdrSettings) -> Vec<Featu
         .filter(|f| f.rank == 1)
         .map(|f| f.hyperscore as f64)
         .collect();
-    let bandwidth =
-        1.06 * stats::std_dev(&target_scores_kde) * (target_scores_kde.len() as f64).powf(-0.2);
+
+    // --- SAFE KERNEL DENSITY BANDWIDTH ---
+    let bandwidth = silverman_bw(&target_scores_kde);
 
     let mut rank1_indices = Vec::new();
     let mut rank1_pvalues = Vec::new();
@@ -425,6 +440,7 @@ pub fn calculate_q_values(psms: &[Feature], settings: &FdrSettings) -> Vec<Featu
         .collect();
 
     // 2. Sort by Score Descending (Best to Worst)
+    // NOTE: This sorting IS ESSENTIAL for PAVA to work correctly.
     pava_data.sort_by(|a, b| b.0.partial_cmp(&a.0).unwrap());
 
     // 3. Extract P-values in that order
