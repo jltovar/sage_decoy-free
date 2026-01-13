@@ -96,9 +96,12 @@ Decoy-free mode is configured in your JSON file under the `fdr` key:
 
 ### 3.2 Thresholds (`*_fdr`)
 
-- `peptide_fdr` (default: `0.01`): Q-value threshold for reported peptides.
-- `protein_fdr` (default: `0.01`): Q-value threshold for reported proteins.
-- `precursor_fdr` (default: `0.01`): Threshold for MS1 precursor quantification (LFQ).
+- `peptide_fdr` (default: `0.01`): The primary gatekeeper. It serves two functions:
+1. Spectrum Filter: Discards any individual Spectrum Match (PSM) with a q-value above this threshold before peptide or protein inference begins.
+2. Peptide Reporting: Sets the maximum allowable q-value for a unique peptide sequence to be considered "discovered" in the final report. (Note: Setting this too low (e.g., 0.01) may aggressively prune "mediocre" spectra that could have otherwise supported protein inference.)
+
+- `protein_fdr` (default: `0.01`): The protein-level cutoff. After mapping the surviving PSMs (those that passed the peptide_fdr filter) to proteins, this threshold determines which proteins are statistically significant enough to be reported.
+- `precursor_fdr` (default: `0.01`): The MS1 noise filter (LFQ only). This validates chromatographic peaks by comparing them to "shadow" (decoy) peaks. Only MS1 features with a probability of being random noise lower than this threshold will be quantified.
 
 ### 3.3 Tuning Parameters
 
