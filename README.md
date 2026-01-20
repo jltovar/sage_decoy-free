@@ -97,7 +97,7 @@ Decoy-free mode is configured in your JSON file under the `fdr` key:
     "precursor_fdr": 0.05,
     "min_null_rank": 4,
     "max_null_rank": 50,
-    "min_null_size": 150,
+    "min_null_size": 300,
     "model_fit": "ensemble_test",
     "type": "storey",
     "min_storey_n": 300
