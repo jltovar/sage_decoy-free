@@ -89,18 +89,20 @@ This allows proteins supported by multiple moderate-confidence peptides to be id
 
 Decoy-free mode is configured in your JSON file under the `fdr` key:
 
- `"fdr": {
+```json
+"fdr": {
     "mode": "decoy_free",
     "peptide_fdr": 0.01,
     "protein_fdr": 0.01,
     "precursor_fdr": 0.05,
-	"min_null_rank": 4,
-	"max_null_rank": 50,
-	"min_null_size": 150,
-	"model_fit": "ensemble_test",
+    "min_null_rank": 4,
+    "max_null_rank": 50,
+    "min_null_size": 150,
+    "model_fit": "ensemble_test",
     "type": "storey",
-	"min_storey_n": 300
-  },`
+    "min_storey_n": 300
+}
+```
 
 ### 3.1 Core Strategy (`mode`)
 
