@@ -17,7 +17,7 @@ pub enum ModelFit {
     LowerOrder,
     Msfdr,
     Ensemble,
-    EnsembleTest,
+    EnsembleDebug,
 }
 
 #[derive(Clone, Serialize, Deserialize, Debug, Default, PartialEq, Eq)]
@@ -78,3 +78,4 @@ impl From<FdrOptions> for FdrSettings {
         }
     }
 }
+

@@ -467,6 +467,9 @@ impl Runner {
             .map(|s| sp.process(s))
             .collect::<Vec<_>>();
 
+        // If all the MS1 spectra contain IMS, then we can process them
+        // we use the IMS! otherwise we dont.
+        // Note: Empty iterators return true.
         let all_contain_ims = spectra.ms1.iter().all(|x| x.mobility.is_some());
         let ms1_empty = spectra.ms1.is_empty();
         let ms1_spectra = if ms1_empty {
@@ -980,7 +983,8 @@ impl Runner {
             .delimiter(b'\t')
             .from_writer(vec![]);
 
-        let csv_headers = vec![
+        // 1. Standard Sage Headers (Always Present)
+        let mut csv_headers = vec![
             "psm_id",
             "peptide",
             "proteins",
@@ -1022,28 +1026,73 @@ impl Runner {
             "peptide_q",
             "protein_q",
             "ms2_intensity",
-            // New Headers
-            "decoy_free_score",
-            "decoy_free_p_value",
-            "decoy_free_pep",
-            "decoy_free_q_value",
-            // Debug Headers
-            "p_moments",
-            "p_mle",
-            "p_lower_order",
-            "p_msfdr",
-            "p_nokoi",
-            "q_nokoi",
         ];
 
-        let headers = csv::ByteRecord::from(csv_headers);
+        // 2. Check for Debug Mode
+        let include_debug =
+            self.parameters.fdr.model_fit == sage_core::input::ModelFit::EnsembleDebug;
 
+        if include_debug {
+            csv_headers.extend_from_slice(&[
+                // Decoy-Free Specifics
+                "decoy_free_score",
+                "decoy_free_p_value",
+                "decoy_free_pep",
+                "decoy_free_q_value",
+                // Internal Model Stats
+                "p_moments",
+                "p_mle",
+                "p_lower_order",
+                "p_msfdr",
+                "p_nokoi",
+                "q_nokoi",
+            ]);
+        }
+
+        let headers = csv::ByteRecord::from(csv_headers);
         wtr.write_byte_record(&headers)?;
-        for record in features
+
+        // Helper: Convert Option<f32> to String (defaults to empty string if None)
+        let fmt_opt = |o: Option<f32>| o.map(|v| v.to_string()).unwrap_or_default();
+
+        // 3. Process Records in Parallel
+        let records: Vec<csv::ByteRecord> = features
             .into_par_iter()
-            .map(|feat| self.serialize_feature(feat, filenames))
-            .collect::<Vec<_>>()
-        {
+            .map(|feat| {
+                // --- A. MAP TO STANDARD COLUMNS ---
+                let mut feat_copy = feat.clone();
+
+                if self.decoy_free_mode {
+                    // FIX: Unwrapping Option<f32> to f32
+                    // 0.0 is a safe default for score, 1.0 (100% error) is safe for PEP
+                    feat_copy.discriminant_score = feat.decoy_free_score.unwrap_or(0.0);
+                    feat_copy.posterior_error = feat.decoy_free_pep.unwrap_or(1.0);
+                }
+
+                // Generate the standard record
+                let mut record = self.serialize_feature(&feat_copy, filenames);
+
+                // --- B. APPEND DEBUG COLUMNS (If Enabled) ---
+                if include_debug {
+                    // FIX: csv::push_field expects bytes (&[u8]), not String
+                    record.push_field(fmt_opt(feat.decoy_free_score).as_bytes());
+                    record.push_field(fmt_opt(feat.decoy_free_p_value).as_bytes());
+                    record.push_field(fmt_opt(feat.decoy_free_pep).as_bytes());
+                    record.push_field(fmt_opt(feat.decoy_free_q_value).as_bytes());
+
+                    record.push_field(fmt_opt(feat.p_moments).as_bytes());
+                    record.push_field(fmt_opt(feat.p_mle).as_bytes());
+                    record.push_field(fmt_opt(feat.p_lower_order).as_bytes());
+                    record.push_field(fmt_opt(feat.p_msfdr).as_bytes());
+                    record.push_field(fmt_opt(feat.p_nokoi).as_bytes());
+                    record.push_field(fmt_opt(feat.q_nokoi).as_bytes());
+                }
+
+                record
+            })
+            .collect();
+
+        for record in records {
             wtr.write_byte_record(&record)?;
         }
 

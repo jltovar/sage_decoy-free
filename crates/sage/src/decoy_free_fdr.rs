@@ -304,8 +304,8 @@ pub fn calculate_q_values(psms: &[Feature], settings: &FdrSettings) -> Vec<Featu
     }
 
     let scores: Vec<f64> = fit_data.iter().map(|(_, s)| *s).collect();
-    let debug_mode = matches!(fit_method, ModelFit::EnsembleTest);
-    let run_all = matches!(fit_method, ModelFit::Ensemble | ModelFit::EnsembleTest);
+    let debug_mode = matches!(fit_method, ModelFit::EnsembleDebug);
+    let run_all = matches!(fit_method, ModelFit::Ensemble | ModelFit::EnsembleDebug);
 
     // --- END PHASE 1 UPDATES ---
 
@@ -376,7 +376,7 @@ pub fn calculate_q_values(psms: &[Feature], settings: &FdrSettings) -> Vec<Featu
                 ModelFit::Msfdr => p_mom,
                 ModelFit::Mle => p_mle,
                 ModelFit::LowerOrder => p_lo,
-                ModelFit::Ensemble | ModelFit::EnsembleTest => {
+                ModelFit::Ensemble | ModelFit::EnsembleDebug => {
                     // Combine Robust MSFDR (if available) with others
                     if let Some(m) = &msfdr_model {
                         let p_msfdr = m.calculate_pep(x);
