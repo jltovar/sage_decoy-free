@@ -130,7 +130,7 @@ Decoy-free mode is configured in your JSON file under the `fdr` key:
     - `"msfdr"`: Uses the Robust Mixture Model (Gumbel + Skew-Normal).
     - `"nokoi"`: Uses the Linear Discriminant Analysis (LDA) p-value and q-value derived from ML-based rescoring.
     - `"ensemble"`: (Recommended) Runs Moments, MLE, Lower-Order, and Robust MSFDR.
-    - `"ensemble_test"`: Same as above but writes **validation columns** (`p_moments`, `p_mle`, `p_msfdr`, `p_lower_order`, `p_nokoi`, `q_nokoi`) to the output.
+    - `"ensemble_debug"`: Same as above but writes **validation columns** (`p_moments`, `p_mle`, `p_msfdr`, `p_lower_order`, `p_nokoi`, `q_nokoi`) to the output.
 - `type`:
     - `"bh"`: Benjamini-Hochberg.
     - `"storey"`: Storey-Tibshirani (requires `min_storey_n` samples).
