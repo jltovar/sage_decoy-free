@@ -983,7 +983,7 @@ impl Runner {
             .delimiter(b'\t')
             .from_writer(vec![]);
 
-        // 1. Standard Sage Headers (Always Present)
+        // 1. Standard Sage Headers (Exactly 41 columns)
         let mut csv_headers = vec![
             "psm_id",
             "peptide",
@@ -1028,6 +1028,8 @@ impl Runner {
             "ms2_intensity",
         ];
 
+        let base_columns = csv_headers.len(); // Should be 41
+
         // 2. Check for Debug Mode
         let include_debug =
             self.parameters.fdr.model_fit == sage_core::input::ModelFit::EnsembleDebug;
@@ -1052,29 +1054,30 @@ impl Runner {
         let headers = csv::ByteRecord::from(csv_headers);
         wtr.write_byte_record(&headers)?;
 
-        // Helper: Convert Option<f32> to String (defaults to empty string if None)
         let fmt_opt = |o: Option<f32>| o.map(|v| v.to_string()).unwrap_or_default();
 
-        // 3. Process Records in Parallel
+        // 3. Process Records
         let records: Vec<csv::ByteRecord> = features
             .into_par_iter()
             .map(|feat| {
                 // --- A. MAP TO STANDARD COLUMNS ---
                 let mut feat_copy = feat.clone();
-
                 if self.decoy_free_mode {
-                    // FIX: Unwrapping Option<f32> to f32
-                    // 0.0 is a safe default for score, 1.0 (100% error) is safe for PEP
                     feat_copy.discriminant_score = feat.decoy_free_score.unwrap_or(0.0);
                     feat_copy.posterior_error = feat.decoy_free_pep.unwrap_or(1.0);
                 }
 
-                // Generate the standard record
+                // Generate the record (This might return 51 columns!)
                 let mut record = self.serialize_feature(&feat_copy, filenames);
+
+                // --- FIX: FORCE TRUNCATE TO 41 COLUMNS ---
+                // If serialize_feature outputs extra NaN columns, we chop them off here.
+                if record.len() > base_columns {
+                    record = record.iter().take(base_columns).collect();
+                }
 
                 // --- B. APPEND DEBUG COLUMNS (If Enabled) ---
                 if include_debug {
-                    // FIX: csv::push_field expects bytes (&[u8]), not String
                     record.push_field(fmt_opt(feat.decoy_free_score).as_bytes());
                     record.push_field(fmt_opt(feat.decoy_free_p_value).as_bytes());
                     record.push_field(fmt_opt(feat.decoy_free_pep).as_bytes());
