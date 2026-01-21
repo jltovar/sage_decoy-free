@@ -168,8 +168,8 @@ The FDR columns in Sage Decoy-Free are dynamic. Their values change depending on
   - `ModelFit::Mle`: Uses the Gumbel MLE p-value.
   - `ModelFit::LowerOrder`: Uses the Lower-Order Statistics p-value (optimized for small sample sizes).
   - `ModelFit::Msfdr`: Uses the MSFDR (Skew-Normal) p-value.
+  - `ModelFit::Nokoi`: Uses the Linear Discriminant Analysis (LDA) p-value derived from ML-based rescoring.
   - `ModelFit::Ensemble`: Calculates the Harmonic Mean of all available p-values (Moments, MLE, Lower-Order, MSFDR).
-  - `ModelFit::Nokoi`: (If selected) Uses the Linear Discriminant Analysis (LDA) p-value derived from ML-based rescoring.
 
 - **Calculation:** After determining the raw P-value, the Benjamini–Hochberg (or Storey) procedure is applied globally to convert it into a Q-value (`spectrum_q`).
 
