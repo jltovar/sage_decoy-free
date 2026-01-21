@@ -136,7 +136,74 @@ Decoy-free mode is configured in your JSON file under the `fdr` key:
 
 ---
 
-## 4. Scientific Summary of This Fork
+
+
+---
+
+## 4. Decoy-Free Output & Column Definitions
+
+When running in `decoy_free` mode, Sage maps its internal statistical calculations to the standard Sage output columns. This ensures that the results files (`results.sage.tsv`) remain compatible with existing downstream analysis tools.
+
+### 4.1 Column Mapping (Decoy-Free Mode)
+
+To maintain compatibility with TDA workflows, Decoy-Free statistics are mapped to standard Sage headers as follows:
+
+| Standard Sage Header | Decoy-Free Source Value | Description |
+|---------------------|------------------------|-------------|
+| `sage_discriminant_score` | `decoy_free_score` | A "Phred-scaled" score derived from the Posterior Error Probability (PEP). Calculated as `-10 * log10(PEP)`. Higher is better. |
+| `posterior_error` | `decoy_free_pep` | The probability that this specific match is incorrect (Local FDR). Calculated as `null_density / total_density`. |
+| `spectrum_q` | `decoy_free_q_value` | The final PSM-level False Discovery Rate (FDR). |
+
+### 4.2 False Discovery Rate (FDR) Calculations
+
+The FDR columns in Sage Decoy-Free are dynamic. Their values change depending on the `model_fit` strategy selected in your configuration (e.g., `moments`, `mle`, `ensemble`).
+
+#### `spectrum_q` (PSM-level FDR)
+
+- **Source:** Derived directly from the `decoy_free_p_value`.
+- **Dependency:** The underlying P-value changes based on the selected model:
+
+  - `ModelFit::Moments`: Uses the Gumbel Moments p-value.  
+  - `ModelFit::Mle`: Uses the Gumbel MLE p-value.  
+  - `ModelFit::Ensemble`: Calculates the Harmonic Mean of all available p-values (Moments, MLE, Lower-Order, MSFDR).
+
+- **Calculation:** After determining the raw P-value, the Benjamini–Hochberg (or Storey) procedure is applied globally to convert it into a Q-value (`spectrum_q`).
+
+#### `peptide_q` (Peptide-level FDR)
+
+- **Calculation:** Computed by taking the best (minimum) `spectrum_q` observed for that peptide sequence across all scans.
+- **Dependency:** Improvements in spectrum-level modeling (e.g., Ensemble vs Moments) directly propagate to peptide-level confidence.
+
+#### `protein_q` (Protein-level FDR)
+
+- **Calculation:** Aggregates the `decoy_free_p_values` of all unique peptides assigned to a protein using **Fisher’s Method** for combining independent p-values.
+- **Dependency:** Strongly influenced by model choice. Sharper p-values from better models (e.g., Ensemble) improve discrimination during protein inference.
+
+### 4.3 Debug Columns (`ensemble_debug`)
+
+Sage includes a special configuration mode for analyzing the internal behavior of the Decoy-Free models.
+
+If you set:
+
+```json
+"model_fit": "ensemble_debug"
+```
+
+in your JSON configuration, the output CSV will additionally include the following raw statistical columns (hidden in standard runs to reduce file size and clutter):
+
+- `decoy_free_p_value` — Raw probability that a hit is a random false match (direct model output).  
+- `p_moments` — P-value from Gumbel Method of Moments.  
+- `p_mle` — P-value from Gumbel Maximum Likelihood Estimation.  
+- `p_lower_order` — P-value from Lower-Order Statistics regression.  
+- `p_msfdr` — P-value from the MSFDR (Skew-Normal mixture) model.  
+- `p_nokoi` / `q_nokoi` — Statistics from the Nokoi rescoring integration.
+
+These columns are intended for **method validation, diagnostics, and calibration studies**, and should not normally be used directly for reporting discoveries.
+
+---
+
+
+## 5. Scientific Summary of This Fork
 
 In this experimental decoy-free fork, Sage is being developed into a **multi-model consensus engine** for proteomics discovery:
 
@@ -157,7 +224,7 @@ The overarching goal is a workflow that is **statistically principled**, **hones
 
 ---
 
-## 5. References
+## 6. References
 
 Core decoy-free and lower-order modeling:
 
@@ -213,7 +280,7 @@ Classical combination and FDR methods:
 
 ---
 
-## 6. Status & Caveats
+## 7. Status & Caveats
 
 - This fork is **experimental** and intended for method development and research.
 - Always inspect log messages and output columns to confirm which models were applied.
