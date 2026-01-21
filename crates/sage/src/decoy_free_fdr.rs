@@ -232,21 +232,18 @@ pub fn calculate_q_values(psms: &[Feature], settings: &FdrSettings) -> Vec<Featu
     // --- PHASE 1: SOFT PURIFIED NULL ---
 
     // 1. Identify "High Confidence" Rank 1 peptides to exclude from Null
-    // We use a heuristic: Top 50% of Rank 1 scores are "likely targets".
     let mut rank1_scores: Vec<(u32, f64)> = new_features
         .iter()
         .filter(|f| f.rank == 1)
         .map(|f| (f.peptide_idx.0, f.hyperscore as f64))
         .collect();
 
-    // Determine threshold (Median of Rank 1)
     let purification_threshold = if !rank1_scores.is_empty() {
-        // Partial sort to find median
         let mid = rank1_scores.len() / 2;
-        rank1_scores.select_nth_unstable_by(mid, |a, b| b.1.total_cmp(&a.1)); // Descending sort
+        rank1_scores.select_nth_unstable_by(mid, |a, b| b.1.total_cmp(&a.1));
         rank1_scores[mid].1
     } else {
-        1000.0 // Impossible score if empty
+        1000.0
     };
 
     let purified_peptides: FnvHashSet<u32> = rank1_scores
@@ -260,7 +257,6 @@ pub fn calculate_q_values(psms: &[Feature], settings: &FdrSettings) -> Vec<Featu
         .iter()
         .filter_map(|psm| {
             if psm.rank >= min_rank && psm.rank <= max_rank {
-                // If this peptide is a "high confidence target", skip it for the null
                 if purified_peptides.contains(&psm.peptide_idx.0) {
                     return None;
                 }
@@ -271,14 +267,9 @@ pub fn calculate_q_values(psms: &[Feature], settings: &FdrSettings) -> Vec<Featu
         })
         .collect();
 
-    // 3. Check Safety and Fallback (Using Configured Value)
+    // 3. Fallback
     if fit_data.len() < min_null_size {
-        log::warn!(
-            "Purified null too small ({}), falling back to unpurified null.",
-            fit_data.len()
-        );
-
-        // Re-collect WITHOUT purification filter
+        log::warn!("Purified null too small, falling back to unpurified null.");
         fit_data = new_features
             .iter()
             .filter_map(|psm| {
@@ -291,10 +282,7 @@ pub fn calculate_q_values(psms: &[Feature], settings: &FdrSettings) -> Vec<Featu
             .collect();
 
         if fit_data.len() < min_null_size {
-            log::error!(
-                "Null distribution too small ({}) even after fallback. Aborting FDR.",
-                fit_data.len()
-            );
+            log::error!("Null distribution too small. Aborting FDR.");
             new_features.par_iter_mut().for_each(|psm| {
                 psm.spectrum_q = 1.0;
                 psm.decoy_free_p_value = Some(1.0);
@@ -304,28 +292,36 @@ pub fn calculate_q_values(psms: &[Feature], settings: &FdrSettings) -> Vec<Featu
     }
 
     let scores: Vec<f64> = fit_data.iter().map(|(_, s)| *s).collect();
-    let debug_mode = matches!(fit_method, ModelFit::EnsembleDebug);
-    let run_all = matches!(fit_method, ModelFit::Ensemble | ModelFit::EnsembleDebug);
 
-    // --- END PHASE 1 UPDATES ---
+    // --- LOGIC UPDATE: SPLIT EXECUTION FLAGS ---
+    let debug_mode = matches!(fit_method, ModelFit::EnsembleDebug);
+
+    // run_parametric: "Teacher" models. Needed for Ensemble, Debug, AND Nokoi (as baseline)
+    let run_parametric = matches!(
+        fit_method,
+        ModelFit::Ensemble | ModelFit::EnsembleDebug | ModelFit::Nokoi
+    );
+
+    // run_nokoi: "Student" model. Only run if explicitly requested (Slow!)
+    let run_nokoi = matches!(fit_method, ModelFit::EnsembleDebug | ModelFit::Nokoi);
 
     let (mu_mom, beta_mom) = fit_gumbel_moments(&scores);
 
-    let (mu_mle, beta_mle) = if matches!(fit_method, ModelFit::Mle) || run_all {
+    let (mu_mle, beta_mle) = if matches!(fit_method, ModelFit::Mle) || run_parametric {
         fit_gumbel_mle(&scores).unwrap_or((mu_mom, beta_mom))
     } else {
         (mu_mom, beta_mom)
     };
 
-    let (mu_lo, beta_lo) = if matches!(fit_method, ModelFit::LowerOrder) || run_all {
+    let (mu_lo, beta_lo) = if matches!(fit_method, ModelFit::LowerOrder) || run_parametric {
         fit_lower_order_regression(&fit_data, min_rank, max_rank).unwrap_or((mu_mom, beta_mom))
     } else {
         (mu_mom, beta_mom)
     };
 
-    // Phase 3: Use Local RobustMsfdrModel
-    let msfdr_model = if matches!(fit_method, ModelFit::Msfdr) || run_all {
-        let (mu_in, beta_in) = if run_all {
+    // Robust MSFDR Model
+    let msfdr_model = if matches!(fit_method, ModelFit::Msfdr) || run_parametric {
+        let (mu_in, beta_in) = if run_parametric {
             (mu_lo, beta_lo)
         } else {
             (mu_mom, beta_mom)
@@ -336,7 +332,6 @@ pub fn calculate_q_values(psms: &[Feature], settings: &FdrSettings) -> Vec<Featu
             .map(|f| f.hyperscore as f64)
             .collect();
         log::info!("Fitting Robust MSFDR mixture model...");
-        // Pass Gumbel params for initialization
         RobustMsfdrModel::fit(&target_scores, mu_in, beta_in)
     } else {
         None
@@ -352,7 +347,6 @@ pub fn calculate_q_values(psms: &[Feature], settings: &FdrSettings) -> Vec<Featu
         .map(|f| f.hyperscore as f64)
         .collect();
 
-    // --- SAFE KERNEL DENSITY BANDWIDTH ---
     let bandwidth = silverman_bw(&target_scores_kde);
 
     let mut rank1_indices = Vec::new();
@@ -360,7 +354,6 @@ pub fn calculate_q_values(psms: &[Feature], settings: &FdrSettings) -> Vec<Featu
     let mut rank1_scores_for_pava = Vec::new();
 
     for (i, psm) in new_features.iter_mut().enumerate() {
-        // Ensure legacy fields are NaN for honesty
         psm.discriminant_score = f32::NAN;
         psm.posterior_error = f32::NAN;
 
@@ -373,11 +366,11 @@ pub fn calculate_q_values(psms: &[Feature], settings: &FdrSettings) -> Vec<Featu
 
             let p_final = match fit_method {
                 ModelFit::Moments => p_mom,
-                ModelFit::Msfdr => p_mom,
+                ModelFit::Msfdr => p_mom, // MSFDR handled in PEP, fallback to Mom for P-value if not overridden
                 ModelFit::Mle => p_mle,
                 ModelFit::LowerOrder => p_lo,
-                ModelFit::Ensemble | ModelFit::EnsembleDebug => {
-                    // Combine Robust MSFDR (if available) with others
+                // Ensemble, Debug, OR Nokoi all start with the Harmonic Mean of Parametric models
+                ModelFit::Ensemble | ModelFit::EnsembleDebug | ModelFit::Nokoi => {
                     if let Some(m) = &msfdr_model {
                         let p_msfdr = m.calculate_pep(x);
                         stats::combine_hmp(&[p_mom, p_mle, p_lo, p_msfdr])
@@ -402,7 +395,6 @@ pub fn calculate_q_values(psms: &[Feature], settings: &FdrSettings) -> Vec<Featu
 
             psm.decoy_free_p_value = Some(p_final as f32);
             psm.decoy_free_pep = Some(pep as f32);
-            // Use p-value for initial Q-value calc
             psm.spectrum_q = p_final as f32;
 
             let safe_pep = pep.max(1e-15);
@@ -429,30 +421,22 @@ pub fn calculate_q_values(psms: &[Feature], settings: &FdrSettings) -> Vec<Featu
         }
     }
 
-    // --- PHASE 3.5: ISOTONIC CALIBRATION ---
-    // Perform PAVA on the ensemble p-values to ensure monotonicity
-
-    // 1. Prepare data (Score, Index)
+    // --- PAVA CALIBRATION ---
     let mut pava_data: Vec<(f64, usize)> = rank1_scores_for_pava
         .iter()
         .zip(rank1_indices.iter())
         .map(|(&s, &idx)| (s, idx))
         .collect();
 
-    // 2. Sort by Score Descending (Best to Worst)
-    // NOTE: This sorting IS ESSENTIAL for PAVA to work correctly.
     pava_data.sort_by(|a, b| b.0.partial_cmp(&a.0).unwrap());
 
-    // 3. Extract P-values in that order
     let mut sorted_pvalues: Vec<f64> = pava_data
         .iter()
         .map(|&(_, idx)| new_features[idx].spectrum_q as f64)
         .collect();
 
-    // 4. Apply PAVA (Increasing: Better score should have lower P-value)
     isotonic_regression_increasing(&mut sorted_pvalues);
 
-    // 5. Write back and update list for Q-value estimation
     let mut calibrated_pvalues_map = FnvHashMap::default();
     for (i, &(_, idx)) in pava_data.iter().enumerate() {
         let cal_p = sorted_pvalues[i];
@@ -460,8 +444,6 @@ pub fn calculate_q_values(psms: &[Feature], settings: &FdrSettings) -> Vec<Featu
         calibrated_pvalues_map.insert(idx, cal_p);
     }
 
-    // 6. Re-create the rank1_pvalues vector for BH/Storey using calibrated values
-    // (rank1_indices is in original order, so we map back)
     let final_pvalues_for_q: Vec<f64> = rank1_indices
         .iter()
         .map(|idx| *calibrated_pvalues_map.get(idx).unwrap())
@@ -478,13 +460,14 @@ pub fn calculate_q_values(psms: &[Feature], settings: &FdrSettings) -> Vec<Featu
         feat.decoy_free_q_value = Some(q as f32);
     }
 
-    // --- NOKOI RESCORING (Preserved at End) ---
-    if run_all {
+    // --- NOKOI RESCORING ---
+    // Optimization: ONLY run if we specifically asked for Nokoi or Debug
+    if run_nokoi {
         log::info!("Running Nokoi Rescoring...");
         if let Some(probs) = nokoi::rescore(&new_features, 0.01) {
             let nokoi_p_values = nokoi::calc_empirical_p_values(&new_features, &probs);
 
-            // A) Calculate Independent Nokoi Q-values
+            // A) Independent Nokoi Q-values
             let nokoi_rank1_p: Vec<f64> = new_features
                 .iter()
                 .zip(&nokoi_p_values)

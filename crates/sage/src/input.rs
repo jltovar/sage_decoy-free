@@ -16,6 +16,7 @@ pub enum ModelFit {
     Mle,
     LowerOrder,
     Msfdr,
+    Nokoi,
     Ensemble,
     EnsembleDebug,
 }
@@ -78,4 +79,3 @@ impl From<FdrOptions> for FdrSettings {
         }
     }
 }
-
