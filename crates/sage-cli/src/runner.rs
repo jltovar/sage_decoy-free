@@ -660,6 +660,7 @@ impl Runner {
                 outputs
                     .features
                     .par_sort_unstable_by(|a, b| a.poisson.total_cmp(&b.poisson));
+
                 sage_core::ml::qvalue::spectrum_q_value(&mut outputs.features);
 
                 let local_alignments = sage_core::ml::retention_alignment::global_alignment(
@@ -667,13 +668,36 @@ impl Runner {
                     self.parameters.mzml_paths.len(),
                     self.decoy_free_mode,
                 );
+
                 let _ =
                     sage_core::ml::retention_model::predict(&self.database, &mut outputs.features);
-                let _ = sage_core::ml::mobility_model::predict(
-                    &self.database,
-                    &mut outputs.features,
-                    self.decoy_free_mode,
-                );
+
+                // --- FIX: PARTITION FEATURES BY VALID MOBILITY ---
+                // The MobilityModel crashes if fed features with ims=0.0 because the matrix dimensions mismatch.
+                // We split them, predict only on valid IMS, and then merge.
+                let (mut with_ims, without_ims): (Vec<Feature>, Vec<Feature>) =
+                    outputs.features.drain(..).partition(|f| f.ims > 0.0);
+
+                if !with_ims.is_empty() {
+                    let _ = sage_core::ml::mobility_model::predict(
+                        &self.database,
+                        &mut with_ims,
+                        self.decoy_free_mode,
+                    );
+                }
+
+                // Merge back
+                outputs.features = with_ims;
+                outputs.features.extend(without_ims);
+
+                // !!! CRITICAL FIX HERE !!!
+                // We must restore the sort order because partitioning scrambled it.
+                // If we don't do this, the Linear Model trains on the wrong data.
+                outputs
+                    .features
+                    .par_sort_unstable_by(|a, b| a.poisson.total_cmp(&b.poisson));
+                // -------------------------------------------------
+
                 Some(local_alignments)
             } else {
                 None
