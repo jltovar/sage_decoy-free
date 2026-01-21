@@ -98,7 +98,7 @@ Decoy-free mode is configured in your JSON file under the `fdr` key:
     "min_null_rank": 4,
     "max_null_rank": 50,
     "min_null_size": 300,
-    "model_fit": "ensemble_test",
+    "model_fit": "ensemble",
     "type": "storey",
     "min_storey_n": 300
 }
@@ -164,7 +164,9 @@ The FDR columns in Sage Decoy-Free are dynamic. Their values change depending on
 - **Dependency:** The underlying P-value changes based on the selected model:
 
   - `ModelFit::Moments`: Uses the Gumbel Moments p-value.  
-  - `ModelFit::Mle`: Uses the Gumbel MLE p-value.  
+  - `ModelFit::Mle`: Uses the Gumbel MLE p-value.
+  - `ModelFit::LowerOrder`: Uses the Lower-Order Statistics p-value (optimized for small sample sizes).
+  - `ModelFit::Msfdr`: Uses the MSFDR (Skew-Normal) p-value.
   - `ModelFit::Ensemble`: Calculates the Harmonic Mean of all available p-values (Moments, MLE, Lower-Order, MSFDR).
 
 - **Calculation:** After determining the raw P-value, the Benjamini–Hochberg (or Storey) procedure is applied globally to convert it into a Q-value (`spectrum_q`).
