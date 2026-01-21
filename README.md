@@ -45,7 +45,7 @@ To reduce dependence on any single statistical assumption, the decoy-free workfl
     - Regresses score against $\ln(\text{rank})$ to exploit the theoretical decay of order statistics.
     - Uses scores from ranks $k = 2 \dots K$ to infer the null density governing rank-1.
 
-4.  **Robust MSFDR Mixture Model (Phase 3)**
+4.  **Robust MSFDR Mixture Model (Peng et al., 2020)**
     - A stability-hardened implementation of the Mix-Max-Score framework.
     - Models the score distribution as a two-component mixture: **Gumbel (Null)** + **Skew-Normal (Target)**.
     - Features **smart data-driven initialization**, **strict EM convergence checks** ($10^{-5}$ tolerance), and **safety clamps** to prevent model collapse on sparse data.
@@ -61,7 +61,7 @@ The engine includes a native implementation of **Nokoi 2.0**, an on-the-fly mach
 - **Adaptive Training:** Uses **K-fold cross-validation** with **early stopping** to prevent overfitting on small datasets.
 - **Integration:** Nokoi probabilities are fed into the ensemble as an additional high-quality evidence stream.
 
-### 2.3 Phase 3.5: Isotonic Calibration (PAVA)
+### 2.3 Isotonic Calibration (PAVA)
 
 Raw probabilities from the ensemble can sometimes be "jittery" due to local noise. This fork implements **Isotonic Regression** using the **Pool Adjacent Violators Algorithm (PAVA)**.
 
@@ -156,7 +156,7 @@ To maintain compatibility with TDA workflows, Decoy-Free statistics are mapped t
 
 ### 4.2 False Discovery Rate (FDR) Calculations
 
-The FDR columns in Sage Decoy-Free are dynamic. Their values change depending on the `model_fit` strategy selected in your configuration (e.g., `moments`, `mle`, `ensemble`).
+The FDR columns in Sage Decoy-Free are dynamic. Their values change depending on the `model_fit` strategy selected in your configuration (e.g., `moments`, `mle`, `lower_order`, `msfdr`, `ensemble`).
 
 #### `spectrum_q` (PSM-level FDR)
 
@@ -168,6 +168,7 @@ The FDR columns in Sage Decoy-Free are dynamic. Their values change depending on
   - `ModelFit::LowerOrder`: Uses the Lower-Order Statistics p-value (optimized for small sample sizes).
   - `ModelFit::Msfdr`: Uses the MSFDR (Skew-Normal) p-value.
   - `ModelFit::Ensemble`: Calculates the Harmonic Mean of all available p-values (Moments, MLE, Lower-Order, MSFDR).
+  - `ModelFit::Nokoi`: (If selected) Uses the Linear Discriminant Analysis (LDA) p-value derived from ML-based rescoring.
 
 - **Calculation:** After determining the raw P-value, the Benjamini–Hochberg (or Storey) procedure is applied globally to convert it into a Q-value (`spectrum_q`).
 
