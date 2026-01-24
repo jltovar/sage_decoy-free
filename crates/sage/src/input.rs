@@ -43,6 +43,7 @@ pub struct FdrOptions {
     // Configurable Safety Brakes
     pub min_storey_n: Option<usize>,
     pub min_null_size: Option<usize>,
+    pub kde_samples: Option<usize>,
 }
 
 #[derive(Clone, Serialize, Debug)]
@@ -59,6 +60,7 @@ pub struct FdrSettings {
     // Configurable Safety Brakes
     pub min_storey_n: usize,
     pub min_null_size: usize,
+    pub kde_samples: usize,
 }
 
 impl From<FdrOptions> for FdrSettings {
@@ -76,6 +78,9 @@ impl From<FdrOptions> for FdrSettings {
             // Apply Defaults Here (500 and 150)
             min_storey_n: options.min_storey_n.unwrap_or(500),
             min_null_size: options.min_null_size.unwrap_or(150),
+
+            // If the user provides a value, use it. Otherwise, default to 20,000.
+            kde_samples: options.kde_samples.unwrap_or(20_000),
         }
     }
 }

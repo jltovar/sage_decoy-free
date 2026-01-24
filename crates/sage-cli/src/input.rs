@@ -425,6 +425,7 @@ impl Input {
                 type_: fdr_type,
                 min_null_size,
                 min_storey_n,
+                kde_samples: 20_000,
             },
         })
     }

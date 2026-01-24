@@ -100,7 +100,8 @@ Decoy-free mode is configured in your JSON file under the `fdr` key:
     "min_null_size": 300,
     "model_fit": "ensemble",
     "type": "storey",
-    "min_storey_n": 300
+    "min_storey_n": 300,
+    "kde_samples": 20000
 }
 ```
 
@@ -123,6 +124,7 @@ Decoy-free mode is configured in your JSON file under the `fdr` key:
 - `min_null_rank` (default: `2`): First rank used for null modeling.
 - `max_null_rank` (default: `5`): Last rank used for null modeling.
 - `min_null_size` (default: `100`): Minimum number of null scores required to attempt a fit.
+- `kde_samples` (default: `20000`): Controls the maximum number of data points used for Kernel Density Estimation (KDE) during P-value calculation in non-parametric modes (e.g., Moments, MLE).  Adjustment: Increase this value (e.g., to 50,000) for marginally higher precision at the cost of speed, or decrease it (e.g., to 5,000) for faster processing on low-memory systems.
 - `model_fit`:
     - `"moments"`: Uses the Gumbel Method of Moments (fast, conservative).
     - `"mle"`: Uses Gumbel Maximum Likelihood Estimation (robust to outliers).

@@ -341,19 +341,45 @@ pub fn calculate_q_values(psms: &[Feature], settings: &FdrSettings) -> Vec<Featu
     let dist_mle = Gumbel::new(mu_mle, beta_mle).unwrap();
     let dist_lo = Gumbel::new(mu_lo, beta_lo).unwrap();
 
-    let target_scores_kde: Vec<f64> = new_features
+    // --- FIX 1: Downsample the KDE reference set ---
+    // With 1M+ PSMs, the naive KDE (N^2) hangs the system.
+    // We downsample to the user-configured limit (default 20k) which is sufficient for density estimation.
+    let mut target_scores_kde: Vec<f64> = new_features
         .iter()
         .filter(|f| f.rank == 1)
         .map(|f| f.hyperscore as f64)
         .collect();
 
+    // Use the setting from JSON, falling back to 20,000 if 0 is accidentally passed
+    let kde_limit = if settings.kde_samples > 0 {
+        settings.kde_samples
+    } else {
+        20_000
+    };
+
+    if target_scores_kde.len() > kde_limit {
+        let step = target_scores_kde.len() / kde_limit;
+        target_scores_kde = target_scores_kde.into_iter().step_by(step).collect();
+
+        log::debug!(
+            "Downsampled KDE reference from {} to {} points (step size: {})",
+            new_features.len(),
+            target_scores_kde.len(),
+            step
+        );
+    } else {
+        log::info!(
+            "Using full KDE reference set ({} points)",
+            target_scores_kde.len()
+        );
+    }
+
     let bandwidth = silverman_bw(&target_scores_kde);
 
-    let mut rank1_indices = Vec::new();
-    let mut rank1_pvalues = Vec::new();
-    let mut rank1_scores_for_pava = Vec::new();
-
-    for (i, psm) in new_features.iter_mut().enumerate() {
+    // --- FIX 2: Parallelize the calculation loop ---
+    // Note: We cannot push to vectors inside par_iter_mut, so we calculate fields in parallel,
+    // then collect the indices/scores for PAVA in a second (fast, linear) pass.
+    new_features.par_iter_mut().for_each(|psm| {
         psm.discriminant_score = f32::NAN;
         psm.posterior_error = f32::NAN;
 
@@ -380,6 +406,9 @@ pub fn calculate_q_values(psms: &[Feature], settings: &FdrSettings) -> Vec<Featu
                 }
             };
 
+            // FIX: This path (else block) was the bottleneck.
+            // KDE over 1M points -> 1 Trillion ops.
+            // Downsampling target_scores_kde makes this tractable.
             let pep = if let Some(model) = &msfdr_model {
                 model.calculate_pep(x)
             } else {
@@ -408,16 +437,24 @@ pub fn calculate_q_values(psms: &[Feature], settings: &FdrSettings) -> Vec<Featu
                     psm.p_msfdr = Some(m.calculate_pep(x) as f32);
                 }
             }
-
-            rank1_indices.push(i);
-            rank1_pvalues.push(p_final);
-            rank1_scores_for_pava.push(x);
         } else {
             psm.spectrum_q = 1.0;
             psm.decoy_free_p_value = None;
             psm.decoy_free_pep = None;
             psm.decoy_free_score = None;
             psm.decoy_free_q_value = None;
+        }
+    });
+
+    // --- Collect vectors for PAVA (Sequential Pass) ---
+    // This is very fast (linear memory access) compared to the calc loop.
+    let mut rank1_indices = Vec::with_capacity(new_features.len() / 2);
+    let mut rank1_scores_for_pava = Vec::with_capacity(new_features.len() / 2);
+
+    for (i, psm) in new_features.iter().enumerate() {
+        if psm.rank == 1 {
+            rank1_indices.push(i);
+            rank1_scores_for_pava.push(psm.hyperscore as f64);
         }
     }
 
