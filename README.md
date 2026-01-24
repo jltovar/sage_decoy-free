@@ -31,7 +31,7 @@ From this null, the engine computes **p-values, q-values, and posterior error pr
 
 ### 2.1 Augmented Ensemble Scoring
 
-To reduce dependence on any single statistical assumption, the decoy-free workflow employs a **consensus ensemble** of four distinct estimators. The final significance is derived by combining their outputs using the **Harmonic Mean P-value (HMP)**, which is robust to correlation between tests.
+To reduce dependence on any single statistical assumption, the decoy-free workflow employs a **consensus ensemble** of four distinct estimators. The final significance (P-value) is derived by combining outputs from the first three models (Moments, MLE, Lower-Order) using the **Harmonic Mean P-value (HMP)**. The fourth model (MSFDR) is used to calculate the Posterior Error Probability (PEP), providing a robust, data-driven measure of local FDR that informs the final score.
 
 1.  **Method of Moments (Gumbel)**
     - Fits a Gumbel distribution to noise scores (ranks 2+) using empirical mean and variance.
@@ -42,7 +42,7 @@ To reduce dependence on any single statistical assumption, the decoy-free workfl
     - More robust to outliers in the tail of the noise distribution.
 
 3.  **Lower-Order Statistics (Madej & Lam, 2023)**
-    - Regresses score against $\ln(\text{rank})$ to exploit the theoretical decay of order statistics.
+    - Regresses score against $-\psi(\text{rank})$ (negative Digamma) to exploit the exact theoretical decay of Gumbel order statistics.
     - Uses scores from ranks $k = 2 \dots K$ to infer the null density governing rank-1.
 
 4.  **Robust MSFDR Mixture Model (Peng et al., 2020)**
@@ -290,6 +290,7 @@ Classical combination and FDR methods:
 
 - This fork is **experimental** and intended for method development and research.
 - Always inspect log messages and output columns to confirm which models were applied.
+- **Fail-Safe Design:** If statistical models cannot be fit (e.g., due to sparse data), the engine defaults to a probability of 1.0 (Fail-Closed) rather than crashing.
 - If opening an issue, please include your `config.json` and a log excerpt showing the active `fdr.mode`.
 
 **Happy Hunting!**
