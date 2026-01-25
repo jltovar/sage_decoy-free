@@ -117,6 +117,30 @@ fn isotonic_regression_increasing(p_values: &mut [f64]) {
     }
 }
 
+// --- Helper: median and clamp (for LO anchoring) ---
+fn median_u64(mut v: Vec<u64>) -> Option<f64> {
+    if v.is_empty() {
+        return None;
+    }
+    v.sort_unstable();
+    let n = v.len();
+    if n % 2 == 1 {
+        Some(v[n / 2] as f64)
+    } else {
+        let a = v[n / 2 - 1] as f64;
+        let b = v[n / 2] as f64;
+        Some((a + b) / 2.0)
+    }
+}
+
+#[inline]
+fn clamp_f64(x: f64, lo: f64, hi: f64) -> f64 {
+    if !x.is_finite() {
+        return lo;
+    }
+    x.max(lo).min(hi)
+}
+
 // --- ROBUST MSFDR MODEL ---
 #[derive(Clone, Debug)]
 struct RobustMsfdrModel {
@@ -579,6 +603,35 @@ pub fn calculate_q_values(psms: &[Feature], settings: &FdrSettings) -> Vec<Featu
 
     log::info!("Global Effective Search Space (n_eff): {:.1}", n_eff_global);
 
+    // --- NEW: LO anchoring reference (n_global / n_ref) ---
+    // IMPORTANT:
+    // - Our LO regression is fit in digamma-space: Score ~ intercept + beta * (-digamma(rank))
+    // - Therefore the fitted intercept already corresponds to the *typical* multiplicity seen in the fit dataset.
+    // - We should NOT back-calculate an absolute μ with (ln(n)+gamma) here (that mixes coordinate systems).
+    // - Instead, we anchor to a reference n_global (median scored_candidates of rank-1 spectra),
+    //   and apply ONLY a relative shift in ln-space: +beta*(ln(n_local)-ln(n_global)).
+    //
+    // REFINEMENT (Multiplicity attenuation):
+    // - In open-search contexts, "scored_candidates" are highly correlated (same peptide with small mass shifts),
+    //   so ln(n_local/n_global) can over-penalize if treated as independent trials.
+    // - We therefore support a damping exponent alpha in [0,1]:
+    //       shift = beta * alpha * ln(n_local/n_global)
+    //   alpha=1.0 => original (full multiplicity penalty), alpha<1.0 => attenuated penalty.
+    let n_global_vec: Vec<u64> = new_features
+        .iter()
+        .filter(|f| f.rank == 1)
+        .map(|f| (f.hyperscore as f64, f.scored_candidates as u64))
+        .filter(|(s, n)| s.is_finite() && *n >= 2)
+        .map(|(_, n)| n)
+        .collect();
+
+    let n_global = median_u64(n_global_vec).unwrap_or(n_eff_global);
+    let n_global = clamp_f64(n_global, 10.0, 1e7);
+    log::info!(
+        "LO reference search space (n_global, median rank-1 scored_candidates): {:.1}",
+        n_global
+    );
+
     // --- SPLIT EXECUTION FLAGS ---
     let debug_mode = matches!(fit_method, ModelFit::EnsembleDebug);
     let run_parametric = matches!(
@@ -604,12 +657,19 @@ pub fn calculate_q_values(psms: &[Feature], settings: &FdrSettings) -> Vec<Featu
     // 2. Fit Lower Order
     // --- SAFETY: LO fallback MUST NOT use invalid Moments params ---
     // If LO regression fails and Moments is invalid, use a conservative last-ditch fallback.
+    //
+    // NOTE ON FALLBACK:
+    // In digamma LO, an "intercept" is an anchored quantity. If we must synthesize it from Moments,
+    // we do so coherently by anchoring the intercept at n_global:
+    //   intercept ≈ μ_mom + β_mom * ln(n_global)
+    // (We do NOT use +EULER_MASCHERONI here, because that is part of the digamma/Gumbel order-statistic
+    // mapping that should not be mixed into the intercept after the fact.)
     let (lo_intercept_raw, lo_beta_raw) =
         if matches!(fit_method, ModelFit::LowerOrder) || run_parametric {
             fit_lower_order_regression(&fit_data, min_rank, max_rank).unwrap_or_else(|| {
                 if moments_params_ok {
-                    let correction = beta_mom * (n_eff_global.ln() + EULER_MASCHERONI);
-                    (mu_mom + correction, beta_mom)
+                    let intercept = mu_mom + beta_mom * n_global.ln();
+                    (intercept, beta_mom)
                 } else {
                     // Last-ditch fallback (safe but not statistically meaningful)
                     (0.0, 1.0)
@@ -617,8 +677,8 @@ pub fn calculate_q_values(psms: &[Feature], settings: &FdrSettings) -> Vec<Featu
             })
         } else {
             if moments_params_ok {
-                let correction = beta_mom * (n_eff_global.ln() + EULER_MASCHERONI);
-                (mu_mom + correction, beta_mom)
+                let intercept = mu_mom + beta_mom * n_global.ln();
+                (intercept, beta_mom)
             } else {
                 // Last-ditch fallback (safe but not statistically meaningful)
                 (0.0, 1.0)
@@ -641,6 +701,30 @@ pub fn calculate_q_values(psms: &[Feature], settings: &FdrSettings) -> Vec<Featu
     } else {
         0.0
     };
+
+    // --- OPTIONAL ROBUSTNESS: shrink LO beta toward Moments beta ---
+    // This reduces parametric fragility in heavy tails without changing the LO functional form.
+    //
+    // REFINEMENT:
+    // - We make the blending weight configurable (default: 0.30 toward Moments).
+    // - Some datasets benefit from stronger shrinkage (e.g., 0.50) when LO slope is tail-noisy.
+    //
+    // If settings.lo_beta_blend_moments is present, it should be in [0,1] and represents the fraction of beta_mom.
+    let w_mom = settings.lo_beta_blend_moments.clamp(0.0, 1.0);
+    let lo_beta_shrunk = if moments_params_ok {
+        ((1.0 - w_mom) * lo_beta) + (w_mom * beta_mom.max(1e-9))
+    } else {
+        lo_beta
+    };
+
+    log::info!(
+        "LO anchor: intercept={:.4}, beta_raw={:.4}, beta_shrunk={:.4}, n_global={:.1}, w_mom={:.2}",
+        lo_intercept,
+        lo_beta,
+        lo_beta_shrunk,
+        n_global,
+        w_mom
+    );
 
     // 3. Fit MLE
     // --- SAFETY: If Moments invalid, do not "fallback" MLE to Moments (would be NaN/NaN) ---
@@ -672,13 +756,19 @@ pub fn calculate_q_values(psms: &[Feature], settings: &FdrSettings) -> Vec<Featu
     let mu_mle = if mu_mle.is_finite() { mu_mle } else { 0.0 };
 
     // 4. Fit Robust MSFDR
-    // MSFDR needs a single starting mu. Use the global average n_eff.
-    // mu = intercept - beta * (ln(n) + gamma)
-    let mu_lo_global = lo_intercept - lo_beta * (n_eff_global.ln() + EULER_MASCHERONI);
+    // MSFDR needs a single starting mu. Use the global average n_eff (seeded null).
+    //
+    // IMPORTANT (Consistency):
+    // - LO intercept is anchored at n_global.
+    // - Therefore the consistent global seeded μ is:
+    //     μ_seed = intercept + β * (ln(n_eff_global) - ln(n_global))
+    // - We do NOT use μ = intercept - β*(ln(n)+gamma) here; that is the coordinate mismatch bug.
+    let beta_lo_seed = lo_beta_shrunk.max(1e-9);
+    let mu_lo_global = lo_intercept + beta_lo_seed * (n_eff_global.ln() - n_global.ln());
 
     let msfdr_model = if matches!(fit_method, ModelFit::Msfdr) || run_parametric {
         let (mu_in, beta_in) = if run_parametric {
-            (mu_lo_global, lo_beta)
+            (mu_lo_global, beta_lo_seed)
         } else {
             (mu_mom, beta_mom)
         };
@@ -764,6 +854,24 @@ pub fn calculate_q_values(psms: &[Feature], settings: &FdrSettings) -> Vec<Featu
     // We prefer a conservative null weight so PEP does not become overly optimistic.
     let pi0_kde = 0.90_f64;
 
+    // --- NEW: multiplicity attenuation controls (synergistic fix) ---
+    //
+    // alpha in [0,1] attenuates the ln(n_local/n_global) shift:
+    //   alpha=1.0 => full multiplicity penalty
+    //   alpha=0.5 => square-root-like damping (reasonable open-search default)
+    //
+    // ln_ratio_cap bounds extreme multiplicity shifts so one pathological spectrum cannot dominate.
+    //
+    // These default conservatively and can be tuned with entrapment calibration.
+    let lo_alpha = settings.lo_multiplicity_alpha.clamp(0.0, 1.0);
+    let lo_ln_ratio_cap = settings.lo_ln_ratio_cap.max(0.0);
+
+    log::info!(
+        "LO multiplicity attenuation: alpha={:.2}, ln_ratio_cap={:.2}",
+        lo_alpha,
+        lo_ln_ratio_cap
+    );
+
     // --- CALCULATION LOOP ---
     new_features.par_iter_mut().for_each(|psm| {
         psm.discriminant_score = f32::NAN;
@@ -793,18 +901,48 @@ pub fn calculate_q_values(psms: &[Feature], settings: &FdrSettings) -> Vec<Featu
 
             // Dynamic Lower Order
             let n_eff = if psm.scored_candidates >= 2 {
-                (psm.scored_candidates as f64).max(2.0)
+                (psm.scored_candidates as f64).max(2.0).min(1e9)
             } else {
                 n_eff_global
             };
 
-            // mu = intercept - beta * (ln(n) + gamma)
-            let correction = lo_beta * (n_eff.ln() + EULER_MASCHERONI);
-            let mu_i = lo_intercept - correction;
+            // --- CORE FIX: LO dynamic mapping via RELATIVE SHIFT (consistent with digamma fit) ---
+            // We treat the fitted LO intercept as an anchored score level corresponding to n_global.
+            // For each spectrum, we shift only by the deviation in search-space complexity:
+            //   mu_local = intercept + beta * (ln(n_local) - ln(n_global))
+            //
+            // REFINEMENT (Multiplicity attenuation):
+            // In open-search, candidates are correlated, so ln(n_local/n_global) can over-penalize.
+            // We therefore attenuate the shift by alpha in [0,1]:
+            //   mu_local = intercept + beta * alpha * clamp(ln(n_local/n_global), +/- ln_ratio_cap)
+            //
+            // This:
+            //   - preserves the correct direction of multiplicity adjustment,
+            //   - prevents “0 discoveries” regimes caused by treating correlated candidates as independent,
+            //   - keeps behavior tunable and stable.
+            // Reference beta (your "βrank"/βref). Pick the right one—see below.
+            let beta_ref = beta_mom.max(1e-9);
+
+            let safety_mult =
+                if settings.lo_beta_safety_mult.is_finite() && settings.lo_beta_safety_mult > 0.0 {
+                    settings.lo_beta_safety_mult
+                } else {
+                    1.5
+                };
+
+            // Safety belt: keep LO beta in a sane range relative to reference beta.
+            let beta_cap = (safety_mult * beta_ref).max(1e-9);
+
+            // Enforce 0 ≤ beta_lo ≤ beta_cap (and keep >0 for Gumbel validity).
+            let beta_lo = lo_beta_shrunk.clamp(1e-9, beta_cap);
+            let mut ln_ratio = n_eff.ln() - n_global.ln();
+            if lo_ln_ratio_cap > 0.0 {
+                ln_ratio = ln_ratio.clamp(-lo_ln_ratio_cap, lo_ln_ratio_cap);
+            }
+            let mu_i = lo_intercept + beta_lo * lo_alpha * ln_ratio;
 
             // --- Guard against Unwrap Panic in Dynamic LO ---
-            let dist_lo_dynamic =
-                Gumbel::new(mu_i, lo_beta.max(1e-9)).unwrap_or_else(|_| dist_mom.clone());
+            let dist_lo_dynamic = Gumbel::new(mu_i, beta_lo).unwrap_or_else(|_| dist_mom.clone());
             let p_lo = dist_lo_dynamic.sf(x).clamp(0.0, 1.0).max(1e-300);
 
             let p_final = match fit_method {
@@ -825,7 +963,18 @@ pub fn calculate_q_values(psms: &[Feature], settings: &FdrSettings) -> Vec<Featu
                 // Ensemble
                 ModelFit::Ensemble | ModelFit::EnsembleDebug | ModelFit::Nokoi => {
                     // Ensemble excludes MSFDR p-value to avoid double-counting seeded null
-                    stats::combine_hmp(&[p_mom, p_mle, p_lo])
+                    //
+                    // --- Guard against "LO hijacking" ---
+                    // HMP is min-like; a single overly-liberal p-value can dominate.
+                    // If LO is >100x smaller than BOTH Moments and MLE, cap it at the best of those two.
+                    let p_base_min = p_mom.min(p_mle);
+                    let p_lo_guarded = if p_lo < (p_base_min / 100.0) {
+                        p_base_min
+                    } else {
+                        p_lo
+                    };
+
+                    stats::combine_hmp(&[p_mom, p_mle, p_lo_guarded])
                 }
             };
 
@@ -930,7 +1079,7 @@ pub fn calculate_q_values(psms: &[Feature], settings: &FdrSettings) -> Vec<Featu
         .map(|(&s, &idx)| (s, idx))
         .collect();
 
-    pava_data.sort_by(|a, b| b.0.total_cmp(&a.0));
+    pava_data.sort_by(|a, b| b.0.total_cmp(&a.0).then_with(|| a.1.cmp(&b.1)));
 
     let mut sorted_pvalues: Vec<f64> = pava_data
         .iter()
