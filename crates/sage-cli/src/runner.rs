@@ -467,6 +467,9 @@ impl Runner {
             .map(|s| sp.process(s))
             .collect::<Vec<_>>();
 
+        // If all the MS1 spectra contain IMS, then we can process them
+        // we use the IMS! otherwise we dont.
+        // Note: Empty iterators return true.
         let all_contain_ims = spectra.ms1.iter().all(|x| x.mobility.is_some());
         let ms1_empty = spectra.ms1.is_empty();
         let ms1_spectra = if ms1_empty {
@@ -657,6 +660,7 @@ impl Runner {
                 outputs
                     .features
                     .par_sort_unstable_by(|a, b| a.poisson.total_cmp(&b.poisson));
+
                 sage_core::ml::qvalue::spectrum_q_value(&mut outputs.features);
 
                 let local_alignments = sage_core::ml::retention_alignment::global_alignment(
@@ -664,13 +668,36 @@ impl Runner {
                     self.parameters.mzml_paths.len(),
                     self.decoy_free_mode,
                 );
+
                 let _ =
                     sage_core::ml::retention_model::predict(&self.database, &mut outputs.features);
-                let _ = sage_core::ml::mobility_model::predict(
-                    &self.database,
-                    &mut outputs.features,
-                    self.decoy_free_mode,
-                );
+
+                // --- FIX: PARTITION FEATURES BY VALID MOBILITY ---
+                // The MobilityModel crashes if fed features with ims=0.0 because the matrix dimensions mismatch.
+                // We split them, predict only on valid IMS, and then merge.
+                let (mut with_ims, without_ims): (Vec<Feature>, Vec<Feature>) =
+                    outputs.features.drain(..).partition(|f| f.ims > 0.0);
+
+                if !with_ims.is_empty() {
+                    let _ = sage_core::ml::mobility_model::predict(
+                        &self.database,
+                        &mut with_ims,
+                        self.decoy_free_mode,
+                    );
+                }
+
+                // Merge back
+                outputs.features = with_ims;
+                outputs.features.extend(without_ims);
+
+                // !!! CRITICAL FIX HERE !!!
+                // We must restore the sort order because partitioning scrambled it.
+                // If we don't do this, the Linear Model trains on the wrong data.
+                outputs
+                    .features
+                    .par_sort_unstable_by(|a, b| a.poisson.total_cmp(&b.poisson));
+                // -------------------------------------------------
+
                 Some(local_alignments)
             } else {
                 None
@@ -980,7 +1007,8 @@ impl Runner {
             .delimiter(b'\t')
             .from_writer(vec![]);
 
-        let csv_headers = vec![
+        // 1. Standard Sage Headers (Exactly 41 columns)
+        let mut csv_headers = vec![
             "psm_id",
             "peptide",
             "proteins",
@@ -1022,28 +1050,76 @@ impl Runner {
             "peptide_q",
             "protein_q",
             "ms2_intensity",
-            // New Headers
-            "decoy_free_score",
-            "decoy_free_p_value",
-            "decoy_free_pep",
-            "decoy_free_q_value",
-            // Debug Headers
-            "p_moments",
-            "p_mle",
-            "p_lower_order",
-            "p_msfdr",
-            "p_nokoi",
-            "q_nokoi",
         ];
 
-        let headers = csv::ByteRecord::from(csv_headers);
+        let base_columns = csv_headers.len(); // Should be 41
 
+        // 2. Check for Debug Mode
+        let include_debug =
+            self.parameters.fdr.model_fit == sage_core::input::ModelFit::EnsembleDebug;
+
+        if include_debug {
+            csv_headers.extend_from_slice(&[
+                // Decoy-Free Specifics
+                "decoy_free_score",
+                "decoy_free_p_value",
+                "decoy_free_pep",
+                "decoy_free_q_value",
+                // Internal Model Stats
+                "p_moments",
+                "p_mle",
+                "p_lower_order",
+                "p_msfdr",
+                "p_nokoi",
+                "q_nokoi",
+            ]);
+        }
+
+        let headers = csv::ByteRecord::from(csv_headers);
         wtr.write_byte_record(&headers)?;
-        for record in features
+
+        let fmt_opt = |o: Option<f32>| o.map(|v| v.to_string()).unwrap_or_default();
+
+        // 3. Process Records
+        let records: Vec<csv::ByteRecord> = features
             .into_par_iter()
-            .map(|feat| self.serialize_feature(feat, filenames))
-            .collect::<Vec<_>>()
-        {
+            .map(|feat| {
+                // --- A. MAP TO STANDARD COLUMNS ---
+                let mut feat_copy = feat.clone();
+                if self.decoy_free_mode {
+                    feat_copy.discriminant_score = feat.decoy_free_score.unwrap_or(0.0);
+                    feat_copy.posterior_error = feat.decoy_free_pep.unwrap_or(1.0);
+                }
+
+                // Generate the record (This might return 51 columns!)
+                let mut record = self.serialize_feature(&feat_copy, filenames);
+
+                // --- FIX: FORCE TRUNCATE TO 41 COLUMNS ---
+                // If serialize_feature outputs extra NaN columns, we chop them off here.
+                if record.len() > base_columns {
+                    record = record.iter().take(base_columns).collect();
+                }
+
+                // --- B. APPEND DEBUG COLUMNS (If Enabled) ---
+                if include_debug {
+                    record.push_field(fmt_opt(feat.decoy_free_score).as_bytes());
+                    record.push_field(fmt_opt(feat.decoy_free_p_value).as_bytes());
+                    record.push_field(fmt_opt(feat.decoy_free_pep).as_bytes());
+                    record.push_field(fmt_opt(feat.decoy_free_q_value).as_bytes());
+
+                    record.push_field(fmt_opt(feat.p_moments).as_bytes());
+                    record.push_field(fmt_opt(feat.p_mle).as_bytes());
+                    record.push_field(fmt_opt(feat.p_lower_order).as_bytes());
+                    record.push_field(fmt_opt(feat.p_msfdr).as_bytes());
+                    record.push_field(fmt_opt(feat.p_nokoi).as_bytes());
+                    record.push_field(fmt_opt(feat.q_nokoi).as_bytes());
+                }
+
+                record
+            })
+            .collect();
+
+        for record in records {
             wtr.write_byte_record(&record)?;
         }
 

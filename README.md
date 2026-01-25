@@ -45,7 +45,7 @@ To reduce dependence on any single statistical assumption, the decoy-free workfl
     - Regresses score against $\ln(\text{rank})$ to exploit the theoretical decay of order statistics.
     - Uses scores from ranks $k = 2 \dots K$ to infer the null density governing rank-1.
 
-4.  **Robust MSFDR Mixture Model (Phase 3)**
+4.  **Robust MSFDR Mixture Model (Peng et al., 2020)**
     - A stability-hardened implementation of the Mix-Max-Score framework.
     - Models the score distribution as a two-component mixture: **Gumbel (Null)** + **Skew-Normal (Target)**.
     - Features **smart data-driven initialization**, **strict EM convergence checks** ($10^{-5}$ tolerance), and **safety clamps** to prevent model collapse on sparse data.
@@ -61,7 +61,7 @@ The engine includes a native implementation of **Nokoi 2.0**, an on-the-fly mach
 - **Adaptive Training:** Uses **K-fold cross-validation** with **early stopping** to prevent overfitting on small datasets.
 - **Integration:** Nokoi probabilities are fed into the ensemble as an additional high-quality evidence stream.
 
-### 2.3 Phase 3.5: Isotonic Calibration (PAVA)
+### 2.3 Isotonic Calibration (PAVA)
 
 Raw probabilities from the ensemble can sometimes be "jittery" due to local noise. This fork implements **Isotonic Regression** using the **Pool Adjacent Violators Algorithm (PAVA)**.
 
@@ -89,6 +89,22 @@ This allows proteins supported by multiple moderate-confidence peptides to be id
 
 Decoy-free mode is configured in your JSON file under the `fdr` key:
 
+```json
+"fdr": {
+    "mode": "decoy_free",
+    "peptide_fdr": 0.01,
+    "protein_fdr": 0.01,
+    "precursor_fdr": 0.05,
+    "min_null_rank": 4,
+    "max_null_rank": 50,
+    "min_null_size": 300,
+    "model_fit": "ensemble",
+    "type": "storey",
+    "min_storey_n": 300,
+    "kde_samples": 20000
+}
+```
+
 ### 3.1 Core Strategy (`mode`)
 
 - `"tdc"` (**Default**): Standard Target–Decoy Competition.
@@ -96,29 +112,104 @@ Decoy-free mode is configured in your JSON file under the `fdr` key:
 
 ### 3.2 Thresholds (`*_fdr`)
 
-- `peptide_fdr` (default: `0.01`): Q-value threshold for reported peptides.
-- `protein_fdr` (default: `0.01`): Q-value threshold for reported proteins.
-- `precursor_fdr` (default: `0.01`): Threshold for MS1 precursor quantification (LFQ).
+- `peptide_fdr` (default: `0.01`): The primary gatekeeper. It serves two functions:
+1. Spectrum Filter: Discards any individual Spectrum Match (PSM) with a q-value above this threshold before peptide or protein inference begins.
+2. Peptide Reporting: Sets the maximum allowable q-value for a unique peptide sequence to be considered "discovered" in the final report. (Note: Setting this too low (e.g., 0.01) may aggressively prune "mediocre" spectra that could have otherwise supported protein inference.)
+
+- `protein_fdr` (default: `0.01`): The protein-level cutoff. After mapping the surviving PSMs (those that passed the peptide_fdr filter) to proteins, this threshold determines which proteins are statistically significant enough to be reported.
+- `precursor_fdr` (default: `0.01`): The MS1 noise filter (LFQ only). This validates chromatographic peaks by comparing them to "shadow" (decoy) peaks. Only MS1 features with a probability of being random noise lower than this threshold will be quantified.
 
 ### 3.3 Tuning Parameters
 
 - `min_null_rank` (default: `2`): First rank used for null modeling.
 - `max_null_rank` (default: `5`): Last rank used for null modeling.
 - `min_null_size` (default: `100`): Minimum number of null scores required to attempt a fit.
+- `kde_samples` (default: `20000`): Controls the maximum number of data points used for Kernel Density Estimation (KDE) during P-value calculation in non-parametric modes (e.g., Moments, MLE).  Adjustment: Increase this value (e.g., to 50,000) for marginally higher precision at the cost of speed, or decrease it (e.g., to 5,000) for faster processing on low-memory systems.
 - `model_fit`:
     - `"moments"`: Uses the Gumbel Method of Moments (fast, conservative).
     - `"mle"`: Uses Gumbel Maximum Likelihood Estimation (robust to outliers).
     - `"lower_order"`: Uses the Lower-Order Statistics regression (good for heavy tails).
     - `"msfdr"`: Uses the Robust Mixture Model (Gumbel + Skew-Normal).
-    - `"ensemble"`: (Recommended) Runs Moments, MLE, Lower-Order, Robust MSFDR, and Nokoi.
-    - `"ensemble_test"`: Same as above but writes **debug columns** (`p_moments`, `p_mle`, `p_msfdr`, `p_lower_order`, `p_nokoi`, `q_nokoi`) to the output.
+    - `"nokoi"`: Uses the Linear Discriminant Analysis (LDA) p-value and q-value derived from ML-based rescoring.
+    - `"ensemble"`: (Recommended) Runs Moments, MLE, Lower-Order, and Robust MSFDR.
+    - `"ensemble_debug"`: Same as above but writes **validation columns** (`p_moments`, `p_mle`, `p_msfdr`, `p_lower_order`, `p_nokoi`, `q_nokoi`) to the output.
 - `type`:
     - `"bh"`: Benjamini-Hochberg.
     - `"storey"`: Storey-Tibshirani (requires `min_storey_n` samples).
 
 ---
 
-## 4. Scientific Summary of This Fork
+
+
+---
+
+## 4. Decoy-Free Output & Column Definitions
+
+When running in `decoy_free` mode, Sage maps its internal statistical calculations to the standard Sage output columns. This ensures that the results files (`results.sage.tsv`) remain compatible with existing downstream analysis tools.
+
+### 4.1 Column Mapping (Decoy-Free Mode)
+
+To maintain compatibility with TDA workflows, Decoy-Free statistics are mapped to standard Sage headers as follows:
+
+| Standard Sage Header | Decoy-Free Source Value | Description |
+|---------------------|------------------------|-------------|
+| `sage_discriminant_score` | `decoy_free_score` | A "Phred-scaled" score derived from the Posterior Error Probability (PEP). Calculated as `-10 * log10(PEP)`. Higher is better. |
+| `posterior_error` | `decoy_free_pep` | The probability that this specific match is incorrect (Local FDR). Calculated as `null_density / total_density`. |
+| `spectrum_q` | `decoy_free_q_value` | The final PSM-level False Discovery Rate (FDR). |
+
+### 4.2 False Discovery Rate (FDR) Calculations
+
+The FDR columns in Sage Decoy-Free are dynamic. Their values change depending on the `model_fit` strategy selected in your configuration (e.g., `moments`, `mle`, `lower_order`, `msfdr`, `ensemble`).
+
+#### `spectrum_q` (PSM-level FDR)
+
+- **Source:** Derived directly from the `decoy_free_p_value`.
+- **Dependency:** The underlying P-value changes based on the selected model:
+
+  - `ModelFit::Moments`: Uses the Gumbel Moments p-value.  
+  - `ModelFit::Mle`: Uses the Gumbel MLE p-value.
+  - `ModelFit::LowerOrder`: Uses the Lower-Order Statistics p-value (optimized for small sample sizes).
+  - `ModelFit::Msfdr`: Uses the MSFDR (Skew-Normal) p-value.
+  - `ModelFit::Nokoi`: Uses the Linear Discriminant Analysis (LDA) p-value derived from ML-based rescoring.
+  - `ModelFit::Ensemble`: Calculates the Harmonic Mean of all available p-values (Moments, MLE, Lower-Order, MSFDR).
+
+- **Calculation:** After determining the raw P-value, the Benjamini–Hochberg (or Storey) procedure is applied globally to convert it into a Q-value (`spectrum_q`).
+
+#### `peptide_q` (Peptide-level FDR)
+
+- **Calculation:** Computed by taking the best (minimum) `spectrum_q` observed for that peptide sequence across all scans.
+- **Dependency:** Improvements in spectrum-level modeling (e.g., Ensemble vs Moments) directly propagate to peptide-level confidence.
+
+#### `protein_q` (Protein-level FDR)
+
+- **Calculation:** Aggregates the `decoy_free_p_values` of all unique peptides assigned to a protein using **Fisher’s Method** for combining independent p-values.
+- **Dependency:** Strongly influenced by model choice. Sharper p-values from better models (e.g., Ensemble) improve discrimination during protein inference.
+
+### 4.3 Debug Columns (`ensemble_debug`)
+
+Sage includes a special configuration mode for analyzing the internal behavior of the Decoy-Free models.
+
+If you set:
+
+```json
+"model_fit": "ensemble_debug"
+```
+
+in your JSON configuration, the output CSV will additionally include the following raw statistical columns (hidden in standard runs to reduce file size and clutter):
+
+- `decoy_free_p_value` — Raw probability that a hit is a random false match (direct model output).  
+- `p_moments` — P-value from Gumbel Method of Moments.  
+- `p_mle` — P-value from Gumbel Maximum Likelihood Estimation.  
+- `p_lower_order` — P-value from Lower-Order Statistics regression.  
+- `p_msfdr` — P-value from the MSFDR (Skew-Normal mixture) model.  
+- `p_nokoi` / `q_nokoi` — Statistics from the Nokoi rescoring integration.
+
+These columns are intended for **method validation, diagnostics, and calibration studies**, and should not normally be used directly for reporting discoveries.
+
+---
+
+
+## 5. Scientific Summary of This Fork
 
 In this experimental decoy-free fork, Sage is being developed into a **multi-model consensus engine** for proteomics discovery:
 
@@ -139,7 +230,7 @@ The overarching goal is a workflow that is **statistically principled**, **hones
 
 ---
 
-## 5. References
+## 6. References
 
 Core decoy-free and lower-order modeling:
 
@@ -195,7 +286,7 @@ Classical combination and FDR methods:
 
 ---
 
-## 6. Status & Caveats
+## 7. Status & Caveats
 
 - This fork is **experimental** and intended for method development and research.
 - Always inspect log messages and output columns to confirm which models were applied.

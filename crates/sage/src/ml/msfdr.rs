@@ -1,5 +1,4 @@
 use crate::ml::skew_normal::SkewNormal;
-use crate::ml::stats;
 use serde::{Deserialize, Serialize};
 use statrs::distribution::{Continuous, Gumbel};
 
@@ -70,28 +69,30 @@ impl MsfdrModel {
             return None;
         }
 
-        // --- 1. Initialization ---
-        // Assume start with 80% targets (optimistic)
-        let mut target_weight = 0.8;
+        // --- 1. Data-Driven Initialization ---
+        // Estimate initial target_weight as fraction of rank-1 scores above null mean + 2*std
+        // This acts as a proxy for "target-like" scores using the known lower-rank null params.
 
-        // Initialize Target Dist as a simple Normal Distribution first
-        // Take the top 50% of scores to estimate mean/var for initialization
-        let mut sorted_scores = scores.to_vec();
-        sorted_scores.sort_by(|a, b| a.total_cmp(b));
-        let top_half = &sorted_scores[(n as usize / 2)..];
+        // Variance of Gumbel = (pi^2 * beta^2) / 6  =>  StdDev = (pi * beta) / sqrt(6)
+        let null_std = null_beta * (std::f64::consts::PI / 6.0f64.sqrt());
+        let threshold = null_mu + 2.0 * null_std;
 
-        let init_mean = stats::mean(top_half);
-        let init_std = stats::std_dev(top_half);
+        let target_frac = scores.iter().filter(|&&s| s > threshold).count() as f64 / n;
 
-        // Initial Target: Normal (alpha=0)
-        let mut target_dist = SkewNormal::new(init_mean, init_std, 0.0);
+        // Clamp initial weight between 0.2 and 0.8 for stability.
+        let mut target_weight = target_frac.clamp(0.2, 0.8);
 
-        // Fixed Null Dist
+        // Initialize Target Dist: SkewNormal starting as standard Normal
+        let mut target_dist = SkewNormal::new(0.0, 1.0, 0.0);
+
+        // Fixed Null Dist (Pre-calculated from lower ranks)
         let null_dist = Gumbel::new(null_mu, null_beta).unwrap();
 
         // --- 2. EM Loop ---
+        let mut prev_ll = f64::NEG_INFINITY;
+
         for _iter in 0..15 {
-            // 15 iterations usually sufficient
+            let mut current_ll = 0.0;
 
             // --- E-STEP: Calculate Responsibilities ---
             // resp[i] = P(Target | score[i])
@@ -105,12 +106,30 @@ impl MsfdrModel {
                 let num = target_weight * f_target;
                 let den = num + (1.0 - target_weight) * f_null;
 
+                // Log-likelihood contribution: sum(ln(density))
+                if den > 0.0 {
+                    current_ll += den.ln();
+                }
+
                 let r = if den > 0.0 { num / den } else { 0.0 };
                 responsibilities.push(r);
                 sum_resp += r;
             }
 
+            // --- Convergence Check ---
+            // If log-likelihood hasn't improved significantly, stop early.
+            if (current_ll - prev_ll).abs() < 1e-5 {
+                break;
+            }
+            prev_ll = current_ll;
+
             // --- M-STEP: Update Parameters ---
+
+            // Safety Check: If sum_resp is too low, the model has lost track of targets.
+            // Keep old parameters and try next iteration or exit.
+            if sum_resp < 1e-9 {
+                break; // or continue, but breaking prevents NaN propagation
+            }
 
             // 1. Update Weight
             let new_weight = sum_resp / n;

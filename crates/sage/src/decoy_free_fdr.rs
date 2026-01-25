@@ -8,9 +8,9 @@ use fnv::{FnvHashMap, FnvHashSet};
 use rayon::prelude::*;
 use statrs::consts::EULER_MASCHERONI;
 use statrs::distribution::{Continuous, ContinuousCDF, Gumbel};
+use statrs::function::gamma::digamma;
 
-// --- HELPER MATH (Phase 3 Dependencies) ---
-
+// --- HELPER MATH ---
 fn erf_approx(x: f64) -> f64 {
     let a1 = 0.254829592;
     let a2 = -0.284496736;
@@ -18,8 +18,12 @@ fn erf_approx(x: f64) -> f64 {
     let a4 = -1.453152027;
     let a5 = 1.061405429;
     let p = 0.3275911;
+
     let sign = if x < 0.0 { -1.0 } else { 1.0 };
-    let abs_x = x.abs();
+
+    // --- SAFETY: clamp to avoid overflow; erf(|x|>=10) is ~1.0 anyway ---
+    let abs_x = x.abs().min(10.0);
+
     let t = 1.0 / (1.0 + p * abs_x);
     let y = 1.0 - (((((a5 * t + a4) * t) + a3) * t + a2) * t + a1) * t * (-abs_x * abs_x).exp();
     sign * y
@@ -33,22 +37,64 @@ fn skew_normal_pdf(x: f64, loc: f64, scale: f64, alpha: f64) -> f64 {
     (2.0 / scale) * phi * big_phi
 }
 
-/// Phase 3.5: Isotonic Regression (INCREASING)
+#[inline]
+fn log_add_exp(a: f64, b: f64) -> f64 {
+    // Handle -inf cases
+    if a.is_infinite() && a.is_sign_negative() {
+        return b;
+    }
+    if b.is_infinite() && b.is_sign_negative() {
+        return a;
+    }
+
+    // Handle +inf cases explicitly (prevents inf - inf => NaN)
+    if a.is_infinite() && a.is_sign_positive() {
+        return a;
+    }
+    if b.is_infinite() && b.is_sign_positive() {
+        return b;
+    }
+
+    let m = a.max(b);
+    m + ((a - m).exp() + (b - m).exp()).ln()
+}
+
+/// Silverman's Rule for KDE Bandwidth (adaptive to data std and n)
+fn silverman_bw(samples: &[f64]) -> f64 {
+    let n = samples.len() as f64;
+    if n < 2.0 {
+        return 1.0; // Fallback width for single points to prevent crash
+    }
+    let sigma = stats::std_dev(samples);
+    if sigma == 0.0 {
+        return 1.0; // Fallback if all scores are identical
+    }
+    1.06 * sigma * n.powf(-0.2)
+}
+
+/// Isotonic Regression (INCREASING)
 /// Ensures P-values increase as Score quality decreases (High Score -> Low P-value)
 fn isotonic_regression_increasing(p_values: &mut [f64]) {
     if p_values.is_empty() {
         return;
     }
 
-    // blocks: (value, weight)
-    let mut blocks: Vec<(f64, f64)> = p_values.iter().map(|&p| (p, 1.0)).collect();
+    // blocks: (value, weight_count)
+    // Using usize for weights prevents floating point drift
+    let mut blocks: Vec<(f64, usize)> = p_values.iter().map(|&p| (p, 1)).collect();
     let mut i = 0;
     while i < blocks.len() - 1 {
         // Violator: Current P > Next P (should be <=)
         if blocks[i].0 > blocks[i + 1].0 {
             // Merge
-            let w_new = blocks[i].1 + blocks[i + 1].1;
-            let val_new = (blocks[i].0 * blocks[i].1 + blocks[i + 1].0 * blocks[i + 1].1) / w_new;
+            let w_prev = blocks[i].1;
+            let w_next = blocks[i + 1].1;
+            let w_new = w_prev + w_next;
+
+            // Weighted average of values
+            let val_new =
+                (blocks[i].0 * w_prev as f64 + blocks[i + 1].0 * w_next as f64) / w_new as f64;
+
             blocks[i] = (val_new, w_new);
             blocks.remove(i + 1);
             if i > 0 {
@@ -62,8 +108,7 @@ fn isotonic_regression_increasing(p_values: &mut [f64]) {
     // Flatten back
     let mut idx = 0;
     for (val, weight) in blocks {
-        let count = weight as usize;
-        for _ in 0..count {
+        for _ in 0..weight {
             if idx < p_values.len() {
                 p_values[idx] = val;
                 idx += 1;
@@ -72,8 +117,31 @@ fn isotonic_regression_increasing(p_values: &mut [f64]) {
     }
 }
 
-// --- PHASE 3: ROBUST MSFDR MODEL ---
+// --- Helper: median and clamp (for LO anchoring) ---
+fn median_u64(mut v: Vec<u64>) -> Option<f64> {
+    if v.is_empty() {
+        return None;
+    }
+    v.sort_unstable();
+    let n = v.len();
+    if n % 2 == 1 {
+        Some(v[n / 2] as f64)
+    } else {
+        let a = v[n / 2 - 1] as f64;
+        let b = v[n / 2] as f64;
+        Some((a + b) / 2.0)
+    }
+}
 
+#[inline]
+fn clamp_f64(x: f64, lo: f64, hi: f64) -> f64 {
+    if !x.is_finite() {
+        return lo;
+    }
+    x.max(lo).min(hi)
+}
+
+// --- ROBUST MSFDR MODEL ---
 #[derive(Clone, Debug)]
 struct RobustMsfdrModel {
     null_loc: f64,
@@ -96,8 +164,18 @@ impl RobustMsfdrModel {
         let null_mean_approx = init_null_loc + EULER_MASCHERONI * init_null_scale;
 
         // Target (Top 20% Heuristic)
-        let mut sorted_targets = rank1_scores.to_vec();
-        sorted_targets.sort_by(|a, b| b.partial_cmp(a).unwrap()); // Descending
+        let mut sorted_targets: Vec<f64> = rank1_scores
+            .iter()
+            .cloned()
+            .filter(|x| x.is_finite())
+            .collect();
+
+        if sorted_targets.len() < 10 {
+            return None;
+        }
+
+        sorted_targets.sort_by(|a, b| b.total_cmp(a));
+
         let top_20 = (sorted_targets.len() as f64 * 0.2) as usize;
         let top_slice = &sorted_targets[0..top_20.max(5).min(sorted_targets.len())];
 
@@ -106,12 +184,14 @@ impl RobustMsfdrModel {
             top_slice.iter().map(|s| (s - t_mean).powi(2)).sum::<f64>() / top_slice.len() as f64;
         let t_std = t_var.sqrt().max(1e-6);
 
-        // Pi (Data-Driven Smart Start: Ratio of Rank1 > Approx Null Mean)
-        let n_better = rank1_scores
+        // Pi (Data-Driven Smart Start)
+        // IMPORTANT: use the *finite* denominator, otherwise NaNs reduce pi spuriously.
+        let n_total_finite = sorted_targets.len().max(1) as f64;
+        let n_better = sorted_targets
             .iter()
             .filter(|&&s| s > null_mean_approx)
             .count();
-        let init_pi = (n_better as f64 / rank1_scores.len() as f64).clamp(0.05, 0.95);
+        let init_pi = (n_better as f64 / n_total_finite).clamp(0.05, 0.95);
 
         let mut params = Self {
             null_loc: init_null_loc,
@@ -122,55 +202,153 @@ impl RobustMsfdrModel {
             pi: init_pi,
         };
 
-        // 2. EM Loop (Convergence Checked)
+        // 2. EM Loop
         let max_iters = 25;
         let mut old_ll = -f64::INFINITY;
 
-        for _iter in 0..max_iters {
+        for iter in 0..max_iters {
             let mut sum_z = 0.0;
             let mut sum_z_x = 0.0;
             let mut sum_z_xx = 0.0;
             let mut new_ll = 0.0;
+            let mut n_used = 0usize;
+
+            // --- Guard parameters before constructing the null distribution ---
+            if !params.null_loc.is_finite()
+                || !params.null_scale.is_finite()
+                || params.null_scale <= 0.0
+            {
+                return None;
+            }
 
             let null_dist = match Gumbel::new(params.null_loc, params.null_scale) {
                 Ok(d) => d,
                 Err(_) => return None,
             };
 
+            // Clamp pi locally during E-step to prevent transient degeneracy
+            let pi = params.pi.clamp(0.01, 0.99);
+
+            // ------------------ E-STEP (log-space; stable) ------------------
+            let log_pi = pi.ln();
+            let log_1m_pi = (1.0 - pi).ln();
+
             for &x in rank1_scores {
-                let f0 = null_dist.pdf(x).max(1e-10);
+                if !x.is_finite() {
+                    continue;
+                }
+
+                // Compute pdfs, floor away from 0 to avoid underflow->drop
+                let f0 = null_dist.pdf(x).max(1e-300);
                 let f1 = skew_normal_pdf(
                     x,
                     params.target_mean,
                     params.target_std,
                     params.target_alpha,
                 )
-                .max(1e-10);
+                .max(1e-300);
 
-                let num = params.pi * f1;
-                let den = (1.0 - params.pi) * f0 + num;
-                let z = num / den;
+                if !f0.is_finite() || !f1.is_finite() {
+                    continue;
+                }
+
+                let log_f0 = f0.ln();
+                let log_f1 = f1.ln();
+
+                // log den = log((1-pi)f0 + pi f1)
+                let log_num = log_pi + log_f1;
+                let log_den = log_add_exp(log_1m_pi + log_f0, log_num);
+
+                if !log_den.is_finite() {
+                    continue;
+                }
+
+                // z = exp(log_num - log_den)
+                let z = (log_num - log_den).exp();
+                if !z.is_finite() {
+                    continue;
+                }
 
                 sum_z += z;
                 sum_z_x += z * x;
                 sum_z_xx += z * x * x;
-                new_ll += den.ln();
+
+                new_ll += log_den;
+                n_used += 1;
             }
 
-            // Convergence Check (Phase 3 Requirement)
-            if (new_ll - old_ll).abs() < 1e-5 {
-                break;
-            }
-            old_ll = new_ll;
+            // --- HARD GUARDS AFTER E-STEP ---
 
-            // M-Step
-            let n_total = rank1_scores.len() as f64;
-            params.pi = sum_z / n_total;
+            // If no usable points, model cannot be fit
+            if n_used < 10 {
+                return None;
+            }
+
+            // If essentially no posteriors are assigned to the alternative, EM is collapsing.
+            // Returning None forces caller to fall back to KDE/other conservative behavior.
+            if sum_z < 1e-8 {
+                if iter == 0 {
+                    return None; // immediate collapse => incompatible
+                } else {
+                    break; // later collapse => keep last stable params
+                }
+            }
+
+            // Prevent NaN / Inf propagation
+            if !new_ll.is_finite() {
+                return None;
+            }
+
+            // --- SCALE-INVARIANT CONVERGENCE CHECK ---
+            // Use average log-likelihood per point to avoid large-N stagnation
+            let avg_ll = new_ll / (n_used as f64);
+            if !avg_ll.is_finite() {
+                return None;
+            }
+
+            // Convergence: relative improvement in average log-likelihood
+            // This is stable across dataset sizes and prevents needless iterations.
+            let tol_rel = 1e-4;
+            let tol_abs = 1e-6;
+
+            if old_ll.is_finite() {
+                let delta = (avg_ll - old_ll).abs();
+                let scale = old_ll.abs().max(1.0); // avoid division by tiny numbers
+                if delta < tol_abs || (delta / scale) < tol_rel {
+                    break;
+                }
+            }
+
+            old_ll = avg_ll;
+
+            // ------------------ M-STEP ------------------
+
+            let n_total = n_used as f64;
+
+            // Update pi (clamped away from 0/1)
+            params.pi = (sum_z / n_total).clamp(0.01, 0.99);
+            if !params.pi.is_finite() {
+                return None;
+            }
+
+            // Update target mean
             params.target_mean = sum_z_x / sum_z;
-            let var = (sum_z_xx / sum_z) - params.target_mean.powi(2);
-            params.target_std = var.sqrt().max(1e-6);
+            if !params.target_mean.is_finite() {
+                return None;
+            }
 
-            // Heuristic alpha update
+            // Update target variance
+            let var = (sum_z_xx / sum_z) - params.target_mean.powi(2);
+            if !var.is_finite() || var < 0.0 {
+                return None;
+            }
+
+            params.target_std = var.sqrt().max(1e-6);
+            if !params.target_std.is_finite() {
+                return None;
+            }
+
+            // Gentle skew adaptation (keeps tail stable)
             if params.target_mean > t_mean {
                 params.target_alpha = (params.target_alpha + 0.1).min(10.0);
             }
@@ -185,26 +363,60 @@ impl RobustMsfdrModel {
     }
 
     pub fn calculate_pep(&self, x: f64) -> f64 {
-        let null_dist = Gumbel::new(self.null_loc, self.null_scale).unwrap();
-        let f0 = null_dist.pdf(x).max(1e-10);
+        // --- Guard against invalid inputs ---
+        if !x.is_finite() {
+            return 1.0;
+        }
+
+        // --- Guard against invalid Gumbel params ---
+        let null_dist = match Gumbel::new(self.null_loc, self.null_scale.max(1e-9)) {
+            Ok(d) => d,
+            Err(_) => return 1.0, // Conservative fallback
+        };
+
+        // Clamp pi away from exact 0/1 to avoid degeneracy
+        let pi = self.pi.clamp(0.01, 0.99);
+
+        let f0 = null_dist.pdf(x).max(1e-300);
         let f1 =
-            skew_normal_pdf(x, self.target_mean, self.target_std, self.target_alpha).max(1e-10);
-        let den = (1.0 - self.pi) * f0 + self.pi * f1;
-        ((1.0 - self.pi) * f0 / den).clamp(0.0, 1.0)
+            skew_normal_pdf(x, self.target_mean, self.target_std, self.target_alpha).max(1e-300);
+
+        let den = (1.0 - pi) * f0 + pi * f1;
+
+        // --- Guard against divide-by-zero / NaN ---
+        if !den.is_finite() || den <= 0.0 {
+            return 1.0;
+        }
+
+        // PEP = P(null | x) = (1-pi)*f0 / ((1-pi)*f0 + pi*f1)
+        (((1.0 - pi) * f0) / den).clamp(0.0, 1.0)
+    }
+
+    // Explicitly named to indicate this uses the Seed parameters (fixed null)
+    pub fn calculate_seeded_null_p(&self, x: f64) -> f64 {
+        // --- Guard against invalid inputs ---
+        if !x.is_finite() {
+            return 1.0;
+        }
+
+        // --- Guard against invalid Gumbel params ---
+        let null_dist = match Gumbel::new(self.null_loc, self.null_scale.max(1e-9)) {
+            Ok(d) => d,
+            Err(_) => return 1.0, // Conservative fallback (P=1.0)
+        };
+
+        // Avoid exact 0.0 p-values (later log / combination safety)
+        null_dist.sf(x).clamp(0.0, 1.0).max(1e-300)
     }
 }
 
 // --- MAIN FUNCTION ---
-
 /// Calculate spectrum-level q-values using Gumbel-based decoy-free methods.
 pub fn calculate_q_values(psms: &[Feature], settings: &FdrSettings) -> Vec<Feature> {
     let mut new_features = psms.to_vec();
-
     let min_rank = settings.min_null_rank;
     let max_rank = settings.max_null_rank;
     let fit_method = &settings.model_fit;
-
-    // Grab config values
     let min_null_size = settings.min_null_size;
     let min_storey_n = settings.min_storey_n;
 
@@ -216,23 +428,29 @@ pub fn calculate_q_values(psms: &[Feature], settings: &FdrSettings) -> Vec<Featu
     );
 
     // --- PHASE 1: SOFT PURIFIED NULL ---
-
     // 1. Identify "High Confidence" Rank 1 peptides to exclude from Null
-    // We use a heuristic: Top 50% of Rank 1 scores are "likely targets".
     let mut rank1_scores: Vec<(u32, f64)> = new_features
         .iter()
         .filter(|f| f.rank == 1)
         .map(|f| (f.peptide_idx.0, f.hyperscore as f64))
+        .filter(|(_, s)| s.is_finite())
         .collect();
 
-    // Determine threshold (Median of Rank 1)
-    let purification_threshold = if !rank1_scores.is_empty() {
-        // Partial sort to find median
-        let mid = rank1_scores.len() / 2;
-        rank1_scores.select_nth_unstable_by(mid, |a, b| b.1.total_cmp(&a.1)); // Descending sort
-        rank1_scores[mid].1
+    // --- FIX: use TOP 20% threshold (not median) ---
+    // We want to exclude only very high-confidence rank1 peptides from the null.
+    // Using the median would exclude ~50% and can collapse the null.
+    let purification_threshold = if rank1_scores.len() >= 10 {
+        // Sort by score descending
+        rank1_scores.sort_by(|a, b| b.1.total_cmp(&a.1));
+
+        // threshold index for top 20% (minimum 5 peptides)
+        let top_k = ((rank1_scores.len() as f64) * 0.20).round() as usize;
+        let top_k = top_k.max(5).min(rank1_scores.len());
+
+        // The last element in the top_k slice sets the cutoff
+        rank1_scores[top_k - 1].1
     } else {
-        1000.0 // Impossible score if empty
+        1000.0
     };
 
     let purified_peptides: FnvHashSet<u32> = rank1_scores
@@ -246,30 +464,32 @@ pub fn calculate_q_values(psms: &[Feature], settings: &FdrSettings) -> Vec<Featu
         .iter()
         .filter_map(|psm| {
             if psm.rank >= min_rank && psm.rank <= max_rank {
-                // If this peptide is a "high confidence target", skip it for the null
                 if purified_peptides.contains(&psm.peptide_idx.0) {
                     return None;
                 }
-                Some((psm.rank, psm.hyperscore as f64))
+                let s = psm.hyperscore as f64;
+                if !s.is_finite() {
+                    return None;
+                }
+                Some((psm.rank, s))
             } else {
                 None
             }
         })
         .collect();
 
-    // 3. Check Safety and Fallback (Using Configured Value)
+    // 3. Fallback
     if fit_data.len() < min_null_size {
-        log::warn!(
-            "Purified null too small ({}), falling back to unpurified null.",
-            fit_data.len()
-        );
-
-        // Re-collect WITHOUT purification filter
+        log::warn!("Purified null too small, falling back to unpurified null.");
         fit_data = new_features
             .iter()
             .filter_map(|psm| {
                 if psm.rank >= min_rank && psm.rank <= max_rank {
-                    Some((psm.rank, psm.hyperscore as f64))
+                    let s = psm.hyperscore as f64;
+                    if !s.is_finite() {
+                        return None;
+                    }
+                    Some((psm.rank, s))
                 } else {
                     None
                 }
@@ -277,42 +497,278 @@ pub fn calculate_q_values(psms: &[Feature], settings: &FdrSettings) -> Vec<Featu
             .collect();
 
         if fit_data.len() < min_null_size {
-            log::error!(
-                "Null distribution too small ({}) even after fallback. Aborting FDR.",
-                fit_data.len()
-            );
+            log::error!("Null distribution too small. Aborting FDR.");
             new_features.par_iter_mut().for_each(|psm| {
                 psm.spectrum_q = 1.0;
-                psm.decoy_free_p_value = Some(1.0);
+                if psm.rank == 1 {
+                    psm.decoy_free_p_value = Some(1.0);
+                    psm.decoy_free_pep = Some(1.0);
+                    psm.decoy_free_score = Some(0.0);
+                    psm.decoy_free_q_value = Some(1.0);
+                } else {
+                    psm.decoy_free_p_value = None;
+                    psm.decoy_free_pep = None;
+                    psm.decoy_free_score = None;
+                    psm.decoy_free_q_value = None;
+                }
             });
             return new_features;
         }
     }
 
-    let scores: Vec<f64> = fit_data.iter().map(|(_, s)| *s).collect();
-    let debug_mode = matches!(fit_method, ModelFit::EnsembleTest);
-    let run_all = matches!(fit_method, ModelFit::Ensemble | ModelFit::EnsembleTest);
+    // --- SAFETY: filter non-finite scores in fit_data (protect LO regression) ---
+    let fit_data_before = fit_data.len();
+    fit_data.retain(|&(_, s)| s.is_finite());
+    let fit_data_dropped = fit_data_before - fit_data.len();
+    if fit_data_dropped > 0 {
+        log::warn!(
+            "Dropped {} non-finite entries from fit_data before LO regression (fit_data {}).",
+            fit_data_dropped,
+            fit_data_before
+        );
+    }
 
-    // --- END PHASE 1 UPDATES ---
+    // If filtering made the null too small, fail-closed.
+    if fit_data.len() < min_null_size {
+        log::error!(
+            "Null distribution too small after filtering non-finite fit_data ({} < {}). Aborting FDR.",
+            fit_data.len(),
+            min_null_size
+        );
+        new_features.par_iter_mut().for_each(|psm| {
+            psm.spectrum_q = 1.0;
+            if psm.rank == 1 {
+                psm.decoy_free_p_value = Some(1.0);
+                psm.decoy_free_pep = Some(1.0);
+                psm.decoy_free_score = Some(0.0);
+                psm.decoy_free_q_value = Some(1.0);
+            } else {
+                psm.decoy_free_p_value = None;
+                psm.decoy_free_pep = None;
+                psm.decoy_free_score = None;
+                psm.decoy_free_q_value = None;
+            }
+        });
+        return new_features;
+    }
 
+    // --- SAFETY: filter non-finite scores before fitting ---
+    let scores: Vec<f64> = fit_data
+        .iter()
+        .map(|(_, s)| *s)
+        .filter(|s| s.is_finite())
+        .collect();
+
+    let dropped = fit_data.len() - scores.len();
+    if dropped > 0 {
+        log::warn!(
+            "Dropped {} non-finite null scores before fitting (fit_data {}).",
+            dropped,
+            fit_data.len()
+        );
+    }
+
+    // If filtering made the null too small, fail-closed.
+    if scores.len() < min_null_size {
+        log::error!(
+            "Null distribution too small after filtering non-finite scores ({} < {}). Aborting FDR.",
+            scores.len(),
+            min_null_size
+        );
+        new_features.par_iter_mut().for_each(|psm| {
+            psm.spectrum_q = 1.0;
+            if psm.rank == 1 {
+                psm.decoy_free_p_value = Some(1.0);
+                psm.decoy_free_pep = Some(1.0);
+                psm.decoy_free_score = Some(0.0);
+                psm.decoy_free_q_value = Some(1.0);
+            } else {
+                psm.decoy_free_p_value = None;
+                psm.decoy_free_pep = None;
+                psm.decoy_free_score = None;
+                psm.decoy_free_q_value = None;
+            }
+        });
+        return new_features;
+    }
+
+    // Calculate Global Fallback n_eff
+    let total_candidates: u64 = new_features
+        .iter()
+        .filter(|f| f.rank == 1)
+        .map(|f| f.scored_candidates as u64)
+        .sum();
+    let num_spectra = new_features.iter().filter(|f| f.rank == 1).count().max(1) as f64;
+    let n_eff_global = (total_candidates as f64 / num_spectra).max(2.0);
+
+    log::info!("Global Effective Search Space (n_eff): {:.1}", n_eff_global);
+
+    // --- NEW: LO anchoring reference (n_global / n_ref) ---
+    // IMPORTANT:
+    // - Our LO regression is fit in digamma-space: Score ~ intercept + beta * (-digamma(rank))
+    // - Therefore the fitted intercept already corresponds to the *typical* multiplicity seen in the fit dataset.
+    // - We should NOT back-calculate an absolute μ with (ln(n)+gamma) here (that mixes coordinate systems).
+    // - Instead, we anchor to a reference n_global (median scored_candidates of rank-1 spectra),
+    //   and apply ONLY a relative shift in ln-space: +beta*(ln(n_local)-ln(n_global)).
+    //
+    // REFINEMENT (Multiplicity attenuation):
+    // - In open-search contexts, "scored_candidates" are highly correlated (same peptide with small mass shifts),
+    //   so ln(n_local/n_global) can over-penalize if treated as independent trials.
+    // - We therefore support a damping exponent alpha in [0,1]:
+    //       shift = beta * alpha * ln(n_local/n_global)
+    //   alpha=1.0 => original (full multiplicity penalty), alpha<1.0 => attenuated penalty.
+    let n_global_vec: Vec<u64> = new_features
+        .iter()
+        .filter(|f| f.rank == 1)
+        .map(|f| (f.hyperscore as f64, f.scored_candidates as u64))
+        .filter(|(s, n)| s.is_finite() && *n >= 2)
+        .map(|(_, n)| n)
+        .collect();
+
+    let n_global = median_u64(n_global_vec).unwrap_or(n_eff_global);
+    let n_global = clamp_f64(n_global, 10.0, 1e7);
+    log::info!(
+        "LO reference search space (n_global, median rank-1 scored_candidates): {:.1}",
+        n_global
+    );
+
+    // --- SPLIT EXECUTION FLAGS ---
+    let debug_mode = matches!(fit_method, ModelFit::EnsembleDebug);
+    let run_parametric = matches!(
+        fit_method,
+        ModelFit::Ensemble | ModelFit::EnsembleDebug | ModelFit::Nokoi
+    );
+    let run_nokoi = matches!(fit_method, ModelFit::EnsembleDebug | ModelFit::Nokoi);
+
+    // 1. Fit Moments
     let (mu_mom, beta_mom) = fit_gumbel_moments(&scores);
 
-    let (mu_mle, beta_mle) = if matches!(fit_method, ModelFit::Mle) || run_all {
-        fit_gumbel_mle(&scores).unwrap_or((mu_mom, beta_mom))
+    // --- SAFETY: explicit validity check for fitted Moments params ---
+    // We do NOT rely on Gumbel::new(...) to detect NaN/Inf consistently.
+    let moments_params_ok = mu_mom.is_finite() && beta_mom.is_finite() && beta_mom > 0.0;
+    if !moments_params_ok {
+        log::warn!(
+            "Moments fit returned invalid params (mu={}, beta={}). Marking moments invalid.",
+            mu_mom,
+            beta_mom
+        );
+    }
+
+    // 2. Fit Lower Order
+    // --- SAFETY: LO fallback MUST NOT use invalid Moments params ---
+    // If LO regression fails and Moments is invalid, use a conservative last-ditch fallback.
+    //
+    // NOTE ON FALLBACK:
+    // In digamma LO, an "intercept" is an anchored quantity. If we must synthesize it from Moments,
+    // we do so coherently by anchoring the intercept at n_global:
+    //   intercept ≈ μ_mom + β_mom * ln(n_global)
+    // (We do NOT use +EULER_MASCHERONI here, because that is part of the digamma/Gumbel order-statistic
+    // mapping that should not be mixed into the intercept after the fact.)
+    let (lo_intercept_raw, lo_beta_raw) =
+        if matches!(fit_method, ModelFit::LowerOrder) || run_parametric {
+            fit_lower_order_regression(&fit_data, min_rank, max_rank).unwrap_or_else(|| {
+                if moments_params_ok {
+                    let intercept = mu_mom + beta_mom * n_global.ln();
+                    (intercept, beta_mom)
+                } else {
+                    // Last-ditch fallback (safe but not statistically meaningful)
+                    (0.0, 1.0)
+                }
+            })
+        } else {
+            if moments_params_ok {
+                let intercept = mu_mom + beta_mom * n_global.ln();
+                (intercept, beta_mom)
+            } else {
+                // Last-ditch fallback (safe but not statistically meaningful)
+                (0.0, 1.0)
+            }
+        };
+
+    // --- Harden LO parameters immediately ---
+    // Ensure finite and positive before using it in any calculations
+    let lo_beta = if lo_beta_raw.is_finite() && lo_beta_raw > 0.0 {
+        lo_beta_raw
+    } else if moments_params_ok {
+        beta_mom.max(1e-9)
     } else {
-        (mu_mom, beta_mom)
+        1.0
     };
 
-    let (mu_lo, beta_lo) = if matches!(fit_method, ModelFit::LowerOrder) || run_all {
-        fit_lower_order_regression(&fit_data, min_rank, max_rank).unwrap_or((mu_mom, beta_mom))
+    // Intercept also needs hardening (can become NaN if fallback path was NaN before)
+    let lo_intercept = if lo_intercept_raw.is_finite() {
+        lo_intercept_raw
     } else {
-        (mu_mom, beta_mom)
+        0.0
     };
 
-    // Phase 3: Use Local RobustMsfdrModel
-    let msfdr_model = if matches!(fit_method, ModelFit::Msfdr) || run_all {
-        let (mu_in, beta_in) = if run_all {
-            (mu_lo, beta_lo)
+    // --- OPTIONAL ROBUSTNESS: shrink LO beta toward Moments beta ---
+    // This reduces parametric fragility in heavy tails without changing the LO functional form.
+    //
+    // REFINEMENT:
+    // - We make the blending weight configurable (default: 0.30 toward Moments).
+    // - Some datasets benefit from stronger shrinkage (e.g., 0.50) when LO slope is tail-noisy.
+    //
+    // If settings.lo_beta_blend_moments is present, it should be in [0,1] and represents the fraction of beta_mom.
+    let w_mom = settings.lo_beta_blend_moments.clamp(0.0, 1.0);
+    let lo_beta_shrunk = if moments_params_ok {
+        ((1.0 - w_mom) * lo_beta) + (w_mom * beta_mom.max(1e-9))
+    } else {
+        lo_beta
+    };
+
+    log::info!(
+        "LO anchor: intercept={:.4}, beta_raw={:.4}, beta_shrunk={:.4}, n_global={:.1}, w_mom={:.2}",
+        lo_intercept,
+        lo_beta,
+        lo_beta_shrunk,
+        n_global,
+        w_mom
+    );
+
+    // 3. Fit MLE
+    // --- SAFETY: If Moments invalid, do not "fallback" MLE to Moments (would be NaN/NaN) ---
+    let (mu_mle, beta_mle) = if matches!(fit_method, ModelFit::Mle) || run_parametric {
+        fit_gumbel_mle(&scores).unwrap_or_else(|| {
+            if moments_params_ok {
+                (mu_mom, beta_mom)
+            } else {
+                // Safe fallback only (will not be used if fail-closed triggers)
+                (0.0, 1.0)
+            }
+        })
+    } else {
+        if moments_params_ok {
+            (mu_mom, beta_mom)
+        } else {
+            (0.0, 1.0)
+        }
+    };
+
+    let beta_mle = if beta_mle.is_finite() && beta_mle > 0.0 {
+        beta_mle
+    } else if moments_params_ok {
+        beta_mom.max(1e-9)
+    } else {
+        1.0
+    };
+
+    let mu_mle = if mu_mle.is_finite() { mu_mle } else { 0.0 };
+
+    // 4. Fit Robust MSFDR
+    // MSFDR needs a single starting mu. Use the global average n_eff (seeded null).
+    //
+    // IMPORTANT (Consistency):
+    // - LO intercept is anchored at n_global.
+    // - Therefore the consistent global seeded μ is:
+    //     μ_seed = intercept + β * (ln(n_eff_global) - ln(n_global))
+    // - We do NOT use μ = intercept - β*(ln(n)+gamma) here; that is the coordinate mismatch bug.
+    let beta_lo_seed = lo_beta_shrunk.max(1e-9);
+    let mu_lo_global = lo_intercept + beta_lo_seed * (n_eff_global.ln() - n_global.ln());
+
+    let msfdr_model = if matches!(fit_method, ModelFit::Msfdr) || run_parametric {
+        let (mu_in, beta_in) = if run_parametric {
+            (mu_lo_global, beta_lo_seed)
         } else {
             (mu_mom, beta_mom)
         };
@@ -320,74 +776,244 @@ pub fn calculate_q_values(psms: &[Feature], settings: &FdrSettings) -> Vec<Featu
             .iter()
             .filter(|f| f.rank == 1)
             .map(|f| f.hyperscore as f64)
+            .filter(|x| x.is_finite())
             .collect();
         log::info!("Fitting Robust MSFDR mixture model...");
-        // Pass Gumbel params for initialization
         RobustMsfdrModel::fit(&target_scores, mu_in, beta_in)
     } else {
         None
     };
 
-    let dist_mom = Gumbel::new(mu_mom, beta_mom).unwrap();
-    let dist_mle = Gumbel::new(mu_mle, beta_mle).unwrap();
-    let dist_lo = Gumbel::new(mu_lo, beta_lo).unwrap();
+    // --- Fail-Closed Logic for Null Distributions ---
+    // --- SAFETY: Moments validity is driven by explicit param check (not constructor behavior) ---
+    let moments_valid = moments_params_ok;
 
-    let target_scores_kde: Vec<f64> = new_features
+    // Build Moments distribution ONLY if valid (otherwise dummy for type-checker; not used)
+    let dist_mom = if moments_valid {
+        Gumbel::new(mu_mom, beta_mom).unwrap()
+    } else {
+        log::warn!(
+            "Moments fit yielded invalid params (mu={}, beta={}). FDR will fail closed.",
+            mu_mom,
+            beta_mom
+        );
+        Gumbel::new(0.0, 1.0).unwrap()
+    };
+
+    // Guard MLE (fallback to Moments if MLE fails)
+    let dist_mle = match Gumbel::new(mu_mle, beta_mle) {
+        Ok(d) => d,
+        Err(_) => Gumbel::new(mu_mom, beta_mom).unwrap(), // safe because moments_valid else fail-closed below
+    };
+
+    // --- Enforce Fail-Closed ---
+    if !moments_valid {
+        log::error!("Invalid null fit (Moments). FDR will fail closed (all q=1).");
+        new_features.par_iter_mut().for_each(|psm| {
+            psm.spectrum_q = 1.0;
+            if psm.rank == 1 {
+                psm.decoy_free_p_value = Some(1.0);
+                psm.decoy_free_pep = Some(1.0);
+                psm.decoy_free_score = Some(0.0);
+                psm.decoy_free_q_value = Some(1.0);
+            } else {
+                psm.decoy_free_p_value = None;
+                psm.decoy_free_pep = None;
+                psm.decoy_free_score = None;
+                psm.decoy_free_q_value = None;
+            }
+        });
+        return new_features;
+    }
+
+    // KDE Setup
+    let kde_limit = if settings.kde_samples > 0 {
+        settings.kde_samples
+    } else {
+        20_000
+    };
+    let mut target_scores_kde: Vec<f64> = new_features
         .iter()
         .filter(|f| f.rank == 1)
         .map(|f| f.hyperscore as f64)
+        .filter(|x| x.is_finite())
         .collect();
-    let bandwidth =
-        1.06 * stats::std_dev(&target_scores_kde) * (target_scores_kde.len() as f64).powf(-0.2);
 
-    let mut rank1_indices = Vec::new();
-    let mut rank1_pvalues = Vec::new();
-    let mut rank1_scores_for_pava = Vec::new();
+    if target_scores_kde.len() > kde_limit {
+        let step = (target_scores_kde.len() / kde_limit).max(1); // --- SAFETY: step_by(0) protection ---
+        target_scores_kde = target_scores_kde.into_iter().step_by(step).collect();
+    }
+    let bandwidth = silverman_bw(&target_scores_kde).max(1e-9);
 
-    for (i, psm) in new_features.iter_mut().enumerate() {
-        // Ensure legacy fields are NaN for honesty
+    // Guard against empty KDE data
+    if target_scores_kde.is_empty() {
+        log::warn!("No rank-1 scores available for KDE; PEP will default to 1.0.");
+    }
+
+    // Conservative KDE mixture weight if MSFDR is not available
+    // We prefer a conservative null weight so PEP does not become overly optimistic.
+    let pi0_kde = 0.90_f64;
+
+    // --- NEW: multiplicity attenuation controls (synergistic fix) ---
+    //
+    // alpha in [0,1] attenuates the ln(n_local/n_global) shift:
+    //   alpha=1.0 => full multiplicity penalty
+    //   alpha=0.5 => square-root-like damping (reasonable open-search default)
+    //
+    // ln_ratio_cap bounds extreme multiplicity shifts so one pathological spectrum cannot dominate.
+    //
+    // These default conservatively and can be tuned with entrapment calibration.
+    let lo_alpha = settings.lo_multiplicity_alpha.clamp(0.0, 1.0);
+    let lo_ln_ratio_cap = settings.lo_ln_ratio_cap.max(0.0);
+
+    log::info!(
+        "LO multiplicity attenuation: alpha={:.2}, ln_ratio_cap={:.2}",
+        lo_alpha,
+        lo_ln_ratio_cap
+    );
+
+    // --- CALCULATION LOOP ---
+    new_features.par_iter_mut().for_each(|psm| {
         psm.discriminant_score = f32::NAN;
         psm.posterior_error = f32::NAN;
 
         if psm.rank == 1 {
             let x = psm.hyperscore as f64;
 
-            let p_mom = dist_mom.sf(x);
-            let p_mle = dist_mle.sf(x);
-            let p_lo = dist_lo.sf(x);
+            // --- SAFETY: hyperscore must be finite ---
+            if !x.is_finite() {
+                psm.decoy_free_p_value = Some(1.0);
+                psm.decoy_free_pep = Some(1.0);
+                psm.spectrum_q = 1.0;
+                psm.decoy_free_score = Some(0.0);
+                if debug_mode {
+                    psm.p_moments = Some(1.0_f32);
+                    psm.p_mle = Some(1.0_f32);
+                    psm.p_lower_order = Some(1.0_f32);
+                    psm.p_msfdr = None;
+                }
+                return;
+            }
+
+            // Static models
+            let p_mom = dist_mom.sf(x).clamp(0.0, 1.0).max(1e-300);
+            let p_mle = dist_mle.sf(x).clamp(0.0, 1.0).max(1e-300);
+
+            // Dynamic Lower Order
+            let n_eff = if psm.scored_candidates >= 2 {
+                (psm.scored_candidates as f64).max(2.0).min(1e9)
+            } else {
+                n_eff_global
+            };
+
+            // --- CORE FIX: LO dynamic mapping via RELATIVE SHIFT (consistent with digamma fit) ---
+            // We treat the fitted LO intercept as an anchored score level corresponding to n_global.
+            // For each spectrum, we shift only by the deviation in search-space complexity:
+            //   mu_local = intercept + beta * (ln(n_local) - ln(n_global))
+            //
+            // REFINEMENT (Multiplicity attenuation):
+            // In open-search, candidates are correlated, so ln(n_local/n_global) can over-penalize.
+            // We therefore attenuate the shift by alpha in [0,1]:
+            //   mu_local = intercept + beta * alpha * clamp(ln(n_local/n_global), +/- ln_ratio_cap)
+            //
+            // This:
+            //   - preserves the correct direction of multiplicity adjustment,
+            //   - prevents “0 discoveries” regimes caused by treating correlated candidates as independent,
+            //   - keeps behavior tunable and stable.
+            // Reference beta (your "βrank"/βref). Pick the right one—see below.
+            let beta_ref = beta_mom.max(1e-9);
+
+            let safety_mult =
+                if settings.lo_beta_safety_mult.is_finite() && settings.lo_beta_safety_mult > 0.0 {
+                    settings.lo_beta_safety_mult
+                } else {
+                    1.5
+                };
+
+            // Safety belt: keep LO beta in a sane range relative to reference beta.
+            let beta_cap = (safety_mult * beta_ref).max(1e-9);
+
+            // Enforce 0 ≤ beta_lo ≤ beta_cap (and keep >0 for Gumbel validity).
+            let beta_lo = lo_beta_shrunk.clamp(1e-9, beta_cap);
+            let mut ln_ratio = n_eff.ln() - n_global.ln();
+            if lo_ln_ratio_cap > 0.0 {
+                ln_ratio = ln_ratio.clamp(-lo_ln_ratio_cap, lo_ln_ratio_cap);
+            }
+            let mu_i = lo_intercept + beta_lo * lo_alpha * ln_ratio;
+
+            // --- Guard against Unwrap Panic in Dynamic LO ---
+            let dist_lo_dynamic = Gumbel::new(mu_i, beta_lo).unwrap_or_else(|_| dist_mom.clone());
+            let p_lo = dist_lo_dynamic.sf(x).clamp(0.0, 1.0).max(1e-300);
 
             let p_final = match fit_method {
                 ModelFit::Moments => p_mom,
-                ModelFit::Msfdr => p_mom,
+
+                // MSFDR mode should use seeded null P-value, not Moments
+                ModelFit::Msfdr => {
+                    if let Some(m) = &msfdr_model {
+                        m.calculate_seeded_null_p(x)
+                    } else {
+                        p_mom
+                    }
+                }
+
                 ModelFit::Mle => p_mle,
                 ModelFit::LowerOrder => p_lo,
-                ModelFit::Ensemble | ModelFit::EnsembleTest => {
-                    // Combine Robust MSFDR (if available) with others
-                    if let Some(m) = &msfdr_model {
-                        let p_msfdr = m.calculate_pep(x);
-                        stats::combine_hmp(&[p_mom, p_mle, p_lo, p_msfdr])
+
+                // Ensemble
+                ModelFit::Ensemble | ModelFit::EnsembleDebug | ModelFit::Nokoi => {
+                    // Ensemble excludes MSFDR p-value to avoid double-counting seeded null
+                    //
+                    // --- Guard against "LO hijacking" ---
+                    // HMP is min-like; a single overly-liberal p-value can dominate.
+                    // If LO is >100x smaller than BOTH Moments and MLE, cap it at the best of those two.
+                    let p_base_min = p_mom.min(p_mle);
+                    let p_lo_guarded = if p_lo < (p_base_min / 100.0) {
+                        p_base_min
                     } else {
-                        stats::combine_hmp(&[p_mom, p_mle, p_lo])
-                    }
+                        p_lo
+                    };
+
+                    stats::combine_hmp(&[p_mom, p_mle, p_lo_guarded])
                 }
             };
 
+            // Safety Clamp P-value [0, 1] and avoid exact 0
+            let p_final = p_final.clamp(0.0, 1.0).max(1e-300);
+
+            // Calculate PEP
+            // DESIGN CHOICE: We intentionally prefer the MSFDR mixture model for PEP
+            // if it fits successfully, even if the primary P-value comes from another model.
             let pep = if let Some(model) = &msfdr_model {
                 model.calculate_pep(x)
-            } else {
-                let dist_active = match fit_method {
-                    ModelFit::Mle => &dist_mle,
-                    ModelFit::LowerOrder => &dist_lo,
-                    _ => &dist_mom,
+            } else if !target_scores_kde.is_empty() {
+                // KDE fallback: approximate mixture posterior with conservative pi0
+                let f0 = match fit_method {
+                    ModelFit::Mle => dist_mle.pdf(x).max(1e-300),
+                    ModelFit::LowerOrder => dist_lo_dynamic.pdf(x).max(1e-300),
+                    _ => dist_mom.pdf(x).max(1e-300),
                 };
-                let f0 = dist_active.pdf(x);
-                let f_target = kde_density(x, &target_scores_kde, bandwidth);
-                (f0 / f_target).min(1.0)
+                let f1 = kde_density(x, &target_scores_kde, bandwidth).max(1e-300);
+
+                let den = pi0_kde * f0 + (1.0 - pi0_kde) * f1;
+                if !den.is_finite() || den <= 0.0 {
+                    1.0
+                } else {
+                    (pi0_kde * f0 / den).clamp(0.0, 1.0)
+                }
+            } else {
+                1.0
+            };
+
+            // --- Safety Clamp PEP to ensure finite range ---
+            let pep = if pep.is_finite() {
+                pep.clamp(0.0, 1.0)
+            } else {
+                1.0
             };
 
             psm.decoy_free_p_value = Some(p_final as f32);
             psm.decoy_free_pep = Some(pep as f32);
-            // Use p-value for initial Q-value calc
             psm.spectrum_q = p_final as f32;
 
             let safe_pep = pep.max(1e-15);
@@ -398,13 +1024,9 @@ pub fn calculate_q_values(psms: &[Feature], settings: &FdrSettings) -> Vec<Featu
                 psm.p_mle = Some(p_mle as f32);
                 psm.p_lower_order = Some(p_lo as f32);
                 if let Some(m) = &msfdr_model {
-                    psm.p_msfdr = Some(m.calculate_pep(x) as f32);
+                    psm.p_msfdr = Some(m.calculate_seeded_null_p(x) as f32);
                 }
             }
-
-            rank1_indices.push(i);
-            rank1_pvalues.push(p_final);
-            rank1_scores_for_pava.push(x);
         } else {
             psm.spectrum_q = 1.0;
             psm.decoy_free_p_value = None;
@@ -412,40 +1034,78 @@ pub fn calculate_q_values(psms: &[Feature], settings: &FdrSettings) -> Vec<Featu
             psm.decoy_free_score = None;
             psm.decoy_free_q_value = None;
         }
+    });
+
+    // --- PAVA ---
+    // --- Collect vectors for PAVA (Sequential Pass) ---
+    let mut rank1_indices = Vec::with_capacity(new_features.len() / 2);
+    let mut rank1_scores_for_pava = Vec::with_capacity(new_features.len() / 2);
+
+    for (i, psm) in new_features.iter().enumerate() {
+        if psm.rank == 1 {
+            let s = psm.hyperscore as f64;
+            if s.is_finite() {
+                rank1_indices.push(i);
+                rank1_scores_for_pava.push(s);
+            }
+        }
     }
 
-    // --- PHASE 3.5: ISOTONIC CALIBRATION ---
-    // Perform PAVA on the ensemble p-values to ensure monotonicity
+    // --- Guard against empty Rank-1 set ---
+    if rank1_indices.is_empty() {
+        log::warn!("No finite rank-1 hyperscores found; failing closed (all q=1).");
+        new_features.par_iter_mut().for_each(|psm| {
+            psm.spectrum_q = 1.0;
+            if psm.rank == 1 {
+                psm.decoy_free_p_value = Some(1.0);
+                psm.decoy_free_pep = Some(1.0);
+                psm.decoy_free_score = Some(0.0);
+                psm.decoy_free_q_value = Some(1.0);
+            } else {
+                psm.decoy_free_p_value = None;
+                psm.decoy_free_pep = None;
+                psm.decoy_free_score = None;
+                psm.decoy_free_q_value = None;
+            }
+        });
+        return new_features;
+    }
 
-    // 1. Prepare data (Score, Index)
+    // --- PAVA CALIBRATION ---
+    // Assumes inputs are sorted by score descending; enforces p-values non-decreasing along that order.
     let mut pava_data: Vec<(f64, usize)> = rank1_scores_for_pava
         .iter()
         .zip(rank1_indices.iter())
         .map(|(&s, &idx)| (s, idx))
         .collect();
 
-    // 2. Sort by Score Descending (Best to Worst)
-    pava_data.sort_by(|a, b| b.0.partial_cmp(&a.0).unwrap());
+    pava_data.sort_by(|a, b| b.0.total_cmp(&a.0).then_with(|| a.1.cmp(&b.1)));
 
-    // 3. Extract P-values in that order
     let mut sorted_pvalues: Vec<f64> = pava_data
         .iter()
         .map(|&(_, idx)| new_features[idx].spectrum_q as f64)
         .collect();
 
-    // 4. Apply PAVA (Increasing: Better score should have lower P-value)
+    // --- SAFETY: sanitize PAVA input p-values ---
+    for p in &mut sorted_pvalues {
+        if !p.is_finite() {
+            *p = 1.0;
+        } else {
+            *p = p.clamp(0.0, 1.0).max(1e-300);
+        }
+    }
+
     isotonic_regression_increasing(&mut sorted_pvalues);
 
-    // 5. Write back and update list for Q-value estimation
     let mut calibrated_pvalues_map = FnvHashMap::default();
     for (i, &(_, idx)) in pava_data.iter().enumerate() {
-        let cal_p = sorted_pvalues[i];
+        // --- SAFETY: calibrated p-values should remain finite and in [0,1] ---
+        let cal_p = sorted_pvalues[i].clamp(0.0, 1.0).max(1e-300);
         new_features[idx].spectrum_q = cal_p as f32;
+        new_features[idx].decoy_free_p_value = Some(cal_p as f32);
         calibrated_pvalues_map.insert(idx, cal_p);
     }
 
-    // 6. Re-create the rank1_pvalues vector for BH/Storey using calibrated values
-    // (rank1_indices is in original order, so we map back)
     let final_pvalues_for_q: Vec<f64> = rank1_indices
         .iter()
         .map(|idx| *calibrated_pvalues_map.get(idx).unwrap())
@@ -462,13 +1122,13 @@ pub fn calculate_q_values(psms: &[Feature], settings: &FdrSettings) -> Vec<Featu
         feat.decoy_free_q_value = Some(q as f32);
     }
 
-    // --- NOKOI RESCORING (Preserved at End) ---
-    if run_all {
+    // --- NOKOI RESCORING ---
+    if run_nokoi {
         log::info!("Running Nokoi Rescoring...");
         if let Some(probs) = nokoi::rescore(&new_features, 0.01) {
             let nokoi_p_values = nokoi::calc_empirical_p_values(&new_features, &probs);
 
-            // A) Calculate Independent Nokoi Q-values
+            // A) Independent Nokoi Q-values
             let nokoi_rank1_p: Vec<f64> = new_features
                 .iter()
                 .zip(&nokoi_p_values)
@@ -499,7 +1159,8 @@ pub fn calculate_q_values(psms: &[Feature], settings: &FdrSettings) -> Vec<Featu
                         q_iter.next();
                     }
 
-                    // Combine old ensemble + nokoi using HMP
+                    // Ensure this uses seeded null if you want consistency, or just Moments as base.
+                    // Sticking to Moments as the base for Nokoi HMP is safe and standard.
                     let old_p = feat.decoy_free_p_value.unwrap_or(1.0) as f64;
                     let final_p = stats::combine_hmp(&[old_p, nokoi_p]);
 
@@ -532,7 +1193,6 @@ pub fn calculate_q_values(psms: &[Feature], settings: &FdrSettings) -> Vec<Featu
     new_features
 }
 
-/// Calculate peptide-level q-values (Best Rank-1 PSM per peptide)
 pub fn calculate_peptide_q(
     features: &mut [Feature],
     db: &IndexedDatabase,
@@ -616,22 +1276,44 @@ pub fn decoy_free_precursor(
         .filter_map(|((_, is_decoy), (peak, _))| if *is_decoy { Some(peak.score) } else { None })
         .collect();
 
-    if decoy_scores.len() < 50 {
+    // Filter out NaNs before fitting to protect mean/variance calculations
+    let valid_scores: Vec<f64> = decoy_scores.into_iter().filter(|s| s.is_finite()).collect();
+
+    if valid_scores.len() < 50 {
         return 0;
     }
 
-    let (mu, beta) = fit_gumbel_moments(&decoy_scores);
-    let gumbel = Gumbel::new(mu, beta).unwrap();
+    let (mu, beta_raw) = fit_gumbel_moments(&valid_scores);
+
+    // --- HARD GUARD: mu/beta must be finite and beta > 0 ---
+    if !mu.is_finite() || !beta_raw.is_finite() || beta_raw <= 0.0 {
+        return 0;
+    }
+
+    // NaN-safe clamp
+    let beta = beta_raw.max(1e-9);
+
+    let gumbel = match Gumbel::new(mu, beta) {
+        Ok(d) => d,
+        Err(_) => return 0,
+    };
 
     let mut target_keys = Vec::new();
     let mut target_pvalues = Vec::new();
 
     for (key, (peak, _)) in peaks.iter() {
         if !key.1 {
-            let p = gumbel.sf(peak.score);
+            if !peak.score.is_finite() {
+                continue;
+            }
+            let p = gumbel.sf(peak.score).clamp(0.0, 1.0).max(1e-300);
             target_keys.push(*key);
             target_pvalues.push(p);
         }
+    }
+
+    if target_keys.is_empty() {
+        return 0;
     }
 
     let q_values = stats::bh_q_value(&target_pvalues);
@@ -641,9 +1323,17 @@ pub fn decoy_free_precursor(
             peak.q_value = q as f32;
         }
     }
+
+    // Explicitly set q=1.0 for skipped (NaN) targets
+    for ((_, is_decoy), (peak, _)) in peaks.iter_mut() {
+        if !*is_decoy && !peak.score.is_finite() {
+            peak.q_value = 1.0;
+        }
+    }
+
     peaks
         .values()
-        .filter(|(peak, _)| !peak.score.is_nan() && peak.q_value <= threshold)
+        .filter(|(peak, _)| peak.score.is_finite() && peak.q_value <= threshold)
         .count()
 }
 
@@ -652,78 +1342,162 @@ fn fit_lower_order_regression(
     min_rank: u32,
     max_rank: u32,
 ) -> Option<(f64, f64)> {
-    let mut rank_sums = FnvHashMap::default();
-    let mut rank_counts = FnvHashMap::default();
+    let span = (max_rank - min_rank + 1) as usize;
+    let mut rank_sums = vec![0.0f64; span];
+    let mut rank_counts = vec![0usize; span];
+
     for &(rank, score) in data {
-        *rank_sums.entry(rank).or_insert(0.0) += score;
-        *rank_counts.entry(rank).or_insert(0) += 1;
+        if rank < min_rank || rank > max_rank {
+            continue;
+        }
+        let idx = (rank - min_rank) as usize;
+        rank_sums[idx] += score;
+        rank_counts[idx] += 1;
     }
+
     let mut x_vec = Vec::new();
     let mut y_vec = Vec::new();
+
     for r in min_rank..=max_rank {
-        if let Some(&sum) = rank_sums.get(&r) {
-            let count = *rank_counts.get(&r).unwrap();
-            if count > 10 {
-                let mean = sum / count as f64;
-                x_vec.push((r as f64).ln());
-                y_vec.push(mean);
-            }
+        let idx = (r - min_rank) as usize;
+        let count = rank_counts[idx];
+        if count > 10 {
+            let mean = rank_sums[idx] / count as f64;
+
+            // --- REFINEMENT: Use Digamma instead of ln(r) ---
+            let neg_psi = -digamma(r as f64);
+
+            x_vec.push(neg_psi);
+            y_vec.push(mean);
         }
     }
+
     if x_vec.len() < 2 {
         return None;
     }
-    let n = x_vec.len() as f64;
+
+    let n_points = x_vec.len() as f64;
     let sum_x: f64 = x_vec.iter().sum();
     let sum_y: f64 = y_vec.iter().sum();
     let sum_xy: f64 = x_vec.iter().zip(&y_vec).map(|(x, y)| x * y).sum();
     let sum_xx: f64 = x_vec.iter().map(|x| x * x).sum();
-    let slope = (n * sum_xy - sum_x * sum_y) / (n * sum_xx - sum_x.powi(2));
-    let intercept = (sum_y - slope * sum_x) / n;
-    let beta = -slope;
-    let mu = intercept;
-    if beta <= 0.0 || mu.is_nan() {
+
+    // --- Guard against degenerate regression (denom ~ 0) ---
+    let denom = n_points * sum_xx - sum_x.powi(2);
+    if !denom.is_finite() || denom.abs() < 1e-12 {
+        return None;
+    }
+
+    // Linear Regression: y = Intercept + Slope * (-psi(r))
+    let slope = (n_points * sum_xy - sum_x * sum_y) / denom;
+    let intercept = (sum_y - slope * sum_x) / n_points;
+
+    // Slope ~= beta
+    let beta = slope;
+
+    // Check for finiteness explicitly
+    if !beta.is_finite() || beta <= 0.0 || !intercept.is_finite() {
         None
     } else {
-        Some((mu, beta))
+        log::info!(
+            "LowerOrder Fit (Digamma): beta={:.4}, intercept={:.4}",
+            beta,
+            intercept
+        );
+        Some((intercept, beta))
     }
 }
 
 fn fit_gumbel_moments(scores: &[f64]) -> (f64, f64) {
-    let n = scores.len() as f64;
-    let mean = scores.iter().sum::<f64>() / n;
-    let variance = scores.iter().map(|s| (s - mean).powi(2)).sum::<f64>() / n;
+    // Require finite inputs
+    let finite: Vec<f64> = scores.iter().cloned().filter(|x| x.is_finite()).collect();
+    if finite.len() < 2 {
+        return (f64::NAN, f64::NAN);
+    }
+
+    let n = finite.len() as f64;
+    let mean = finite.iter().sum::<f64>() / n;
+
+    let variance = finite
+        .iter()
+        .map(|s| {
+            let d = s - mean;
+            d * d
+        })
+        .sum::<f64>()
+        / n;
+
+    if !variance.is_finite() || variance < 0.0 {
+        return (f64::NAN, f64::NAN);
+    }
+
     let beta = (variance * 6.0 / std::f64::consts::PI.powi(2)).sqrt();
+    if !beta.is_finite() || beta <= 0.0 {
+        return (f64::NAN, f64::NAN);
+    }
+
     let mu = mean - EULER_MASCHERONI * beta;
+    if !mu.is_finite() {
+        return (f64::NAN, f64::NAN);
+    }
+
     (mu, beta)
 }
 
 fn fit_gumbel_mle(scores: &[f64]) -> Option<(f64, f64)> {
-    let n = scores.len() as f64;
-    let x_bar = scores.iter().sum::<f64>() / n;
-    let (_, mut beta) = fit_gumbel_moments(scores);
+    let finite: Vec<f64> = scores.iter().cloned().filter(|x| x.is_finite()).collect();
+    if finite.len() < 2 {
+        return None;
+    }
+
+    let n = finite.len() as f64;
+    let x_bar = finite.iter().sum::<f64>() / n;
+
+    let (_, mut beta) = fit_gumbel_moments(&finite);
+    if !beta.is_finite() || beta <= 0.0 {
+        return None;
+    }
+
     for _ in 0..20 {
         let mut num = 0.0;
         let mut den = 0.0;
-        for &x in scores {
+
+        for &x in &finite {
             let z = x / beta;
+            if !z.is_finite() {
+                continue;
+            }
             let exp_neg_z = (-z).exp();
+            if !exp_neg_z.is_finite() {
+                continue;
+            }
             num += x * exp_neg_z;
             den += exp_neg_z;
         }
-        if den == 0.0 {
+
+        if !den.is_finite() || den <= 0.0 {
             return None;
         }
+
         let next_beta = x_bar - (num / den);
+        if !next_beta.is_finite() || next_beta <= 0.0 {
+            return None;
+        }
+
         if (next_beta - beta).abs() < 1e-5 {
             beta = next_beta;
             break;
         }
         beta = next_beta;
     }
-    let sum_exp = scores.iter().map(|&x| (-x / beta).exp()).sum::<f64>();
+
+    let sum_exp = finite.iter().map(|&x| (-x / beta).exp()).sum::<f64>();
+    if !sum_exp.is_finite() || sum_exp <= 0.0 {
+        return None;
+    }
+
     let mu = -beta * (sum_exp / n).ln();
-    if mu.is_nan() || beta.is_nan() || beta <= 0.0 {
+    if !mu.is_finite() || !beta.is_finite() || beta <= 0.0 {
         None
     } else {
         Some((mu, beta))
@@ -731,6 +1505,12 @@ fn fit_gumbel_mle(scores: &[f64]) -> Option<(f64, f64)> {
 }
 
 fn kde_density(x: f64, samples: &[f64], bw: f64) -> f64 {
+    // --- Internal Guard against bad inputs ---
+    // Added !x.is_finite() check as requested
+    if !x.is_finite() || samples.is_empty() || !bw.is_finite() || bw <= 0.0 {
+        return 1e-300;
+    }
+
     let n = samples.len() as f64;
     let norm = 1.0 / (n * bw * (2.0 * std::f64::consts::PI).sqrt());
     let sum_kernel: f64 = samples

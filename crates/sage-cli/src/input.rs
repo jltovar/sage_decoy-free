@@ -389,6 +389,38 @@ impl Input {
             report_psms
         };
 
+        let lo_multiplicity_alpha = self
+            .fdr
+            .as_ref()
+            .and_then(|f| f.lo_multiplicity_alpha)
+            .filter(|v| v.is_finite())
+            .unwrap_or(0.50)
+            .clamp(0.0, 1.0);
+
+        let lo_ln_ratio_cap = self
+            .fdr
+            .as_ref()
+            .and_then(|f| f.lo_ln_ratio_cap)
+            .filter(|v| v.is_finite())
+            .unwrap_or(6.9)
+            .max(0.0);
+
+        let lo_beta_blend_moments = self
+            .fdr
+            .as_ref()
+            .and_then(|f| f.lo_beta_blend_moments)
+            .filter(|v| v.is_finite())
+            .unwrap_or(0.30)
+            .clamp(0.0, 1.0);
+
+        let lo_beta_safety_mult = self
+            .fdr
+            .as_ref()
+            .and_then(|f| f.lo_beta_safety_mult)
+            .filter(|v| v.is_finite())
+            .unwrap_or(1.50)
+            .max(0.1);
+
         Ok(Search {
             version: clap::crate_version!().into(),
             database,
@@ -425,6 +457,11 @@ impl Input {
                 type_: fdr_type,
                 min_null_size,
                 min_storey_n,
+                kde_samples: 20_000,
+                lo_multiplicity_alpha,
+                lo_ln_ratio_cap,
+                lo_beta_blend_moments,
+                lo_beta_safety_mult,
             },
         })
     }
