@@ -1,10 +1,13 @@
 [package]
 name = "sage-cloudpath"
-version = "0.15.0-beta.1"
-authors = ["Michael Lazear <michaellazear92@gmail.com"]
-edition = "2021"
+version = "0.15.0-beta.1.decoyfree-prealpha.1"
+authors = [
+    "Michael Lazear <michaellazear92@gmail.com>",
+    "jltovar <jltovar>",
+]
+edition = "2026"
 rust-version = "1.62"
-description = "A very fast proteomics database search tool"
+description = "A very fast proteomics database search tool, now decoy-free."
 readme = "README.md"
 license = "MIT"
 

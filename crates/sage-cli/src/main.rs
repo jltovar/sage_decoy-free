@@ -17,17 +17,17 @@ fn main() -> anyhow::Result<()> {
         .parse_env(env_logger::Env::default().filter_or("SAGE_LOG", "error,sage=info"))
         .init();
 
-    let matches = Command::new("sage")
-        .version(clap::crate_version!())
-        .author("Michael Lazear <michaellazear92@gmail.com>")
-        .about("\u{1F52E} Sage \u{1F9D9} - Proteomics searching so fast it feels like magic!")
-        .arg(
-            Arg::new("parameters")
-                .required(true)
-                .value_parser(clap::builder::NonEmptyStringValueParser::new())
-                .help("Path to configuration parameters (JSON file)")
-                .value_hint(ValueHint::FilePath),
-        )
+	let matches = Command::new("sage")
+		.version(clap::crate_version!())
+		.author("Original Sage by Michael Lazear <michaellazear92@gmail.com>\nSage Decoy-free version by JLTovar")
+		.about("\u{1F52E} Sage \u{1F9D9} - Proteomics searching so fast—and now decoy-free—it feels like magic!")
+		.arg(
+			Arg::new("parameters")
+				.required(true)
+				.value_parser(clap::builder::NonEmptyStringValueParser::new())
+				.help("Path to configuration parameters (JSON file)")
+				.value_hint(ValueHint::FilePath),
+		)
         .arg(
             Arg::new("mzml_paths")
                 .num_args(1..)
