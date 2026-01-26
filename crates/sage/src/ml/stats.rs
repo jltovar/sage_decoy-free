@@ -102,7 +102,7 @@ pub fn storey_q_value(p_values: &[f64], min_n: usize) -> Vec<f64> {
     let mut min_q = 1.0;
 
     for (i, &idx) in indices.iter().enumerate().rev() {
-        let p = p_values[idx].clamp(1e-15, 1.0); // Safety clamp
+        let p = p_values[idx].max(f64::MIN_POSITIVE); // Safety clamp
         let rank = (i + 1) as f64;
         let m_f64 = m as f64;
 
@@ -123,7 +123,8 @@ pub fn combine_hmp(p_values: &[f64]) -> f64 {
         return 1.0;
     }
     let k = p_values.len() as f64;
-    let sum_inverse: f64 = p_values.iter().map(|&p| 1.0 / p.max(1e-15)).sum();
+    // FIX: Relaxed clamp from 1e-15 to 1e-100 to preserve high-confidence scores
+    let sum_inverse: f64 = p_values.iter().map(|&p| 1.0 / p.max(1e-100)).sum();
 
     // Landau's correction factor usually applied for dependent tests,
     // here simplified to the asymptotic HMP bound.
@@ -150,7 +151,8 @@ pub fn combine_fisher(p_values: &[f64]) -> f64 {
     }
     let k = p_values.len() as f64;
     // X = -2 * sum(ln(p))
-    let chi_sq_stat: f64 = -2.0 * p_values.iter().map(|&p| p.max(1e-15).ln()).sum::<f64>();
+    // FIX: Relaxed clamp here too
+    let chi_sq_stat: f64 = -2.0 * p_values.iter().map(|&p| p.max(1e-100).ln()).sum::<f64>();
 
     // Degrees of freedom = 2k
     let dof = 2.0 * k;

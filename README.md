@@ -31,7 +31,7 @@ From this null, the engine computes **p-values, q-values, and posterior error pr
 
 ### 2.1 Augmented Ensemble Scoring
 
-To reduce dependence on any single statistical assumption, the decoy-free workflow employs a **consensus ensemble** of four distinct estimators. The final significance (P-value) is derived by combining outputs from the first three models (Moments, MLE, Lower-Order) using the **Harmonic Mean P-value (HMP)**. The fourth model (MSFDR) is used to calculate the Posterior Error Probability (PEP), providing a robust, data-driven measure of local FDR that informs the final score.
+To reduce dependence on any single statistical assumption, the decoy-free workflow employs a **consensus ensemble** of four distinct estimators. The final significance is derived by combining their outputs using the **Harmonic Mean P-value (HMP)**, which is robust to correlation between tests.
 
 1.  **Method of Moments (Gumbel)**
     - Fits a Gumbel distribution to noise scores (ranks 2+) using empirical mean and variance.
@@ -42,10 +42,8 @@ To reduce dependence on any single statistical assumption, the decoy-free workfl
     - More robust to outliers in the tail of the noise distribution.
 
 3.  **Lower-Order Statistics (Madej & Lam, 2023)**
-    - Regresses score against $-\psi(\text{rank})$ (negative Digamma) to exploit the exact theoretical decay of Gumbel order statistics.
-    - Fits an anchored intercept and slope from ranks $k = 2 \dots K$ to model the null governing rank-1.
-    -  Applies a relative multiplicity shift to account for spectrum-specific search space size without reconstructing an absolute location parameter.
-    -  Includes multiplicity attenuation, slope shrinkage, and safety caps to ensure numerical stability and prevent over-penalization in correlated open-search regimes.
+    - Regresses score against $\ln(\text{rank})$ to exploit the theoretical decay of order statistics.
+    - Uses scores from ranks $k = 2 \dots K$ to infer the null density governing rank-1.
 
 4.  **Robust MSFDR Mixture Model (Peng et al., 2020)**
     - A stability-hardened implementation of the Mix-Max-Score framework.
@@ -53,78 +51,6 @@ To reduce dependence on any single statistical assumption, the decoy-free workfl
     - Features **smart data-driven initialization**, **strict EM convergence checks** ($10^{-5}$ tolerance), and **safety clamps** to prevent model collapse on sparse data.
 
 > **Scientific Idea:** The engine acts as a **multi-model jury**, preventing false discoveries if one model fits poorly while boosting sensitivity when models agree.
-
-#### 2.1.1 Lower-Order Multiplicity Correction & Stabilization
-
-The original Lower-Order model exploits the exact theory of Gumbel order statistics by fitting:
-
-$$
-\mathrm{Score}_k \approx \mu_{\mathrm{ref}} + \beta \cdot \left[-\psi(k)\right]
-$$
-
-where $\psi(\cdot)$ is the Digamma function and $k$ is the rank.
-
-However, in practice each spectrum is searched against a different effective number of candidates (`scored_candidates`). Treating all spectra as having identical multiplicity leads to systematic miscalibration.
-
-**Anchored Relative Shift (Coordinate-Consistent Mapping)**  
-This fork applies a coordinate-consistent relative correction:
-
-1. Define a reference search space:
-
-$$
-n_{\mathrm{global}} = \mathrm{median}(\mathrm{scored\_candidates\ of\ rank\text{-}1\ spectra})
-$$
-
-2. For each spectrum with local multiplicity $n_i$, shift only *relative* to the reference:
-
-$$
-\mu_i = \mu_{\mathrm{intercept}} + \beta \cdot \alpha \cdot
-\mathrm{clamp}\!\left(\ln n_i - \ln n_{\mathrm{global}}, \pm c\right)
-$$
-
-Key properties:
--	Preserves the digamma regression coordinate system
--	Avoids reconstructing an absolute $\mu$ from incompatible formulas
--	Penalizes only deviations from the typical search space
--	Ensures monotonic behavior across spectra
-
-Multiplicity Attenuation (Correlation Control)
-In open-search and PTM-heavy workflows, candidates are highly correlated.
-To avoid over-penalization, the multiplicity shift is damped by:
--	lo_multiplicity_alpha ∈ [0, 1]
--	1.0 → full theoretical penalty
--	0.5 → square-root-like attenuation (default)
-
-Slope Stabilization & Safety Belt
-Lower-Order slopes can become unstable in heavy tails or sparse nulls.
-Three safeguards are applied:
--	1.	Shrinkage toward Moments
-
-\beta_\text{shrunk} = (1-w)\,\beta_\text{LO} + w\,\beta_\text{Moments}
--	2.	Hard safety cap
-
-\beta_\text{LO} \;\le\; \text{safety\_mult} \times \beta_\text{Moments}
--	3.	Ensemble hijack protection
-
-If LO produces a p-value more than 100× smaller than both Moments and MLE, it is capped to the best of those two before HMP combination.
-
-**Result**:
-The Lower-Order model now remains:
--	Statistically coherent
--	Stable under heavy tails
--	Calibrated under entrapment
--	Safe in ensemble combination
-
-This correction is essential for open search, ultra-low-input data, and correlated candidate spaces.
-
-> **Scientific Note (Decoy-Free Lower-Order Calibration)**  
-> The Lower-Order model in this fork differs from the original formulation by applying a relative, anchored multiplicity correction rather than reconstructing an absolute location parameter from rank statistics.  
->
-> This avoids coordinate mismatches between digamma regression and log-space multiplicity correction, which can otherwise cause severe miscalibration in correlated open searches.  
->
-> The implementation follows invariance principles and has been validated by mirror tests, entrapment calibration, peptide- and protein-level concordance, and ensemble stability analysis.
-
-⸻
 
 ### 2.2 Nokoi 2.0 Rescoring (Lasso/FISTA)
 
@@ -175,11 +101,7 @@ Decoy-free mode is configured in your JSON file under the `fdr` key:
     "model_fit": "ensemble",
     "type": "storey",
     "min_storey_n": 300,
-    "kde_samples": 20000,
-    "lo_multiplicity_alpha": 0.50,
-    "lo_ln_ratio_cap": 6.9,
-    "lo_beta_blend_moments": 0.30,
-    "lo_beta_safety_mult": 1.50
+    "kde_samples": 20000
 }
 ```
 
@@ -214,30 +136,6 @@ Decoy-free mode is configured in your JSON file under the `fdr` key:
 - `type`:
     - `"bh"`: Benjamini-Hochberg.
     - `"storey"`: Storey-Tibshirani (requires `min_storey_n` samples).
-
-#### 3.3.1 Lower-Order Stabilization Parameters (Decoy-Free only)
-
-These parameters control multiplicity correction and stabilization of the Lower-Order model. They are most relevant for open searches and other highly correlated candidate spaces.
-
-- `lo_multiplicity_alpha` (default: `0.50`): Attenuates the multiplicity shift applied to spectra with unusually large candidate sets.  
-  - `1.0` = full theoretical shift  
-  - `< 1.0` = damped shift (recommended for correlated searches)
-
-- `lo_ln_ratio_cap` (default: `6.9`): Caps the multiplicity shift magnitude to prevent a single spectrum from dominating calibration.  
-  `6.9 ≈ ln(1000)`.
-
-- `lo_beta_blend_moments` (default: `0.30`): Shrinks the Lower-Order slope toward the Moments slope for stability on sparse or heavy-tailed nulls.  
-  - `0.0` = pure Lower-Order  
-  - higher values = more stabilization
-
-- `lo_beta_safety_mult` (default: `1.50`): Hard cap on the effective Lower-Order slope relative to the Moments slope to prevent runaway regression fits and ensemble hijacking.  
-  Enforces:
-
-  $$
-  \beta_{\mathrm{LO}} \le \mathrm{safety\_mult} \times \beta_{\mathrm{Moments}}
-  $$
-
-  where `safety_mult` is the validated form of `lo_beta_safety_mult` (must be finite and positive).
 
 ---
 
@@ -392,7 +290,6 @@ Classical combination and FDR methods:
 
 - This fork is **experimental** and intended for method development and research.
 - Always inspect log messages and output columns to confirm which models were applied.
-- **Fail-Safe Design:** If statistical models cannot be fit (e.g., due to sparse data), the engine defaults to a probability of 1.0 (Fail-Closed) rather than crashing.
 - If opening an issue, please include your `config.json` and a log excerpt showing the active `fdr.mode`.
 
 **Happy Hunting!**
