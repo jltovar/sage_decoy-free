@@ -103,7 +103,9 @@ Three safeguards are applied:
 $$\beta_{\text{shrunk}} = (1-w) \beta_{\text{LO}} + w \beta_{\text{Moments}}$$
 -	2.	Hard safety cap
 
-$$\beta_{\text{LO}} \le \text{safety\_mult} \times \beta_{\text{Moments}}$$
+$$
+\beta_{\operatorname{LO}} \le \operatorname{safety\_mult} \times \beta_{\operatorname{Moments}}
+$$
 -	3.	Ensemble hijack protection
 
 If LO produces a p-value more than 100× smaller than both Moments and MLE, it is capped to the best of those two before HMP combination.
@@ -234,7 +236,7 @@ These parameters control multiplicity correction and stabilization of the Lower-
   Enforces:
 
 $$
-\beta_{\text{LO}} \le \text{safety\_mult} \times \beta_{\text{Moments}}
+\beta_{\operatorname{LO}} \le \operatorname{safety\_mult} \times \beta_{\operatorname{Moments}}
 $$
 
   where `safety_mult` is the validated form of `lo_beta_safety_mult` (must be finite and positive).
