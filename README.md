@@ -1,4 +1,4 @@
-# Sage: Decoy-Free Edition (EXPERIMENTAL)
+# Sage: Decoy-Free Edition (EXPERIMENTAL TEST)
 
 > ⚠️ **Experimental fork.**
 > This is a research fork of the original [Sage search engine by Michael Lazear](https://github.com/lazear/sage).
