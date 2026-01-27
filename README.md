@@ -233,9 +233,9 @@ These parameters control multiplicity correction and stabilization of the Lower-
 - `lo_beta_safety_mult` (default: `1.50`): Hard cap on the effective Lower-Order slope relative to the Moments slope to prevent runaway regression fits and ensemble hijacking.  
   Enforces:
 
-  $$
-  \beta_{\mathrm{LO}} \le \mathrm{safety\_mult} \times \beta_{\mathrm{Moments}}
-  $$
+$$
+\beta_{\text{LO}} \le \text{safety\_mult} \times \beta_{\text{Moments}}
+$$
 
   where `safety_mult` is the validated form of `lo_beta_safety_mult` (must be finite and positive).
 
