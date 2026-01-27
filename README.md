@@ -104,7 +104,7 @@ $$\beta_{\text{shrunk}} = (1-w) \beta_{\text{LO}} + w \beta_{\text{Moments}}$$
 -	2.	Hard safety cap
 
 $$
-\beta_{\operatorname{LO}} \le \operatorname{safety\_mult} \times \beta_{\operatorname{Moments}}
+\beta_{\text{LO}} \le \text{safety}\,\text{\_}\,\text{mult} \times \beta_{\text{Moments}}
 $$
 -	3.	Ensemble hijack protection
 
@@ -236,7 +236,7 @@ These parameters control multiplicity correction and stabilization of the Lower-
   Enforces:
 
 $$
-\beta_{\operatorname{LO}} \le \operatorname{safety\_mult} \times \beta_{\operatorname{Moments}}
+\beta_{\text{LO}} \le \text{safety}\,\text{\_}\,\text{mult} \times \beta_{\text{Moments}}
 $$
 
   where `safety_mult` is the validated form of `lo_beta_safety_mult` (must be finite and positive).
