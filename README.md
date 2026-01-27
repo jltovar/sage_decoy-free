@@ -1,4 +1,4 @@
-# Sage: Decoy-Free Edition (EXPERIMENTAL TEST)
+# Sage: Decoy-Free Edition (EXPERIMENTAL)
 
 > ⚠️ **Experimental fork.**
 > This is a research fork of the original [Sage search engine by Michael Lazear](https://github.com/lazear/sage).
@@ -104,7 +104,7 @@ $$\beta_{\text{shrunk}} = (1-w) \beta_{\text{LO}} + w \beta_{\text{Moments}}$$
 -	2.	Hard safety cap
 
 $$
-\beta_{\text{LO}} \le \text{safety_mult} \times \beta_{\text{Moments}}
+\beta_{\text{LO}} \le \text{safety&#95;mult} \times \beta_{\text{Moments}}
 $$
 -	3.	Ensemble hijack protection
 
@@ -236,7 +236,7 @@ These parameters control multiplicity correction and stabilization of the Lower-
   Enforces:
 
 $$
-\beta_{\text{LO}} \le \text{safety_mult} \times \beta_{\text{Moments}}
+\beta_{\text{LO}} \le \text{safety&#95;mult} \times \beta_{\text{Moments}}
 $$
 
   where `safety_mult` is the validated form of `lo_beta_safety_mult` (must be finite and positive).
