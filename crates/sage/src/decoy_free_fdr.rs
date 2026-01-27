@@ -9,6 +9,7 @@ use rayon::prelude::*;
 use statrs::consts::EULER_MASCHERONI;
 use statrs::distribution::{Continuous, ContinuousCDF, Gumbel};
 use statrs::function::gamma::digamma;
+use std::sync::atomic::{AtomicU64, Ordering};
 
 // --- HELPER MATH ---
 fn erf_approx(x: f64) -> f64 {
@@ -118,17 +119,21 @@ fn isotonic_regression_increasing(p_values: &mut [f64]) {
 }
 
 // --- Helper: median and clamp (for LO anchoring) ---
-fn median_u64(mut v: Vec<u64>) -> Option<f64> {
+fn median_f64(mut v: Vec<f64>) -> Option<f64> {
     if v.is_empty() {
         return None;
     }
-    v.sort_unstable();
+    v.retain(|x| x.is_finite());
+    if v.is_empty() {
+        return None;
+    }
+    v.sort_by(|a, b| a.total_cmp(b));
     let n = v.len();
     if n % 2 == 1 {
-        Some(v[n / 2] as f64)
+        Some(v[n / 2])
     } else {
-        let a = v[n / 2 - 1] as f64;
-        let b = v[n / 2] as f64;
+        let a = v[n / 2 - 1];
+        let b = v[n / 2];
         Some((a + b) / 2.0)
     }
 }
@@ -416,7 +421,7 @@ pub fn calculate_q_values(psms: &[Feature], settings: &FdrSettings) -> Vec<Featu
     let mut new_features = psms.to_vec();
     let min_rank = settings.min_null_rank;
     let max_rank = settings.max_null_rank;
-    let fit_method = &settings.model_fit;
+    let fit_method = settings.model_fit.clone();
     let min_null_size = settings.min_null_size;
     let min_storey_n = settings.min_storey_n;
 
@@ -443,11 +448,13 @@ pub fn calculate_q_values(psms: &[Feature], settings: &FdrSettings) -> Vec<Featu
         // Sort by score descending
         rank1_scores.sort_by(|a, b| b.1.total_cmp(&a.1));
 
-        // threshold index for top 20% (minimum 5 peptides)
-        let top_k = ((rank1_scores.len() as f64) * 0.20).round() as usize;
+        // Use the materialized setting from your new input.rs
+        let p_factor = settings.purification_factor;
+
+        let top_k = ((rank1_scores.len() as f64) * p_factor).round() as usize;
         let top_k = top_k.max(5).min(rank1_scores.len());
 
-        // The last element in the top_k slice sets the cutoff
+        // The score at this index becomes the cutoff for "too good to be null"
         rank1_scores[top_k - 1].1
     } else {
         1000.0
@@ -617,18 +624,39 @@ pub fn calculate_q_values(psms: &[Feature], settings: &FdrSettings) -> Vec<Featu
     // - We therefore support a damping exponent alpha in [0,1]:
     //       shift = beta * alpha * ln(n_local/n_global)
     //   alpha=1.0 => original (full multiplicity penalty), alpha<1.0 => attenuated penalty.
-    let n_global_vec: Vec<u64> = new_features
+    // --- NEW: geometric reference for n_global ---
+    // n_global = exp(median(log(n_i))) with n_i clamped and filtered
+    let log_n_global_vec: Vec<f64> = new_features
         .iter()
         .filter(|f| f.rank == 1)
-        .map(|f| (f.hyperscore as f64, f.scored_candidates as u64))
-        .filter(|(s, n)| s.is_finite() && *n >= 2)
-        .map(|(_, n)| n)
+        .filter_map(|f| {
+            let n = f.scored_candidates as f64;
+            if !n.is_finite() || n < 2.0 {
+                return None;
+            }
+
+            // Clamp BEFORE log to avoid log(0), log(inf), extreme leverage
+            let n_clamped = n.max(10.0).min(1e7);
+            let ln = n_clamped.ln();
+            if ln.is_finite() {
+                Some(ln)
+            } else {
+                None
+            }
+        })
         .collect();
 
-    let n_global = median_u64(n_global_vec).unwrap_or(n_eff_global);
+    let n_global = if let Some(med_ln) = median_f64(log_n_global_vec) {
+        med_ln.exp()
+    } else {
+        // fallback stays coherent with your existing behavior
+        clamp_f64(n_eff_global, 10.0, 1e7)
+    };
+
     let n_global = clamp_f64(n_global, 10.0, 1e7);
+
     log::info!(
-        "LO reference search space (n_global, median rank-1 scored_candidates): {:.1}",
+        "LO reference search space (n_global, geometric median rank-1 scored_candidates): {:.1}",
         n_global
     );
 
@@ -664,18 +692,13 @@ pub fn calculate_q_values(psms: &[Feature], settings: &FdrSettings) -> Vec<Featu
     //   intercept ≈ μ_mom + β_mom * ln(n_global)
     // (We do NOT use +EULER_MASCHERONI here, because that is part of the digamma/Gumbel order-statistic
     // mapping that should not be mixed into the intercept after the fact.)
-    let (lo_intercept_raw, lo_beta_raw) =
-        if matches!(fit_method, ModelFit::LowerOrder) || run_parametric {
-            fit_lower_order_regression(&fit_data, min_rank, max_rank).unwrap_or_else(|| {
-                if moments_params_ok {
-                    let intercept = mu_mom + beta_mom * n_global.ln();
-                    (intercept, beta_mom)
-                } else {
-                    // Last-ditch fallback (safe but not statistically meaningful)
-                    (0.0, 1.0)
-                }
-            })
-        } else {
+    let min_count = settings.min_rank_count;
+
+    let (lo_intercept_raw, lo_beta_raw) = if matches!(fit_method, ModelFit::LowerOrder)
+        || run_parametric
+    {
+        // UPDATED: Now passing min_count to the regression function
+        fit_lower_order_regression(&fit_data, min_rank, max_rank, min_count).unwrap_or_else(|| {
             if moments_params_ok {
                 let intercept = mu_mom + beta_mom * n_global.ln();
                 (intercept, beta_mom)
@@ -683,7 +706,16 @@ pub fn calculate_q_values(psms: &[Feature], settings: &FdrSettings) -> Vec<Featu
                 // Last-ditch fallback (safe but not statistically meaningful)
                 (0.0, 1.0)
             }
-        };
+        })
+    } else {
+        if moments_params_ok {
+            let intercept = mu_mom + beta_mom * n_global.ln();
+            (intercept, beta_mom)
+        } else {
+            // Last-ditch fallback (safe but not statistically meaningful)
+            (0.0, 1.0)
+        }
+    };
 
     // --- Harden LO parameters immediately ---
     // Ensure finite and positive before using it in any calculations
@@ -803,7 +835,14 @@ pub fn calculate_q_values(psms: &[Feature], settings: &FdrSettings) -> Vec<Featu
     // Guard MLE (fallback to Moments if MLE fails)
     let dist_mle = match Gumbel::new(mu_mle, beta_mle) {
         Ok(d) => d,
-        Err(_) => Gumbel::new(mu_mom, beta_mom).unwrap(), // safe because moments_valid else fail-closed below
+        Err(_) => {
+            if moments_valid {
+                Gumbel::new(mu_mom, beta_mom).unwrap()
+            } else {
+                // dummy; will not be used because we fail-closed immediately after
+                Gumbel::new(0.0, 1.0).unwrap()
+            }
+        }
     };
 
     // --- Enforce Fail-Closed ---
@@ -863,7 +902,17 @@ pub fn calculate_q_values(psms: &[Feature], settings: &FdrSettings) -> Vec<Featu
     // ln_ratio_cap bounds extreme multiplicity shifts so one pathological spectrum cannot dominate.
     //
     // These default conservatively and can be tuned with entrapment calibration.
-    let lo_alpha = settings.lo_multiplicity_alpha.clamp(0.0, 1.0);
+    // --- DYNAMIC ALPHA IMPLEMENTATION ---
+    let n_rank1_est = new_features.iter().filter(|f| f.rank == 1).count();
+    let low_input_scaling = if n_rank1_est < 1000 {
+        // Smoothly scale alpha down for low-input samples
+        // to be less punishing when competition is low.
+        0.75
+    } else {
+        1.0
+    };
+
+    let lo_alpha = (settings.lo_multiplicity_alpha.clamp(0.0, 1.0)) * low_input_scaling;
     let lo_ln_ratio_cap = settings.lo_ln_ratio_cap.max(0.0);
 
     log::info!(
@@ -871,6 +920,11 @@ pub fn calculate_q_values(psms: &[Feature], settings: &FdrSettings) -> Vec<Featu
         lo_alpha,
         lo_ln_ratio_cap
     );
+
+    // --- LO saturation diagnostics counters (thread-safe) ---
+    let clipped_ln = AtomicU64::new(0);
+    let capped_beta = AtomicU64::new(0);
+    let n_rank1 = AtomicU64::new(0);
 
     // --- CALCULATION LOOP ---
     new_features.par_iter_mut().for_each(|psm| {
@@ -936,9 +990,24 @@ pub fn calculate_q_values(psms: &[Feature], settings: &FdrSettings) -> Vec<Featu
             // Enforce 0 ≤ beta_lo ≤ beta_cap (and keep >0 for Gumbel validity).
             let beta_lo = lo_beta_shrunk.clamp(1e-9, beta_cap);
             let mut ln_ratio = n_eff.ln() - n_global.ln();
+            let ln_ratio_raw = ln_ratio; // optional but helpful for exact “did clamp happen?”
+
             if lo_ln_ratio_cap > 0.0 {
                 ln_ratio = ln_ratio.clamp(-lo_ln_ratio_cap, lo_ln_ratio_cap);
             }
+
+            // --- LO saturation diagnostics ---
+            n_rank1.fetch_add(1, Ordering::Relaxed);
+
+            if lo_ln_ratio_cap > 0.0 && (ln_ratio != ln_ratio_raw) {
+                clipped_ln.fetch_add(1, Ordering::Relaxed);
+            }
+
+            // Count how often beta_lo is at the cap (within eps)
+            if beta_lo >= beta_cap * (1.0 - 1e-12) {
+                capped_beta.fetch_add(1, Ordering::Relaxed);
+            }
+
             let mu_i = lo_intercept + beta_lo * lo_alpha * ln_ratio;
 
             // --- Guard against Unwrap Panic in Dynamic LO ---
@@ -968,7 +1037,22 @@ pub fn calculate_q_values(psms: &[Feature], settings: &FdrSettings) -> Vec<Featu
                     // HMP is min-like; a single overly-liberal p-value can dominate.
                     // If LO is >100x smaller than BOTH Moments and MLE, cap it at the best of those two.
                     let p_base_min = p_mom.min(p_mle);
-                    let p_lo_guarded = if p_lo < (p_base_min / 100.0) {
+
+                    // Detect whether LO is operating in a "saturated" regime for this spectrum:
+                    // - ln_ratio got clipped (extreme multiplicity shift)
+                    // - or beta hit the safety cap
+                    let ln_was_clipped =
+                        lo_ln_ratio_cap > 0.0 && (ln_ratio.abs() >= lo_ln_ratio_cap - 1e-12);
+
+                    let beta_was_capped = beta_lo >= beta_cap - 1e-12;
+
+                    let lo_saturated = ln_was_clipped || beta_was_capped;
+
+                    // Soft guard:
+                    // - If LO is massively smaller than the conservative base AND LO is saturated,
+                    //   treat LO as unreliable and fall back to the base.
+                    // - Otherwise, allow LO to contribute (this is the main sensitivity unlock).
+                    let p_lo_guarded = if lo_saturated && (p_lo < (p_base_min / 1000.0)) {
                         p_base_min
                     } else {
                         p_lo
@@ -1036,10 +1120,28 @@ pub fn calculate_q_values(psms: &[Feature], settings: &FdrSettings) -> Vec<Featu
         }
     });
 
-    // --- PAVA ---
-    // --- Collect vectors for PAVA (Sequential Pass) ---
+    // Apply PAVA to enforce monotonicity only when NOT running pure LowerOrder mode.
+    // But: q-values must ALWAYS be computed, regardless of PAVA.
+    // --- PAVA SOFT GUARD IMPLEMENTATION ---
+    // We skip PAVA if we are in pure LowerOrder mode OR if the user
+    // explicitly wants to trust the raw dynamic nulls in an Ensemble.
+    let apply_pava = match fit_method {
+        ModelFit::LowerOrder => false,
+        // If you want Ensemble to also skip PAVA for ultra-low input testing:
+        ModelFit::Ensemble | ModelFit::EnsembleDebug => {
+            if n_rank1_est < 500 {
+                false
+            } else {
+                true
+            }
+        }
+        _ => true,
+    };
+
+    // --- Collect Rank-1 indices and p-values (always) ---
     let mut rank1_indices = Vec::with_capacity(new_features.len() / 2);
     let mut rank1_scores_for_pava = Vec::with_capacity(new_features.len() / 2);
+    let mut rank1_pvalues = Vec::with_capacity(new_features.len() / 2);
 
     for (i, psm) in new_features.iter().enumerate() {
         if psm.rank == 1 {
@@ -1047,11 +1149,12 @@ pub fn calculate_q_values(psms: &[Feature], settings: &FdrSettings) -> Vec<Featu
             if s.is_finite() {
                 rank1_indices.push(i);
                 rank1_scores_for_pava.push(s);
+                rank1_pvalues.push(psm.spectrum_q as f64); // currently holds p_final from loop
             }
         }
     }
 
-    // --- Guard against empty Rank-1 set ---
+    // --- Guard against empty Rank-1 set (always) ---
     if rank1_indices.is_empty() {
         log::warn!("No finite rank-1 hyperscores found; failing closed (all q=1).");
         new_features.par_iter_mut().for_each(|psm| {
@@ -1071,49 +1174,86 @@ pub fn calculate_q_values(psms: &[Feature], settings: &FdrSettings) -> Vec<Featu
         return new_features;
     }
 
+    // --- LO SATURATION DIAGNOSTICS ---
+    // These counters measure how often the stabilizers are actively constraining the LO model.
+    //
+    // Interpretation:
+    //   frac_ln_clipped  = fraction of rank-1 spectra whose ln(n_i / n_global) shift hit the cap
+    //                      → high values mean multiplicity correction is saturating frequently
+    //                      → suggests ln_ratio_cap is too small or search-space variability is extreme
+    //
+    //   frac_beta_capped = fraction of spectra where beta_lo was clamped to safety_mult * beta_ref
+    //                      → high values mean the LO regression slope is too aggressive
+    //                      → indicates tail regression instability or insufficient shrinkage
+    //
+    // In a healthy, well-behaved LO model:
+    //   • frac_ln_clipped  should typically be < 0.10–0.20
+    //   • frac_beta_capped should typically be < 0.05–0.10
+    //
+    // Values significantly above these ranges indicate the model is operating in a constrained regime
+    // and that calibration is being driven by guards rather than the statistical fit itself.
+
+    let n_seen = n_rank1.load(Ordering::Relaxed);
+    if n_seen > 0 {
+        let n = n_seen as f64;
+        let frac_ln = clipped_ln.load(Ordering::Relaxed) as f64 / n;
+        let frac_beta = capped_beta.load(Ordering::Relaxed) as f64 / n;
+
+        log::info!(
+            "LO saturation diagnostics: n_rank1={}, frac_ln_clipped={:.3}, frac_beta_capped={:.3}",
+            n_seen,
+            frac_ln,
+            frac_beta
+        );
+    } else {
+        // This should only occur if no rank-1 spectra were processed in the scoring loop
+        // (e.g., pathological dataset or early failure paths).
+        log::info!("LO saturation diagnostics: n_rank1=0 (no rank-1 spectra processed)");
+    }
+
     // --- PAVA CALIBRATION ---
     // Assumes inputs are sorted by score descending; enforces p-values non-decreasing along that order.
-    let mut pava_data: Vec<(f64, usize)> = rank1_scores_for_pava
-        .iter()
-        .zip(rank1_indices.iter())
-        .map(|(&s, &idx)| (s, idx))
-        .collect();
+    if apply_pava {
+        // Sort by score descending (high score = should be low p)
+        let mut pava_data: Vec<(f64, usize, f64)> = rank1_scores_for_pava
+            .iter()
+            .zip(rank1_indices.iter())
+            .zip(rank1_pvalues.iter())
+            .map(|((&s, &idx), &p)| (s, idx, p))
+            .collect();
 
-    pava_data.sort_by(|a, b| b.0.total_cmp(&a.0).then_with(|| a.1.cmp(&b.1)));
+        pava_data.sort_by(|a, b| b.0.total_cmp(&a.0).then_with(|| a.1.cmp(&b.1)));
 
-    let mut sorted_pvalues: Vec<f64> = pava_data
-        .iter()
-        .map(|&(_, idx)| new_features[idx].spectrum_q as f64)
-        .collect();
+        let mut sorted_pvalues: Vec<f64> = pava_data.iter().map(|&(_, _, p)| p).collect();
 
-    // --- SAFETY: sanitize PAVA input p-values ---
-    for p in &mut sorted_pvalues {
-        if !p.is_finite() {
-            *p = 1.0;
-        } else {
-            *p = p.clamp(0.0, 1.0).max(1e-300);
+        // Sanitize input to PAVA
+        for p in &mut sorted_pvalues {
+            if !p.is_finite() {
+                *p = 1.0;
+            } else {
+                *p = p.clamp(0.0, 1.0).max(1e-300);
+            }
+        }
+
+        isotonic_regression_increasing(&mut sorted_pvalues);
+
+        // Write calibrated p-values back to the corresponding features and rank1_pvalues vector
+        for (i, &(_, idx, _)) in pava_data.iter().enumerate() {
+            let cal_p = sorted_pvalues[i].clamp(0.0, 1.0).max(1e-300);
+            new_features[idx].spectrum_q = cal_p as f32;
+            new_features[idx].decoy_free_p_value = Some(cal_p as f32);
+        }
+
+        // Refresh rank1_pvalues from updated spectrum_q after PAVA
+        for (k, &idx) in rank1_indices.iter().enumerate() {
+            rank1_pvalues[k] = new_features[idx].spectrum_q as f64;
         }
     }
 
-    isotonic_regression_increasing(&mut sorted_pvalues);
-
-    let mut calibrated_pvalues_map = FnvHashMap::default();
-    for (i, &(_, idx)) in pava_data.iter().enumerate() {
-        // --- SAFETY: calibrated p-values should remain finite and in [0,1] ---
-        let cal_p = sorted_pvalues[i].clamp(0.0, 1.0).max(1e-300);
-        new_features[idx].spectrum_q = cal_p as f32;
-        new_features[idx].decoy_free_p_value = Some(cal_p as f32);
-        calibrated_pvalues_map.insert(idx, cal_p);
-    }
-
-    let final_pvalues_for_q: Vec<f64> = rank1_indices
-        .iter()
-        .map(|idx| *calibrated_pvalues_map.get(idx).unwrap())
-        .collect();
-
+    // --- Compute q-values (always) ---
     let q_values = match settings.type_ {
-        FdrType::Storey => stats::storey_q_value(&final_pvalues_for_q, min_storey_n),
-        FdrType::Bh => stats::bh_q_value(&final_pvalues_for_q),
+        FdrType::Storey => stats::storey_q_value(&rank1_pvalues, min_storey_n),
+        FdrType::Bh => stats::bh_q_value(&rank1_pvalues),
     };
 
     for (idx, q) in rank1_indices.into_iter().zip(q_values) {
@@ -1341,6 +1481,7 @@ fn fit_lower_order_regression(
     data: &[(u32, f64)],
     min_rank: u32,
     max_rank: u32,
+    min_count: usize,
 ) -> Option<(f64, f64)> {
     let span = (max_rank - min_rank + 1) as usize;
     let mut rank_sums = vec![0.0f64; span];
@@ -1361,7 +1502,7 @@ fn fit_lower_order_regression(
     for r in min_rank..=max_rank {
         let idx = (r - min_rank) as usize;
         let count = rank_counts[idx];
-        if count > 10 {
+        if count >= min_count {
             let mean = rank_sums[idx] / count as f64;
 
             // --- REFINEMENT: Use Digamma instead of ln(r) ---

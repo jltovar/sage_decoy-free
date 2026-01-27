@@ -446,23 +446,29 @@ impl Input {
             write_pin: self.write_pin.unwrap_or(false),
             bruker_config: self.bruker_config.unwrap_or_default(),
             score_type,
-            fdr: FdrSettings {
-                mode: fdr_mode,
-                peptide_fdr,
-                protein_fdr,
-                precursor_fdr,
-                min_null_rank,
-                max_null_rank,
-                model_fit,
-                type_: fdr_type,
-                min_null_size,
-                min_storey_n,
-                kde_samples: 20_000,
-                lo_multiplicity_alpha,
-                lo_ln_ratio_cap,
-                lo_beta_blend_moments,
-                lo_beta_safety_mult,
-            },
+            fdr: self.fdr.map(Into::into).unwrap_or_else(|| {
+                FdrOptions {
+                    mode: Some(fdr_mode),
+                    peptide_fdr: Some(peptide_fdr),
+                    protein_fdr: Some(protein_fdr),
+                    precursor_fdr: Some(precursor_fdr),
+                    min_null_rank: Some(min_null_rank),
+                    max_null_rank: Some(max_null_rank),
+                    model_fit: Some(model_fit),
+                    type_: Some(fdr_type),
+                    min_null_size: Some(min_null_size),
+                    min_storey_n: Some(min_storey_n),
+                    // Leave these as None so sage-core applies the defaults
+                    kde_samples: None,
+                    lo_multiplicity_alpha: Some(lo_multiplicity_alpha),
+                    lo_ln_ratio_cap: Some(lo_ln_ratio_cap),
+                    lo_beta_blend_moments: Some(lo_beta_blend_moments),
+                    lo_beta_safety_mult: Some(lo_beta_safety_mult),
+                    purification_factor: None,
+                    min_rank_count: None,
+                }
+                .into()
+            }),
         })
     }
 }

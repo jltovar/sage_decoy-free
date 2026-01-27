@@ -38,6 +38,7 @@ pub struct FdrOptions {
     pub min_null_rank: Option<u32>,
     pub max_null_rank: Option<u32>,
     pub model_fit: Option<ModelFit>,
+    #[serde(alias = "type")]
     pub type_: Option<FdrType>,
 
     // Configurable Safety Brakes
@@ -74,6 +75,10 @@ pub struct FdrOptions {
     pub lo_ln_ratio_cap: Option<f64>,
     pub lo_beta_blend_moments: Option<f64>,
     pub lo_beta_safety_mult: Option<f64>,
+
+    // New Controls for Ultra-Low Input Sensitivity
+    pub purification_factor: Option<f64>,
+    pub min_rank_count: Option<usize>,
 }
 
 #[derive(Clone, Serialize, Debug)]
@@ -104,6 +109,10 @@ pub struct FdrSettings {
     pub lo_ln_ratio_cap: f64,
     pub lo_beta_blend_moments: f64,
     pub lo_beta_safety_mult: f64,
+
+    // New Controls for Ultra-Low Input Sensitivity
+    pub purification_factor: f64,
+    pub min_rank_count: usize,
 }
 
 impl From<FdrOptions> for FdrSettings {
@@ -124,6 +133,10 @@ impl From<FdrOptions> for FdrSettings {
 
         // Safety Belt multiplier: must be sane and positive
         let lo_beta_safety_mult = options.lo_beta_safety_mult.unwrap_or(1.50).max(0.1);
+
+        // This creates the local variables that the compiler is looking for below
+        let purification_factor = options.purification_factor.unwrap_or(0.20).clamp(0.0, 0.9);
+        let min_rank_count = options.min_rank_count.unwrap_or(10);
 
         Self {
             mode: options.mode.unwrap_or(FdrMode::Tdc),
@@ -147,6 +160,8 @@ impl From<FdrOptions> for FdrSettings {
             lo_ln_ratio_cap,
             lo_beta_blend_moments,
             lo_beta_safety_mult,
+            purification_factor,
+            min_rank_count,
         }
     }
 }

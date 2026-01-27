@@ -17,7 +17,7 @@ fn main() -> anyhow::Result<()> {
         .parse_env(env_logger::Env::default().filter_or("SAGE_LOG", "error,sage=info"))
         .init();
 
-	let matches = Command::new("sage")
+    let matches = Command::new("sage")
 		.version(clap::crate_version!())
 		.author("Sage by Michael Lazear <michaellazear92@gmail.com>\nSage Decoy-free version by JLTovar")
 		.about("\u{1F52E} Sage \u{1F9D9} - Proteomics searching so fast—and now decoy-free—it feels like magic!")
