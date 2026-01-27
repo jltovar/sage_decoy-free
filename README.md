@@ -220,7 +220,9 @@ Decoy-free mode is configured in your JSON file under the `fdr` key:
     "lo_multiplicity_alpha": 0.50,
     "lo_ln_ratio_cap": 6.9,
     "lo_beta_blend_moments": 0.30,
-    "lo_beta_safety_mult": 1.50
+    "lo_beta_safety_mult": 1.50,
+    "purification_factor": 0.50,
+	"min_rank_count": 10
 }
 ```
 
@@ -280,7 +282,7 @@ $$
 
   where `safety_mult` is the validated form of `lo_beta_safety_mult` (must be finite and positive).
   
-- `purification_factor` (default: `0.20`): Sensitivity Unlock. Excludes the top-tier Rank-1 PSMs from the null distribution fit to prevent real signal from contaminating the background model.
+- `purification_factor` (default: `0.50`): Sensitivity Unlock. Excludes the top-tier Rank-1 PSMs from the null distribution fit to prevent real signal from contaminating the background model.
 
 - `min_rank_count` (default: `10`): The minimum PSMs required at a specific rank for inclusion in the Lower-Order regression. Lowering to 4–6 helps stabilize models in sparse datasets.
 
