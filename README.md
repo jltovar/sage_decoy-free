@@ -50,7 +50,7 @@ To reduce dependence on any single statistical assumption, the decoy-free workfl
 4.  **Robust MSFDR Mixture Model (Peng et al., 2020)**
     - A stability-hardened implementation of the Mix-Max-Score framework.
     - Models the score distribution as a two-component mixture: **Gumbel (Null)** + **Skew-Normal (Target)**.
-    - Features **smart data-driven initialization**, **strict EM convergence checks** ($10^{-5}$ tolerance), and **safety clamps** to prevent model collapse on sparse data.
+    - Features **smart data-driven initialization**, **scale-invariant EM convergence** checks using relative (1e-4) and absolute (1e-6) tolerances on the average log-likelihood per point, and **safety clamps** to prevent model collapse on sparse data.
 
 > **Scientific Idea:** The engine acts as a **multi-model jury**, preventing false discoveries if one model fits poorly while boosting sensitivity when models agree.
 
@@ -69,11 +69,44 @@ However, in practice each spectrum is searched against a different effective num
 **Anchored Relative Shift (Coordinate-Consistent Mapping)**  
 This fork applies a coordinate-consistent relative correction:
 
-1. Define a reference search space:
+1. To define a stable reference multiplicity for the Lower-Order correction, we compute the **geometric median** of the effective search space sizes across all rank-1 spectra:
 
 $$
-n_{\mathrm{global}} = \mathrm{median}(\mathrm{scored\_candidates\ of\ rank\text{-}1\ spectra})
+n_{\mathrm{global}}
+\exp!\left(
+\mathrm{median}
+\left[
+\log!\left(
+\mathrm{clamp}(n_i,,[10,,10^7])
+\right)
+\right]
+\right),
+\qquad
+n_i = \mathrm{scored_candidates}_i
 $$
+
+That is, we take the median in **log-space** and exponentiate, yielding the geometric center of the multiplicity distribution.
+
+**Rationale:**
+
+* **Multiplicative Shift:** Search space size enters multiplicatively into the null location shift.
+* **Tail Robustness:** Candidate counts are heavy-tailed across spectra; an arithmetic median would bias the reference upward and systematically over-penalize the majority of spectra.
+* **Scale Invariance:** The geometric median provides a scale-invariant, tail-robust reference consistent with multiplicative extreme value theory.
+
+This reference is used strictly as an **anchor**, and all multiplicity corrections are applied **relatively**:
+
+$$
+\Delta\mu_i = \beta \cdot \alpha \cdot
+\mathrm{clamp}!\left(
+\ln n_i - \ln n_{\mathrm{global}}, \pm c
+\right)
+$$
+
+**This ensures:**
+
+* **Coordinate Consistency:** Maintains alignment with the digamma regression coordinate system.
+* **Scaling Invariance:** Ensures the model is invariant under global database scaling.
+* **Controlled Penalization:** Dampens the penalty for unusually large or correlated candidate spaces.
 
 2. For each spectrum with local multiplicity $n_i$, shift only *relative* to the reference:
 
@@ -108,7 +141,11 @@ $$
 $$
 -	3.	Ensemble hijack protection
 
-If LO produces a p-value more than 100× smaller than both Moments and MLE, it is capped to the best of those two before HMP combination.
+Soft ensemble hijack protection is applied only when the Lower-Order model is operating in a saturated regime (extreme multiplicity clipping or slope capping) **and** produces a p-value more than 1000× smaller than both Moments and MLE.
+
+In this case, the LO p-value is replaced by the best of the conservative models before HMP combination.
+  
+Otherwise, LO is allowed to dominate the ensemble when it provides stable tail evidence.
 
 **Result**:
 The Lower-Order model now remains:
@@ -139,7 +176,9 @@ The engine includes a native implementation of **Nokoi 2.0**, an on-the-fly mach
 
 ### 2.3 Isotonic Calibration (PAVA)
 
-Raw probabilities from the ensemble can sometimes be "jittery" due to local noise. This fork implements **Isotonic Regression** using the **Pool Adjacent Violators Algorithm (PAVA)**.
+Raw probabilities from the ensemble can sometimes be "jittery" due to local noise. This fork implements Isotonic Regression (PAVA) to enforce monotonicity on final P-values.
+
+PAVA is applied for all ensemble and parametric modes, but is **skipped in pure Lower-Order mode** to preserve the intrinsic ordering of the digamma regression.
 
 - **Function:** Enforces monotonicity on the final P-values.
 - **Guarantee:** Ensures that a better matching score *always* results in an equal or better P-value/PEP.
@@ -236,10 +275,14 @@ These parameters control multiplicity correction and stabilization of the Lower-
   Enforces:
 
 $$
-\beta_{\text{LO}} \le \text{safety&#95;mult} \times \beta_{\text{Moments}}
+\beta_{\text{LO}} \le \text{safety}_{\text{mult}} \times \beta_{\text{Moments}}
 $$
 
   where `safety_mult` is the validated form of `lo_beta_safety_mult` (must be finite and positive).
+  
+- `purification_factor` (default: `0.20`): Sensitivity Unlock. Excludes the top-tier Rank-1 PSMs from the null distribution fit to prevent real signal from contaminating the background model.
+
+- `min_rank_count` (default: `10`): The minimum PSMs required at a specific rank for inclusion in the Lower-Order regression. Lowering to 4–6 helps stabilize models in sparse datasets.
 
 ---
 
@@ -273,9 +316,9 @@ The FDR columns in Sage Decoy-Free are dynamic. Their values change depending on
   - `ModelFit::Moments`: Uses the Gumbel Moments p-value.  
   - `ModelFit::Mle`: Uses the Gumbel MLE p-value.
   - `ModelFit::LowerOrder`: Uses the Lower-Order Statistics p-value (optimized for small sample sizes).
-  - `ModelFit::Msfdr`: Uses the MSFDR (Skew-Normal) p-value.
+  - `ModelFit::Msfdr`: Uses the **seeded null survival p-value** from the MSFDR model’s null component (Gumbel), while the mixture model is used to compute **PEP**.
   - `ModelFit::Nokoi`: Uses the Linear Discriminant Analysis (LDA) p-value derived from ML-based rescoring.
-  - `ModelFit::Ensemble`: Calculates the Harmonic Mean of all available p-values (Moments, MLE, Lower-Order, MSFDR).
+  - `ModelFit::Ensemble`: Calculates the Harmonic Mean of the parametric null models (Moments, MLE, Lower-Order). The MSFDR mixture model is **not included in the ensemble P-value** to avoid double-counting the seeded null. Instead, MSFDR is used exclusively to compute the Posterior Error Probability (PEP).
 
 - **Calculation:** After determining the raw P-value, the Benjamini–Hochberg (or Storey) procedure is applied globally to convert it into a Q-value (`spectrum_q`).
 
@@ -396,6 +439,7 @@ Classical combination and FDR methods:
 - Always inspect log messages and output columns to confirm which models were applied.
 - **Fail-Safe Design:** If statistical models cannot be fit (e.g., due to sparse data), the engine defaults to a probability of 1.0 (Fail-Closed) rather than crashing.
 - If opening an issue, please include your `config.json` and a log excerpt showing the active `fdr.mode`.
+- Log messages report LO saturation diagnostics (frac_ln_clipped, frac_beta_capped) to assist calibration tuning.
 
 **Happy Hunting!**
 
