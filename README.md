@@ -104,7 +104,7 @@ $$\beta_{\text{shrunk}} = (1-w) \beta_{\text{LO}} + w \beta_{\text{Moments}}$$
 -	2.	Hard safety cap
 
 $$
-\beta_{\text{LO}} \le \text{safety&#95;mult} \times \beta_{\text{Moments}}
+\beta_{\text{LO}} \le \text{safety}_{\text{mult}} \times \beta_{\text{Moments}}
 $$
 -	3.	Ensemble hijack protection
 
