@@ -601,12 +601,18 @@ pub fn calculate_q_values(psms: &[Feature], settings: &FdrSettings) -> Vec<Featu
 
     // Calculate Global Fallback n_eff
     let total_candidates: u64 = new_features
-        .iter()
-        .filter(|f| f.rank == 1)
-        .map(|f| f.scored_candidates as u64)
-        .sum();
-    let num_spectra = new_features.iter().filter(|f| f.rank == 1).count().max(1) as f64;
-    let n_eff_global = (total_candidates as f64 / num_spectra).max(2.0);
+    .iter()
+    .filter(|f| f.rank == 1 && (f.hyperscore as f64).is_finite())
+    .map(|f| f.scored_candidates as u64)
+    .sum();
+
+	let num_spectra = new_features
+		.iter()
+		.filter(|f| f.rank == 1 && (f.hyperscore as f64).is_finite())
+		.count()
+		.max(1) as f64;
+	
+	let n_eff_global = (total_candidates as f64 / num_spectra).max(2.0);
 
     log::info!("Global Effective Search Space (n_eff): {:.1}", n_eff_global);
 
@@ -627,24 +633,20 @@ pub fn calculate_q_values(psms: &[Feature], settings: &FdrSettings) -> Vec<Featu
     // --- NEW: geometric reference for n_global ---
     // n_global = exp(median(log(n_i))) with n_i clamped and filtered
     let log_n_global_vec: Vec<f64> = new_features
-        .iter()
-        .filter(|f| f.rank == 1)
-        .filter_map(|f| {
-            let n = f.scored_candidates as f64;
-            if !n.is_finite() || n < 2.0 {
-                return None;
-            }
-
-            // Clamp BEFORE log to avoid log(0), log(inf), extreme leverage
-            let n_clamped = n.max(10.0).min(1e7);
-            let ln = n_clamped.ln();
-            if ln.is_finite() {
-                Some(ln)
-            } else {
-                None
-            }
-        })
-        .collect();
+		.iter()
+		.filter(|f| f.rank == 1 && (f.hyperscore as f64).is_finite())
+		.filter_map(|f| {
+			let n = f.scored_candidates as f64;
+			if !n.is_finite() || n < 2.0 {
+				return None;
+			}
+	
+			// Clamp BEFORE log to avoid log(0), log(inf), extreme leverage
+			let n_clamped = n.max(10.0).min(1e7);
+			let ln = n_clamped.ln();
+			if ln.is_finite() { Some(ln) } else { None }
+		})
+		.collect();
 
     let n_global = if let Some(med_ln) = median_f64(log_n_global_vec) {
         med_ln.exp()
@@ -981,7 +983,7 @@ pub fn calculate_q_values(psms: &[Feature], settings: &FdrSettings) -> Vec<Featu
                 if settings.lo_beta_safety_mult.is_finite() && settings.lo_beta_safety_mult > 0.0 {
                     settings.lo_beta_safety_mult
                 } else {
-                    1.5
+                    0.60
                 };
 
             // Safety belt: keep LO beta in a sane range relative to reference beta.

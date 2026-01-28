@@ -56,114 +56,174 @@ To reduce dependence on any single statistical assumption, the decoy-free workfl
 
 #### 2.1.1 Lower-Order Multiplicity Correction & Stabilization
 
-The original Lower-Order model exploits the exact theory of Gumbel order statistics by fitting:
+The Lower-Order model exploits the theory of Gumbel order statistics by fitting mean score versus rank:
 
 $$
-\mathrm{Score}_k \approx \mu_{\mathrm{ref}} + \beta \cdot \left[-\psi(k)\right]
+\mathrm{Score}_k \approx \mu_{\mathrm{intercept}} + \beta_{\mathrm{LO}} \, \bigl[-\psi(k)\bigr]
 $$
 
 where $\psi(\cdot)$ is the Digamma function and $k$ is the rank.
 
-However, in practice each spectrum is searched against a different effective number of candidates (`scored_candidates`). Treating all spectra as having identical multiplicity leads to systematic miscalibration.
+In practice, each spectrum is searched against a different effective number of candidates (`scored_candidates`). Treating all spectra as having identical multiplicity leads to systematic miscalibration, especially when candidate counts vary widely across spectra.
 
-**Anchored Relative Shift (Coordinate-Consistent Mapping)**  
-This fork applies a coordinate-consistent relative correction:
+**Anchored Relative Shift (coordinate-consistent mapping)**  
+This fork applies multiplicity correction as a *relative* shift anchored to a global reference multiplicity, rather than reconstructing an absolute location parameter from incompatible formulas.
 
-1. To define a stable reference multiplicity for the Lower-Order correction, we compute the **geometric median** of the effective search space sizes across all rank-1 spectra:
+---
+
+##### Step 1 — Define a reference multiplicity ($n_{\mathrm{global}}$)
+
+Let $n_i$ denote the effective candidate count for spectrum $i$:
+
+$$
+n_i = \mathrm{scored\_candidates}_i.
+$$
+
+We define the global reference multiplicity using the **median on the log scale** (i.e., $\exp(\mathrm{median}(\log n))$) over rank-1 spectra:
 
 $$
 n_{\mathrm{global}}
-\exp!\left(
-\mathrm{median}
-\left[
-\log!\left(
-\mathrm{clamp}(n_i,,[10,,10^7])
-\right)
+=
+\exp\!\left(
+\operatorname{median}\!\left[
+\log\!\Big(
+\operatorname{clamp}(n_i,\;10,\;10^{7})
+\Big)
 \right]
+\right).
+$$
+
+This is a scale-robust anchor for multiplicative search-space effects: the median is taken in log-space and exponentiated.
+
+---
+
+##### Step 2 — Apply a bounded, attenuated multiplicity shift
+
+For a spectrum with local multiplicity $n_i$, we compute a bounded log-ratio:
+
+$$
+\Delta_i
+=
+\operatorname{clamp}\!\left(
+\ln n_i - \ln n_{\mathrm{global}},\;
+-c,\;
+c
 \right),
-\qquad
-n_i = \mathrm{scored_candidates}_i
 $$
 
-That is, we take the median in **log-space** and exponentiate, yielding the geometric center of the multiplicity distribution.
+where $c$ corresponds to `lo_ln_ratio_cap`.
 
-**Rationale:**
-
-* **Multiplicative Shift:** Search space size enters multiplicatively into the null location shift.
-* **Tail Robustness:** Candidate counts are heavy-tailed across spectra; an arithmetic median would bias the reference upward and systematically over-penalize the majority of spectra.
-* **Scale Invariance:** The geometric median provides a scale-invariant, tail-robust reference consistent with multiplicative extreme value theory.
-
-This reference is used strictly as an **anchor**, and all multiplicity corrections are applied **relatively**:
+We then shift only *relative* to the reference anchor:
 
 $$
-\Delta\mu_i = \beta \cdot \alpha \cdot
-\mathrm{clamp}!\left(
-\ln n_i - \ln n_{\mathrm{global}}, \pm c
-\right)
+\mu_i
+=
+\mu_{\mathrm{intercept}}
++
+\beta_{\mathrm{LO,eff}} \, \alpha \, \Delta_i,
 $$
 
-**This ensures:**
+where:
 
-* **Coordinate Consistency:** Maintains alignment with the digamma regression coordinate system.
-* **Scaling Invariance:** Ensures the model is invariant under global database scaling.
-* **Controlled Penalization:** Dampens the penalty for unusually large or correlated candidate spaces.
-
-2. For each spectrum with local multiplicity $n_i$, shift only *relative* to the reference:
-
-$$
-\mu_i = \mu_{\mathrm{intercept}} + \beta \cdot \alpha \cdot
-\mathrm{clamp}\!\left(\ln n_i - \ln n_{\mathrm{global}}, \pm c\right)
-$$
+- $\alpha \in [0,1]$ is `lo_multiplicity_alpha` (attenuates multiplicity in correlated candidate spaces),
+- $\beta_{\mathrm{LO,eff}}$ is the stabilized Lower-Order scale used for the dynamic Gumbel null.
 
 Key properties:
--	Preserves the digamma regression coordinate system
--	Avoids reconstructing an absolute $\mu$ from incompatible formulas
--	Penalizes only deviations from the typical search space
--	Ensures monotonic behavior across spectra
+- preserves the digamma regression coordinate system,
+- avoids reconstructing an absolute $\mu$ using mixed coordinate formulas,
+- penalizes only deviations from the typical search space,
+- keeps behavior bounded and monotone.
 
-Multiplicity Attenuation (Correlation Control)
-In open-search and PTM-heavy workflows, candidates are highly correlated.
-To avoid over-penalization, the multiplicity shift is damped by:
--	lo_multiplicity_alpha ∈ [0, 1]
--	1.0 → full theoretical penalty
--	0.5 → square-root-like attenuation (default)
+---
 
-Slope Stabilization & Safety Belt
-Lower-Order slopes can become unstable in heavy tails or sparse nulls.
-Three safeguards are applied:
--	1.	Shrinkage toward Moments
+##### Multiplicity attenuation (correlation control)
 
-$$\beta_{\text{shrunk}} = (1-w) \beta_{\text{LO}} + w \beta_{\text{Moments}}$$
--	2.	Hard safety cap
+In open-search and PTM-heavy workflows, candidates can be highly correlated. To avoid over-penalization, the multiplicity shift is damped by `lo_multiplicity_alpha`:
+
+- $\alpha = 1.0$ → full theoretical penalty,
+- $\alpha = 0.5$ → attenuated penalty (default in this fork).
+
+---
+
+##### Slope stabilization & safety belt
+
+Lower-Order slopes can become unstable in heavy tails or sparse nulls. Three safeguards are applied:
+
+**(1) Shrinkage toward Moments**
 
 $$
-\beta_{\text{LO}} \le \text{safety}_{\text{mult}} \times \beta_{\text{Moments}}
+\beta_{\mathrm{shrunk}}
+=
+(1-w)\,\beta_{\mathrm{LO}}
++
+w\,\beta_{\mathrm{Moments}},
 $$
--	3.	Ensemble hijack protection
 
-Soft ensemble hijack protection is applied only when the Lower-Order model is operating in a saturated regime (extreme multiplicity clipping or slope capping) **and** produces a p-value more than 1000× smaller than both Moments and MLE.
+where $w$ is `lo_beta_blend_moments`.
 
-In this case, the LO p-value is replaced by the best of the conservative models before HMP combination.
-  
-Otherwise, LO is allowed to dominate the ensemble when it provides stable tail evidence.
+**(2) Hard safety cap relative to a reference scale**
 
-**Result**:
-The Lower-Order model now remains:
--	Statistically coherent
--	Stable under heavy tails
--	Calibrated under entrapment
--	Safe in ensemble combination
+Let $\beta_{\mathrm{ref}}$ denote the reference scale (Moments beta). Then:
 
-This correction is essential for open search, ultra-low-input data, and correlated candidate spaces.
+$$
+\beta_{\mathrm{LO,eff}}
+=
+\operatorname{clamp}\!\left(
+\beta_{\mathrm{shrunk}},\;
+\epsilon,\;
+\text{safety}_{\mathrm{mult}} \cdot \beta_{\mathrm{ref}}
+\right),
+$$
+
+where `safety_mult` is `lo_beta_safety_mult` and $\epsilon$ is a small positive constant to keep the Gumbel scale valid.
+
+---
+
+##### (3) Ensemble hijack protection (ensemble modes only)
+
+To prevent pathological dominance by the Lower-Order model during *ensemble* combination, soft hijack protection is applied **only** in modes that compute an ensemble P-value (e.g., `ensemble`, `ensemble_debug`, and Nokoi-augmented ensemble paths). It is **not** applied in pure `lower_order` mode.
+
+Define the conservative base:
+
+$$
+p_{\mathrm{base}} = \min\!\left(p_{\mathrm{Moments}},\,p_{\mathrm{MLE}}\right).
+$$
+
+For each spectrum, define a "saturated regime" indicator:
+
+- the multiplicity shift was clipped (i.e., $|\Delta_i| = c$), **or**
+- the LO scale hit the safety cap (i.e., $\beta_{\mathrm{LO,eff}} = \beta_{\mathrm{cap}}$).
+
+Hijack protection triggers only if LO is saturated **and** LO is extremely more liberal than the base:
+
+$$
+p_{\mathrm{LO}} < \frac{p_{\mathrm{base}}}{1000}.
+$$
+
+If both conditions hold, LO is guarded:
+
+$$
+p_{\mathrm{LO,guarded}} = p_{\mathrm{base}},
+$$
+
+otherwise:
+
+$$
+p_{\mathrm{LO,guarded}} = p_{\mathrm{LO}}.
+$$
+
+The ensemble P-value is then computed as:
+
+$$
+p_{\mathrm{ens}} = \operatorname{HMP}\!\left(p_{\mathrm{Moments}},\,p_{\mathrm{MLE}},\,p_{\mathrm{LO,guarded}}\right).
+$$
+
+---
 
 > **Scientific Note (Decoy-Free Lower-Order Calibration)**  
-> The Lower-Order model in this fork differs from the original formulation by applying a relative, anchored multiplicity correction rather than reconstructing an absolute location parameter from rank statistics.  
->
-> This avoids coordinate mismatches between digamma regression and log-space multiplicity correction, which can otherwise cause severe miscalibration in correlated open searches.  
->
-> The implementation follows invariance principles and has been validated by mirror tests, entrapment calibration, peptide- and protein-level concordance, and ensemble stability analysis.
-
-⸻
+> This fork applies a relative, anchored multiplicity correction rather than reconstructing an absolute location parameter from rank statistics.  
+> This avoids coordinate mismatches between digamma regression and log-multiplicity correction that can otherwise cause severe miscalibration.  
+> The implementation is validated using mirror tests, entrapment calibration, and ensemble stability diagnostics.
 
 ### 2.2 Nokoi 2.0 Rescoring (Lasso/FISTA)
 
@@ -220,7 +280,7 @@ Decoy-free mode is configured in your JSON file under the `fdr` key:
     "lo_multiplicity_alpha": 0.50,
     "lo_ln_ratio_cap": 6.9,
     "lo_beta_blend_moments": 0.30,
-    "lo_beta_safety_mult": 1.50,
+    "lo_beta_safety_mult": 0.60,
     "purification_factor": 0.50,
 	"min_rank_count": 10
 }
@@ -273,14 +333,19 @@ These parameters control multiplicity correction and stabilization of the Lower-
   - `0.0` = pure Lower-Order  
   - higher values = more stabilization
 
-- `lo_beta_safety_mult` (default: `1.50`): Hard cap on the effective Lower-Order slope relative to the Moments slope to prevent runaway regression fits and ensemble hijacking.  
-  Enforces:
+- `lo_beta_safety_mult` (default: `0.60`): **Safety belt on the effective LO scale** relative to the Moments scale.  
+  In code, the dynamic LO null uses:
 
 $$
-\beta_{\text{LO}} \le \text{safety}_{\text{mult}} \times \beta_{\text{Moments}}
+\beta_{\mathrm{cap}} = \text{safety}_{\text{mult}} \cdot \beta_{\text{Moments}},
+\qquad
+\beta_{\text{LO,eff}} = \operatorname{clamp}\!\left(\beta_{\text{shrunk}},\;10^{-9},\;\beta_{\mathrm{cap}}\right)
 $$
 
-  where `safety_mult` is the validated form of `lo_beta_safety_mult` (must be finite and positive).
+  **Why the default is < 1:** in open-search / PTM-heavy workflows, `scored_candidates` are highly correlated (not independent trials).  
+  Without a tight cap, LO can enter an overly heavy-tailed regime and become **off-the-chart conservative** (inflated survival p-values), collapsing discoveries.  
+  The default `0.60` was selected because it yields stable entrapment calibration behavior across ISB18 and PXD001468 in this fork.  
+  Increase toward `1.0–1.5` only if your candidate sets behave closer to independent trials.
   
 - `purification_factor` (default: `0.50`): Sensitivity Unlock. Excludes the top-tier Rank-1 PSMs from the null distribution fit to prevent real signal from contaminating the background model.
 
