@@ -67,10 +67,10 @@ pub struct FdrOptions {
     //    Default w_mom=0.30. Use 0.50 if you want stronger stabilization.
     //
     // 4) lo_beta_safety_mult (Safety Belt):
-	//    Hard clamp on LO beta relative to the reference beta (Moments beta):
-	//      beta_eff <= safety_mult * beta_ref
-	//    Default 0.60 is recommended for correlated candidate spaces (open search / PTM-heavy / ultra-low-input)
-	//    where larger LO beta can drive overly conservative behavior (tail too heavy → inflated survival p-values).
+    //    Hard clamp on LO beta relative to the reference beta (Moments beta):
+    //      beta_eff <= safety_mult * beta_ref
+    //    Default 0.60 is recommended for correlated candidate spaces (open search / PTM-heavy / ultra-low-input)
+    //    where larger LO beta can drive overly conservative behavior (tail too heavy → inflated survival p-values).
     // -------------------------------------------------------------------------
     pub lo_multiplicity_alpha: Option<f64>,
     pub lo_ln_ratio_cap: Option<f64>,
@@ -134,9 +134,9 @@ impl From<FdrOptions> for FdrSettings {
 
         // Safety Belt multiplier: must be sane and positive
         let lo_beta_safety_mult = match options.lo_beta_safety_mult {
-			Some(x) if x.is_finite() && x > 0.0 => x.clamp(0.1, 10.0),
-			_ => 0.60,
-		};
+            Some(x) if x.is_finite() && x > 0.0 => x.clamp(0.1, 10.0),
+            _ => 0.60,
+        };
 
         // This creates the local variables that the compiler is looking for below
         let purification_factor = options.purification_factor.unwrap_or(0.20).clamp(0.0, 0.9);
