@@ -175,7 +175,7 @@ pub fn score_psms(
         .build(&delta_mass, &decoys);
 
     let features = scores
-        .into_par_iter()
+        .par_iter()
         .flat_map_iter(|perc| {
             let poisson = match (-perc.poisson).ln_1p() {
                 x if x.is_finite() => x,
