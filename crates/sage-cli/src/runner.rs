@@ -1095,13 +1095,15 @@ impl Runner {
         let records: Vec<csv::ByteRecord> = features
             .into_par_iter()
             .map(|feat| {
-                // --- A. MAP TO STANDARD COLUMNS ---
                 let mut feat_copy = feat.clone();
+
+                // ONLY overwrite if we are in decoy_free_mode AND not doing a standard TDC run
                 if self.decoy_free_mode {
                     feat_copy.discriminant_score = feat.decoy_free_score.unwrap_or(0.0);
                     feat_copy.posterior_error = feat.decoy_free_pep.unwrap_or(1.0);
                 }
-
+                // If decoy_free_mode is false, we don't touch feat_copy.
+                // It will naturally contain the LDA score from score_psms().
                 // Generate the record (This might return 51 columns!)
                 let mut record = self.serialize_feature(&feat_copy, filenames);
 
