@@ -665,13 +665,11 @@ impl Runner {
             // =====================================================================
         } else {
             // ======================== TARGET-DECOY WORKFLOW ======================
-
             alignments = if self.parameters.predict_rt {
-                // Vanilla Sage sorts by Poisson for RT alignment training
+                // 1. Initial sort for RT alignment training
                 outputs
                     .features
                     .par_sort_unstable_by(|a, b| a.poisson.total_cmp(&b.poisson));
-
                 sage_core::ml::qvalue::spectrum_q_value(&mut outputs.features);
 
                 let local_alignments = sage_core::ml::retention_alignment::global_alignment(
@@ -680,10 +678,11 @@ impl Runner {
                     self.decoy_free_mode,
                 );
 
+                // 2. Apply RT Model
                 let _ =
                     sage_core::ml::retention_model::predict(&self.database, &mut outputs.features);
 
-                // --- YOUR MOBILITY FIX ---
+                // 3. Apply Mobility Model (with your IMS partition fix)
                 let (mut with_ims, without_ims): (Vec<Feature>, Vec<Feature>) =
                     outputs.features.drain(..).partition(|f| f.ims > 0.0);
 
@@ -696,14 +695,14 @@ impl Runner {
                 }
                 outputs.features = with_ims;
                 outputs.features.extend(without_ims);
-                // -------------------------
 
                 Some(local_alignments)
             } else {
                 None
             };
 
-            // 1. Calculate Spectrum FDR (This calls your fixed spectrum_fdr logic)
+            // 4. Calculate Spectrum FDR (LDA)
+            // Note: spectrum_fdr handles its own internal sorting for score_psms/LDA
             let q_spectrum = self.spectrum_fdr(&mut outputs.features);
 
             log::info!(
@@ -711,8 +710,8 @@ impl Runner {
                 q_spectrum
             );
 
-            // 2. CRITICAL: Re-sort by discriminant_score before Picked FDR
-            // Vanilla Sage requires the features to be sorted by the score before running picked-peptide/protein
+            // 5. CRITICAL: Re-sort by discriminant_score for Picked FDR
+            // Picked FDR scans the list and expects high scores at the top.
             outputs
                 .features
                 .par_sort_unstable_by(|a, b| b.discriminant_score.total_cmp(&a.discriminant_score));
