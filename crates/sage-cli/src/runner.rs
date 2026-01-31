@@ -270,13 +270,14 @@ impl Runner {
 
     // This is the unified final FDR function.
     fn spectrum_fdr(&self, features: &mut [Feature]) -> usize {
-        if score_psms(
+        // Call the standard scorer
+        let score_res = score_psms(
             features,
             self.parameters.precursor_tol,
             self.decoy_free_mode,
-        )
-        .is_none()
-        {
+        );
+
+        if score_res.is_none() {
             log::warn!("linear model fitting failed, using heuristic score");
             features.par_iter_mut().for_each(|feat| {
                 feat.discriminant_score = (-feat.poisson as f32).ln_1p() + feat.longest_y_pct / 3.0
@@ -286,8 +287,17 @@ impl Runner {
             return sage_core::ml::qvalue::spectrum_q_value(features);
         }
 
-        features.sort_unstable_by(|a, b| a.discriminant_score.total_cmp(&b.discriminant_score));
+        // IF WE ARE IN TDC MODE: Match Vanilla Sage exactly
+        if !self.decoy_free_mode {
+            // Sort descending by score
+            features
+                .par_sort_unstable_by(|a, b| b.discriminant_score.total_cmp(&a.discriminant_score));
+            // Use the vanilla counting/BH-procedure
+            return sage_core::ml::qvalue::spectrum_q_value(features);
+        }
 
+        // IF WE ARE IN DECOY-FREE MODE: Use your custom PEP-based logic
+        features.sort_unstable_by(|a, b| a.discriminant_score.total_cmp(&b.discriminant_score));
         let mut min_pep: f32 = 1.0;
         for feat in features.iter_mut().rev() {
             let pep = 10.0f32.powf(feat.posterior_error);
@@ -297,7 +307,7 @@ impl Runner {
 
         features
             .iter()
-            .filter(|f| f.rank == 1 && f.spectrum_q <= 0.01)
+            .filter(|f| f.rank == 1 && f.spectrum_q <= 0.01 && f.label == 1) // Ensure f.label == 1 for target count
             .count()
     }
 
@@ -657,6 +667,7 @@ impl Runner {
             // ======================== TARGET-DECOY WORKFLOW ======================
 
             alignments = if self.parameters.predict_rt {
+                // Vanilla Sage sorts by Poisson for RT alignment training
                 outputs
                     .features
                     .par_sort_unstable_by(|a, b| a.poisson.total_cmp(&b.poisson));
@@ -672,9 +683,7 @@ impl Runner {
                 let _ =
                     sage_core::ml::retention_model::predict(&self.database, &mut outputs.features);
 
-                // --- FIX: PARTITION FEATURES BY VALID MOBILITY ---
-                // The MobilityModel crashes if fed features with ims=0.0 because the matrix dimensions mismatch.
-                // We split them, predict only on valid IMS, and then merge.
+                // --- YOUR MOBILITY FIX ---
                 let (mut with_ims, without_ims): (Vec<Feature>, Vec<Feature>) =
                     outputs.features.drain(..).partition(|f| f.ims > 0.0);
 
@@ -685,32 +694,32 @@ impl Runner {
                         self.decoy_free_mode,
                     );
                 }
-
-                // Merge back
                 outputs.features = with_ims;
                 outputs.features.extend(without_ims);
-
-                // !!! CRITICAL FIX HERE !!!
-                // We must restore the sort order because partitioning scrambled it.
-                // If we don't do this, the Linear Model trains on the wrong data.
-                outputs
-                    .features
-                    .par_sort_unstable_by(|a, b| a.poisson.total_cmp(&b.poisson));
-                // -------------------------------------------------
+                // -------------------------
 
                 Some(local_alignments)
             } else {
                 None
             };
 
+            // 1. Calculate Spectrum FDR (This calls your fixed spectrum_fdr logic)
             let q_spectrum = self.spectrum_fdr(&mut outputs.features);
+
             log::info!(
                 "discovered {} target peptide-spectrum matches at 1% FDR",
                 q_spectrum
             );
 
+            // 2. CRITICAL: Re-sort by discriminant_score before Picked FDR
+            // Vanilla Sage requires the features to be sorted by the score before running picked-peptide/protein
+            outputs
+                .features
+                .par_sort_unstable_by(|a, b| b.discriminant_score.total_cmp(&a.discriminant_score));
+
             let q_peptide = sage_core::fdr::picked_peptide(&self.database, &mut outputs.features);
             let q_protein = sage_core::fdr::picked_protein(&self.database, &mut outputs.features);
+
             log::info!("discovered {} target peptides at 1% FDR", q_peptide);
             log::info!("discovered {} target proteins at 1% FDR", q_protein);
 
@@ -723,6 +732,8 @@ impl Runner {
                         self.decoy_free_mode,
                     )
                     .quantify(&self.database, &outputs.ms1, alignments_ref);
+
+                    // Use vanilla precursor FDR
                     let q_precursor = sage_core::fdr::picked_precursor(&mut areas_map);
                     log::info!("discovered {} target MS1 peaks at 5% FDR", q_precursor);
                     Some(areas_map)
