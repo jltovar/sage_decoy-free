@@ -667,9 +667,11 @@ impl Runner {
             // ======================== TARGET-DECOY WORKFLOW ======================
             alignments = if self.parameters.predict_rt {
                 // 1. Initial sort for RT alignment training
+                // Vanilla Sage sorts by Poisson for RT alignment training
                 outputs
                     .features
                     .par_sort_unstable_by(|a, b| a.poisson.total_cmp(&b.poisson));
+
                 sage_core::ml::qvalue::spectrum_q_value(&mut outputs.features);
 
                 let local_alignments = sage_core::ml::retention_alignment::global_alignment(
@@ -679,20 +681,31 @@ impl Runner {
                 );
 
                 // 2. Apply RT Model
-                let _ =
-                    sage_core::ml::retention_model::predict(&self.database, &mut outputs.features);
+                let _ = sage_core::ml::retention_model::predict(&self.database, &mut outputs.features);
 
                 // 3. Apply Mobility Model (with your IMS partition fix)
-                // --- THE CLEAN FIX ---
-                // Do not drain. Simply call predict.
-                // If predict is broken for ims=0.0, we must fix the sort order immediately.
-                let _ = sage_core::ml::mobility_model::predict(
-                    &self.database,
-                    &mut outputs.features,
-                    self.decoy_free_mode,
-                );
+                // We MUST partition because the model crashes on ims=0.0.
+                // We use drain/partition to split them.
+                let (mut with_ims, without_ims): (Vec<Feature>, Vec<Feature>) =
+                    outputs.features.drain(..).partition(|f| f.ims > 0.0);
 
-                // RESTORE ORIGINAL DISCOVERY ORDER before LDA
+                if !with_ims.is_empty() {
+                    let _ = sage_core::ml::mobility_model::predict(
+                        &self.database,
+                        &mut with_ims,
+                        self.decoy_free_mode,
+                    );
+                }
+                
+                // Merge them back together
+                outputs.features = with_ims;
+                outputs.features.extend(without_ims);
+
+                // !!! CRITICAL FIX !!!
+                // Restore the original "discovery order" (by PSM ID) before LDA runs.
+                // This ensures the LDA math matrix matches the feature list row-for-row.
+                // Without this sort, the partition above scrambles the data, causing
+                // the 450ppm mass error and the 0.01 discriminant score.
                 outputs.features.sort_by_key(|f| f.psm_id);
 
                 Some(local_alignments)
