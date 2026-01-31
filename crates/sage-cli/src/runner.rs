@@ -683,18 +683,17 @@ impl Runner {
                     sage_core::ml::retention_model::predict(&self.database, &mut outputs.features);
 
                 // 3. Apply Mobility Model (with your IMS partition fix)
-                let (mut with_ims, without_ims): (Vec<Feature>, Vec<Feature>) =
-                    outputs.features.drain(..).partition(|f| f.ims > 0.0);
+                // --- THE CLEAN FIX ---
+                // Do not drain. Simply call predict.
+                // If predict is broken for ims=0.0, we must fix the sort order immediately.
+                let _ = sage_core::ml::mobility_model::predict(
+                    &self.database,
+                    &mut outputs.features,
+                    self.decoy_free_mode,
+                );
 
-                if !with_ims.is_empty() {
-                    let _ = sage_core::ml::mobility_model::predict(
-                        &self.database,
-                        &mut with_ims,
-                        self.decoy_free_mode,
-                    );
-                }
-                outputs.features = with_ims;
-                outputs.features.extend(without_ims);
+                // RESTORE ORIGINAL DISCOVERY ORDER before LDA
+                outputs.features.sort_by_key(|f| f.psm_id);
 
                 Some(local_alignments)
             } else {
