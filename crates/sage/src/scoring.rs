@@ -5,7 +5,60 @@ use crate::mass::{Tolerance, NEUTRON, PROTON};
 use crate::spectrum::{Peak, Precursor, ProcessedSpectrum};
 use serde::{Deserialize, Serialize};
 use std::ops::AddAssign;
-use std::sync::atomic::{AtomicUsize, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
+
+//
+// =======================
+// DEBUG HELPERS (SAFE)
+// =======================
+//
+// Enable with:
+//   SAGE_DBG_EXPMASS=1 SAGE_DBG_FILE_ID=<usize> SAGE_DBG_SCAN=<u32>
+//
+// This will NOT spam: it only prints for the single matching scan+file,
+// and the header prints once per run.
+//
+static DBG_EXPMASS_PRINTED: AtomicBool = AtomicBool::new(false);
+
+fn dbg_extract_scan(spec_id: &str) -> Option<u32> {
+    // Looks for "scan=####" anywhere in the string
+    let key = "scan=";
+    let pos = spec_id.rfind(key)? + key.len();
+    let tail = &spec_id[pos..];
+    let end = tail
+        .find(|c: char| !c.is_ascii_digit())
+        .unwrap_or(tail.len());
+    tail[..end].parse::<u32>().ok()
+}
+
+fn dbg_env_usize(name: &str) -> Option<usize> {
+    std::env::var(name).ok()?.parse::<usize>().ok()
+}
+
+fn dbg_env_u32(name: &str) -> Option<u32> {
+    std::env::var(name).ok()?.parse::<u32>().ok()
+}
+
+fn dbg_expmass_match(query: &ProcessedSpectrum<Peak>) -> bool {
+    if std::env::var("SAGE_DBG_EXPMASS").is_err() {
+        return false;
+    }
+    let tf = match dbg_env_usize("SAGE_DBG_FILE_ID") {
+        Some(v) => v,
+        None => return false,
+    };
+    let ts = match dbg_env_u32("SAGE_DBG_SCAN") {
+        Some(v) => v,
+        None => return false,
+    };
+    if query.file_id != tf {
+        return false;
+    }
+    match dbg_extract_scan(&query.id) {
+        Some(scan) => scan == ts,
+        None => false,
+    }
+}
 
 #[derive(Copy, Clone, Debug, Serialize, Deserialize)]
 pub enum ScoreType {
@@ -435,12 +488,40 @@ impl<'db> Scorer<'db> {
         // Sage operates on masses without protons; [M] instead of [MH+]
         let mz = precursor.mz - PROTON;
 
+        // Header-ish precursor info (will only print for your target scan/file and only until header is printed)
+        if dbg_expmass_match(query) && !DBG_EXPMASS_PRINTED.load(Ordering::Relaxed) {
+            eprintln!(
+                "[DBG_PRECURSOR] spec_id={} file_id={} precursor.mz={} precursor.charge={:?} mz_no_proton={} wide_window={} override_precursor_charge={} min_z={} max_z={} iso_window={:?}",
+                query.id,
+                query.file_id,
+                precursor.mz,
+                precursor.charge,
+                mz,
+                self.wide_window,
+                self.override_precursor_charge,
+                self.min_precursor_charge,
+                self.max_precursor_charge,
+                precursor.isolation_window,
+            );
+        }
+
         // Search in wide-window/DIA mode
         let mut hits = if self.wide_window {
             (self.min_precursor_charge..=self.max_precursor_charge).fold(
                 InitialHits::default(),
                 |mut hits, precursor_charge| {
                     let precursor_mass = mz * precursor_charge as f32;
+
+                    if dbg_expmass_match(query)
+                        && !DBG_EXPMASS_PRINTED.load(Ordering::Relaxed)
+                        && (precursor_charge <= self.min_precursor_charge + 3)
+                    {
+                        eprintln!(
+                            "[DBG_PRECURSOR_MASS] spec_id={} z={} expmass={}",
+                            query.id, precursor_charge, precursor_mass
+                        );
+                    }
+
                     let precursor_tol = precursor
                         .isolation_window
                         .unwrap_or(Tolerance::Da(-2.4, 2.4))
@@ -452,17 +533,32 @@ impl<'db> Scorer<'db> {
             )
         } else if precursor.charge.is_some() && self.override_precursor_charge == false {
             let charge = precursor.charge.unwrap();
-            // Charge state is already annotated for this precusor, only search once
             let precursor_mass = mz * charge as f32;
+
+            if dbg_expmass_match(query) && !DBG_EXPMASS_PRINTED.load(Ordering::Relaxed) {
+                eprintln!(
+                    "[DBG_PRECURSOR_MASS] spec_id={} z={} expmass={}",
+                    query.id, charge, precursor_mass
+                );
+            }
+
             self.matched_peaks(query, precursor_mass, charge, self.precursor_tol)
         } else {
-            // Not all selected ion precursors have charge states annotated (or user has set
-            // `override_precursor_charge`)
-            // assume it could be z=2, z=3, z=4 and search all three
             (self.min_precursor_charge..=self.max_precursor_charge).fold(
                 InitialHits::default(),
                 |mut hits, precursor_charge| {
                     let precursor_mass = mz * precursor_charge as f32;
+
+                    if dbg_expmass_match(query)
+                        && !DBG_EXPMASS_PRINTED.load(Ordering::Relaxed)
+                        && (precursor_charge <= self.min_precursor_charge + 3)
+                    {
+                        eprintln!(
+                            "[DBG_PRECURSOR_MASS] spec_id={} z={} expmass={}",
+                            query.id, precursor_charge, precursor_mass
+                        );
+                    }
+
                     hits += self.matched_peaks(
                         query,
                         precursor_mass,
@@ -473,6 +569,7 @@ impl<'db> Scorer<'db> {
                 },
             )
         };
+
         self.trim_hits(&mut hits);
         hits
     }
@@ -499,6 +596,35 @@ impl<'db> Scorer<'db> {
         report_psms: usize,
         features: &mut Vec<Feature>,
     ) {
+        // ONE-TIME header for the target scan/file
+        if dbg_expmass_match(query) && !DBG_EXPMASS_PRINTED.swap(true, Ordering::Relaxed) {
+            eprintln!(
+                "\n[SAGE_DBG] HIT file_id={} scan={}",
+                query.file_id,
+                dbg_extract_scan(&query.id).unwrap_or(0)
+            );
+            eprintln!("[SAGE_DBG] query.id = {}", query.id);
+            eprintln!("[SAGE_DBG] precursor.mz = {:.8}", precursor.mz);
+            eprintln!("[SAGE_DBG] precursor.charge = {:?}", precursor.charge);
+            eprintln!(
+                "[SAGE_DBG] precursor.isolation_window = {:?}",
+                precursor.isolation_window
+            );
+            eprintln!(
+                "[SAGE_DBG] query.precursors.len() = {}",
+                query.precursors.len()
+            );
+            for (i, p) in query.precursors.iter().enumerate() {
+                eprintln!(
+                    "  [SAGE_DBG] prec[{}]: mz={:.8} charge={:?} inv_ion_mobility={:?} iso_win={:?}",
+                    i, p.mz, p.charge, p.inverse_ion_mobility, p.isolation_window
+                );
+            }
+            let mz_no_proton = precursor.mz - PROTON;
+            eprintln!("[SAGE_DBG] mz_no_proton = {:.8}", mz_no_proton);
+            eprintln!("[SAGE_DBG] end\n");
+        }
+
         let mut score_vector = hits
             .preliminary
             .iter()
@@ -524,6 +650,17 @@ impl<'db> Scorer<'db> {
 
             let peptide = &self.db[score.peptide];
             let precursor_mass = mz * score.precursor_charge as f32;
+
+            // Per-rank expmass proof (limited to 10 ranks)
+            if dbg_expmass_match(query) && idx < 10 {
+                eprintln!(
+                    "[DBG_EXPMASS_ROW] spec_id={} rank={} score_charge={} expmass={}",
+                    query.id,
+                    idx + 1,
+                    score.precursor_charge,
+                    precursor_mass
+                );
+            }
 
             let next = score_vector
                 .get(idx + 1)

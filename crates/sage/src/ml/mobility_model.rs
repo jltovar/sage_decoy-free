@@ -10,28 +10,38 @@ use crate::peptide::Peptide;
 use crate::scoring::Feature;
 use rayon::prelude::*;
 
-/// Try to fit a retention time prediction model
 // Add `decoy_free: bool` to the function signature
-pub fn predict(db: &IndexedDatabase, features: &mut [Feature], decoy_free: bool) -> Option<()> {
+/// Try to fit an ion mobility prediction model
+pub fn predict(db: &IndexedDatabase, feats: &mut [Feature], decoy_free_mode: bool) -> Option<()> {
+    // Just for debugging so you can see which path is running;
+    // it does NOT change the behavior.
+    let mode_str = if decoy_free_mode { "decoy_free" } else { "tdc" };
+    log::info!("mobility_model::predict: mode = {}", mode_str);
+
+    // ================= MASTER BEHAVIOR (unchanged) =================
+    //
     // Training LR might fail - not enough values, or r-squared is < 0.7
-    // Pass the flag down to the `fit` function
-    let lr = match MobilityModel::fit(db, features, decoy_free) {
+    let lr = match MobilityModel::fit(db, feats, decoy_free_mode) {
         Some(lr) => lr,
         None => {
             log::warn!("Mobility model failed to train");
             return None;
         }
     };
-    features.par_iter_mut().for_each(|feat| {
-        // LR can sometimes predict crazy values - clamp predicted RT
+
+    feats.par_iter_mut().for_each(|feat| {
+        // LR can sometimes predict crazy values - clamp predicted IMS
         let ims = lr.predict_peptide(db, feat);
         let bounded = ims.clamp(0.0, 2.0) as f32;
         feat.predicted_ims = bounded;
 
+        // Absolute residual between observed and predicted IMS
         feat.delta_ims_model = (feat.ims - bounded).abs();
     });
+
     Some(())
 }
+
 pub struct MobilityModel {
     beta: Vec<f64>,
     map: [usize; 26],
@@ -159,47 +169,49 @@ impl MobilityModel {
             map[(aa - b'A') as usize] = idx;
         }
 
-        // Create a filtered iterator of high-quality PSMs ONCE.
-        let training_candidates = training_set.par_iter().filter(|feat| {
-            // This is the new conditional filter logic
+        // Filter ONCE and use that same filter for both X and y.
+        // Also require ims > 0.0 so non-IMS files don't poison training.
+        let keep = |feat: &&Feature| {
             let is_target = if decoy_free {
                 feat.rank == 1
             } else {
                 feat.label == 1
             };
-            // In both cases, we only want to train on high-confidence peptides
-            is_target && feat.spectrum_q <= 0.01
-        });
+            is_target && feat.spectrum_q <= 0.01 && feat.ims > 0.0
+        };
 
-        // Use the filtered iterator to collect ion mobilities
-        let ims = training_candidates
-            .clone()
+        let ims = training_set
+            .par_iter()
+            .filter(keep)
             .map(|psm| psm.ims as f64)
             .collect::<Vec<f64>>();
 
-        // ADD THIS CHECK
         if ims.len() < 10 {
             log::warn!(
-                "Not enough high-quality PSMs ({}) to train the ion mobility model.",
+                "Not enough high-quality IMS PSMs ({}) to train the ion mobility model.",
                 ims.len()
             );
             return None;
         }
-        // END ADDITION
 
         let ims_mean = ims.iter().sum::<f64>() / ims.len() as f64;
-        let ims_var = ims.iter().map(|rt| (rt - ims_mean).powi(2)).sum::<f64>();
+        let ims_var = ims.iter().map(|v| (v - ims_mean).powi(2)).sum::<f64>();
+
+        if ims_var == 0.0 {
+            log::warn!("Mobility model training aborted: ims variance is zero");
+            return None;
+        }
 
         let rt = Matrix::col_vector(ims);
 
-        let features = training_set
+        let x = training_set
             .par_iter()
-            .filter(|feat| feat.rank == 1 && feat.spectrum_q <= 0.01)
+            .filter(keep)
             .flat_map_iter(|psm| Self::embed(&db[psm.peptide_idx], &psm.charge, &map))
             .collect::<Vec<_>>();
 
-        let rows = features.len() / FEATURES;
-        let features = Matrix::new(features, rows, FEATURES);
+        let rows = x.len() / FEATURES;
+        let features = Matrix::new(x, rows, FEATURES);
 
         let f_t = features.transpose();
         let cov = f_t.dot(&features);

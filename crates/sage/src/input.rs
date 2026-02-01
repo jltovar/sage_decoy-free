@@ -118,28 +118,31 @@ pub struct FdrSettings {
 
 impl From<FdrOptions> for FdrSettings {
     fn from(options: FdrOptions) -> Self {
-        // Defaults requested/used:
-        // alpha=0.50, ln_ratio_cap=6.9, w_mom=0.30, safety_mult=1.50
+        // Multiplicity attenuation: default 0.50 (square-root-like damping)
         let lo_multiplicity_alpha = options
             .lo_multiplicity_alpha
             .unwrap_or(0.50)
             .clamp(0.0, 1.0);
 
+        // Cap shifts at ~1000x search space difference
         let lo_ln_ratio_cap = options.lo_ln_ratio_cap.unwrap_or(6.9).max(0.0);
 
+        // Shrinkage: default 30% toward stable Moments beta
         let lo_beta_blend_moments = options
             .lo_beta_blend_moments
             .unwrap_or(0.30)
             .clamp(0.0, 1.0);
 
-        // Safety Belt multiplier: must be sane and positive
+        // Safety Belt: HARD CLAMP on LO beta relative to reference
         let lo_beta_safety_mult = match options.lo_beta_safety_mult {
             Some(x) if x.is_finite() && x > 0.0 => x.clamp(0.1, 10.0),
-            _ => 0.60,
+            _ => 0.60, // or 1.50 if you want your older behavior
         };
 
-        // This creates the local variables that the compiler is looking for below
+        // Purification: default 20%
         let purification_factor = options.purification_factor.unwrap_or(0.20).clamp(0.0, 0.9);
+
+        // Minimum spectra per rank for regression
         let min_rank_count = options.min_rank_count.unwrap_or(10);
 
         Self {
@@ -151,15 +154,9 @@ impl From<FdrOptions> for FdrSettings {
             max_null_rank: options.max_null_rank.unwrap_or(10),
             model_fit: options.model_fit.unwrap_or(ModelFit::Moments),
             type_: options.type_.unwrap_or(FdrType::Bh),
-
-            // Apply Defaults Here (500 and 150)
             min_storey_n: options.min_storey_n.unwrap_or(500),
             min_null_size: options.min_null_size.unwrap_or(150),
-
-            // If the user provides a value, use it. Otherwise, default to 20,000.
             kde_samples: options.kde_samples.unwrap_or(20_000),
-
-            // LO robustness defaults applied here
             lo_multiplicity_alpha,
             lo_ln_ratio_cap,
             lo_beta_blend_moments,

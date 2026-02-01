@@ -128,30 +128,19 @@ pub fn score_psms(
     precursor_tol: Tolerance,
     decoy_free: bool,
 ) -> Option<()> {
-    // PHASE 1 FIX: Output Honesty
-    // If we are in decoy-free mode, we skip the standard LDA/KDE model entirely.
-    // Standard `discriminant_score` and `posterior_error` rely on a robust
-    // target-decoy competition which doesn't exist here.
+    // Decoy-free mode:
+    //  - Do NOT run TDC-style LDA/KDE here.
+    //  - Do NOT touch discriminant_score/posterior_error/spectrum_q.
+    //  - Let decoy_free_fdr.rs populate decoy_free_* fields, and map them
+    //    to the standard columns only at write time.
     if decoy_free {
-        scores.par_iter_mut().for_each(|perc| {
-            // Set these to NaN to indicate "not computed by LDA"
-            // This prevents downstream tools from misinterpreting them as valid probabilities.
-            perc.discriminant_score = f32::NAN;
-            perc.posterior_error = f32::NAN;
-        });
         return Some(());
     }
 
     log::trace!("fitting linear discriminant model...");
-
-    // Conditionally define what a "decoy" is based on the mode
     let decoys = scores
         .par_iter()
-        .map(|sc| {
-            // (Note: The old decoy_free check inside here is effectively dead code now
-            // because of the early return above, which is cleaner).
-            sc.label == -1
-        })
+        .map(|sc| sc.label == -1)
         .collect::<Vec<_>>();
 
     let mass_error = match precursor_tol {
@@ -175,11 +164,28 @@ pub fn score_psms(
         .build(&delta_mass, &decoys);
 
     let features = scores
-        .par_iter()
+        .into_par_iter()
         .flat_map_iter(|perc| {
             let poisson = match (-perc.poisson).ln_1p() {
                 x if x.is_finite() => x,
                 _ => 3.5,
+            };
+
+            let ims_raw = perc.ims as f64;
+            let delta_ims_raw = perc.delta_ims_model as f64;
+
+            // Treat "sentinel" IMS values as missing: 0.0 or ~0.999 → 0.0 for LDA
+            let ims_for_lda = if ims_raw == 0.0 || (ims_raw - 0.999).abs() < 1e-4 {
+                0.0
+            } else {
+                ims_raw
+            };
+
+            let delta_ims_for_lda = if delta_ims_raw == 0.0 || (delta_ims_raw - 0.999).abs() < 1e-4
+            {
+                0.0
+            } else {
+                delta_ims_raw
             };
 
             // Transform features - LDA requires that each feature is normally
@@ -203,9 +209,9 @@ pub fn score_psms(
                 (perc.peptide_len as f64).ln_1p(),
                 (perc.missed_cleavages as f64),
                 (perc.aligned_rt as f64),
-                (perc.ims as f64),
+                ims_for_lda,
                 (perc.delta_rt_model as f64).clamp(0.001, 0.999).sqrt(),
-                (perc.delta_ims_model as f64).clamp(0.001, 0.999).sqrt(),
+                delta_ims_for_lda.clamp(0.001, 0.999).sqrt(),
             ];
             x
         })
@@ -245,4 +251,65 @@ pub fn score_psms(
         });
 
     Some(())
+}
+
+#[cfg(test)]
+mod test {
+    use super::*;
+    use crate::ml::*;
+
+    #[test]
+    fn linear_discriminant() {
+        let a = Matrix::new([1., 2., 3., 4.], 2, 2);
+        let eigenvector = [0.4159736, 0.90937671];
+        assert!(all_close(
+            &a.power_method(&[0.54, 0.34]),
+            &eigenvector,
+            1E-5
+        ));
+
+        #[rustfmt::skip]
+        let feats = Matrix::new(
+            [
+                5., 4., 3., 2., 
+                4., 5., 4., 3., 
+                6., 3., 4., 5., 
+                1., 0., 2., 9., 
+                5., 4., 4., 3., 
+                2., 1., 1., 9.5, 
+                1., 0., 2., 8., 
+                3., 2., -2., 10.,
+            ],
+            8,
+            4,
+        );
+
+        let lda = LinearDiscriminantAnalysis::train(
+            &feats,
+            &[false, false, false, true, false, true, true, true],
+        )
+        .expect("error training LDA");
+
+        let mut scores = lda.score(&feats);
+        let norm = norm(&scores);
+        scores = scores.into_iter().map(|s| s / norm).collect();
+
+        let expected = [
+            0.49706043,
+            0.48920177,
+            0.48920177,
+            -0.07209359,
+            0.51204672,
+            -0.02849527,
+            -0.04924864,
+            -0.06055943,
+        ];
+
+        assert!(
+            all_close(&scores, &expected, 1E-8),
+            "{:?} {:?}",
+            scores,
+            expected
+        );
+    }
 }

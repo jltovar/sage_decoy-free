@@ -65,16 +65,32 @@ impl Gauss {
     // Is `left` an identity matrix, or else contains rows of all zeros?
     fn left_solved(&self) -> bool {
         let n = self.left.cols;
+        // Off-diagonal tolerance: anything with magnitude > 1e-8 means "not solved"
+        let off_diag_eps = 1e-8;
+
         for i in 0..n {
             for j in 0..n {
                 let x = self.left[(i, j)];
+
                 if i == j {
+                    // Diagonal entries must be exactly 1.0 or 0.0 (same as before)
                     if x != 1.0 && x != 0.0 {
-                        log::debug!("Finding solution to linear system failed: left side of matrix [{},{}] = {}", i, j, x);
+                        log::debug!(
+                            "Finding solution to linear system failed: left side of matrix [{},{}] = {}",
+                            i,
+                            j,
+                            x
+                        );
                         return false;
                     }
-                } else if x > 1E-8 {
-                    log::debug!("Finding solution to linear system failed: left side of matrix [{},{}] = {}", i, j, x);
+                } else if x.abs() > off_diag_eps {
+                    // IMPORTANT CHANGE: use absolute value, so small *negative* junk is also caught
+                    log::debug!(
+                        "Finding solution to linear system failed: left side of matrix [{},{}] = {}",
+                        i,
+                        j,
+                        x
+                    );
                     return false;
                 }
             }

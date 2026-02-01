@@ -1,7 +1,7 @@
 use anyhow::{ensure, Context};
 use clap::ArgMatches;
 use sage_cloudpath::{tdf::BrukerProcessingConfig, CloudPath};
-use sage_core::input::{FdrMode, FdrOptions, FdrSettings, FdrType, ModelFit};
+use sage_core::input::{FdrMode, FdrOptions, FdrSettings};
 use sage_core::scoring::ScoreType;
 use sage_core::{
     database::{Builder, Parameters},
@@ -277,69 +277,32 @@ impl Input {
     }
 
     pub fn build(mut self) -> anyhow::Result<Search> {
-        let fdr_mode_opt = self.fdr.as_ref().and_then(|f| f.mode.clone());
-        let fdr_mode = fdr_mode_opt.unwrap_or(FdrMode::Tdc);
-
-        let peptide_fdr = self
+        // ---------------------------------------------------------------------
+        // FDR mode: used ONLY for logging and the report_psms safety guard.
+        // All other defaults are handled in FdrSettings::from(FdrOptions).
+        // ---------------------------------------------------------------------
+        let fdr_mode = self
             .fdr
             .as_ref()
-            .and_then(|f| f.peptide_fdr)
-            .unwrap_or(0.01);
-        let protein_fdr = self
-            .fdr
-            .as_ref()
-            .and_then(|f| f.protein_fdr)
-            .unwrap_or(0.01);
-        let precursor_fdr = self
-            .fdr
-            .as_ref()
-            .and_then(|f| f.precursor_fdr)
-            .unwrap_or(0.05);
-
-        let min_null_rank = self.fdr.as_ref().and_then(|f| f.min_null_rank).unwrap_or(2);
-        let max_null_rank = self
-            .fdr
-            .as_ref()
-            .and_then(|f| f.max_null_rank)
-            .unwrap_or(10);
-
-        let model_fit = self
-            .fdr
-            .as_ref()
-            .and_then(|f| f.model_fit.clone())
-            .unwrap_or(ModelFit::Moments);
-
-        // These read from the JSON config or default to 250/500 if missing
-        let min_null_size = self
-            .fdr
-            .as_ref()
-            .and_then(|f| f.min_null_size)
-            .unwrap_or(250);
-
-        let min_storey_n = self
-            .fdr
-            .as_ref()
-            .and_then(|f| f.min_storey_n)
-            .unwrap_or(500);
-        // ----------------------------
-
-        // --- Read FDR Type from JSON ---
-        let fdr_type = self
-            .fdr
-            .as_ref()
-            .and_then(|f| f.type_.clone())
-            .unwrap_or(FdrType::Bh);
+            .and_then(|f| f.mode.clone())
+            .unwrap_or(FdrMode::Tdc);
 
         if self.fdr.as_ref().and_then(|f| f.mode.clone()).is_none() {
             log::info!("`fdr.mode` not specified; defaulting to target-decoy competition (tdc).");
         }
 
+        // ---------------------------------------------------------------------
+        // Mass tolerance sanity checks
+        // ---------------------------------------------------------------------
         Self::check_mass_tolerances(&self.fragment_tol);
         Self::check_mass_tolerances(&self.precursor_tol);
 
         if let Some(isotope_errors) = self.isotope_errors {
             if isotope_errors.0 > isotope_errors.1 {
-                log::error!("Minimum isotope_error value greater than maximum! Typical usage: `isotope_errors: [-1, 3]`");
+                log::error!(
+                    "Minimum isotope_error value greater than maximum! \
+					 Typical usage: `isotope_errors: [-1, 3]`"
+                );
                 std::process::exit(1);
             }
         }
@@ -355,17 +318,24 @@ impl Input {
             }
         }
 
+        // ---------------------------------------------------------------------
+        // Database + RT / LFQ compatibility
+        // ---------------------------------------------------------------------
         let database = self.database.make_parameters();
 
         if !self.predict_rt.unwrap_or(true)
             && self.quant.as_ref().and_then(|q| q.lfq).unwrap_or(false)
         {
             log::warn!(
-                "`predict_rt: false` and `lfq: true` are incompatible. Setting `predict_rt: true`"
+                "`predict_rt: false` and `lfq: true` are incompatible. \
+				 Setting `predict_rt: true`"
             );
             self.predict_rt = Some(true);
         }
 
+        // ---------------------------------------------------------------------
+        // mzMLs + output directory
+        // ---------------------------------------------------------------------
         let mzml_paths = self.mzml_paths.expect("'mzml_paths' must be provided!");
 
         let output_directory = match self.output_directory {
@@ -379,6 +349,9 @@ impl Input {
             None => CloudPath::Local(std::env::current_dir()?),
         };
 
+        // ---------------------------------------------------------------------
+        // Scoring + report_psms (DecoyFree safety)
+        // ---------------------------------------------------------------------
         let score_type = self.score_type.unwrap_or(ScoreType::SageHyperScore);
 
         let report_psms = self.report_psms.unwrap_or(1);
@@ -389,38 +362,38 @@ impl Input {
             report_psms
         };
 
-        let lo_multiplicity_alpha = self
-            .fdr
-            .as_ref()
-            .and_then(|f| f.lo_multiplicity_alpha)
-            .filter(|v| v.is_finite())
-            .unwrap_or(0.50)
-            .clamp(0.0, 1.0);
+        // ---------------------------------------------------------------------
+        // FdrSettings: single source of truth via FdrOptions -> FdrSettings
+        // ---------------------------------------------------------------------
+        let fdr_settings: FdrSettings = match self.fdr.clone() {
+            Some(opts) => opts.into(),
+            None => FdrOptions {
+                // We can pass the resolved mode here, or leave as None and let
+                // FdrSettings::from default to Tdc; both are safe.
+                mode: Some(fdr_mode),
+                peptide_fdr: None,
+                protein_fdr: None,
+                precursor_fdr: None,
+                min_null_rank: None,
+                max_null_rank: None,
+                model_fit: None,
+                type_: None,
+                min_storey_n: None,
+                min_null_size: None,
+                kde_samples: None,
+                lo_multiplicity_alpha: None,
+                lo_ln_ratio_cap: None,
+                lo_beta_blend_moments: None,
+                lo_beta_safety_mult: None,
+                purification_factor: None,
+                min_rank_count: None,
+            }
+            .into(),
+        };
 
-        let lo_ln_ratio_cap = self
-            .fdr
-            .as_ref()
-            .and_then(|f| f.lo_ln_ratio_cap)
-            .filter(|v| v.is_finite())
-            .unwrap_or(6.9)
-            .max(0.0);
-
-        let lo_beta_blend_moments = self
-            .fdr
-            .as_ref()
-            .and_then(|f| f.lo_beta_blend_moments)
-            .filter(|v| v.is_finite())
-            .unwrap_or(0.30)
-            .clamp(0.0, 1.0);
-
-        let lo_beta_safety_mult = self
-            .fdr
-            .as_ref()
-            .and_then(|f| f.lo_beta_safety_mult)
-            .filter(|v| v.is_finite())
-            .unwrap_or(1.50)
-            .max(0.1);
-
+        // ---------------------------------------------------------------------
+        // Assemble Search
+        // ---------------------------------------------------------------------
         Ok(Search {
             version: clap::crate_version!().into(),
             database,
@@ -446,29 +419,7 @@ impl Input {
             write_pin: self.write_pin.unwrap_or(false),
             bruker_config: self.bruker_config.unwrap_or_default(),
             score_type,
-            fdr: self.fdr.map(Into::into).unwrap_or_else(|| {
-                FdrOptions {
-                    mode: Some(fdr_mode),
-                    peptide_fdr: Some(peptide_fdr),
-                    protein_fdr: Some(protein_fdr),
-                    precursor_fdr: Some(precursor_fdr),
-                    min_null_rank: Some(min_null_rank),
-                    max_null_rank: Some(max_null_rank),
-                    model_fit: Some(model_fit),
-                    type_: Some(fdr_type),
-                    min_null_size: Some(min_null_size),
-                    min_storey_n: Some(min_storey_n),
-                    // Leave these as None so sage-core applies the defaults
-                    kde_samples: None,
-                    lo_multiplicity_alpha: Some(lo_multiplicity_alpha),
-                    lo_ln_ratio_cap: Some(lo_ln_ratio_cap),
-                    lo_beta_blend_moments: Some(lo_beta_blend_moments),
-                    lo_beta_safety_mult: Some(lo_beta_safety_mult),
-                    purification_factor: None,
-                    min_rank_count: None,
-                }
-                .into()
-            }),
+            fdr: fdr_settings,
         })
     }
 }

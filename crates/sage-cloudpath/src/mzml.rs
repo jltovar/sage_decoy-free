@@ -223,15 +223,20 @@ impl MzMLReader {
                         let accession = extract!(ev, b"accession");
                         match accession.as_ref() {
                             ISO_WINDOW_TARGET => {
-                                // use isolation window target for precursor m/z, e.g. to handle
-                                // DIA setups where the mzML conversion software doesn't write
-                                // a selection ion tag
+                                // DIA-friendly fallback:
+                                // Use the isolation window target *only* if we don't already
+                                // have a precursor m/z. This lets SelectedIon (monoisotopic)
+                                // overwrite it later if present.
                                 if precursor.mz == 0.0 {
-                                    precursor.mz = extract_value!(ev)
+                                    precursor.mz = extract_value!(ev);
                                 }
                             }
-                            ISO_WINDOW_LOWER => iso_window_lo = Some(extract_value!(ev)),
-                            ISO_WINDOW_UPPER => iso_window_hi = Some(extract_value!(ev)),
+                            ISO_WINDOW_LOWER => {
+                                iso_window_lo = Some(extract_value!(ev));
+                            }
+                            ISO_WINDOW_UPPER => {
+                                iso_window_hi = Some(extract_value!(ev));
+                            }
                             _ => {}
                         }
                     }
@@ -242,9 +247,12 @@ impl MzMLReader {
                                 precursor.charge = Some(extract_value!(ev));
                             }
                             SELECTED_ION_MZ => {
-                                if precursor.mz == 0.0 {
-                                    precursor.mz = extract_value!(ev)
-                                }
+                                // DDA / PRM priority:
+                                // Always overwrite with the selected ion m/z.
+                                // This is typically monoisotopic and possibly deisotoped/refined
+                                // by the vendor’s processing, and should be used instead of the
+                                // isolation window center when present.
+                                precursor.mz = extract_value!(ev);
                             }
                             SELECTED_ION_INT => {
                                 precursor.intensity = Some(extract_value!(ev));
