@@ -1,4 +1,5 @@
 use crate::database::IndexedDatabase;
+use crate::input::FdrMode;
 use crate::input::{FdrSettings, FdrType, ModelFit};
 use crate::lfq::{Peak, PrecursorId};
 use crate::ml::nokoi;
@@ -674,6 +675,17 @@ pub fn calculate_q_values(psms: &[Feature], settings: &FdrSettings) -> Vec<Featu
     );
     let run_nokoi = matches!(fit_method, ModelFit::EnsembleDebug | ModelFit::Nokoi);
 
+    // --- OUTPUT MAPPING MODE ---
+    // map_to_standard_output controls ownership of standard Sage columns.
+    // Only DecoyFree mode may write posterior_error / discriminant_score.
+    // TDC mode must leave these untouched.
+    let map_to_standard_output = matches!(settings.mode, FdrMode::DecoyFree);
+
+    debug_assert!(
+        !(settings.mode == FdrMode::Tdc && map_to_standard_output),
+        "TDC must never map decoy-free stats into standard columns"
+    );
+
     // 1. Fit Moments
     let (mu_mom, beta_mom) = fit_gumbel_moments(&scores);
 
@@ -947,8 +959,10 @@ pub fn calculate_q_values(psms: &[Feature], settings: &FdrSettings) -> Vec<Featu
                 psm.decoy_free_pep = Some(1.0);
 
                 // Map to standard output columns too (fail-closed)
-                psm.posterior_error = 1.0;
-                psm.discriminant_score = 0.0;
+                if map_to_standard_output {
+                    psm.posterior_error = 1.0;
+                    psm.discriminant_score = 0.0;
+                }
 
                 psm.spectrum_q = 1.0;
                 psm.decoy_free_score = Some(0.0);
@@ -1081,73 +1095,68 @@ pub fn calculate_q_values(psms: &[Feature], settings: &FdrSettings) -> Vec<Featu
             // Calculate PEP
             // DESIGN CHOICE: We intentionally prefer the MSFDR mixture model for PEP
             // if it fits successfully, even if the primary P-value comes from another model.
+            let pep_raw = if let Some(model) = &msfdr_model {
+                model.calculate_pep(x)
+            } else if !target_scores_kde.is_empty() {
+                // KDE fallback: approximate mixture posterior with conservative pi0
+                let f0 = match fit_method {
+                    ModelFit::Mle => dist_mle.pdf(x).max(1e-300),
+                    ModelFit::LowerOrder => dist_lo_dynamic.pdf(x).max(1e-300),
+                    _ => dist_mom.pdf(x).max(1e-300),
+                };
+                let f1 = kde_density(x, &target_scores_kde, bandwidth).max(1e-300);
+
+                let den = pi0_kde * f0 + (1.0 - pi0_kde) * f1;
+                if !den.is_finite() || den <= 0.0 {
+                    1.0
+                } else {
+                    (pi0_kde * f0 / den).clamp(0.0, 1.0)
+                }
+            } else {
+                1.0
+            };
+
             // --- Safety Clamp PEP to ensure finite range ---
-			let pep = if pep.is_finite() {
-				pep.clamp(0.0, 1.0)
-			} else {
-				1.0
-			};
-			
-			psm.decoy_free_p_value = Some(p_final as f32);
-			psm.decoy_free_pep = Some(pep as f32);
-			psm.spectrum_q = p_final as f32;
-			
-			let safe_pep = pep.max(1e-15);
-			let df_score = (-10.0 * safe_pep.log10()) as f32;
-			psm.decoy_free_score = Some(df_score);
-			
-			//
-			// BULLETPROOF OUTPUT MAPPING:
-			//
-			// Only map decoy-free values into standard Sage output fields when we're in
-			// a decoy-free run. In TDC runs, these columns must remain the TDC values.
-			//
-			let map_to_standard_output = {
-				// ✅ OPTION A (recommended): if you already have a mode enum somewhere
-				// Replace this with your real check, e.g.:
-				// matches!(settings.fdr_mode, FdrMode::DecoyFree | FdrMode::DecoyFreeDebug)
-			
-				// ✅ OPTION B: if you add a bool to FdrSettings, e.g. settings.map_decoy_free_to_standard
-				// settings.map_decoy_free_to_standard
-			
-				true // <-- REPLACE THIS with the real mode check
-			};
-			
-			if map_to_standard_output {
-				// --- CRITICAL MAPPING FOR OUTPUT COMPATIBILITY ---
-				// Standard Sage TSV columns:
-				//   - posterior_error => decoy-free PEP
-				//   - sage_discriminant_score => -10 * log10(PEP)
-				psm.posterior_error = pep as f32;
-				psm.discriminant_score = df_score;
-			}
-			
-			if debug_mode {
-				psm.p_moments = Some(p_mom as f32);
-				psm.p_mle = Some(p_mle as f32);
-				psm.p_lower_order = Some(p_lo as f32);
-				if let Some(m) = &msfdr_model {
-					psm.p_msfdr = Some(m.calculate_seeded_null_p(x) as f32);
-				}
-			}
+            let pep = if pep_raw.is_finite() {
+                pep_raw.clamp(0.0, 1.0)
+            } else {
+                1.0
+            };
+
+            psm.decoy_free_p_value = Some(p_final as f32);
+            psm.decoy_free_pep = Some(pep as f32);
+            psm.spectrum_q = p_final as f32;
+
+            let safe_pep = pep.max(1e-15);
+            let df_score = (-10.0 * safe_pep.log10()) as f32;
+            psm.decoy_free_score = Some(df_score);
+
+            // Only map into standard columns in decoy-free mode
+            if map_to_standard_output {
+                psm.posterior_error = pep as f32;
+                psm.discriminant_score = df_score;
+            }
+
+            if debug_mode {
+                psm.p_moments = Some(p_mom as f32);
+                psm.p_mle = Some(p_mle as f32);
+                psm.p_lower_order = Some(p_lo as f32);
+                if let Some(m) = &msfdr_model {
+                    psm.p_msfdr = Some(m.calculate_seeded_null_p(x) as f32);
+                }
+            }
         } else {
-			psm.spectrum_q = 1.0;
-			psm.decoy_free_p_value = None;
-			psm.decoy_free_pep = None;
-			psm.decoy_free_score = None;
-			psm.decoy_free_q_value = None;
-		
-			// Only do this conservative fill if we're in decoy-free mode
-			let map_to_standard_output = {
-				// same exact flag/check as above
-				true // <-- REPLACE THIS with the real mode check
-			};
-		
-			if map_to_standard_output {
-				psm.posterior_error = 1.0;
-				psm.discriminant_score = 0.0;
-			}
-		}
+            psm.spectrum_q = 1.0;
+            psm.decoy_free_p_value = None;
+            psm.decoy_free_pep = None;
+            psm.decoy_free_score = None;
+            psm.decoy_free_q_value = None;
+
+            if map_to_standard_output {
+                psm.posterior_error = 1.0;
+                psm.discriminant_score = 0.0;
+            }
+        }
     });
 
     // Apply PAVA to enforce monotonicity only when NOT running pure LowerOrder mode.
@@ -1341,9 +1350,10 @@ pub fn calculate_q_values(psms: &[Feature], settings: &FdrSettings) -> Vec<Featu
                     let df_score = (-10.0 * proxy_pep.log10()) as f32;
                     feat.decoy_free_score = Some(df_score);
 
-                    // If you treat this as a "proxy pep", keep output fields consistent too.
-                    feat.posterior_error = proxy_pep as f32;
-                    feat.discriminant_score = df_score;
+                    if map_to_standard_output {
+                        feat.posterior_error = proxy_pep as f32;
+                        feat.discriminant_score = df_score;
+                    }
 
                     final_p_values.push(final_p);
                     final_indices.push(i);
