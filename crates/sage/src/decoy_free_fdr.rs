@@ -1133,6 +1133,9 @@ pub fn calculate_q_values(psms: &[Feature], settings: &FdrSettings) -> Vec<Featu
 
             // Only map into standard columns in decoy-free mode
             if map_to_standard_output {
+                // Standard Sage TSV columns:
+                //   - posterior_error => decoy-free PEP
+                //   - sage_discriminant_score => -10 * log10(PEP)
                 psm.posterior_error = pep as f32;
                 psm.discriminant_score = df_score;
             }
