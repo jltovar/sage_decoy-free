@@ -206,6 +206,7 @@ In Decoy-Free mode, the output TSV replaces standard Sage columns with explicit 
 | `decoy_free_p_value` | The raw consensus P-value derived from the 5-way ensemble. |
 | `decoy_free_q_value` | The PSM-level False Discovery Rate (FDR). |
 | `decoy_free_peptide_q` | The Peptide-level FDR. |
+| `decoy_free_protein_q` | The Protein-level FDR. Aggregated significance of the protein inference using Fisher's Method. |
 | `p_mom` / `p_mle` / `p_lo` | Individual P-values from the Moments, MLE, and Lower-Order statistical experts. |
 | `p_msfdr` / `p_nokoi` | Individual P-values from the Robust Mixture Model and Nokoi Machine Learning experts. |
 
@@ -216,7 +217,7 @@ In Decoy-Free mode, the output TSV replaces standard Sage columns with explicit 
 
 The FDR columns in Sage Decoy-Free are dynamic. Their values change depending on the `model_fit` strategy selected in your configuration (e.g., `moments`, `mle`, `lower_order`, `msfdr`, `ensemble`).
 
-#### `spectrum_q` (PSM-level FDR)
+#### `decoy_free_q_value` (PSM-level FDR)
 
 - **Source:** Derived directly from the `decoy_free_p_value`.
 - **Dependency:** The underlying P-value changes based on the selected model:
@@ -230,12 +231,12 @@ The FDR columns in Sage Decoy-Free are dynamic. Their values change depending on
 
 - **Calculation:** After determining the raw P-value, the Benjamini–Hochberg (or Storey) procedure is applied globally to convert it into a Q-value (`spectrum_q`).
 
-#### `peptide_q` (Peptide-level FDR)
+#### `decoy_free_peptide_q` (Peptide-level FDR)
 
-- **Calculation:** Computed by taking the best (minimum) decoy_free_q_value observed for that peptide sequence across all scans. This is now calculated unconditionally for every search, ensuring valid peptide-level statistics are always available for LFQ.
+- **Calculation:** Computed by taking the best (minimum) `decoy_free_q_value` observed for that peptide sequence across all scans. This is now calculated unconditionally for every search, ensuring valid peptide-level statistics are always available for LFQ.
 - **Dependency:** Improvements in spectrum-level modeling (e.g., Ensemble vs Moments) directly propagate to peptide-level confidence.
 
-#### `protein_q` (Protein-level FDR)
+#### `decoy_free_protein_q` (Protein-level FDR)
 
 - **Calculation:** Aggregates the `decoy_free_p_values` of all unique peptides assigned to a protein using **Fisher’s Method** for combining independent p-values.
 - **Dependency:** Strongly influenced by model choice. Sharper p-values from better models (e.g., Ensemble) improve discrimination during protein inference.

@@ -1061,6 +1061,7 @@ impl Runner {
                 "decoy_free_score",
                 "decoy_free_q_value",
                 "decoy_free_peptide_q",
+                "decoy_free_protein_q",
                 "p_mom",
                 "p_mle",
                 "p_lo",
@@ -1169,6 +1170,7 @@ impl Runner {
                     record.push_field(fmt_f32(feat.decoy_free_score).as_bytes());
                     record.push_field(fmt_f32(feat.decoy_free_q_value).as_bytes());
                     record.push_field(fmt_f32(feat.decoy_free_peptide_q).as_bytes());
+                    record.push_field(fmt_f32(Some(feat.protein_q)).as_bytes());
                     record.push_field(fmt_f32(feat.p_mom).as_bytes());
                     record.push_field(fmt_f32(feat.p_mle).as_bytes());
                     record.push_field(fmt_f32(feat.p_lo).as_bytes());

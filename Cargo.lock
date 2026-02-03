@@ -2599,6 +2599,7 @@ dependencies = [
  "nalgebra 0.32.6",
  "quickcheck",
  "quickcheck_macros",
+ "rand",
  "rayon",
  "regex",
  "serde",
