@@ -8,6 +8,7 @@ use rayon::prelude::*;
 use sage_cloudpath::{CloudPath, FileFormat};
 use sage_core::database::{IndexedDatabase, Parameters, PeptideIx};
 use sage_core::fasta::Fasta;
+use sage_core::input::FdrMode;
 use sage_core::ion_series::Kind;
 use sage_core::lfq::{Peak, PrecursorId};
 use sage_core::mass::Tolerance;
@@ -20,8 +21,6 @@ use sage_core::tmt::TmtQuant;
 use std::collections::HashMap;
 use std::collections::HashSet;
 use std::time::Instant;
-// FIXED: Import FdrMode correctly
-use sage_core::input::FdrMode;
 
 pub struct Runner {
     pub database: IndexedDatabase,
@@ -565,26 +564,14 @@ impl Runner {
                 );
             }
 
-            // DEBUG: Rank histogram for decoy-free FDR
-            {
-                use std::collections::BTreeMap;
+            let fdr_settings = self.parameters.fdr.clone();
 
-                let mut by_rank: BTreeMap<u32, usize> = BTreeMap::new();
-                for f in &outputs.features {
-                    *by_rank.entry(f.rank).or_insert(0) += 1;
-                }
+            let pep_fdr_cutoff = fdr_settings.peptide_fdr;
 
-                log::info!("PSMs by rank: {:?}", by_rank);
-                log::info!("Total PSMs: {}", outputs.features.len());
-            }
+            outputs.features =
+                sage_core::decoy_free_fdr::calculate_q_values(&outputs.features, &fdr_settings);
 
-            // Decoy-free spectrum q-values
-            outputs.features = sage_core::decoy_free_fdr::calculate_q_values(
-                &outputs.features,
-                &self.parameters.fdr,
-            );
-
-            // 1. Spectrum FDR
+            // 1. Spectrum FDR Logging
             let q_spectrum = outputs
                 .features
                 .iter()
@@ -597,29 +584,20 @@ impl Runner {
                 self.parameters.fdr.peptide_fdr * 100.0
             );
 
-            // 2. Pass the custom thresholds here
-            let q_peptide = sage_core::decoy_free_fdr::calculate_peptide_q(
-                &mut outputs.features,
-                &self.database,
-                self.parameters.fdr.peptide_fdr,
-            );
-
-            let q_protein = sage_core::decoy_free_fdr::calculate_protein_q(
-                &mut outputs.features,
-                &self.database,
-                &self.parameters.fdr,
-            );
-
-            log::info!(
-                "discovered {} target peptides at {}% FDR",
-                q_peptide,
-                self.parameters.fdr.peptide_fdr * 100.0
-            );
-            log::info!(
-                "discovered {} target proteins at {}% FDR",
-                q_protein,
-                self.parameters.fdr.protein_fdr * 100.0
-            );
+            // --- JIT SYNC #1: For RT and Ion Mobility Models ---
+            // These models read `spectrum_q` and `discriminant_score` to filter training data.
+            // We ensure they see the Decoy-Free values right now.
+            if self.parameters.predict_rt {
+                log::info!("Syncing Decoy-Free stats to standard columns for RT/IMS prediction...");
+                outputs.features.par_iter_mut().for_each(|f| {
+                    if let Some(q) = f.decoy_free_q_value {
+                        f.spectrum_q = q;
+                    }
+                    if let Some(s) = f.decoy_free_score {
+                        f.discriminant_score = s;
+                    }
+                });
+            }
 
             alignments = if self.parameters.predict_rt {
                 let local_alignments = sage_core::ml::retention_alignment::global_alignment(
@@ -644,9 +622,40 @@ impl Runner {
                 None
             };
 
+            // 1. Re-sync spectrum_q (Safety in case models modified it, though unlikely)
+            outputs.features.par_iter_mut().for_each(|f| {
+                if let Some(q) = f.decoy_free_q_value {
+                    f.spectrum_q = q;
+                }
+            });
+
+            // 2. Calculate Peptide Q using the Decoy-Free PSMs
+            // This function now populates `peptide_q` (standard) and `decoy_free_peptide_q` (new)
+            let q_peptide = sage_core::decoy_free_fdr::calculate_peptide_q(
+                &mut outputs.features,
+                &self.database,
+                pep_fdr_cutoff,
+            );
+
+            let q_protein = sage_core::decoy_free_fdr::calculate_protein_q(
+                &mut outputs.features,
+                &self.database,
+                &fdr_settings,
+            );
+
+            log::info!(
+                "discovered {} target peptides at {}% FDR (Decoy-Free)",
+                q_peptide,
+                pep_fdr_cutoff * 100.0
+            );
+            log::info!("discovered {} target proteins (Decoy-Free)", q_protein);
+
+            // --- JIT SYNC #2: For LFQ ---
             areas = alignments.as_ref().and_then(|alignments_ref| {
                 if self.parameters.quant.lfq {
-                    // 1. Quantify (Build Map + Integrate)
+                    log::info!("Performing Decoy-Free LFQ...");
+
+                    // 3. Quantify (Build Map + Integrate)
                     let mut areas_map = sage_core::lfq::build_feature_map(
                         self.parameters.quant.lfq_settings,
                         self.parameters.precursor_charge,
@@ -655,16 +664,16 @@ impl Runner {
                     )
                     .quantify(&self.database, &outputs.ms1, alignments_ref);
 
-                    // 2. Compute FDR using the Shadow Traces
-                    let q_precursor = sage_core::decoy_free_fdr::decoy_free_precursor(
-                        &mut areas_map,
-                        self.parameters.fdr.precursor_fdr,
-                    );
+                    // 4. Compute FDR using the Shadow Traces
+                    // Use concrete precursor_fdr
+                    let prec_fdr = fdr_settings.precursor_fdr;
+                    let q_precursor =
+                        sage_core::decoy_free_fdr::decoy_free_precursor(&mut areas_map, prec_fdr);
 
                     log::info!(
                         "discovered {} target MS1 peaks at {}% FDR (using Shadow Traces)",
                         q_precursor,
-                        self.parameters.fdr.precursor_fdr * 100.0
+                        prec_fdr * 100.0
                     );
 
                     Some(areas_map)
@@ -757,7 +766,6 @@ impl Runner {
             // =====================================================================
         }
 
-        // ADD THE FILENAMES BLOCK HERE
         let filenames = self
             .parameters
             .mzml_paths
@@ -769,13 +777,6 @@ impl Runner {
                     .unwrap_or_else(|| s.clone())
             })
             .collect::<Vec<_>>();
-
-        // ADD THE LOGGING BLOCK HERE
-        log::trace!("Runner view of q-values (first 5):");
-        for feat in outputs.features.iter().take(5) {
-            log::trace!("  - PSM {}: spectrum_q = {}", feat.psm_id, feat.spectrum_q);
-        }
-        // END LOGGING BLOCK
 
         log::trace!("writing outputs");
 
@@ -861,6 +862,7 @@ impl Runner {
 
         Ok(telemetry)
     }
+
     pub fn serialize_feature(&self, feature: &Feature, filenames: &[String]) -> csv::ByteRecord {
         let mut record = csv::ByteRecord::new();
 
@@ -927,7 +929,11 @@ impl Runner {
                 .format(feature.scored_candidates)
                 .as_bytes(),
         );
-        record.push_field(ryu::Buffer::new().format(feature.poisson).as_bytes());
+        record.push_field(
+            ryu::Buffer::new()
+                .format((-feature.poisson).ln_1p())
+                .as_bytes(),
+        );
         record.push_field(
             ryu::Buffer::new()
                 .format(feature.discriminant_score)
@@ -1004,7 +1010,10 @@ impl Runner {
             .delimiter(b'\t')
             .from_writer(vec![]);
 
-        // 1. 40 standard headers
+        // 1. Base Headers (matching serialize_feature order up to poisson)
+        // Note: serialize_feature uses "precursor_ppm" (average_ppm) and "fragment_ppm" (not in struct but implied)
+        // Wait, serialize_feature uses delta_mass, average_ppm, hyperscore.
+        // Standard headers are typically:
         let mut headers = vec![
             "psm_id",
             "peptide",
@@ -1040,36 +1049,33 @@ impl Runner {
             "matched_intensity_pct",
             "scored_candidates",
             "poisson",
-            "sage_discriminant_score",
-            "posterior_error",
-            "spectrum_q",
-            "peptide_q",
-            "protein_q",
-            "ms2_intensity",
         ];
 
-        // Decoy-free output gate (based on JSON)
-        let decoy_free_output = matches!(
-            self.parameters.fdr.mode,
-            sage_core::input::FdrMode::DecoyFree
-        );
-
-        // Debug (EnsembleDebug) gate
-        let is_debug = self.parameters.fdr.model_fit == sage_core::input::ModelFit::EnsembleDebug;
-
-        if is_debug {
+        // Conditional Columns
+        if self.decoy_free_mode {
+            // Decoy-Free: Skip standard FDR columns, write MS2 intensity, then Decoy-Free extras
+            headers.push("ms2_intensity");
             headers.extend_from_slice(&[
-                "raw_p_value",
-                "decoy_free_score",
                 "decoy_free_p_value",
                 "decoy_free_pep",
+                "decoy_free_score",
                 "decoy_free_q_value",
-                "p_moments",
+                "decoy_free_peptide_q",
+                "p_mom",
                 "p_mle",
-                "p_lower_order",
+                "p_lo",
                 "p_msfdr",
                 "p_nokoi",
-                "q_nokoi",
+            ]);
+        } else {
+            // Vanilla: Add standard columns in standard order
+            headers.extend_from_slice(&[
+                "sage_discriminant_score",
+                "posterior_error",
+                "spectrum_q",
+                "peptide_q",
+                "protein_q",
+                "ms2_intensity",
             ]);
         }
 
@@ -1080,42 +1086,107 @@ impl Runner {
                 .unwrap_or_else(|| "NaN".to_string())
         };
 
+        // We must construct records manually to handle the conditional exclusion logic
+        // duplicating strict serialization order from serialize_feature
         let records: Vec<csv::ByteRecord> = features
             .into_par_iter()
             .map(|feat| {
-                // Clone for projection
-                let mut feat_to_serialize = feat.clone();
+                let mut record = csv::ByteRecord::new();
 
-                // Project decoy-free values onto standard fields for OUTPUT ONLY
-                if decoy_free_output {
-                    if let Some(df_score) = feat.decoy_free_score {
-                        feat_to_serialize.discriminant_score = df_score;
-                    }
-                    if let Some(df_pep) = feat.decoy_free_pep {
-                        feat_to_serialize.posterior_error = df_pep;
-                    }
-                    if let Some(df_q) = feat.decoy_free_q_value {
-                        feat_to_serialize.spectrum_q = df_q;
-                    }
-                }
+                // --- Core Columns (34 fields) ---
+                record.push_field(itoa::Buffer::new().format(feat.psm_id).as_bytes());
+                let peptide = &self.database[feat.peptide_idx];
+                record.push_field(peptide.to_string().as_bytes());
+                record.push_field(
+                    peptide
+                        .proteins(&self.database.decoy_tag, self.database.generate_decoys)
+                        .as_bytes(),
+                );
+                record.push_field(
+                    itoa::Buffer::new()
+                        .format(peptide.proteins.len())
+                        .as_bytes(),
+                );
+                let fname = filenames
+                    .get(feat.file_id)
+                    .map(|s| s.as_str())
+                    .unwrap_or("unknown");
+                record.push_field(fname.as_bytes());
+                record.push_field(feat.spec_id.as_bytes());
+                record.push_field(itoa::Buffer::new().format(feat.rank).as_bytes());
+                record.push_field(itoa::Buffer::new().format(feat.label).as_bytes());
+                record.push_field(ryu::Buffer::new().format(feat.expmass).as_bytes());
+                record.push_field(ryu::Buffer::new().format(feat.calcmass).as_bytes());
+                record.push_field(itoa::Buffer::new().format(feat.charge).as_bytes());
+                record.push_field(itoa::Buffer::new().format(feat.peptide_len).as_bytes());
+                record.push_field(itoa::Buffer::new().format(feat.missed_cleavages).as_bytes());
+                record.push_field(
+                    itoa::Buffer::new()
+                        .format(peptide.semi_enzymatic as u8)
+                        .as_bytes(),
+                );
+                record.push_field(ryu::Buffer::new().format(feat.isotope_error).as_bytes());
+                record.push_field(ryu::Buffer::new().format(feat.delta_mass).as_bytes()); // precursor_ppm
+                record.push_field(ryu::Buffer::new().format(feat.average_ppm).as_bytes()); // fragment_ppm
+                record.push_field(ryu::Buffer::new().format(feat.hyperscore).as_bytes());
+                record.push_field(ryu::Buffer::new().format(feat.delta_next).as_bytes());
+                record.push_field(ryu::Buffer::new().format(feat.delta_best).as_bytes());
+                record.push_field(ryu::Buffer::new().format(feat.rt).as_bytes());
+                record.push_field(ryu::Buffer::new().format(feat.aligned_rt).as_bytes());
+                record.push_field(ryu::Buffer::new().format(feat.predicted_rt).as_bytes());
+                record.push_field(ryu::Buffer::new().format(feat.delta_rt_model).as_bytes());
+                record.push_field(ryu::Buffer::new().format(feat.ims).as_bytes());
+                record.push_field(ryu::Buffer::new().format(feat.predicted_ims).as_bytes());
+                record.push_field(ryu::Buffer::new().format(feat.delta_ims_model).as_bytes());
+                record.push_field(itoa::Buffer::new().format(feat.matched_peaks).as_bytes());
+                record.push_field(itoa::Buffer::new().format(feat.longest_b).as_bytes());
+                record.push_field(itoa::Buffer::new().format(feat.longest_y).as_bytes());
+                record.push_field(ryu::Buffer::new().format(feat.longest_y_pct).as_bytes());
+                record.push_field(
+                    ryu::Buffer::new()
+                        .format(feat.matched_intensity_pct)
+                        .as_bytes(),
+                );
+                record.push_field(
+                    itoa::Buffer::new()
+                        .format(feat.scored_candidates)
+                        .as_bytes(),
+                );
+                record.push_field(
+                    ryu::Buffer::new()
+                        .format((-feat.poisson).ln_1p())
+                        .as_bytes(),
+                );
 
-                // 40 core columns
-                let mut record = self.serialize_feature(&feat_to_serialize, filenames);
-
-                // Debug extras
-                if is_debug {
-                    let raw_p = 10.0f64.powf(feat.poisson);
-                    record.push_field(ryu::Buffer::new().format(raw_p).as_bytes());
-                    record.push_field(fmt_f32(feat.decoy_free_score).as_bytes());
+                // --- Conditional Columns ---
+                if self.decoy_free_mode {
+                    // Skip the 5 standard FDR columns
+                    // Write MS2 intensity
+                    record.push_field(ryu::Buffer::new().format(feat.ms2_intensity).as_bytes());
+                    // Write Decoy-Free columns
                     record.push_field(fmt_f32(feat.decoy_free_p_value).as_bytes());
                     record.push_field(fmt_f32(feat.decoy_free_pep).as_bytes());
+                    record.push_field(fmt_f32(feat.decoy_free_score).as_bytes());
                     record.push_field(fmt_f32(feat.decoy_free_q_value).as_bytes());
-                    record.push_field(fmt_f32(feat.p_moments).as_bytes());
+                    record.push_field(fmt_f32(feat.decoy_free_peptide_q).as_bytes());
+                    record.push_field(fmt_f32(feat.p_mom).as_bytes());
                     record.push_field(fmt_f32(feat.p_mle).as_bytes());
-                    record.push_field(fmt_f32(feat.p_lower_order).as_bytes());
+                    record.push_field(fmt_f32(feat.p_lo).as_bytes());
                     record.push_field(fmt_f32(feat.p_msfdr).as_bytes());
                     record.push_field(fmt_f32(feat.p_nokoi).as_bytes());
-                    record.push_field(fmt_f32(feat.q_nokoi).as_bytes());
+                } else {
+                    // Write Standard 5 columns
+                    record.push_field(
+                        ryu::Buffer::new()
+                            .format(feat.discriminant_score)
+                            .as_bytes(),
+                    );
+                    record.push_field(ryu::Buffer::new().format(feat.posterior_error).as_bytes());
+                    record.push_field(ryu::Buffer::new().format(feat.spectrum_q).as_bytes());
+                    record.push_field(ryu::Buffer::new().format(feat.peptide_q).as_bytes());
+                    record.push_field(ryu::Buffer::new().format(feat.protein_q).as_bytes());
+                    // Write MS2 intensity
+                    record.push_field(ryu::Buffer::new().format(feat.ms2_intensity).as_bytes());
                 }
 
                 record
@@ -1266,7 +1337,7 @@ impl Runner {
         record.push_field(ryu::Buffer::new().format(feature.predicted_ims).as_bytes());
         record.push_field(
             ryu::Buffer::new()
-                .format(feature.delta_ims_model)
+                .format(feature.delta_ims_model.clamp(0.0, 1.0).sqrt())
                 .as_bytes(),
         );
         record.push_field(itoa::Buffer::new().format(feature.matched_peaks).as_bytes());

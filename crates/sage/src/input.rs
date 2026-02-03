@@ -18,7 +18,6 @@ pub enum ModelFit {
     Msfdr,
     Nokoi,
     Ensemble,
-    EnsembleDebug,
 }
 
 #[derive(Clone, Serialize, Deserialize, Debug, Default, PartialEq, Eq)]
@@ -29,7 +28,7 @@ pub enum FdrType {
     Storey, // Storey-Tibshirani
 }
 
-#[derive(Clone, Serialize, Deserialize, Debug)]
+#[derive(Clone, Serialize, Deserialize, Debug, Default)]
 pub struct FdrOptions {
     pub mode: Option<FdrMode>,
     pub peptide_fdr: Option<f32>,
@@ -46,38 +45,13 @@ pub struct FdrOptions {
     pub min_null_size: Option<usize>,
     pub kde_samples: Option<usize>,
 
-    // -------------------------------------------------------------------------
     // Decoy-Free Lower-Order (LO) robustness controls
-    //
-    // These are optional so old JSON configs continue to parse unchanged.
-    //
-    // 1) lo_multiplicity_alpha:
-    //    Attenuates the ln(n_local/n_global) multiplicity shift in LO.
-    //      1.0 = full multiplicity penalty
-    //      0.5 = square-root damping (recommended default)
-    //      0.0 = disable multiplicity penalty
-    //
-    // 2) lo_ln_ratio_cap:
-    //    Caps |ln(n_local/n_global)| to prevent extreme spectra from producing
-    //    unbounded μ shifts. Default 6.9 ~ ln(1000).
-    //
-    // 3) lo_beta_blend_moments:
-    //    Shrinks LO beta toward Moments beta:
-    //      beta_shrunk = (1-w_mom)*beta_lo + w_mom*beta_mom
-    //    Default w_mom=0.30. Use 0.50 if you want stronger stabilization.
-    //
-    // 4) lo_beta_safety_mult (Safety Belt):
-    //    Hard clamp on LO beta relative to the reference beta (Moments beta):
-    //      beta_eff <= safety_mult * beta_ref
-    //    Default 0.60 is recommended for correlated candidate spaces (open search / PTM-heavy / ultra-low-input)
-    //    where larger LO beta can drive overly conservative behavior (tail too heavy → inflated survival p-values).
-    // -------------------------------------------------------------------------
     pub lo_multiplicity_alpha: Option<f64>,
     pub lo_ln_ratio_cap: Option<f64>,
     pub lo_beta_blend_moments: Option<f64>,
     pub lo_beta_safety_mult: Option<f64>,
 
-    // New Controls for Ultra-Low Input Sensitivity
+    // New Controls
     pub purification_factor: Option<f64>,
     pub min_rank_count: Option<usize>,
 }
@@ -93,56 +67,37 @@ pub struct FdrSettings {
     pub model_fit: ModelFit,
     pub type_: FdrType,
 
-    // Configurable Safety Brakes
     pub min_storey_n: usize,
     pub min_null_size: usize,
     pub kde_samples: usize,
 
-    // -------------------------------------------------------------------------
-    // Decoy-Free Lower-Order (LO) robustness controls (materialized values)
-    //
-    // These are NOT Option<> at runtime; defaults are applied in From<FdrOptions>.
-    // Keeping them as concrete f64s makes downstream code simpler and faster.
-    //
-    // See FdrOptions docs for semantics.
-    // -------------------------------------------------------------------------
     pub lo_multiplicity_alpha: f64,
     pub lo_ln_ratio_cap: f64,
     pub lo_beta_blend_moments: f64,
     pub lo_beta_safety_mult: f64,
 
-    // New Controls for Ultra-Low Input Sensitivity
     pub purification_factor: f64,
     pub min_rank_count: usize,
 }
 
 impl From<FdrOptions> for FdrSettings {
     fn from(options: FdrOptions) -> Self {
-        // Multiplicity attenuation: default 0.50 (square-root-like damping)
         let lo_multiplicity_alpha = options
             .lo_multiplicity_alpha
             .unwrap_or(0.50)
             .clamp(0.0, 1.0);
-
-        // Cap shifts at ~1000x search space difference
         let lo_ln_ratio_cap = options.lo_ln_ratio_cap.unwrap_or(6.9).max(0.0);
-
-        // Shrinkage: default 30% toward stable Moments beta
         let lo_beta_blend_moments = options
             .lo_beta_blend_moments
             .unwrap_or(0.30)
             .clamp(0.0, 1.0);
 
-        // Safety Belt: HARD CLAMP on LO beta relative to reference
         let lo_beta_safety_mult = match options.lo_beta_safety_mult {
             Some(x) if x.is_finite() && x > 0.0 => x.clamp(0.1, 10.0),
-            _ => 0.60, // or 1.50 if you want your older behavior
+            _ => 0.60,
         };
 
-        // Purification: default 20%
         let purification_factor = options.purification_factor.unwrap_or(0.20).clamp(0.0, 0.9);
-
-        // Minimum spectra per rank for regression
         let min_rank_count = options.min_rank_count.unwrap_or(10);
 
         Self {

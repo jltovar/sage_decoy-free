@@ -1,4 +1,6 @@
 use crate::scoring::Feature;
+use rand::seq::SliceRandom;
+use rand::thread_rng;
 use serde::{Deserialize, Serialize};
 use std::cmp::Ordering;
 
@@ -225,10 +227,14 @@ impl LogisticRegression {
             return;
         }
 
-        // --- CHANGE 1: Log-Spaced Lambda Grid ---
+        // --- Log-Spaced Lambda Grid ---
         // Search orders of magnitude: [1e-4, 1e-3, 1e-2, 1e-1, 1.0]
         // This is much better for finding the "sparsity sweet spot"
-        let lambdas: Vec<f64> = (0..5).map(|i| 1e-4 * 10f64.powi(i)).collect();
+        // let lambdas: Vec<f64> = (0..5).map(|i| 1e-4 * 10f64.powi(i)).collect();
+
+        // Paper uses 2^-10 to 2^5.
+        // 2^-10 = 0.00097, 2^5 = 32.0.
+        let lambdas: Vec<f64> = (-10..=5).map(|i| 2.0_f64.powi(i)).collect();
 
         // Use 3-fold CV for speed, or 5 if data allows
         let k_folds = if n_samples >= 100 { 5 } else { 3 };
@@ -384,17 +390,37 @@ pub fn rescore(features: &[Feature], train_fdr: f32) -> Option<Vec<f64>> {
         patience: 15,
     };
 
-    let mut training_data = Vec::new();
+    // 1. Separate Positives and Negatives
+    let mut positives = Vec::new();
+    let mut negatives = Vec::new();
     let mut all_data = Vec::with_capacity(features.len());
 
-    let confident_count = features
-        .iter()
-        .filter(|f| f.rank == 1 && f.spectrum_q <= train_fdr)
-        .count();
+    for (i, f) in features.iter().enumerate() {
+        let feat_vec = extract_features(f);
+        let psm = PsmData {
+            features: feat_vec.clone(),
+            label: 0.0, // Default, will set to 1.0 for positives in separate list
+            original_idx: i,
+        };
 
-    // --- CHANGE 2: Graceful Fallback for Low Data (<50) ---
+        // Paper criteria for positive class: "rank1 PSMs... above significance threshold" [cite: 94]
+        if f.rank == 1 && f.spectrum_q <= train_fdr {
+            let mut pos_psm = psm.clone();
+            pos_psm.label = 1.0;
+            positives.push(pos_psm);
+        }
+        // Paper criteria for negative class: "rank2 PSMs" (or lower ranks) [cite: 94, 106]
+        else if f.rank > 1 {
+            negatives.push(psm.clone());
+        }
+
+        all_data.push(psm); // We predict on everything later
+    }
+
+    // --- Graceful Fallback for Low Data (<50) ---
     // If we have fewer than 50 confident PSMs, ML training is unstable.
     // Instead of failing, we return "probabilities" based on min-max scaled Hyperscore.
+    let confident_count = positives.len();
     if confident_count < 50 {
         log::warn!(
             "Nokoi: Too few positives ({} < 50) - falling back to normalized hyperscore",
@@ -435,38 +461,46 @@ pub fn rescore(features: &[Feature], train_fdr: f32) -> Option<Vec<f64>> {
     }
 
     // 1. Feature Extraction
-    for (i, f) in features.iter().enumerate() {
-        let feat_vec = extract_features(f);
+    // --- Balanced Sampling  ---
+    // The paper explicitly creates a "balanced training data set" of 10k pos / 10k neg.
+    // Without this, the model will just predict "0.0" for everything because negatives
+    // vastly outnumber positives.
 
-        // Training set: High confidence Rank 1 (Pos) vs Rank > 1 (Neg)
-        if f.rank == 1 && f.spectrum_q <= train_fdr {
-            training_data.push(PsmData {
-                features: feat_vec.clone(),
-                label: 1.0,
-                original_idx: i,
-            });
-        } else if f.rank > 1 {
-            training_data.push(PsmData {
-                features: feat_vec.clone(),
-                label: 0.0,
-                original_idx: i,
-            });
-        }
+    let mut rng = thread_rng();
+    positives.shuffle(&mut rng);
+    negatives.shuffle(&mut rng);
 
-        all_data.push(PsmData {
-            features: feat_vec,
-            label: 0.0,
-            original_idx: i,
-        });
-    }
+    // Determine sample size: min of (pos count, neg count, 10,000 cap)
+    let n_pos = positives.len();
+    let n_neg = negatives.len();
+    let sample_size = n_pos.min(n_neg).min(10_000);
+
+    let mut training_data = Vec::with_capacity(sample_size * 2);
+    training_data.extend_from_slice(&positives[0..sample_size]);
+    training_data.extend_from_slice(&negatives[0..sample_size]);
+
+    // Shuffle the training set so positives/negatives aren't clustered
+    training_data.shuffle(&mut rng);
+
+    log::info!(
+        "Nokoi: Constructed balanced training set: {} positives, {} negatives (drawn from {} pos, {} neg)",
+        sample_size, sample_size, n_pos, n_neg
+    );
 
     // 2. Normalize
+    // IMPORTANT: Learn normalization parameters (mean/std) ONLY from the balanced set.
+    // If we learned from 'all_data', the massive number of low-quality spectra would skew the means.
     let (means, stds) = normalize_features(&mut training_data);
 
-    // Apply normalization to prediction set
+    // Apply that same normalization to the full dataset so predictions are valid
     for sample in all_data.iter_mut() {
         for (i, x) in sample.features.iter_mut().enumerate() {
-            *x = (*x - means[i]) / stds[i];
+            // Apply Z-score: (x - mean) / std
+            if stds[i] > 1e-9 {
+                *x = (*x - means[i]) / stds[i];
+            } else {
+                *x = 0.0;
+            }
         }
     }
 
@@ -483,6 +517,7 @@ pub fn rescore(features: &[Feature], train_fdr: f32) -> Option<Vec<f64>> {
     model.train_cv(&training_data, &config);
 
     // 4. Predict
+    // We predict probabilities for *every* PSM in the file
     let probabilities: Vec<f64> = all_data
         .iter()
         .map(|sample| model.predict(&sample.features))

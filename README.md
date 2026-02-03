@@ -31,7 +31,7 @@ From this null, the engine computes **p-values, q-values, and posterior error pr
 
 ### 2.1 Augmented Ensemble Scoring
 
-To reduce dependence on any single statistical assumption, the decoy-free workflow employs a **consensus ensemble** of four distinct estimators. The final significance (P-value) is derived by combining outputs from the first three models (Moments, MLE, Lower-Order) using the **Harmonic Mean P-value (HMP)**. The fourth model (MSFDR) is used to calculate the Posterior Error Probability (PEP), providing a robust, data-driven measure of local FDR that informs the final score.
+To reduce dependence on any single statistical assumption, the decoy-free workflow employs a **consensus ensemble** of four distinct estimators. The final significance (P-value) is derived by combining outputs from the first three models (Moments, MLE, Lower-Order) using the **Harmonic Mean P-value (HMP)**. The fourth model (MSFDR) contributes its probability estimate to the ensemble. The final Posterior Error Probability (PEP) is calculated utilizing an "Consensus Strategy", where the consensus Ensemble P-value serves directly as the PEP (PEP ≈ P-value). This ensures that if the machine learning expert (Nokoi) identifies a strong match, the error probability reflects that confidence, preventing pessimistic mixture models from overruling high-quality signal.
 
 1.  **Method of Moments (Gumbel)**
     - Fits a Gumbel distribution to noise scores (ranks 2+) using empirical mean and variance.
@@ -56,167 +56,11 @@ To reduce dependence on any single statistical assumption, the decoy-free workfl
 
 #### 2.1.1 Lower-Order Multiplicity Correction & Stabilization
 
-The Lower-Order model exploits the theory of Gumbel order statistics by fitting mean score versus rank:
-
-$$
-\mathrm{Score}_k \approx \mu_{\mathrm{intercept}} + \beta_{\mathrm{LO}} \, \bigl[-\psi(k)\bigr]
-$$
-
-where $\psi(\cdot)$ is the Digamma function and $k$ is the rank.
-
-In practice, each spectrum is searched against a different effective number of candidates (`scored_candidates`). Treating all spectra as having identical multiplicity leads to systematic miscalibration, especially when candidate counts vary widely across spectra.
-
-**Anchored Relative Shift (coordinate-consistent mapping)**  
-This fork applies multiplicity correction as a *relative* shift anchored to a global reference multiplicity, rather than reconstructing an absolute location parameter from incompatible formulas.
-
----
-
-##### Step 1 — Define a reference multiplicity ($n_{\mathrm{global}}$)
-
-Let $n_i$ denote the effective candidate count for spectrum $i$:
-
-$$
-n_i = \mathrm{scored\_candidates}_i.
-$$
-
-We define the global reference multiplicity using the **median on the log scale** (i.e., $\exp(\mathrm{median}(\log n))$) over rank-1 spectra:
-
-$$
-n_{\mathrm{global}}
-=
-\exp\!\left(
-\operatorname{median}\!\left[
-\log\!\Big(
-\operatorname{clamp}(n_i,\;10,\;10^{7})
-\Big)
-\right]
-\right).
-$$
-
-This is a scale-robust anchor for multiplicative search-space effects: the median is taken in log-space and exponentiated.
-
----
-
-##### Step 2 — Apply a bounded, attenuated multiplicity shift
-
-For a spectrum with local multiplicity $n_i$, we compute a bounded log-ratio:
-
-$$
-\Delta_i
-=
-\operatorname{clamp}\!\left(
-\ln n_i - \ln n_{\mathrm{global}},\;
--c,\;
-c
-\right),
-$$
-
-where $c$ corresponds to `lo_ln_ratio_cap`.
-
-We then shift only *relative* to the reference anchor:
-
-$$
-\mu_i
-=
-\mu_{\mathrm{intercept}}
-+
-\beta_{\mathrm{LO,eff}} \, \alpha \, \Delta_i,
-$$
-
-where:
-
-- $\alpha \in [0,1]$ is `lo_multiplicity_alpha` (attenuates multiplicity in correlated candidate spaces),
-- $\beta_{\mathrm{LO,eff}}$ is the stabilized Lower-Order scale used for the dynamic Gumbel null.
-
-Key properties:
-- preserves the digamma regression coordinate system,
-- avoids reconstructing an absolute $\mu$ using mixed coordinate formulas,
-- penalizes only deviations from the typical search space,
-- keeps behavior bounded and monotone.
-
----
-
-##### Multiplicity attenuation (correlation control)
-
-In open-search and PTM-heavy workflows, candidates can be highly correlated. To avoid over-penalization, the multiplicity shift is damped by `lo_multiplicity_alpha`:
-
-- $\alpha = 1.0$ → full theoretical penalty,
-- $\alpha = 0.5$ → attenuated penalty (default in this fork).
-
----
-
-##### Slope stabilization & safety belt
-
-Lower-Order slopes can become unstable in heavy tails or sparse nulls. Three safeguards are applied:
-
-**(1) Shrinkage toward Moments**
-
-$$
-\beta_{\mathrm{shrunk}}
-=
-(1-w)\,\beta_{\mathrm{LO}}
-+
-w\,\beta_{\mathrm{Moments}},
-$$
-
-where $w$ is `lo_beta_blend_moments`.
-
-**(2) Hard safety cap relative to a reference scale**
-
-Let $\beta_{\mathrm{ref}}$ denote the reference scale (Moments beta). Then:
-
-$$
-\beta_{\mathrm{LO,eff}}
-=
-\operatorname{clamp}\!\left(
-\beta_{\mathrm{shrunk}},\;
-\epsilon,\;
-\text{safety}_{\mathrm{mult}} \cdot \beta_{\mathrm{ref}}
-\right),
-$$
-
-where `safety_mult` is `lo_beta_safety_mult` and $\epsilon$ is a small positive constant to keep the Gumbel scale valid.
-
----
-
-##### (3) Ensemble hijack protection (ensemble modes only)
-
-To prevent pathological dominance by the Lower-Order model during *ensemble* combination, soft hijack protection is applied **only** in modes that compute an ensemble P-value (e.g., `ensemble`, `ensemble_debug`, and Nokoi-augmented ensemble paths). It is **not** applied in pure `lower_order` mode.
-
-Define the conservative base:
-
-$$
-p_{\mathrm{base}} = \min\!\left(p_{\mathrm{Moments}},\,p_{\mathrm{MLE}}\right).
-$$
-
-For each spectrum, define a "saturated regime" indicator:
-
-- the multiplicity shift was clipped (i.e., $|\Delta_i| = c$), **or**
-- the LO scale hit the safety cap (i.e., $\beta_{\mathrm{LO,eff}} = \beta_{\mathrm{cap}}$).
-
-Hijack protection triggers only if LO is saturated **and** LO is extremely more liberal than the base:
-
-$$
-p_{\mathrm{LO}} < \frac{p_{\mathrm{base}}}{1000}.
-$$
-
-If both conditions hold, LO is guarded:
-
-$$
-p_{\mathrm{LO,guarded}} = p_{\mathrm{base}},
-$$
-
-otherwise:
-
-$$
-p_{\mathrm{LO,guarded}} = p_{\mathrm{LO}}.
-$$
-
-The ensemble P-value is then computed as:
-
-$$
-p_{\mathrm{ens}} = \operatorname{HMP}\!\left(p_{\mathrm{Moments}},\,p_{\mathrm{MLE}},\,p_{\mathrm{LO,guarded}}\right).
-$$
+The Lower-Order model fits a regression line to the scores of lower-ranked matches (ranks 2, 3, etc.) to predict the expected distribution of the top rank.
+- **Anchored Relative Shift** Instead of recalculating parameters from scratch for every spectrum, this fork calculates a "global reference" search space size (the geometric median of candidate counts). For each individual spectrum, it then applies a relative shift to the score baseline. This shift is proportional to the difference between that spectrum's candidate count and the global reference.
+- **Multiplicity Attenuation** In open searches, candidate peptides are often highly correlated (e.g., the same peptide with different PTMs). Treating them as independent trials would over-penalize the score. This fork allows you to "dampen" this penalty using an attenuation factor ().
+- **Slope Stabilization** To prevent the model from becoming unstable on sparse data, the regression slope is partially blended with the more conservative "Moments" slope. Additionally, a "safety belt" cap is applied to ensure the slope never exceeds a safe multiple of the reference Moments slope.
+- **Ensemble Hijack Protection** In the ensemble mode, if the Lower-Order model produces a P-value that is drastically more optimistic (e.g., >1000x smaller) than the standard statistical models for a saturated spectrum, the system automatically falls back to the more conservative estimate to prevent false discoveries.
 
 ---
 
@@ -233,6 +77,7 @@ The engine includes a native implementation of **Nokoi 2.0**, an on-the-fly mach
 - **Feature Selection:** Automatically selects relevant features (e.g., retention time alignment, ion mobility delta, intensity coverage) and zeros out noise features using L1 sparsity.
 - **Adaptive Training:** Uses **K-fold cross-validation** with **early stopping** to prevent overfitting on small datasets.
 - **Integration:** Nokoi probabilities are fed into the ensemble as an additional high-quality evidence stream.
+- **Robust Training:** Implements balanced sampling (1:1 positive/negative ratio) to prevent class imbalance from biasing the model, and utilizes the specific wide regularization grid proposed in the original Nokoi paper.
 
 ### 2.3 Isotonic Calibration (PAVA)
 
@@ -254,9 +99,7 @@ The fork supports two procedures for converting P-values to Q-values:
 - **`storey` (Storey–Tibshirani):** Estimates the fraction of true nulls ($\hat{\pi}_0$) from the P-value distribution. This increases power in high-quality datasets by "reclaiming" true positives that BH would discard.
 
 #### Protein Inference (Fisher's Method)
-Peptide-level evidence is aggregated into protein-level confidence using **Fisher's Combined Probability Test**:
-$$X = -2 \sum_{i=1}^{n} \ln(p_i)$$
-This allows proteins supported by multiple moderate-confidence peptides to be identified confidently, even if no single peptide reaches strict significance on its own.
+Peptide-level evidence is aggregated into protein-level confidence using **Fisher's Combined Probability Test**. This method sums the natural logarithms of the individual peptide p-values to create a single score that reflects the aggregate evidence for a protein. This allows proteins supported by multiple moderate-confidence peptides to be identified confidently.
 
 ---
 
@@ -313,7 +156,6 @@ Decoy-free mode is configured in your JSON file under the `fdr` key:
     - `"msfdr"`: Uses the Robust Mixture Model (Gumbel + Skew-Normal).
     - `"nokoi"`: Uses the Linear Discriminant Analysis (LDA) p-value and q-value derived from ML-based rescoring.
     - `"ensemble"`: (Recommended) Runs Moments, MLE, Lower-Order, and Robust MSFDR.
-    - `"ensemble_debug"`: Same as above but writes **validation columns** (`p_moments`, `p_mle`, `p_msfdr`, `p_lower_order`, `p_nokoi`, `q_nokoi`) to the output.
 - `type`:
     - `"bh"`: Benjamini-Hochberg.
     - `"storey"`: Storey-Tibshirani (requires `min_storey_n` samples).
@@ -334,16 +176,8 @@ These parameters control multiplicity correction and stabilization of the Lower-
   - higher values = more stabilization
 
 - `lo_beta_safety_mult` (default: `0.60`): **Safety belt on the effective LO scale** relative to the Moments scale.  
-  In code, the dynamic LO null uses:
 
-$$
-\beta_{\mathrm{cap}} = \text{safety}_{\text{mult}} \cdot \beta_{\text{Moments}},
-\qquad
-\beta_{\text{LO,eff}} = \operatorname{clamp}\!\left(\beta_{\text{shrunk}},\;10^{-9},\;\beta_{\mathrm{cap}}\right)
-$$
-
-  **Why the default is < 1:** in open-search / PTM-heavy workflows, `scored_candidates` are highly correlated (not independent trials).  
-  Without a tight cap, LO can enter an overly heavy-tailed regime and become **off-the-chart conservative** (inflated survival p-values), collapsing discoveries.  
+  **Why the default is < 1**: In open-search or PTM-heavy workflows, candidate matches are often highly correlated rather than independent trials. Without a safety cap, the Lower-Order model can become overly conservative, inflating P-values and killing true discoveries. The safety belt effectively clamps the regression slope so it never exceeds a specific multiple (default 0.60x) of the global Moments slope.  
   The default `0.60` was selected because it yields stable entrapment calibration behavior across ISB18 and PXD001468 in this fork.  
   Increase toward `1.0–1.5` only if your candidate sets behave closer to independent trials.
   
@@ -361,15 +195,22 @@ $$
 
 When running in `decoy_free` mode, Sage maps its internal statistical calculations to the standard Sage output columns. This ensures that the results files (`results.sage.tsv`) remain compatible with existing downstream analysis tools.
 
-### 4.1 Column Mapping (Decoy-Free Mode)
+### 4.1 Output Columns (Decoy-Free Mode)
 
-To maintain compatibility with TDA workflows, Decoy-Free statistics are mapped to standard Sage headers as follows:
+In Decoy-Free mode, the output TSV replaces standard Sage columns with explicit decoy-free metrics to avoid ambiguity.
 
-| Standard Sage Header | Decoy-Free Source Value | Description |
-|---------------------|------------------------|-------------|
-| `sage_discriminant_score` | `decoy_free_score` | A "Phred-scaled" score derived from the Posterior Error Probability (PEP). Calculated as `-10 * log10(PEP)`. Higher is better. |
-| `posterior_error` | `decoy_free_pep` | The probability that this specific match is incorrect (Local FDR). Calculated as `null_density / total_density`. |
-| `spectrum_q` | `decoy_free_q_value` | The final PSM-level False Discovery Rate (FDR). |
+| Decoy-Free Column | Description |
+| --- | --- |
+| `decoy_free_score` | A "Phred-scaled" score derived from the PEP (). Used for ranking. Higher is better. |
+| `decoy_free_pep` | The Posterior Error Probability (Local FDR). In Optimistic mode, this equals the Ensemble P-value. |
+| `decoy_free_p_value` | The raw consensus P-value derived from the 5-way ensemble. |
+| `decoy_free_q_value` | The PSM-level False Discovery Rate (FDR). |
+| `decoy_free_peptide_q` | The Peptide-level FDR. |
+| `p_mom` / `p_mle` / `p_lo` | Individual P-values from the Moments, MLE, and Lower-Order statistical experts. |
+| `p_msfdr` / `p_nokoi` | Individual P-values from the Robust Mixture Model and Nokoi Machine Learning experts. |
+
+> **Note on Compatibility:** While the output CSV uses these specific headers, the engine internally maps these values to standard structures during runtime. This ensures that internal Sage modules (Retention Time Prediction, Ion Mobility, and LFQ) automatically train on your Decoy-Free results without requiring external converters.
+
 
 ### 4.2 False Discovery Rate (FDR) Calculations
 
@@ -391,34 +232,13 @@ The FDR columns in Sage Decoy-Free are dynamic. Their values change depending on
 
 #### `peptide_q` (Peptide-level FDR)
 
-- **Calculation:** Computed by taking the best (minimum) `spectrum_q` observed for that peptide sequence across all scans.
+- **Calculation:** Computed by taking the best (minimum) decoy_free_q_value observed for that peptide sequence across all scans. This is now calculated unconditionally for every search, ensuring valid peptide-level statistics are always available for LFQ.
 - **Dependency:** Improvements in spectrum-level modeling (e.g., Ensemble vs Moments) directly propagate to peptide-level confidence.
 
 #### `protein_q` (Protein-level FDR)
 
 - **Calculation:** Aggregates the `decoy_free_p_values` of all unique peptides assigned to a protein using **Fisher’s Method** for combining independent p-values.
 - **Dependency:** Strongly influenced by model choice. Sharper p-values from better models (e.g., Ensemble) improve discrimination during protein inference.
-
-### 4.3 Debug Columns (`ensemble_debug`)
-
-Sage includes a special configuration mode for analyzing the internal behavior of the Decoy-Free models.
-
-If you set:
-
-```json
-"model_fit": "ensemble_debug"
-```
-
-in your JSON configuration, the output CSV will additionally include the following raw statistical columns (hidden in standard runs to reduce file size and clutter):
-
-- `decoy_free_p_value` — Raw probability that a hit is a random false match (direct model output).  
-- `p_moments` — P-value from Gumbel Method of Moments.  
-- `p_mle` — P-value from Gumbel Maximum Likelihood Estimation.  
-- `p_lower_order` — P-value from Lower-Order Statistics regression.  
-- `p_msfdr` — P-value from the MSFDR (Skew-Normal mixture) model.  
-- `p_nokoi` / `q_nokoi` — Statistics from the Nokoi rescoring integration.
-
-These columns are intended for **method validation, diagnostics, and calibration studies**, and should not normally be used directly for reporting discoveries.
 
 ---
 
@@ -504,7 +324,7 @@ Classical combination and FDR methods:
 
 - This fork is **experimental** and intended for method development and research.
 - Always inspect log messages and output columns to confirm which models were applied.
-- **Fail-Safe Design:** If statistical models cannot be fit (e.g., due to sparse data), the engine defaults to a probability of 1.0 (Fail-Closed) rather than crashing.
+- **Fail-Safe Design:** If statistical models cannot be fit (e.g., due to sparse data), the engine defaults to a probability of 1.0 (Fail-Closed). Additionally, Nokoi ML includes a graceful fallback for datasets with fewer than 50 confident PSMs, defaulting to normalized hyperscores to prevent unstable training.
 - If opening an issue, please include your `config.json` and a log excerpt showing the active `fdr.mode`.
 - Log messages report LO saturation diagnostics (frac_ln_clipped, frac_beta_capped) to assist calibration tuning.
 
