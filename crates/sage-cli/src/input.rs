@@ -378,15 +378,24 @@ impl Input {
                 max_null_rank: None,
                 model_fit: None,
                 type_: None,
+
+                // Configurable Safety Brakes
                 min_storey_n: None,
                 min_null_size: None,
                 kde_samples: None,
+
+                // Decoy-Free Lower-Order (LO) robustness controls
                 lo_multiplicity_alpha: None,
                 lo_ln_ratio_cap: None,
                 lo_beta_blend_moments: None,
                 lo_beta_safety_mult: None,
+
+                // New Controls (existing)
                 purification_factor: None,
                 min_rank_count: None,
+
+                // IMPORTANT: fill all newly-added knobs (and any future ones)
+                ..Default::default()
             }
             .into(),
         };

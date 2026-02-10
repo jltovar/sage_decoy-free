@@ -1,14 +1,4 @@
-//! Perform global retention time alignment using a modified algorithm based on
-//! Chen AT, et al. DART-ID https://pubmed.ncbi.nlm.nih.gov/31260443/ (Fig 1A/B)
-//!
-//! 0) Transform all RTs into unit-less percentages (0.0 - 1.0)
-//! 1) Assume that the expected RT for a peptide can be estimated from the average
-//!    RT across all runs
-//! 2) For each run, calculate a linear regression between the observed peptide RTs
-//!    and the global average. Transform all PSM retention times by the regression
-//!    parameters
-//!
-//! If LFQ is enabled, MS1 apex times will be used instead of PSM retention times
+//! Perform global retention time alignment
 
 use std::collections::HashMap;
 use std::hash::BuildHasherDefault;
@@ -16,14 +6,14 @@ use std::sync::atomic::AtomicU32;
 
 use super::matrix::Matrix;
 use crate::database::PeptideIx;
-use crate::scoring::Feature;
+use crate::scoring::FeatureCore;
 use dashmap::DashMap;
 use fnv::FnvHasher;
 use rayon::prelude::*;
 
 type FnvDashMap<K, V> = DashMap<K, V, BuildHasherDefault<FnvHasher>>;
 
-fn max_rt_by_file(features: &[Feature], n_files: usize) -> Vec<f64> {
+fn max_rt_by_file(features: &[FeatureCore], n_files: usize) -> Vec<f64> {
     let max_rt = (0..n_files)
         .map(|_| AtomicU32::new(0))
         .map(|_| AtomicU32::new(0))
@@ -39,25 +29,14 @@ fn max_rt_by_file(features: &[Feature], n_files: usize) -> Vec<f64> {
         .collect()
 }
 
-/// Return a map from PeptideIx to a map from File ID to average RT of the parent
-/// PeptideIX
-// Add the `decoy_free: bool` flag to the function signature
 fn mean_rt_by_file(
-    features: &[Feature],
-    decoy_free: bool,
+    features: &[FeatureCore],
+    filter: impl Fn(&FeatureCore) -> bool + Sync + Send,
 ) -> FnvDashMap<PeptideIx, HashMap<usize, f64>> {
     let rts: FnvDashMap<PeptideIx, HashMap<usize, f64>> = DashMap::default();
     features
         .par_iter()
-        .filter(|feat| {
-            // This is the new conditional filter logic
-            let is_target = if decoy_free {
-                feat.rank == 1
-            } else {
-                feat.label == 1
-            };
-            is_target && feat.spectrum_q <= 0.01
-        })
+        .filter(|feat| filter(feat))
         .for_each(|feat| {
             rts.entry(feat.peptide_idx)
                 .or_default()
@@ -68,14 +47,12 @@ fn mean_rt_by_file(
     rts
 }
 
-// Add the `decoy_free: bool` flag to the function signature
 fn rt_matrix(
-    features: &[Feature],
+    features: &[FeatureCore],
     max_rt: &[f64],
-    decoy_free: bool,
+    filter: impl Fn(&FeatureCore) -> bool + Sync + Send,
 ) -> (HashMap<PeptideIx, f64>, Matrix) {
-    // Pass the flag down
-    let mean_rt = mean_rt_by_file(features, decoy_free);
+    let mean_rt = mean_rt_by_file(features, filter);
 
     let (means, mat): (HashMap<PeptideIx, f64>, Vec<_>) = mean_rt
         .par_iter()
@@ -109,20 +86,17 @@ pub struct Alignment {
     pub intercept: f32,
 }
 
-// Add the `decoy_free: bool` flag to the function signature
 pub fn global_alignment(
-    features: &mut [Feature],
+    features: &mut [FeatureCore],
     n_files: usize,
-    decoy_free: bool,
+    filter: impl Fn(&FeatureCore) -> bool + Sync + Send,
 ) -> Vec<Alignment> {
     let max_rt = max_rt_by_file(features, n_files);
-    // Pass the flag down
-    let (_, rt) = rt_matrix(features, &max_rt, decoy_free);
+    let (_, rt) = rt_matrix(features, &max_rt, filter);
 
     let mean_rts: Vec<f64> = (0..rt.rows)
         .into_par_iter()
         .map(|row| {
-            // Don't include NaN values
             let (len, sum) = rt
                 .row(row)
                 .filter(|rt| rt.is_finite())
@@ -131,11 +105,9 @@ pub fn global_alignment(
         })
         .collect();
 
-    // for file_idx in 0..n_files {
     let alignments = (0..n_files)
         .into_par_iter()
         .map(|file_id| {
-            // calculate dot product across all ID'ed peptides
             let (len, dot, sum_x, sum_y) = rt
                 .col(file_id)
                 .zip(mean_rts.iter())
@@ -185,10 +157,6 @@ pub fn global_alignment(
 
     features.par_iter_mut().for_each(|feature| {
         let a = alignments[feature.file_id];
-
-        // Calculate aligned RT
-        // - Divide by maximum RT of this run
-        // - Multiply by regression parameters
         feature.aligned_rt = (feature.rt / a.max_rt) * a.slope + a.intercept;
     });
 

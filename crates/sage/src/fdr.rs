@@ -7,7 +7,7 @@
 use crate::database::{IndexedDatabase, PeptideIx};
 use crate::lfq::PrecursorId;
 use crate::ml::kde::Estimator;
-use crate::scoring::Feature;
+use crate::scoring::TdcFeature;
 use fnv::FnvHashMap;
 use rayon::prelude::*;
 use std::collections::HashMap;
@@ -120,10 +120,10 @@ impl<Ix: Default + Send> Competition<Ix> {
     }
 }
 
-pub fn picked_peptide(db: &IndexedDatabase, features: &mut [Feature]) -> usize {
+pub fn picked_peptide(db: &IndexedDatabase, features: &mut [TdcFeature]) -> usize {
     let mut map: FnvHashMap<String, Competition<PeptideIx>> = FnvHashMap::default();
     for feat in features.iter() {
-        let peptide = &db[feat.peptide_idx];
+        let peptide = &db[feat.core.peptide_idx];
         // Only reverse the peptide sequence if we generated decoys ourselves
         let key = match db.generate_decoys && peptide.decoy {
             true => peptide.reverse().to_string(),
@@ -134,11 +134,11 @@ pub fn picked_peptide(db: &IndexedDatabase, features: &mut [Feature]) -> usize {
         match peptide.decoy {
             true => {
                 entry.reverse = entry.reverse.max(feat.discriminant_score);
-                entry.reverse_ix = Some(feat.peptide_idx);
+                entry.reverse_ix = Some(feat.core.peptide_idx);
             }
             false => {
                 entry.forward = entry.forward.max(feat.discriminant_score);
-                entry.foward_ix = Some(feat.peptide_idx);
+                entry.foward_ix = Some(feat.core.peptide_idx);
             }
         }
     }
@@ -146,18 +146,18 @@ pub fn picked_peptide(db: &IndexedDatabase, features: &mut [Feature]) -> usize {
     let (scores, passing) = Competition::assign_q_value(map, 0.01);
 
     features.par_iter_mut().for_each(|feat| {
-        feat.peptide_q = scores[&feat.peptide_idx];
+        feat.peptide_q = scores[&feat.core.peptide_idx];
     });
 
     passing
 }
 
-pub fn picked_protein(db: &IndexedDatabase, features: &mut [Feature]) -> usize {
+pub fn picked_protein(db: &IndexedDatabase, features: &mut [TdcFeature]) -> usize {
     let mut map: FnvHashMap<_, Competition<String>> = FnvHashMap::default();
     for feat in features.iter() {
-        let decoy = db[feat.peptide_idx].decoy;
-        let entry = map.entry(&db[feat.peptide_idx].proteins).or_default();
-        let proteins = db[feat.peptide_idx].proteins(&db.decoy_tag, db.generate_decoys);
+        let decoy = db[feat.core.peptide_idx].decoy;
+        let entry = map.entry(&db[feat.core.peptide_idx].proteins).or_default();
+        let proteins = db[feat.core.peptide_idx].proteins(&db.decoy_tag, db.generate_decoys);
         match decoy {
             true => {
                 entry.reverse = entry.reverse.max(feat.discriminant_score);
@@ -173,35 +173,21 @@ pub fn picked_protein(db: &IndexedDatabase, features: &mut [Feature]) -> usize {
     let (scores, passing) = Competition::assign_q_value(map, 0.01);
 
     features.par_iter_mut().for_each(|feat| {
-        let proteins = db[feat.peptide_idx].proteins(&db.decoy_tag, db.generate_decoys);
+        let proteins = db[feat.core.peptide_idx].proteins(&db.decoy_tag, db.generate_decoys);
         feat.protein_q = scores[&proteins];
     });
 
     passing
 }
 
-pub fn picked_precursor(
-    peaks: &mut FnvHashMap<(PrecursorId, bool), (crate::lfq::Peak, Vec<f64>)>,
+pub fn picked_precursor<H: BuildHasher>(
+    peaks: &mut HashMap<(PrecursorId, bool), (crate::lfq::Peak, Vec<f64>), H>,
 ) -> usize {
-    // let mut map: FnvHashMap<PeptideIx, Competition<(PeptideIx, bool)>> = FnvHashMap::default();
-    // for (key, (peak, _)) in peaks.iter() {
-    //     let entry = map.entry(key.0).or_default();
-    //     match key.1 {
-    //         true => {
-    //             entry.reverse = entry.reverse.max(peak.score as f32);
-    //             entry.reverse_ix = Some(*key);
-    //         }
-    //         false => {
-    //             entry.forward = entry.forward.max(peak.score as f32);
-    //             entry.foward_ix = Some(*key);
-    //         }
-    //     }
-    // }
     let mut scores = peaks
         .par_iter()
-        .map(|(&(ix, decoy), (peak, _))| Row {
-            ix,
-            decoy,
+        .map(|(key, (peak, _))| Row {
+            ix: key.0,
+            decoy: key.1,
             score: peak.score as f32,
             q: 1.0,
         })
@@ -218,25 +204,25 @@ pub fn picked_precursor(
         };
         score.q = decoy / target;
     }
-    // Q-value is the minimum q-value at any given score threshold
-    // `q = q[::-1].cummin()[::-1] in python`
-    let mut q_min = 1.0f32;
+
+    let mut q_min: f32 = 1.0;
     let mut passing = 0;
+    let mut precursor_q = HashMap::new();
+
     for score in scores.iter_mut().rev() {
         q_min = q_min.min(score.q);
         score.q = q_min;
-        if q_min <= 0.05 && !score.decoy {
+        if q_min <= 0.01 && !score.decoy {
             passing += 1;
+        }
+        precursor_q.insert((score.ix, score.decoy), score.q);
+    }
+
+    for ((id, decoy), (peak, _)) in peaks.iter_mut() {
+        if let Some(q) = precursor_q.get(&(*id, *decoy)) {
+            peak.q_value = *q;
         }
     }
 
-    let scores = scores
-        .into_par_iter()
-        .map(|score| ((score.ix, score.decoy), score.q))
-        .collect::<FnvHashMap<_, _>>();
-
-    peaks.par_iter_mut().for_each(|(ix, (peak, _))| {
-        peak.q_value = scores[ix];
-    });
     passing
 }

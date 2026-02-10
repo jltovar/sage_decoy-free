@@ -7,21 +7,17 @@ use super::{gauss::Gauss, matrix::Matrix};
 use crate::database::IndexedDatabase;
 use crate::mass::VALID_AA;
 use crate::peptide::Peptide;
-use crate::scoring::Feature;
+use crate::scoring::FeatureCore;
 use rayon::prelude::*;
 
 /// Try to fit a retention time prediction model
-///
-/// Mode behavior:
-/// - `decoy_free == false` (TDC / vanilla):
-///     * use label == 1 targets with spectrum_q <= 0.01
-/// - `decoy_free == true` (decoy-free rank-null mode):
-///     * use rank == 1 PSMs with spectrum_q <= 0.01
-pub fn predict(db: &IndexedDatabase, features: &mut [Feature], decoy_free: bool) -> Option<()> {
-    // Mode-aware RT model fitting
-    let lr = RetentionModel::fit(db, features, decoy_free)?;
+pub fn predict(
+    db: &IndexedDatabase,
+    features: &mut [FeatureCore],
+    filter: impl Fn(&FeatureCore) -> bool + Sync + Send,
+) -> Option<()> {
+    let lr = RetentionModel::fit(db, features, filter)?;
     features.par_iter_mut().for_each(|feat| {
-        // LR can sometimes predict crazy values - clamp predicted RT
         let rt = lr.predict_peptide(db, feat);
         let bounded = rt.clamp(0.0, 1.0) as f32;
         feat.predicted_rt = bounded;
@@ -45,7 +41,6 @@ const INTERCEPT: usize = FEATURES - 1;
 
 impl RetentionModel {
     /// One-hot encoding of peptide sequences into feature vector
-    /// Note that this currently does not take into account any modifications
     fn embed(peptide: &Peptide, map: &[usize; 26]) -> [f64; FEATURES] {
         let mut embedding = [0.0; FEATURES];
         let cterm = peptide.sequence.len().saturating_sub(3);
@@ -71,39 +66,28 @@ impl RetentionModel {
     }
 
     /// Attempt to fit a linear regression model: peptide sequence ~ retention time
-    ///
-    /// `decoy_free == false` (TDC / vanilla):
-    ///   - use label == 1 targets with spectrum_q <= 0.01
-    ///
-    /// `decoy_free == true` (decoy-free rank-null mode):
-    ///   - use rank == 1 PSMs with spectrum_q <= 0.01
-    pub fn fit(db: &IndexedDatabase, training_set: &[Feature], decoy_free: bool) -> Option<Self> {
-        // Optional debugging; you can remove this block later if it's too noisy
-        log::trace!("RetentionModel::fit received training_set (first 5 q-values):");
-        for feat in training_set.iter().take(5) {
-            log::trace!("  - PSM {}: spectrum_q = {}", feat.psm_id, feat.spectrum_q);
-        }
-
+    pub fn fit(
+        db: &IndexedDatabase,
+        training_set: &[FeatureCore],
+        filter: impl Fn(&FeatureCore) -> bool + Sync + Send,
+    ) -> Option<Self> {
         // Create AA -> index map
         let mut map = [0; 26];
         for (idx, aa) in VALID_AA.iter().enumerate() {
             map[(aa - b'A') as usize] = idx;
         }
 
-        // 1) Collect aligned RTs for the training PSMs, using explicit mode logic
-        let rt = training_set
+        // Build gated indices once
+        let gated_idx: Vec<usize> = training_set
+            .iter()
+            .enumerate()
+            .filter_map(|(i, feat)| filter(feat).then_some(i))
+            .collect();
+
+        // 1) Collect aligned RTs for the training PSMs
+        let rt = gated_idx
             .par_iter()
-            .filter(|feat| {
-                let is_target = if decoy_free {
-                    // decoy-free branch: treat rank 1 as "trusted" targets
-                    feat.rank == 1
-                } else {
-                    // TDC / vanilla branch: use label == 1 targets
-                    feat.label == 1
-                };
-                is_target && feat.spectrum_q <= 0.01
-            })
-            .map(|psm| psm.aligned_rt as f64)
+            .map(|&i| training_set[i].aligned_rt as f64)
             .collect::<Vec<f64>>();
 
         if rt.len() < 10 {
@@ -119,18 +103,13 @@ impl RetentionModel {
 
         let rt = Matrix::col_vector(rt);
 
-        // 2) Build the design matrix using the same filter
-        let features = training_set
+        // 2) Build the design matrix
+        let features = gated_idx
             .par_iter()
-            .filter(|feat| {
-                let is_target = if decoy_free {
-                    feat.rank == 1
-                } else {
-                    feat.label == 1
-                };
-                is_target && feat.spectrum_q <= 0.01
+            .flat_map_iter(|&i| {
+                let psm = &training_set[i];
+                Self::embed(&db[psm.peptide_idx], &map)
             })
-            .flat_map_iter(|psm| Self::embed(&db[psm.peptide_idx], &map))
             .collect::<Vec<_>>();
 
         let rows = features.len() / FEATURES;
@@ -160,7 +139,7 @@ impl RetentionModel {
     }
 
     /// Predict retention times for a collection of PSMs
-    pub fn predict_peptide(&self, db: &IndexedDatabase, psm: &Feature) -> f64 {
+    pub fn predict_peptide(&self, db: &IndexedDatabase, psm: &FeatureCore) -> f64 {
         let v = Self::embed(&db[psm.peptide_idx], &self.map);
         v.into_iter()
             .zip(&self.beta)

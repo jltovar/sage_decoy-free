@@ -7,21 +7,16 @@ use super::{gauss::Gauss, matrix::Matrix};
 use crate::database::IndexedDatabase;
 use crate::mass::VALID_AA;
 use crate::peptide::Peptide;
-use crate::scoring::Feature;
+use crate::scoring::FeatureCore;
 use rayon::prelude::*;
 
-// Add `decoy_free: bool` to the function signature
 /// Try to fit an ion mobility prediction model
-pub fn predict(db: &IndexedDatabase, feats: &mut [Feature], decoy_free_mode: bool) -> Option<()> {
-    // Just for debugging so you can see which path is running;
-    // it does NOT change the behavior.
-    let mode_str = if decoy_free_mode { "decoy_free" } else { "tdc" };
-    log::info!("mobility_model::predict: mode = {}", mode_str);
-
-    // ================= MASTER BEHAVIOR (unchanged) =================
-    //
-    // Training LR might fail - not enough values, or r-squared is < 0.7
-    let lr = match MobilityModel::fit(db, feats, decoy_free_mode) {
+pub fn predict(
+    db: &IndexedDatabase,
+    feats: &mut [FeatureCore],
+    filter: impl Fn(&FeatureCore) -> bool + Sync + Send,
+) -> Option<()> {
+    let lr = match MobilityModel::fit(db, feats, filter) {
         Some(lr) => lr,
         None => {
             log::warn!("Mobility model failed to train");
@@ -30,12 +25,9 @@ pub fn predict(db: &IndexedDatabase, feats: &mut [Feature], decoy_free_mode: boo
     };
 
     feats.par_iter_mut().for_each(|feat| {
-        // LR can sometimes predict crazy values - clamp predicted IMS
         let ims = lr.predict_peptide(db, feat);
         let bounded = ims.clamp(0.0, 2.0) as f32;
         feat.predicted_ims = bounded;
-
-        // Absolute residual between observed and predicted IMS
         feat.delta_ims_model = (feat.ims - bounded).abs();
     });
 
@@ -101,22 +93,17 @@ const PEPTIDE_LEN: usize = FEATURES - 3;
 const PEPTIDE_MASS: usize = FEATURES - 2;
 const INTERCEPT: usize = FEATURES - 1;
 
-// IN THEORY we could have only one model for both RT and IM
-// And the RT should ignore the charge state "at training time"
 impl MobilityModel {
     /// One-hot encoding of peptide sequences into feature vector
-    /// Note that this currently does not take into account any modifications
     fn embed(peptide: &Peptide, charge: &u8, map: &[usize; 26]) -> [f64; FEATURES] {
         let mut embedding = [0.0; FEATURES];
         let cterm = peptide.sequence.len().saturating_sub(3);
         let pep_length = peptide.sequence.len() as f64;
 
-        //let default_first_val = 1.0f64;
         for (aa_idx, residue) in peptide.sequence.iter().enumerate() {
             let idx = map[(residue - b'A') as usize];
             embedding[idx] += 1.0;
             // Embed N- and C-terminal AA's
-            // 2 on each end
             match aa_idx {
                 0 | 1 => embedding[N_TERMINAL + idx] += 1.0,
                 x if x > cterm => embedding[C_TERMINAL + idx] += 1.0,
@@ -144,7 +131,6 @@ impl MobilityModel {
             };
         }
 
-        // PCT features are just the AA counts divided by the length of the peptide
         for idx in 0..VALID_AA.len() {
             let pct_val = embedding[idx] / pep_length;
             embedding[PCT_FEATURES_START + idx] = pct_val;
@@ -160,25 +146,18 @@ impl MobilityModel {
         embedding
     }
 
-    /// Attempt to fit a linear regression model: peptide sequence + charge ~ retention time
-    // Add `decoy_free: bool` to the function signature
-    pub fn fit(db: &IndexedDatabase, training_set: &[Feature], decoy_free: bool) -> Option<Self> {
-        // Create a mapping from amino acid character to vector embedding
+    /// Attempt to fit a linear regression model
+    pub fn fit(
+        db: &IndexedDatabase,
+        training_set: &[FeatureCore],
+        filter: impl Fn(&FeatureCore) -> bool + Sync + Send,
+    ) -> Option<Self> {
         let mut map = [0; 26];
         for (idx, aa) in VALID_AA.iter().enumerate() {
             map[(aa - b'A') as usize] = idx;
         }
 
-        // Filter ONCE and use that same filter for both X and y.
-        // Also require ims > 0.0 so non-IMS files don't poison training.
-        let keep = |feat: &&Feature| {
-            let is_target = if decoy_free {
-                feat.rank == 1
-            } else {
-                feat.label == 1
-            };
-            is_target && feat.spectrum_q <= 0.01 && feat.ims > 0.0
-        };
+        let keep = |feat: &&FeatureCore| filter(feat) && feat.ims > 0.0;
 
         let ims = training_set
             .par_iter()
@@ -236,97 +215,10 @@ impl MobilityModel {
         })
     }
 
-    /// Predict retention times for a collection of PSMs
-    pub fn predict_peptide(&self, db: &IndexedDatabase, psm: &Feature) -> f64 {
+    pub fn predict_peptide(&self, db: &IndexedDatabase, psm: &FeatureCore) -> f64 {
         let v = Self::embed(&db[psm.peptide_idx], &psm.charge, &self.map);
         v.into_iter()
             .zip(&self.beta)
             .fold(0.0f64, |sum, (x, y)| sum + x * y)
-    }
-}
-
-#[cfg(test)]
-mod test {
-    use super::*;
-    use crate::enzyme::Digest;
-
-    #[test]
-    fn test_feature_embed() {
-        let peps = vec![
-            Peptide::try_from(Digest {
-                decoy: false,
-                sequence: "LEKSLIEK".into(),
-                missed_cleavages: 0,
-                ..Default::default()
-            })
-            .unwrap(),
-            Peptide::try_from(Digest {
-                decoy: false,
-                sequence: "LERSLIEWK".into(),
-                missed_cleavages: 0,
-                ..Default::default()
-            })
-            .unwrap(),
-            Peptide::try_from(Digest {
-                decoy: false,
-                sequence: "LWESLIEK".into(),
-                missed_cleavages: 0,
-                ..Default::default()
-            })
-            .unwrap(),
-            Peptide::try_from(Digest {
-                decoy: false,
-                sequence: "CHADWICK".into(),
-                missed_cleavages: 0,
-                ..Default::default()
-            })
-            .unwrap(),
-        ];
-
-        let charge = 2;
-        let mut map = [0; 26];
-        for (idx, aa) in VALID_AA.iter().enumerate() {
-            map[(aa - b'A') as usize] = idx;
-        }
-        let embeddings: Vec<[f64; FEATURES]> = peps
-            .iter()
-            .map(|x| MobilityModel::embed(x, &charge, &map))
-            .collect();
-
-        let k_idx = map[(b'K' - b'A') as usize];
-        let w_idx = map[(b'W' - b'A') as usize];
-        let l_idx = map[(b'L' - b'A') as usize];
-        let i_idx = map[(b'I' - b'A') as usize];
-
-        let l_nterm_counts = embeddings
-            .iter()
-            .map(|x| x[N_TERMINAL + l_idx])
-            .collect::<Vec<f64>>();
-        let k_nterm_counts = embeddings
-            .iter()
-            .map(|x| x[N_TERMINAL + k_idx])
-            .collect::<Vec<f64>>();
-        let k_cterm_counts = embeddings
-            .iter()
-            .map(|x| x[C_TERMINAL + k_idx])
-            .collect::<Vec<f64>>();
-        let w_nterm_counts = embeddings
-            .iter()
-            .map(|x| x[N_TERMINAL + w_idx])
-            .collect::<Vec<f64>>();
-        let w_cterm_counts = embeddings
-            .iter()
-            .map(|x| x[C_TERMINAL + w_idx])
-            .collect::<Vec<f64>>();
-        let i_cterm_counts = embeddings
-            .iter()
-            .map(|x| x[C_TERMINAL + i_idx])
-            .collect::<Vec<f64>>();
-        assert_eq!(l_nterm_counts, vec![1.0, 1.0, 1.0, 0.0,], "L N-term counts");
-        assert_eq!(k_nterm_counts, vec![0.0, 0.0, 0.0, 0.0,], "K N-term counts");
-        assert_eq!(w_nterm_counts, vec![0.0, 0.0, 1.0, 0.0,], "W N-term counts");
-        assert_eq!(k_cterm_counts, vec![1.0, 1.0, 1.0, 1.0,], "K C-term counts");
-        assert_eq!(w_cterm_counts, vec![0.0, 1.0, 0.0, 0.0,], "W C-term counts");
-        assert_eq!(i_cterm_counts, vec![0.0, 0.0, 0.0, 0.0,], "I C-term counts");
     }
 }

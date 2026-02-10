@@ -22,7 +22,7 @@ use parquet::{
 use sage_core::database::IndexedDatabase;
 use sage_core::ion_series::Kind;
 use sage_core::lfq::{Peak, PrecursorId};
-use sage_core::scoring::Feature;
+use sage_core::scoring::{FeatureCore, TdcFeature};
 use sage_core::tmt::TmtQuant;
 
 pub fn build_schema() -> Result<Type, parquet::errors::ParquetError> {
@@ -82,7 +82,7 @@ pub fn build_schema() -> Result<Type, parquet::errors::ParquetError> {
 /// Caller must guarantee that `reporter_ions` is not an empty slice
 fn write_reporter_ions(
     mut column: SerializedColumnWriter,
-    features: &[Feature],
+    features: &[TdcFeature],
     reporter_ions: &[TmtQuant],
 ) -> parquet::errors::Result<()> {
     let mut scan_map = HashMap::new();
@@ -102,7 +102,7 @@ fn write_reporter_ions(
 
     let col = column.typed::<FloatType>();
     for feature in features {
-        if let Some(rs) = scan_map.get(&(feature.file_id, &feature.spec_id)) {
+        if let Some(rs) = scan_map.get(&(feature.core.file_id, &feature.core.spec_id)) {
             col.write_batch(&rs.peaks, Some(&def_levels), Some(&rep_levels))?;
         } else {
             col.write_batch(&[], Some(&[0]), Some(&[0]))?;
@@ -125,7 +125,7 @@ fn write_null_column(
 }
 
 pub fn serialize_features(
-    features: &[Feature],
+    features: &[TdcFeature],
     reporter_ions: &[TmtQuant],
     filenames: &[String],
     database: &IndexedDatabase,
@@ -147,7 +147,7 @@ pub fn serialize_features(
                     col.typed::<$ty>().write_batch(
                         &features
                             .iter()
-                            .map(|f| f.$field as <$ty as DataType>::T)
+                            .map(|f| f.core.$field as <$ty as DataType>::T)
                             .collect::<Vec<_>>(),
                         None,
                         None,
@@ -167,40 +167,59 @@ pub fn serialize_features(
             };
         }
 
-        write_col!(|f: &Feature| f.psm_id as i64, Int64Type);
+        macro_rules! write_col_top {
+            ($field:ident, $ty:ident) => {
+                if let Some(mut col) = rg.next_column()? {
+                    col.typed::<$ty>().write_batch(
+                        &features
+                            .iter()
+                            .map(|f| f.$field as <$ty as DataType>::T)
+                            .collect::<Vec<_>>(),
+                        None,
+                        None,
+                    )?;
+                    col.close()?;
+                }
+            };
+        }
+
+        write_col!(psm_id, Int64Type); // f.core.psm_id
         write_col!(
-            |f: &Feature| filenames[f.file_id].as_str().into(),
+            |f: &TdcFeature| filenames[f.core.file_id].as_bytes().into(),
             ByteArrayType
         );
-        write_col!(|f: &Feature| f.spec_id.as_str().into(), ByteArrayType);
         write_col!(
-            |f: &Feature| database[f.peptide_idx].to_string().as_bytes().into(),
+            |f: &TdcFeature| f.core.spec_id.as_bytes().into(),
             ByteArrayType
         );
         write_col!(
-            |f: &Feature| database[f.peptide_idx].sequence.as_ref().into(),
+            |f: &TdcFeature| database[f.core.peptide_idx].to_string().as_bytes().into(),
             ByteArrayType
         );
         write_col!(
-            |f: &Feature| database[f.peptide_idx]
+            |f: &TdcFeature| database[f.core.peptide_idx].sequence.as_ref().into(),
+            ByteArrayType
+        );
+        write_col!(
+            |f: &TdcFeature| database[f.core.peptide_idx]
                 .proteins(&database.decoy_tag, database.generate_decoys)
-                .as_str()
+                .as_bytes()
                 .into(),
             ByteArrayType
         );
         write_col!(
-            |f: &Feature| database[f.peptide_idx].proteins.len() as i32,
+            |f: &TdcFeature| database[f.core.peptide_idx].proteins.len() as i32,
             Int32Type
         );
         write_col!(rank, Int32Type);
-        write_col!(|f: &Feature| f.label == -1, BoolType);
+        write_col!(|f: &TdcFeature| f.core.label == -1, BoolType);
         write_col!(expmass, FloatType);
         write_col!(calcmass, FloatType);
         write_col!(charge, Int32Type);
         write_col!(peptide_len, Int32Type);
         write_col!(missed_cleavages, Int32Type);
         write_col!(
-            |f: &Feature| database[f.peptide_idx].semi_enzymatic,
+            |f: &TdcFeature| database[f.core.peptide_idx].semi_enzymatic,
             BoolType
         );
         write_col!(ms2_intensity, FloatType);
@@ -223,12 +242,17 @@ pub fn serialize_features(
         write_col!(longest_y_pct, FloatType);
         write_col!(matched_intensity_pct, FloatType);
         write_col!(scored_candidates, Int32Type);
-        write_col!(poisson, FloatType);
-        write_col!(discriminant_score, FloatType);
-        write_col!(posterior_error, FloatType);
-        write_col!(spectrum_q, FloatType);
-        write_col!(peptide_q, FloatType);
-        write_col!(protein_q, FloatType);
+        write_col!(
+            |f: &TdcFeature| (-(f.core.poisson as f32)).ln_1p(),
+            FloatType
+        );
+
+        // These are on TdcFeature, not core
+        write_col_top!(discriminant_score, FloatType);
+        write_col_top!(posterior_error, FloatType);
+        write_col_top!(spectrum_q, FloatType);
+        write_col_top!(peptide_q, FloatType);
+        write_col_top!(protein_q, FloatType);
 
         if let Some(col) = rg.next_column()? {
             if reporter_ions.is_empty() {
@@ -259,8 +283,151 @@ pub fn build_matched_fragment_schema() -> parquet::errors::Result<Type> {
     parquet::schema::parser::parse_message_type(msg)
 }
 
+pub fn serialize_fragments(
+    features: &[&FeatureCore],
+    _filenames: &[String],
+) -> Result<Vec<u8>, parquet::errors::ParquetError> {
+    let schema = build_matched_fragment_schema()?;
+
+    let options = WriterProperties::builder()
+        .set_compression(parquet::basic::Compression::ZSTD(ZstdLevel::try_new(3)?))
+        .build();
+
+    let buf = Vec::new();
+    let mut writer = SerializedFileWriter::new(buf, schema.into(), options.into())?;
+
+    for features in features.chunks(65536) {
+        let mut rg = writer.next_row_group()?;
+
+        if let Some(mut col) = rg.next_column()? {
+            let psm_ids = features
+                .iter()
+                .flat_map(|f| {
+                    std::iter::repeat(f.psm_id as i64).take(
+                        f.fragments
+                            .as_ref()
+                            .map(|fragments| fragments.fragment_ordinals.len())
+                            .unwrap_or_default(),
+                    )
+                })
+                .collect::<Vec<_>>();
+
+            col.typed::<Int64Type>().write_batch(&psm_ids, None, None)?;
+            col.close()?;
+        }
+
+        if let Some(mut col) = rg.next_column()? {
+            let fragment_types = features
+                .iter()
+                .flat_map(|f| {
+                    f.fragments
+                        .as_ref()
+                        .map(|fragments| fragments.kinds.iter().copied())
+                })
+                .flatten()
+                .map(|kind| match kind {
+                    Kind::A => "a".as_bytes().into(),
+                    Kind::B => "b".as_bytes().into(),
+                    Kind::C => "c".as_bytes().into(),
+                    Kind::X => "x".as_bytes().into(),
+                    Kind::Y => "y".as_bytes().into(),
+                    Kind::Z => "z".as_bytes().into(),
+                })
+                .collect::<Vec<ByteArray>>();
+
+            col.typed::<ByteArrayType>()
+                .write_batch(&fragment_types, None, None)?;
+            col.close()?;
+        }
+
+        if let Some(mut col) = rg.next_column()? {
+            let fragment_ordinals = features
+                .iter()
+                .flat_map(|f| {
+                    f.fragments
+                        .as_ref()
+                        .map(|fragments| fragments.fragment_ordinals.iter().copied())
+                })
+                .flatten()
+                .collect::<Vec<_>>();
+
+            col.typed::<Int32Type>()
+                .write_batch(&fragment_ordinals, None, None)?;
+            col.close()?;
+        }
+
+        if let Some(mut col) = rg.next_column()? {
+            let fragment_charge = features
+                .iter()
+                .flat_map(|f| {
+                    f.fragments
+                        .as_ref()
+                        .map(|fragments| fragments.charges.iter().copied())
+                })
+                .flatten()
+                .collect::<Vec<i32>>();
+
+            col.typed::<Int32Type>()
+                .write_batch(&fragment_charge, None, None)?;
+            col.close()?;
+        }
+
+        if let Some(mut col) = rg.next_column()? {
+            let fragment_mz_experimental = features
+                .iter()
+                .flat_map(|f| {
+                    f.fragments
+                        .as_ref()
+                        .map(|fragments| fragments.mz_experimental.iter().copied())
+                })
+                .flatten()
+                .collect::<Vec<_>>();
+
+            col.typed::<FloatType>()
+                .write_batch(&fragment_mz_experimental, None, None)?;
+            col.close()?;
+        }
+
+        if let Some(mut col) = rg.next_column()? {
+            let fragment_mz_calculated = features
+                .iter()
+                .flat_map(|f| {
+                    f.fragments
+                        .as_ref()
+                        .map(|fragments| fragments.mz_calculated.iter().copied())
+                })
+                .flatten()
+                .collect::<Vec<_>>();
+
+            col.typed::<FloatType>()
+                .write_batch(&fragment_mz_calculated, None, None)?;
+            col.close()?;
+        }
+
+        if let Some(mut col) = rg.next_column()? {
+            let fragment_intensity = features
+                .iter()
+                .flat_map(|f| {
+                    f.fragments
+                        .as_ref()
+                        .map(|fragments| fragments.intensities.iter().copied())
+                })
+                .flatten()
+                .collect::<Vec<_>>();
+
+            col.typed::<FloatType>()
+                .write_batch(&fragment_intensity, None, None)?;
+            col.close()?;
+        }
+
+        rg.close()?;
+    }
+
+    writer.into_inner()
+}
+
 pub fn serialize_matched_fragments(
-    features: &[Feature],
+    features: &[FeatureCore],
 ) -> Result<Vec<u8>, parquet::errors::ParquetError> {
     let schema = build_matched_fragment_schema()?;
 
@@ -394,6 +561,101 @@ pub fn serialize_matched_fragments(
             col.typed::<FloatType>()
                 .write_batch(&fragment_intensity, None, None)?;
             col.close()?;
+        }
+
+        rg.close()?;
+    }
+
+    writer.into_inner()
+}
+
+pub fn build_tmt_schema() -> Result<Type, parquet::errors::ParquetError> {
+    let msg = r#"
+        message schema {
+            required byte_array filename (utf8);
+            required byte_array scannr (utf8);
+            required float ion_injection_time;
+            optional group reporter_ion_intensity (LIST) {
+                repeated group list {
+                    optional float element;
+                }
+            }
+        }
+    "#;
+    parquet::schema::parser::parse_message_type(msg)
+}
+
+/// Caller must guarantee `quant` is not empty if writing reporter ion list
+fn write_tmt_peaks(
+    mut column: SerializedColumnWriter,
+    quant: &[TmtQuant],
+) -> parquet::errors::Result<()> {
+    let channels = quant[0].peaks.len();
+
+    let def_levels = vec![3; channels];
+    let mut rep_levels = vec![1; channels];
+    rep_levels[0] = 0;
+
+    let col = column.typed::<FloatType>();
+    for q in quant {
+        col.write_batch(&q.peaks, Some(&def_levels), Some(&rep_levels))?;
+    }
+
+    column.close()?;
+    Ok(())
+}
+
+pub fn serialize_tmt(
+    quant: &[TmtQuant],
+    filenames: &[String],
+) -> Result<Vec<u8>, parquet::errors::ParquetError> {
+    let schema = build_tmt_schema()?;
+
+    let options = WriterProperties::builder()
+        .set_compression(parquet::basic::Compression::ZSTD(ZstdLevel::try_new(3)?))
+        .build();
+
+    let buf = Vec::new();
+    let mut writer = SerializedFileWriter::new(buf, schema.into(), options.into())?;
+
+    for quant in quant.chunks(65536) {
+        let mut rg = writer.next_row_group()?;
+
+        if let Some(mut col) = rg.next_column()? {
+            let values = quant
+                .iter()
+                .map(|q| filenames[q.file_id].as_bytes().into())
+                .collect::<Vec<ByteArray>>();
+            col.typed::<ByteArrayType>()
+                .write_batch(&values, None, None)?;
+            col.close()?;
+        }
+
+        if let Some(mut col) = rg.next_column()? {
+            let values = quant
+                .iter()
+                .map(|q| q.spec_id.as_bytes().into())
+                .collect::<Vec<ByteArray>>();
+            col.typed::<ByteArrayType>()
+                .write_batch(&values, None, None)?;
+            col.close()?;
+        }
+
+        if let Some(mut col) = rg.next_column()? {
+            let values = quant
+                .iter()
+                .map(|q| q.ion_injection_time)
+                .collect::<Vec<f32>>();
+            col.typed::<FloatType>().write_batch(&values, None, None)?;
+            col.close()?;
+        }
+
+        if let Some(col) = rg.next_column()? {
+            if quant.is_empty() {
+                write_null_column(col, 0)?;
+            } else {
+                write_tmt_peaks(col, quant)?;
+            }
         }
 
         rg.close()?;

@@ -1,11 +1,11 @@
 use rayon::prelude::*;
 use sage_core::spectrum::MS1Spectra;
-use sage_core::{scoring::Feature, tmt::TmtQuant};
+use sage_core::{scoring::FeatureCore, tmt::TmtQuant};
 
 #[derive(Default)]
 pub struct SageResults {
     pub ms1: MS1Spectra,
-    pub features: Vec<Feature>,
+    pub features: Vec<FeatureCore>,
     pub quant: Vec<TmtQuant>,
 }
 

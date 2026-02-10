@@ -24,12 +24,17 @@ pub struct Iter<'a, Axes> {
 }
 
 impl<'a> Iterator for Iter<'a, Row> {
-    type Item = f64;
+    type Item = &'a f64;
 
     fn next(&mut self) -> Option<Self::Item> {
-        let data = self.data.get(self.row, self.col);
+        // STOP at end of row (critical invariant)
+        if self.col >= self.data.cols {
+            return None;
+        }
+
+        let idx = self.data.cols * self.row + self.col;
         self.col += 1;
-        data
+        self.data.data.get(idx)
     }
 }
 
@@ -127,13 +132,11 @@ impl Matrix {
     }
 
     /// Return an iterator over values in a single row
-    pub fn row(&self, row: usize) -> Iter<'_, Row> {
-        Iter {
-            data: self,
-            row,
-            col: 0,
-            axes: PhantomData,
-        }
+    pub fn row(&self, row: usize) -> impl Iterator<Item = &f64> {
+        debug_assert!(row < self.rows, "row index out of bounds");
+        let start = row * self.cols;
+        let end = start + self.cols; // EXCLUSIVE
+        self.data[start..end].iter()
     }
 
     pub fn row_slice(&self, row: usize) -> &[f64] {

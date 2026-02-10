@@ -1,4 +1,4 @@
-use crate::scoring::Feature;
+use crate::scoring::{DfFeature, FeatureCore};
 use rand::seq::SliceRandom;
 use rand::thread_rng;
 use serde::{Deserialize, Serialize};
@@ -39,7 +39,7 @@ pub struct PsmData {
 
 /// Extract features from a Sage Feature struct
 /// Implements the "High-Performance Feature Set" (~12 features)
-pub fn extract_features(feat: &Feature) -> Vec<f64> {
+pub fn extract_features(feat: &FeatureCore) -> Vec<f64> {
     // Safety check for log transform
     let log_intensity = if feat.ms2_intensity > 0.0 {
         (feat.ms2_intensity as f64).log10()
@@ -379,7 +379,13 @@ pub fn normalize_features(data: &mut [PsmData]) -> (Vec<f64>, Vec<f64>) {
 }
 
 /// Main entry point: Train model and return probabilities for all features
-pub fn rescore(features: &[Feature], train_fdr: f32) -> Option<Vec<f64>> {
+///
+/// `is_positive` determines if a feature is considered a high-confidence target for training.
+pub fn rescore(
+    features: &[FeatureCore],
+    train_fdr: f32,
+    is_positive: impl Fn(&FeatureCore) -> bool,
+) -> Option<Vec<f64>> {
     // Nokoi 2.0 Config
     let config = NokoiConfig {
         enabled: true,
@@ -403,13 +409,13 @@ pub fn rescore(features: &[Feature], train_fdr: f32) -> Option<Vec<f64>> {
             original_idx: i,
         };
 
-        // Paper criteria for positive class: "rank1 PSMs... above significance threshold" [cite: 94]
-        if f.rank == 1 && f.spectrum_q <= train_fdr {
+        // Check if positive using the provided closure
+        if is_positive(f) {
             let mut pos_psm = psm.clone();
             pos_psm.label = 1.0;
             positives.push(pos_psm);
         }
-        // Paper criteria for negative class: "rank2 PSMs" (or lower ranks) [cite: 94, 106]
+        // Paper criteria for negative class: "rank2 PSMs" (or lower ranks)
         else if f.rank > 1 {
             negatives.push(psm.clone());
         }
@@ -526,8 +532,181 @@ pub fn rescore(features: &[Feature], train_fdr: f32) -> Option<Vec<f64>> {
     Some(probabilities)
 }
 
+/// Decoy-free entry point:
+/// - Positives: decided by caller via `is_positive`
+/// - Negatives: rank in [min_null_rank, max_null_rank]
+///
+/// Returns P(target) for every PSM (aligned 1:1 with `features`).
+pub fn rescore_df(
+    features: &[DfFeature],
+    train_fdr: f32,
+    min_null_rank: u32,
+    max_null_rank: u32,
+    is_positive: impl Fn(&DfFeature) -> bool,
+) -> Option<Vec<f64>> {
+    // Nokoi 2.0 Config (same defaults as `rescore`)
+    let config = NokoiConfig {
+        enabled: true,
+        train_fdr,
+        learning_rate: 0.1,
+        epochs: 500,
+        l1_lambda: 0.005,
+        patience: 15,
+    };
+
+    // 1) Build positives/negatives + all_data (predict on everything)
+    let mut positives: Vec<PsmData> = Vec::new();
+    let mut negatives: Vec<PsmData> = Vec::new();
+    let mut all_data: Vec<PsmData> = Vec::with_capacity(features.len());
+
+    for (i, f) in features.iter().enumerate() {
+        let feat_vec = extract_features(&f.core);
+        let psm = PsmData {
+            features: feat_vec.clone(),
+            label: 0.0,
+            original_idx: i,
+        };
+
+        // Positives: caller-defined (should include rank==1 gate)
+        if is_positive(f) {
+            let mut pos_psm = psm.clone();
+            pos_psm.label = 1.0;
+            positives.push(pos_psm);
+        } else {
+            // Negatives: rank-window only
+            let r = f.core.rank as u32;
+            if r >= min_null_rank && r <= max_null_rank {
+                negatives.push(psm.clone());
+            }
+        }
+
+        all_data.push(psm);
+    }
+
+    // --- Graceful fallback for low data (match your existing behavior) ---
+    let confident_count = positives.len();
+    if confident_count < 50 {
+        log::warn!(
+            "Nokoi DF: Too few positives ({} < 50) - falling back to normalized hyperscore",
+            confident_count
+        );
+
+        if features.is_empty() {
+            return None;
+        }
+
+        let min_hs = features
+            .iter()
+            .map(|f| f.core.hyperscore as f64)
+            .fold(f64::INFINITY, f64::min);
+        let max_hs = features
+            .iter()
+            .map(|f| f.core.hyperscore as f64)
+            .fold(f64::NEG_INFINITY, f64::max);
+        let range = max_hs - min_hs;
+
+        if range == 0.0 {
+            return Some(vec![0.5; features.len()]);
+        }
+
+        let probabilities: Vec<f64> = features
+            .iter()
+            .map(|f| (f.core.hyperscore as f64 - min_hs) / range)
+            .collect();
+
+        return Some(probabilities);
+    } else if confident_count < 100 {
+        log::warn!(
+            "Nokoi DF: Low training data ({}), model may vary.",
+            confident_count
+        );
+    }
+
+    // 2) Balanced sampling (same as existing)
+    let mut rng = thread_rng();
+    positives.shuffle(&mut rng);
+    negatives.shuffle(&mut rng);
+
+    let n_pos = positives.len();
+    let n_neg = negatives.len();
+
+    // If negatives are too few, fail closed to fallback hyperscore behavior (consistent + safe)
+    if n_neg < 50 {
+        log::warn!(
+            "Nokoi DF: Too few negatives from rank window ({} < 50) - falling back to normalized hyperscore",
+            n_neg
+        );
+        if features.is_empty() {
+            return None;
+        }
+        let min_hs = features
+            .iter()
+            .map(|f| f.core.hyperscore as f64)
+            .fold(f64::INFINITY, f64::min);
+        let max_hs = features
+            .iter()
+            .map(|f| f.core.hyperscore as f64)
+            .fold(f64::NEG_INFINITY, f64::max);
+        let range = max_hs - min_hs;
+        if range == 0.0 {
+            return Some(vec![0.5; features.len()]);
+        }
+        let probabilities: Vec<f64> = features
+            .iter()
+            .map(|f| (f.core.hyperscore as f64 - min_hs) / range)
+            .collect();
+        return Some(probabilities);
+    }
+
+    let sample_size = n_pos.min(n_neg).min(10_000);
+
+    let mut training_data = Vec::with_capacity(sample_size * 2);
+    training_data.extend_from_slice(&positives[0..sample_size]);
+    training_data.extend_from_slice(&negatives[0..sample_size]);
+
+    training_data.shuffle(&mut rng);
+
+    log::info!(
+        "Nokoi DF: Constructed balanced training set: {} positives, {} negatives (drawn from {} pos, {} neg)",
+        sample_size, sample_size, n_pos, n_neg
+    );
+
+    // 3) Normalize (same as existing)
+    let (means, stds) = normalize_features(&mut training_data);
+
+    for sample in all_data.iter_mut() {
+        for (i, x) in sample.features.iter_mut().enumerate() {
+            if stds[i] > 1e-9 {
+                *x = (*x - means[i]) / stds[i];
+            } else {
+                *x = 0.0;
+            }
+        }
+    }
+
+    // 4) Train (same as existing)
+    let n_features = training_data[0].features.len();
+    let mut model = LogisticRegression::new(n_features);
+
+    log::info!(
+        "Nokoi DF: Training on {} pos, {} neg samples...",
+        training_data.iter().filter(|d| d.label == 1.0).count(),
+        training_data.iter().filter(|d| d.label == 0.0).count()
+    );
+
+    model.train_cv(&training_data, &config);
+
+    // 5) Predict on all
+    let probabilities: Vec<f64> = all_data
+        .iter()
+        .map(|sample| model.predict(&sample.features))
+        .collect();
+
+    Some(probabilities)
+}
+
 /// Convert Probabilities to P-values using ECDF of Negatives (Rank > 1)
-pub fn calc_empirical_p_values(features: &[Feature], probs: &[f64]) -> Vec<f64> {
+pub fn calc_empirical_p_values(features: &[FeatureCore], probs: &[f64]) -> Vec<f64> {
     let mut neg_probs: Vec<f64> = features
         .iter()
         .zip(probs)
