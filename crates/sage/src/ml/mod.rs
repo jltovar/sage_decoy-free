@@ -3,6 +3,7 @@
 pub mod gauss;
 pub mod kde;
 pub mod linear_discriminant;
+pub mod lower_order; //decoy-free addition
 pub mod matrix;
 pub mod mobility_model;
 pub mod msfdr; //decoy-free addition

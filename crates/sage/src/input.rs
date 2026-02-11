@@ -55,8 +55,8 @@ impl Default for MsfdrSeedMode {
 #[derive(Clone, Serialize, Deserialize, Debug, Default, PartialEq, Eq)]
 #[serde(rename_all = "snake_case")]
 pub enum LoRankKey {
-    Hyperscore,
     #[default]
+    Hyperscore,
     LoAdjusted,
 }
 
@@ -280,9 +280,10 @@ impl From<FdrOptions> for FdrSettings {
         // Independence default: do NOT blend LO toward Moments unless explicitly requested.
         let lo_beta_blend_moments = options.lo_beta_blend_moments.unwrap_or(0.0).clamp(0.0, 1.0);
 
+        // Neutral default: 1.0 means "no safety scaling applied unless user sets it".
         let lo_beta_safety_mult = match options.lo_beta_safety_mult {
             Some(x) if x.is_finite() && x > 0.0 => x.clamp(0.1, 10.0),
-            _ => 0.60,
+            _ => 1.0,
         };
 
         let calibrate_per_method = options.calibrate_per_method.unwrap_or(true);

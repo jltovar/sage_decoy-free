@@ -2,6 +2,9 @@ use crate::database::IndexedDatabase;
 use crate::input::{EnsemblePCombiner, EnsemblePepCombiner, LoRankKey};
 use crate::input::{FdrSettings, FdrType, ModelFit};
 use crate::lfq::{Peak, PrecursorId};
+use crate::ml::lower_order::{
+    fit_decoy_free_model, fit_gumbel_mle, fit_gumbel_moments, LowerOrderModel,
+};
 use crate::ml::nokoi;
 use crate::ml::stats;
 use crate::scoring::DfFeature;
@@ -9,7 +12,6 @@ use fnv::{FnvHashMap, FnvHashSet};
 use rayon::prelude::*;
 use statrs::consts::EULER_MASCHERONI;
 use statrs::distribution::{Continuous, ContinuousCDF, Gumbel};
-use statrs::function::gamma::digamma;
 use std::sync::Arc;
 
 #[derive(Clone, Debug)]
@@ -32,6 +34,44 @@ struct Rank1Computed {
     pep_final: f64,
     df_score: f32,
 }
+
+// =============================================================================
+// Decoy-Free Lower-Order (LO) contract (Phase 0 / Step 0.1 — comment-only)
+// =============================================================================
+//
+// Purpose
+// -------
+// LO implements a charge-stratified “Top Null Model” (TNM) selection via minimum
+// BIC, and a set of per-charge Lower-Order Models (LOMs) fit on rank-null pools.
+//
+// Definitions (paper-aligned)
+// ---------------------------
+// - TNM (Top Null Model): a Gumbel(mu, beta) intended to model the top-scoring
+//   distribution (rank==1) for a given charge state.
+// - LOM (Lower-Order Model): regression fit using rank-null pool scores over
+//   ranks k=2..10 (paper default), per charge state.
+//
+// Selection / fitting rules (invariants)
+// --------------------------------------
+// 1) LO is charge-stratified.
+//    - All TNM/LOM fitting and selection are done independently per charge.
+//
+// 2) TNM selection considers exactly 4 candidates:
+//      (LR vs mean-β) × (MLE vs moments)
+//    - “LR”      : beta derived from lower-order regression strategy.
+//    - “mean-β”  : beta derived as the mean of β estimates from multiple LOM fits.
+//    - “MLE”     : mu (and beta when applicable) fitted by maximum likelihood.
+//    - “moments” : mu/beta fitted by method of moments.
+//
+// 3) TNM BIC is computed using ONLY rank==1 scores for that charge.
+//    - Candidate TNMs are compared by BIC on the charge-specific rank==1 set.
+//    - The selected TNM is the candidate with minimum BIC (for that charge).
+//
+// 4) LOMs are fit from the rank-null pool for that charge using ranks k=2..10
+//    (paper default), per charge.
+//    - The rank-null pool is charge-specific and excludes rank==1.
+//    - LOM fitting uses only ranks within the configured null-rank window.
+// =============================================================================
 
 // =============================================================================
 // Helpers (math, calibration, parsing, diagnostics, and model fitting)
@@ -76,17 +116,27 @@ fn log_add_exp(a: f64, b: f64) -> f64 {
 }
 
 #[inline]
-fn clamp_f64(x: f64, lo: f64, hi: f64) -> f64 {
-    if !x.is_finite() {
-        return lo;
-    }
-    x.max(lo).min(hi)
-}
-
-#[inline]
 fn neg_log10_p(p: f64) -> f64 {
     // “quality”: bigger is better
     -p.max(1e-300).log10()
+}
+
+// -----------------------------------------------------------------------------
+// 1b) TEV normalization helper
+// -----------------------------------------------------------------------------
+//
+// We keep core.hyperscore unchanged.
+// For any Gumbel(mu,beta).sf(hyperscore), we compute TEV_norm = (hs - mu)/beta
+// and evaluate sf(TEV_norm) under a standard Gumbel(0,1).
+//
+// This makes the sf(x) input a normalized TEV scale without changing outputs.
+//
+#[inline]
+fn tev_norm_from_hyperscore(hs: f64, mu: f64, beta: f64) -> f64 {
+    if !hs.is_finite() || !mu.is_finite() || !beta.is_finite() || beta <= 0.0 {
+        return f64::NEG_INFINITY; // yields sf ~ 1.0 (fail-closed)
+    }
+    (hs - mu) / beta
 }
 
 // -----------------------------------------------------------------------------
@@ -258,6 +308,33 @@ fn df_p_value(psm: &DfFeature) -> f32 {
 #[inline(always)]
 fn df_q_value(psm: &DfFeature) -> f32 {
     psm.decoy_free_q_value.unwrap_or(1.0)
+}
+
+// -----------------------------------------------------------------------------
+// 6b) Canonical evidence accessor (raw hyperscore) + TEV normalization
+// -----------------------------------------------------------------------------
+//
+// Contract:
+// - We keep `core.hyperscore` UNCHANGED and treat it as the raw evidence score
+//   produced by vanilla Sage ("hyperscore").
+// - The decoy-free null is modeled as Gumbel(mu, beta) over this raw hyperscore
+//   (fitted from the rank-null pool).
+// - Whenever we need a "TEV-normalized" input for survival evaluation, we compute:
+//       tev_norm = (hyperscore - mu) / beta
+//   and evaluate `sf(tev_norm)` under a STANDARD Gumbel(0, 1).
+//
+// Invariants:
+// - Null pool scores == raw hyperscore values returned by `tev(f)` below.
+// - Moments/MLE/LO fit parameters are fit on those same raw values.
+// - All p-value computations use `tev_norm_from_hyperscore(hs, mu, beta)`
+#[inline(always)]
+fn tev(f: &DfFeature) -> Option<f64> {
+    let x = f.core.hyperscore as f64;
+    if x.is_finite() {
+        Some(x)
+    } else {
+        None
+    }
 }
 
 // -----------------------------------------------------------------------------
@@ -519,7 +596,7 @@ impl WorkSet {
         let rank1_indices: Vec<usize> = features
             .iter()
             .enumerate()
-            .filter(|(_, f)| f.core.rank == 1 && (f.core.hyperscore as f64).is_finite())
+            .filter(|(_, f)| f.core.rank == 1 && tev(f).is_some())
             .map(|(i, _)| i)
             .collect();
         Self { rank1_indices }
@@ -574,145 +651,27 @@ fn log_rank1_composition(features: &[DfFeature], work: &WorkSet, db: &IndexedDat
     );
 }
 
-// -----------------------------------------------------------------------------
-// 13) Model fitting helpers (LO regression, Gumbel moments, Gumbel MLE)
-// -----------------------------------------------------------------------------
-
-fn fit_lower_order_regression(
-    data: &[(u32, f64)],
-    min_rank: u32,
-    max_rank: u32,
-    min_count: usize,
-) -> Option<(f64, f64)> {
-    let span = (max_rank - min_rank + 1) as usize;
-    let mut rank_sums = vec![0.0f64; span];
-    let mut rank_counts = vec![0usize; span];
-    for &(rank, score) in data {
-        if rank >= min_rank && rank <= max_rank {
-            let idx = (rank - min_rank) as usize;
-            rank_sums[idx] += score;
-            rank_counts[idx] += 1;
-        }
-    }
-    let mut x_vec = Vec::new();
-    let mut y_vec = Vec::new();
-    for r in min_rank..=max_rank {
-        let idx = (r - min_rank) as usize;
-        if rank_counts[idx] >= min_count {
-            x_vec.push(-digamma(r as f64));
-            y_vec.push(rank_sums[idx] / rank_counts[idx] as f64);
-        }
-    }
-    if x_vec.len() < 2 {
-        return None;
-    }
-    let n = x_vec.len() as f64;
-    let sum_x: f64 = x_vec.iter().sum();
-    let sum_y: f64 = y_vec.iter().sum();
-    let sum_xy: f64 = x_vec.iter().zip(&y_vec).map(|(x, y)| x * y).sum();
-    let sum_xx: f64 = x_vec.iter().map(|x| x * x).sum();
-    let denom = n * sum_xx - sum_x.powi(2);
-    if !denom.is_finite() || denom.abs() < 1e-12 {
-        return None;
-    }
-    let slope = (n * sum_xy - sum_x * sum_y) / denom;
-    let intercept = (sum_y - slope * sum_x) / n;
-    if !slope.is_finite() || slope <= 0.0 || !intercept.is_finite() {
-        None
-    } else {
-        Some((intercept, slope))
-    }
-}
-
-fn fit_gumbel_moments(scores: &[f64]) -> (f64, f64) {
-    let finite: Vec<f64> = scores.iter().cloned().filter(|x| x.is_finite()).collect();
-    if finite.len() < 2 {
-        return (f64::NAN, f64::NAN);
-    }
-    let n = finite.len() as f64;
-    let mean = finite.iter().sum::<f64>() / n;
-    let var = finite.iter().map(|s| (s - mean).powi(2)).sum::<f64>() / n;
-    if !var.is_finite() || var < 0.0 {
-        return (f64::NAN, f64::NAN);
-    }
-    let beta = (var * 6.0 / std::f64::consts::PI.powi(2)).sqrt();
-    if !beta.is_finite() || beta <= 0.0 {
-        (f64::NAN, f64::NAN)
-    } else {
-        (mean - EULER_MASCHERONI * beta, beta)
-    }
-}
-
-fn fit_gumbel_mle(scores: &[f64]) -> Option<(f64, f64)> {
-    let finite: Vec<f64> = scores.iter().cloned().filter(|x| x.is_finite()).collect();
-    if finite.len() < 2 {
-        return None;
-    }
-    let n = finite.len() as f64;
-    let x_bar = finite.iter().sum::<f64>() / n;
-    let (_, mut beta) = fit_gumbel_moments(&finite);
-    if !beta.is_finite() || beta <= 0.0 {
-        return None;
-    }
-    for _ in 0..20 {
-        let mut num = 0.0;
-        let mut den = 0.0;
-        for &x in &finite {
-            let z = x / beta;
-            let exp_neg_z = (-z).exp();
-            if exp_neg_z.is_finite() {
-                num += x * exp_neg_z;
-                den += exp_neg_z;
-            }
-        }
-        if den <= 0.0 {
-            return None;
-        }
-        let next_beta = x_bar - (num / den);
-        if !next_beta.is_finite() || next_beta <= 0.0 {
-            return None;
-        }
-        if (next_beta - beta).abs() < 1e-5 {
-            beta = next_beta;
-            break;
-        }
-        beta = next_beta;
-    }
-    let sum_exp = finite.iter().map(|&x| (-x / beta).exp()).sum::<f64>();
-    let mu = -beta * (sum_exp / n).ln();
-    if mu.is_finite() {
-        Some((mu, beta))
-    } else {
-        None
-    }
-}
-
 // --- STAGE STRUCTS ---
 #[derive(Clone, Debug)]
 struct RankNullPool {
     // Null pool members (purified) are rank in [min_rank..=max_rank]
     // We keep indices so other models (e.g., Nokoi) can reuse the same null pool.
-    fit_data: Vec<(u32, f64)>, // (rank, hyperscore)
-    null_indices: Vec<usize>,  // indices into `features`, aligned with fit_data/scores
-    scores: Vec<f64>,          // hyperscore scores for null fit (aligned)
-    n_eff_global: f64,         // mean scored_candidates among rank1
-    n_global: f64,             // median-based effective search space (clamped)
+    fit_data: Vec<(u32, f64, u8)>, // (rank, hyperscore, charge)
+    null_indices: Vec<usize>,      // indices into `features`, aligned with fit_data/scores
+    scores: Vec<f64>,              // hyperscore scores for global moments/mle fit (aligned)
 }
 
 #[derive(Clone)]
 struct Engines {
-    dist_mom: Gumbel,
-    dist_mle: Gumbel,
+    // Fitted parameters for TEV normalization (no need to carry Gumbel objects)
+    mom_mu: f64,
+    mom_beta: f64,
 
-    // LO parameters
-    lo_intercept: f64,
-    lo_beta_shrunk: f64,
-    lo_alpha: f64,
-    lo_ln_ratio_cap: f64,
+    mle_mu: f64,
+    mle_beta: f64,
 
-    // global search space
-    n_eff_global: f64,
-    n_global: f64,
+    // LO parameters (charge-stratified TNM model; Step 2.2)
+    lo_model: LowerOrderModel,
 
     // optional engines
     msfdr_model: Option<RobustMsfdrModel>,
@@ -730,9 +689,11 @@ fn build_rank_null_pool(
     work: &WorkSet,
     settings: &FdrSettings,
 ) -> Option<RankNullPool> {
+    let min_null_size = settings.min_null_size;
+
+    // Null-rank window (used throughout this function)
     let min_rank = settings.min_null_rank;
     let max_rank = settings.max_null_rank;
-    let min_null_size = settings.min_null_size;
 
     // --- PHASE 1: SOFT PURIFIED NULL (same logic we already wrote) ---
 
@@ -740,9 +701,9 @@ fn build_rank_null_pool(
     let mut rank1_scores: Vec<(u32, f64)> = work
         .rank1_indices
         .iter()
-        .map(|&i| {
+        .filter_map(|&i| {
             let f = &features[i];
-            (f.core.peptide_idx.0, f.core.hyperscore as f64)
+            Some((f.core.peptide_idx.0, tev(f)?))
         })
         .collect();
 
@@ -762,7 +723,7 @@ fn build_rank_null_pool(
         .map(|(idx, _)| *idx)
         .collect();
 
-    let mut fit_data: Vec<(u32, f64)> = Vec::new();
+    let mut fit_data: Vec<(u32, f64, u8)> = Vec::new();
     let mut null_indices: Vec<usize> = Vec::new();
 
     for (idx, psm) in features.iter().enumerate() {
@@ -773,11 +734,11 @@ fn build_rank_null_pool(
         if purified_peptides.contains(&psm.core.peptide_idx.0) {
             continue;
         }
-        let s = psm.core.hyperscore as f64;
-        if !s.is_finite() {
-            continue;
-        }
-        fit_data.push((r, s));
+        let s = match tev(psm) {
+            Some(v) => v,
+            None => continue,
+        };
+        fit_data.push((r, s, psm.core.charge));
         null_indices.push(idx);
     }
 
@@ -791,22 +752,22 @@ fn build_rank_null_pool(
             if r < min_rank || r > max_rank {
                 continue;
             }
-            let s = psm.core.hyperscore as f64;
-            if !s.is_finite() {
-                continue;
-            }
-            fit_data.push((r, s));
+            let s = match tev(psm) {
+                Some(v) => v,
+                None => continue,
+            };
+            fit_data.push((r, s, psm.core.charge));
             null_indices.push(idx);
         }
     }
 
     // final safety (keep alignment between fit_data and null_indices)
-    let mut fit2: Vec<(u32, f64)> = Vec::with_capacity(fit_data.len());
+    let mut fit2: Vec<(u32, f64, u8)> = Vec::with_capacity(fit_data.len());
     let mut idx2: Vec<usize> = Vec::with_capacity(null_indices.len());
 
-    for (k, (r, s)) in fit_data.into_iter().enumerate() {
+    for (k, (r, s, z)) in fit_data.into_iter().enumerate() {
         if s.is_finite() {
-            fit2.push((r, s));
+            fit2.push((r, s, z));
             idx2.push(null_indices[k]);
         }
     }
@@ -817,46 +778,19 @@ fn build_rank_null_pool(
         return None;
     }
 
-    let scores: Vec<f64> = fit_data.iter().map(|(_, s)| *s).collect();
-
-    // --- global candidate stats (use Stage-0 work set only) ---
-    let total_candidates: u64 = work
-        .rank1_indices
-        .iter()
-        .map(|&i| features[i].core.scored_candidates as u64)
-        .sum();
-
-    let num_spectra = (work.rank1_indices.len().max(1)) as f64;
-    let n_eff_global = (total_candidates as f64 / num_spectra).max(2.0);
-
-    let log_n_global_vec: Vec<f64> = work
-        .rank1_indices
-        .iter()
-        .filter_map(|&i| {
-            let n = features[i].core.scored_candidates as f64;
-            if !n.is_finite() || n < 2.0 {
-                return None;
-            }
-            let n_clamped = n.max(10.0).min(1e7);
-            let ln = n_clamped.ln();
-            ln.is_finite().then_some(ln)
-        })
-        .collect();
-
-    let n_global = if let Some(med_ln) = median_f64(log_n_global_vec) {
-        med_ln.exp()
-    } else {
-        clamp_f64(n_eff_global, 10.0, 1e7)
-    };
-    let n_global = clamp_f64(n_global, 10.0, 1e7);
+    let scores: Vec<f64> = fit_data.iter().map(|(_, s, _)| *s).collect();
 
     Some(RankNullPool {
         fit_data,
         null_indices,
         scores,
-        n_eff_global,
-        n_global,
     })
+}
+
+#[derive(Clone, Copy, Debug)]
+struct RunGates {
+    run_msfdr: bool,
+    run_nokoi: bool,
 }
 
 // --- FIT/PREPARE ENGINES ---
@@ -865,72 +799,69 @@ fn fit_engines(
     work: &WorkSet,
     pool: &RankNullPool,
     settings: &FdrSettings,
+    gates: RunGates,
 ) -> Option<Engines> {
-    let min_rank = settings.min_null_rank;
-    let max_rank = settings.max_null_rank;
-
-    let use_ensemble = matches!(settings.model_fit, ModelFit::Ensemble);
-
     // 1) Moments
     let (mu_mom, beta_mom) = fit_gumbel_moments(&pool.scores);
     let moments_ok = mu_mom.is_finite() && beta_mom.is_finite() && beta_mom > 0.0;
     if !moments_ok {
         return None;
     }
-    let dist_mom = Gumbel::new(mu_mom, beta_mom).ok()?;
 
-    // 2) LO regression
-    let min_count = settings.min_rank_count;
-    let (lo_intercept_raw, lo_beta_raw) =
-        fit_lower_order_regression(&pool.fit_data, min_rank, max_rank, min_count)
-            .unwrap_or((mu_mom + beta_mom * pool.n_global.ln(), beta_mom));
+    // Standard Gumbel for TEV-normalized sf inputs (used in Nokoi provisional p gate).
+    let std_gumbel = Gumbel::new(0.0, 1.0).expect("standard gumbel");
 
-    let lo_beta = if lo_beta_raw.is_finite() && lo_beta_raw > 0.0 {
-        lo_beta_raw
-    } else {
-        beta_mom.max(1e-9)
-    };
-    let lo_intercept = if lo_intercept_raw.is_finite() {
-        lo_intercept_raw
-    } else {
-        0.0
-    };
-    let blend = settings.lo_beta_blend_moments.clamp(0.0, 1.0); // default 0.0 in input.rs
-    let mut lo_beta_shrunk = (1.0 - blend) * lo_beta + blend * beta_mom.max(1e-9);
+    // 2) LO: call the new fitter directly
+    //
+    // Required by the new fitter:
+    // - pool.fit_data:           full rank-null pool stream (rank, hyperscore, charge)
+    // - rank1_scores_by_charge:  rank-1 stream (hyperscore, charge)
+    let mut rank1_scores_by_charge: Vec<(f64, u8)> = Vec::with_capacity(work.rank1_indices.len());
+    for &i in &work.rank1_indices {
+        let f = &features[i];
+        let x = match tev(f) {
+            Some(v) => v,
+            None => continue,
+        };
+        rank1_scores_by_charge.push((x, f.core.charge));
+    }
 
-    // optional: apply safety multiplier (we already surfaced this knob)
-    lo_beta_shrunk *= settings.lo_beta_safety_mult.clamp(0.1, 10.0);
-
-    // final safety
-    lo_beta_shrunk = lo_beta_shrunk.max(1e-9);
+    // IMPORTANT: preserve your existing knobs, but apply them INSIDE the LO module
+    // as explicit (mu,beta) post-selection transforms (non-paper calibration levers).
+    let lo_model = fit_decoy_free_model(
+        &pool.fit_data,
+        &rank1_scores_by_charge,
+        settings.min_null_size,
+        settings.min_rank_count,
+        settings.lo_beta_blend_moments,
+        settings.lo_beta_safety_mult,
+    );
 
     // 3) MLE
     let (mu_mle, beta_mle) = fit_gumbel_mle(&pool.scores).unwrap_or((mu_mom, beta_mom));
-    let dist_mle = Gumbel::new(mu_mle, beta_mle).unwrap_or(dist_mom.clone());
 
-    // knobs
-    let lo_alpha = settings.lo_multiplicity_alpha.clamp(0.0, 1.0);
-    let lo_ln_ratio_cap = settings.lo_ln_ratio_cap.max(0.0);
+    // 4) MSFDR seeding (Phase 4.2)
+    // Minimal-delta option: keep MSFDR global, but choose the null seed source via settings.
+    let (seed_mu, seed_beta) = match settings.msfdr_seed_mode {
+        crate::input::MsfdrSeedMode::Lo => lo_model.fallback_params,
+        crate::input::MsfdrSeedMode::PoolMoments => (mu_mom, beta_mom),
+        crate::input::MsfdrSeedMode::PoolMle => (mu_mle, beta_mle),
+    };
+    let seed_beta = seed_beta.max(1e-9);
 
-    // 4) MSFDR
-    let beta_lo_seed = lo_beta_shrunk.max(1e-9);
-    let mu_lo_global = lo_intercept + beta_lo_seed * (pool.n_eff_global.ln() - pool.n_global.ln());
-
-    let run_msfdr = use_ensemble || matches!(settings.model_fit, ModelFit::Msfdr);
-    let msfdr_model = if run_msfdr {
+    let msfdr_model = if gates.run_msfdr {
         let target_scores: Vec<f64> = work
             .rank1_indices
             .iter()
-            .map(|&i| features[i].core.hyperscore as f64)
-            .filter(|x| x.is_finite())
+            .filter_map(|&i| tev(&features[i]))
             .collect();
-        RobustMsfdrModel::fit(&target_scores, mu_lo_global, beta_lo_seed)
+        RobustMsfdrModel::fit(&target_scores, seed_mu, seed_beta)
     } else {
         None
     };
 
     // 5) Nokoi: pep from probability, p from rank-null pool empirical survival
-    let run_nokoi = use_ensemble || matches!(settings.model_fit, ModelFit::Nokoi);
+    let run_nokoi = gates.run_nokoi;
 
     let mut nokoi_prob_target: Option<Arc<Vec<f64>>> = None;
     let mut nokoi_p_values: Option<Arc<Vec<f64>>> = None;
@@ -946,10 +877,7 @@ fn fit_engines(
         let mut rank1_hs: Vec<f64> = work
             .rank1_indices
             .iter()
-            .filter_map(|&i| {
-                let x = features[i].core.hyperscore as f64;
-                x.is_finite().then_some(x)
-            })
+            .filter_map(|&i| tev(&features[i]))
             .collect();
 
         let pos_hyperscore_threshold: f64 = if rank1_hs.len() >= 10 {
@@ -965,8 +893,6 @@ fn fit_engines(
         // Provisional p-value threshold (moments null), used when hyperscore isn't in top slice.
         let nokoi_pos_p_thresh: f64 = 0.01;
 
-        let dist_mom_for_nokoi = dist_mom.clone();
-
         let probs = nokoi::rescore_df(
             features,
             0.01, // epsilon (same as before)
@@ -976,15 +902,16 @@ fn fit_engines(
                 if f.core.rank != 1 {
                     return false;
                 }
-                let x = f.core.hyperscore as f64;
-                if !x.is_finite() {
-                    return false;
-                }
+                let x = match tev(f) {
+                    Some(v) => v,
+                    None => return false,
+                };
                 if x >= pos_hyperscore_threshold {
                     return true;
                 }
                 // provisional p-value check (moments null)
-                let p0 = dist_mom_for_nokoi.sf(x).clamp(0.0, 1.0).max(1e-300);
+                let tev = tev_norm_from_hyperscore(x, mu_mom, beta_mom);
+                let p0 = std_gumbel.sf(tev).clamp(0.0, 1.0).max(1e-300);
                 p0 <= nokoi_pos_p_thresh
             },
         )?; // returns P(target) per PSM index
@@ -1042,14 +969,14 @@ fn fit_engines(
     }
 
     Some(Engines {
-        dist_mom,
-        dist_mle,
-        lo_intercept,
-        lo_beta_shrunk,
-        lo_alpha,
-        lo_ln_ratio_cap,
-        n_eff_global: pool.n_eff_global,
-        n_global: pool.n_global,
+        mom_mu: mu_mom,
+        mom_beta: beta_mom,
+
+        mle_mu: mu_mle,
+        mle_beta: beta_mle,
+
+        lo_model,
+
         msfdr_model,
         nokoi_prob_target,
         nokoi_p_values,
@@ -1222,14 +1149,10 @@ impl RobustMsfdrModel {
             return 1.0;
         }
 
-        // --- Guard against invalid Gumbel params ---
-        let null_dist = match Gumbel::new(self.null_loc, self.null_scale.max(1e-9)) {
-            Ok(d) => d,
-            Err(_) => return 1.0, // Conservative fallback (P=1.0)
-        };
-
         // Avoid exact 0.0 p-values (later log / combination safety)
-        null_dist.sf(x).clamp(0.0, 1.0).max(1e-300)
+        let std = Gumbel::new(0.0, 1.0).expect("standard gumbel");
+        let tev = tev_norm_from_hyperscore(x, self.null_loc, self.null_scale.max(1e-9));
+        std.sf(tev).clamp(0.0, 1.0).max(1e-300)
     }
 
     /// Mixture-model PEP: P(null | x)
@@ -1283,6 +1206,11 @@ pub fn calculate_q_values(
     let run_lo = use_ensemble || matches!(settings.model_fit, ModelFit::LowerOrder);
     let run_msfdr = use_ensemble || matches!(settings.model_fit, ModelFit::Msfdr);
     let run_nokoi = use_ensemble || matches!(settings.model_fit, ModelFit::Nokoi);
+
+    let gates = RunGates {
+        run_msfdr,
+        run_nokoi,
+    };
 
     log::info!(
         "DF: rank1_work={} model_fit={:?} ensemble={}",
@@ -1339,17 +1267,12 @@ pub fn calculate_q_values(
         }
     };
 
-    log::info!(
-        "DF: pool_size={} n_eff_global={:.2} n_global={:.2}",
-        pool.fit_data.len(),
-        pool.n_eff_global,
-        pool.n_global
-    );
+    log::info!("DF: pool_size={}", pool.fit_data.len());
 
     // ==============================
     // Stage 2 — fit engines
     // ==============================
-    let engines = match fit_engines(&new_features, &work, &pool, settings) {
+    let engines = match fit_engines(&new_features, &work, &pool, settings, gates) {
         Some(e) => e,
         None => {
             log::error!("Invalid null fit. FDR will fail closed.");
@@ -1360,27 +1283,21 @@ pub fn calculate_q_values(
         }
     };
 
-    log::info!(
-        "DF: Effective search space (n_global): {:.1}",
-        engines.n_global
-    );
-
     // --- CALCULATION LOOP ---
     // --- capture small config once for rayon closure ---
     let ensemble_p_combiner = settings.ensemble_p_combiner.clone();
     let ensemble_pep_combiner = settings.ensemble_pep_combiner.clone();
 
-    let use_ensemble = matches!(settings.model_fit, ModelFit::Ensemble);
+    let mom_mu = engines.mom_mu;
+    let mom_beta = engines.mom_beta;
 
-    let dist_mom = engines.dist_mom.clone();
-    let dist_mle = engines.dist_mle.clone();
-    let lo_intercept = engines.lo_intercept;
-    let lo_beta_shrunk = engines.lo_beta_shrunk;
-    let lo_alpha = engines.lo_alpha;
-    let lo_ln_ratio_cap = engines.lo_ln_ratio_cap;
+    let mle_mu = engines.mle_mu;
+    let mle_beta = engines.mle_beta;
 
-    let n_eff_global = engines.n_eff_global;
-    let n_global = engines.n_global;
+    let lo_model = engines.lo_model.clone();
+
+    // Standard Gumbel for TEV-normalized sf inputs
+    let std_gumbel = Gumbel::new(0.0, 1.0).expect("standard gumbel");
 
     let msfdr_model = engines.msfdr_model.clone(); // Option<RobustMsfdrModel>
     let nokoi_prob_target = engines.nokoi_prob_target.clone(); // Option<Arc<Vec<f64>>>
@@ -1416,37 +1333,30 @@ pub fn calculate_q_values(
 
                 for &psm_idx in work.rank1_indices.iter().step_by(step) {
                     let psm = &new_features[psm_idx];
-                    let x = psm.core.hyperscore as f64;
-                    if !x.is_finite() {
-                        continue;
-                    }
+                    let x = match tev(psm) {
+                        Some(v) => v,
+                        None => continue,
+                    };
 
                     // Build experts using the SAME gates as PART A (enabled + present)
                     let mut experts: Vec<f64> = Vec::new();
 
                     // Moments
                     if run_mom {
-                        experts.push(dist_mom.sf(x).clamp(0.0, 1.0).max(1e-300));
+                        let tev = tev_norm_from_hyperscore(x, mom_mu, mom_beta);
+                        experts.push(std_gumbel.sf(tev).clamp(0.0, 1.0).max(1e-300));
                     }
 
                     // MLE
                     if run_mle {
-                        experts.push(dist_mle.sf(x).clamp(0.0, 1.0).max(1e-300));
+                        let tev = tev_norm_from_hyperscore(x, mle_mu, mle_beta);
+                        experts.push(std_gumbel.sf(tev).clamp(0.0, 1.0).max(1e-300));
                     }
 
-                    // Lower-Order (LO)
+                    // Lower-Order (LO) — global TNM only (no per-PSM ln_ratio shift)
                     if run_lo {
-                        let n_eff = if psm.core.scored_candidates >= 2 {
-                            (psm.core.scored_candidates as f64).max(2.0).min(1e9)
-                        } else {
-                            n_eff_global
-                        };
-                        let ln_ratio =
-                            (n_eff.ln() - n_global.ln()).clamp(-lo_ln_ratio_cap, lo_ln_ratio_cap);
-                        let mu_i = lo_intercept + lo_beta_shrunk * lo_alpha * ln_ratio;
-                        let dist_lo =
-                            Gumbel::new(mu_i, lo_beta_shrunk).unwrap_or_else(|_| dist_mom.clone());
-                        experts.push(dist_lo.sf(x).clamp(0.0, 1.0).max(1e-300));
+                        let charge = psm.core.charge;
+                        experts.push(lo_model.p_value(x, charge).clamp(0.0, 1.0).max(1e-300));
                     }
 
                     // MSFDR (only if present for this run)
@@ -1494,45 +1404,38 @@ pub fn calculate_q_values(
         .par_iter()
         .filter_map(|&idx| {
             let psm = &new_features[idx]; // Immutable borrow - safe for Rayon
-            let x = psm.core.hyperscore as f64;
-
-            if !x.is_finite() {
-                return None;
-            }
+            let x = tev(psm)?;
 
             // 1. Calculate base Null P-values (STRICT compute gating)
             let p_mom = if run_mom {
-                dist_mom.sf(x).clamp(0.0, 1.0).max(1e-300)
+                let tev = tev_norm_from_hyperscore(x, mom_mu, mom_beta);
+                std_gumbel.sf(tev).clamp(0.0, 1.0).max(1e-300)
             } else {
                 1.0
             };
 
             let p_mle = if run_mle {
-                dist_mle.sf(x).clamp(0.0, 1.0).max(1e-300)
+                let tev = tev_norm_from_hyperscore(x, mle_mu, mle_beta);
+                std_gumbel.sf(tev).clamp(0.0, 1.0).max(1e-300)
             } else {
                 1.0
             };
 
             // 2. Lower-Order (LO) adjustment (STRICT compute gating)
             let p_lo = if run_lo {
-                let n_eff = if psm.core.scored_candidates >= 2 {
-                    (psm.core.scored_candidates as f64).max(2.0).min(1e9)
-                } else {
-                    n_eff_global
-                };
-
-                let ln_ratio =
-                    (n_eff.ln() - n_global.ln()).clamp(-lo_ln_ratio_cap, lo_ln_ratio_cap);
-                let mu_i = lo_intercept + lo_beta_shrunk * lo_alpha * ln_ratio;
-                let dist_lo =
-                    Gumbel::new(mu_i, lo_beta_shrunk).unwrap_or_else(|_| dist_mom.clone());
-                dist_lo.sf(x).clamp(0.0, 1.0).max(1e-300)
+                let charge = psm.core.charge;
+                lo_model.p_value(x, charge).clamp(0.0, 1.0).max(1e-300)
             } else {
                 1.0
             };
 
             // 3. Optional Models (MSFDR and Nokoi)
-            let (p_msfdr, pep_msfdr) = if let Some(m) = msfdr_model.as_ref() {
+            // STRICT compute gating: only compute when the method is enabled for this run
+            // AND the required model/vector is present.
+            let (p_msfdr, pep_msfdr) = if use_msfdr_expert {
+                let m = msfdr_model
+                    .as_ref()
+                    .expect("use_msfdr_expert implies msfdr_model.is_some()");
                 let p = m.calculate_seeded_null_p(x).clamp(0.0, 1.0).max(1e-300);
                 let pep = m.calculate_pep(x).clamp(0.0, 1.0).max(1e-300);
                 (Some(p), Some(pep))
@@ -1540,8 +1443,8 @@ pub fn calculate_q_values(
                 (None, None)
             };
 
-            let (p_nokoi, pep_nokoi) = {
-                // pep from probability if available
+            let (p_nokoi, pep_nokoi) = if run_nokoi {
+                // pep from probability if available (still gated by run_nokoi)
                 let pep = if let Some(prob) = nokoi_prob_target.as_ref() {
                     let pt = prob.get(idx).copied().unwrap_or(0.0).clamp(0.0, 1.0);
                     Some((1.0 - pt).clamp(0.0, 1.0).max(1e-300))
@@ -1549,8 +1452,11 @@ pub fn calculate_q_values(
                     None
                 };
 
-                // p from rank-null-calibrated p-values
-                let p = if let Some(p_vec) = nokoi_p_values.as_ref() {
+                // p from rank-null-calibrated p-values ONLY if this expert is usable this run
+                let p = if use_nokoi_expert {
+                    let p_vec = nokoi_p_values
+                        .as_ref()
+                        .expect("use_nokoi_expert implies nokoi_p_values.is_some()");
                     Some(
                         p_vec
                             .get(idx)
@@ -1564,6 +1470,8 @@ pub fn calculate_q_values(
                 };
 
                 (p, pep)
+            } else {
+                (None, None)
             };
 
             // 4. Ensemble Logic: Combine Experts (build list from run flags)
@@ -1625,10 +1533,9 @@ pub fn calculate_q_values(
                 if run_lo {
                     pep_experts.push(pep_lo);
                 }
-                if run_msfdr {
-                    if let Some(v) = pep_msfdr {
-                        pep_experts.push(v);
-                    }
+                if use_msfdr_expert {
+                    // pep_msfdr is only computed when use_msfdr_expert is true
+                    pep_experts.push(pep_msfdr.unwrap_or(1.0));
                 }
                 if run_nokoi {
                     if let Some(v) = pep_nokoi {
@@ -1722,11 +1629,9 @@ pub fn calculate_q_values(
         };
 
         // Final DF outputs ALWAYS populated (rank1-only by design)
-        psm.decoy_free_p_value = Some(r.p_final as f32);
+        set_df_p_value(psm, r.p_final as f32); // sets decoy_free_p_value
         psm.decoy_free_pep = Some(r.pep_final as f32);
         psm.decoy_free_score = Some(r.df_score);
-
-        set_df_p_value(psm, r.p_final as f32);
     }
 
     // --- PART C: Clear Non-Rank1 (Cheap safety pass) ---
@@ -1734,10 +1639,7 @@ pub fn calculate_q_values(
     // to avoid stale values leaking into downstream tables / plots.
     new_features.par_iter_mut().for_each(|psm| {
         if psm.core.rank != 1 {
-            // --- standard/public outputs ---
-            set_df_q_value(psm, 1.0);
-
-            // --- decoy-free "chosen" outputs ---
+            // Rank!=1: DF outputs are undefined by contract; scrub to None (fail-closed via accessors).
             psm.decoy_free_p_value = None;
             psm.decoy_free_pep = None;
             psm.decoy_free_score = None;
@@ -1787,28 +1689,10 @@ pub fn calculate_q_values(
                 .collect()
         };
 
-        // LO canonical ranking key aligned to LO p-value computation:
-        // quality = x - beta * alpha * ln_ratio  (larger = better)
-        let lo_quality = |f: &DfFeature| -> f64 {
-            let x = f.core.hyperscore as f64;
-            if !x.is_finite() {
-                return f64::NEG_INFINITY;
-            }
-
-            let n_eff = if f.core.scored_candidates >= 2 {
-                (f.core.scored_candidates as f64).max(2.0).min(1e9)
-            } else {
-                // If missing/invalid, keep it unadjusted (rank like hyperscore)
-                n_eff_global
-            };
-
-            let ln_ratio = (n_eff.ln() - n_global.ln()).clamp(-lo_ln_ratio_cap, lo_ln_ratio_cap);
-
-            // This matches the LO shift you used when building mu_i:
-            // mu_i = lo_intercept + lo_beta_shrunk * lo_alpha * ln_ratio
-            // Using x - (lo_beta_shrunk * lo_alpha * ln_ratio) is a monotone proxy for LO ordering.
-            x - (lo_beta_shrunk * lo_alpha * ln_ratio)
-        };
+        // LO rank-key helper aligned to LO p-value computation.
+        // Current LO implementation uses TEV ordering (larger TEV = better).
+        // If LO ranking ever changes, implement that change here.
+        let lo_rank_key = |f: &DfFeature| -> f64 { tev(f).unwrap_or(f64::NEG_INFINITY) };
 
         // Build rows for chosen-output calibration.
         let rows: Vec<(f64, usize, f64)> = work
@@ -1829,11 +1713,11 @@ pub fn calculate_q_values(
 
                 // quality key: larger = better (sorted descending)
                 let quality: f64 = match settings.model_fit {
-                    ModelFit::Moments | ModelFit::Mle => f.core.hyperscore as f64,
+                    ModelFit::Moments | ModelFit::Mle => tev(f).unwrap_or(f64::NEG_INFINITY),
 
                     ModelFit::LowerOrder => match settings.lo_rank_key {
                         LoRankKey::Hyperscore => f.core.hyperscore as f64,
-                        LoRankKey::LoAdjusted => lo_quality(f),
+                        LoRankKey::LoAdjusted => lo_rank_key(f),
                     },
 
                     // method-aligned ranking:
@@ -1850,8 +1734,7 @@ pub fn calculate_q_values(
 
         // Write calibrated chosen p-values back into DF p-value stream
         for (i, pcal) in calibrate(rows) {
-            set_df_p_value(&mut new_features[i], pcal as f32);
-            new_features[i].decoy_free_p_value = Some(pcal as f32);
+            set_df_p_value(&mut new_features[i], pcal as f32); // sets decoy_free_p_value
         }
     }
 
@@ -1874,23 +1757,8 @@ pub fn calculate_q_values(
                 .collect()
         };
 
-        // LO ranking helper (same as above)
-        let lo_quality = |f: &DfFeature| -> f64 {
-            let x = f.core.hyperscore as f64;
-            if !x.is_finite() {
-                return f64::NEG_INFINITY;
-            }
-
-            let n_eff = if f.core.scored_candidates >= 2 {
-                (f.core.scored_candidates as f64).max(2.0).min(1e9)
-            } else {
-                n_eff_global
-            };
-
-            let ln_ratio = (n_eff.ln() - n_global.ln()).clamp(-lo_ln_ratio_cap, lo_ln_ratio_cap);
-
-            x - (lo_beta_shrunk * lo_alpha * ln_ratio)
-        };
+        // LO rank-key helper aligned to LO p-value computation (TEV ordering).
+        let lo_rank_key = |f: &DfFeature| -> f64 { tev(f).unwrap_or(f64::NEG_INFINITY) };
 
         // Moments: rank by hyperscore
         {
@@ -1900,7 +1768,7 @@ pub fn calculate_q_values(
                 .filter_map(|&i| {
                     let f = &new_features[i];
                     let p = f.p_mom? as f64;
-                    Some((f.core.hyperscore as f64, i, p))
+                    Some((tev(f).unwrap_or(f64::NEG_INFINITY), i, p))
                 })
                 .collect();
 
@@ -1919,7 +1787,7 @@ pub fn calculate_q_values(
                 .filter_map(|&i| {
                     let f = &new_features[i];
                     let p = f.p_mle? as f64;
-                    Some((f.core.hyperscore as f64, i, p))
+                    Some((tev(f).unwrap_or(f64::NEG_INFINITY), i, p))
                 })
                 .collect();
 
@@ -1939,7 +1807,7 @@ pub fn calculate_q_values(
                     let p = f.p_lo? as f64;
                     let quality = match settings.lo_rank_key {
                         LoRankKey::Hyperscore => f.core.hyperscore as f64,
-                        LoRankKey::LoAdjusted => lo_quality(f),
+                        LoRankKey::LoAdjusted => lo_rank_key(f),
                     };
                     Some((quality, i, p))
                 })
@@ -2126,77 +1994,94 @@ pub fn calculate_q_values(
     let mut nokoi_pos: Vec<usize> = Vec::new();
     let mut p_nokoi_present: Vec<f64> = Vec::new();
 
+    // Per-method pi0 reference sets (label==1, non-ENT, non-CONT), aligned to each method's p-values.
+    let mut p_mom_ref: Vec<f64> = Vec::new();
+    let mut p_mle_ref: Vec<f64> = Vec::new();
+    let mut p_lo_ref: Vec<f64> = Vec::new();
+    let mut p_msfdr_ref: Vec<f64> = Vec::new();
+    let mut p_nokoi_ref: Vec<f64> = Vec::new();
+
     for (k, &i) in work.rank1_indices.iter().enumerate() {
         let f = &new_features[i];
 
+        // Reference-set membership for pi0 estimation
+        let is_ref = if f.core.label != 1 {
+            false
+        } else {
+            let prot = db[f.core.peptide_idx].proteins(&db.decoy_tag, db.generate_decoys);
+            !is_contam_str(&prot) && !is_entrapment_str(&prot)
+        };
+
         if let Some(v) = f.p_mom {
+            let p = (v as f64).clamp(0.0, 1.0).max(1e-300);
             mom_pos.push(k);
-            p_mom_present.push((v as f64).clamp(0.0, 1.0).max(1e-300));
+            p_mom_present.push(p);
+            if is_ref {
+                p_mom_ref.push(p);
+            }
         }
         if let Some(v) = f.p_mle {
+            let p = (v as f64).clamp(0.0, 1.0).max(1e-300);
             mle_pos.push(k);
-            p_mle_present.push((v as f64).clamp(0.0, 1.0).max(1e-300));
+            p_mle_present.push(p);
+            if is_ref {
+                p_mle_ref.push(p);
+            }
         }
         if let Some(v) = f.p_lo {
+            let p = (v as f64).clamp(0.0, 1.0).max(1e-300);
             lo_pos.push(k);
-            p_lo_present.push((v as f64).clamp(0.0, 1.0).max(1e-300));
+            p_lo_present.push(p);
+            if is_ref {
+                p_lo_ref.push(p);
+            }
         }
 
         if let Some(v) = f.p_msfdr {
+            let p = (v as f64).clamp(0.0, 1.0).max(1e-300);
             msfdr_pos.push(k);
-            p_msfdr_present.push((v as f64).clamp(0.0, 1.0).max(1e-300));
+            p_msfdr_present.push(p);
+            if is_ref {
+                p_msfdr_ref.push(p);
+            }
         }
         if let Some(v) = f.p_nokoi {
+            let p = (v as f64).clamp(0.0, 1.0).max(1e-300);
             nokoi_pos.push(k);
-            p_nokoi_present.push((v as f64).clamp(0.0, 1.0).max(1e-300));
+            p_nokoi_present.push(p);
+            if is_ref {
+                p_nokoi_ref.push(p);
+            }
         }
     }
 
     // Compute q-vectors only for non-empty present sets.
-    let q_mom_present: Vec<f64> = if p_mom_present.is_empty() {
-        Vec::new()
-    } else {
+    // IMPORTANT: Storey uses the SAME grid-π0 codepath as the chosen DF stream.
+    let compute_q_present = |p_present: &Vec<f64>, p_ref: &Vec<f64>| -> Vec<f64> {
+        if p_present.is_empty() {
+            return Vec::new();
+        }
         match settings.type_ {
-            FdrType::Storey => stats::storey_q_value(&p_mom_present, min_storey_n),
-            FdrType::Bh => stats::bh_q_value(&p_mom_present),
+            FdrType::Bh => stats::bh_q_value(p_present),
+
+            FdrType::Storey => {
+                // Enforce minimum reference size (old API used min_storey_n as a safety brake).
+                if p_ref.len() < min_storey_n {
+                    return stats::bh_q_value(p_present);
+                }
+                match estimate_pi0_from_reference_grid(p_ref, settings) {
+                    Some(pi0) => storey_q_value_with_pi0(p_present, pi0, settings),
+                    None => stats::bh_q_value(p_present),
+                }
+            }
         }
     };
 
-    let q_mle_present: Vec<f64> = if p_mle_present.is_empty() {
-        Vec::new()
-    } else {
-        match settings.type_ {
-            FdrType::Storey => stats::storey_q_value(&p_mle_present, min_storey_n),
-            FdrType::Bh => stats::bh_q_value(&p_mle_present),
-        }
-    };
-
-    let q_lo_present: Vec<f64> = if p_lo_present.is_empty() {
-        Vec::new()
-    } else {
-        match settings.type_ {
-            FdrType::Storey => stats::storey_q_value(&p_lo_present, min_storey_n),
-            FdrType::Bh => stats::bh_q_value(&p_lo_present),
-        }
-    };
-
-    let q_msfdr_present: Vec<f64> = if p_msfdr_present.is_empty() {
-        Vec::new()
-    } else {
-        match settings.type_ {
-            FdrType::Storey => stats::storey_q_value(&p_msfdr_present, min_storey_n),
-            FdrType::Bh => stats::bh_q_value(&p_msfdr_present),
-        }
-    };
-
-    let q_nokoi_present: Vec<f64> = if p_nokoi_present.is_empty() {
-        Vec::new()
-    } else {
-        match settings.type_ {
-            FdrType::Storey => stats::storey_q_value(&p_nokoi_present, min_storey_n),
-            FdrType::Bh => stats::bh_q_value(&p_nokoi_present),
-        }
-    };
+    let q_mom_present: Vec<f64> = compute_q_present(&p_mom_present, &p_mom_ref);
+    let q_mle_present: Vec<f64> = compute_q_present(&p_mle_present, &p_mle_ref);
+    let q_lo_present: Vec<f64> = compute_q_present(&p_lo_present, &p_lo_ref);
+    let q_msfdr_present: Vec<f64> = compute_q_present(&p_msfdr_present, &p_msfdr_ref);
+    let q_nokoi_present: Vec<f64> = compute_q_present(&p_nokoi_present, &p_nokoi_ref);
 
     // Sparse write-back: only where p_* existed.
     for (j, &k) in mom_pos.iter().enumerate() {
@@ -2243,13 +2128,19 @@ pub fn calculate_peptide_q_df(
             .or_insert(q);
     }
 
-    // Write ONLY DF peptide q
+    // Write ONLY DF peptide q (rank1-only by contract)
     for feat in features.iter_mut() {
+        if feat.core.rank != 1 {
+            // DF peptide_q is undefined for rank!=1; scrub to avoid leakage.
+            feat.decoy_free_peptide_q = None;
+            continue;
+        }
+
         let peptide = db[feat.core.peptide_idx].to_string();
         if let Some(q) = best_q.get(&peptide) {
             feat.decoy_free_peptide_q = Some(*q);
         } else {
-            // If peptide never seen in rank1, fail-closed.
+            // If peptide never seen in rank1 (should be rare), fail-closed.
             feat.decoy_free_peptide_q = Some(1.0);
         }
     }
@@ -2257,6 +2148,7 @@ pub fn calculate_peptide_q_df(
     best_q.values().filter(|&&q| q <= threshold).count()
 }
 
+// DF aggregation/write-back contract: rank1-only; rank!=1 must be None to prevent stale leakage.
 pub fn calculate_protein_q_df(
     features: &mut [DfFeature],
     db: &IndexedDatabase,
@@ -2301,18 +2193,54 @@ pub fn calculate_protein_q_df(
         protein_p_values.push(combined_p);
     }
 
-    // If no proteins, write fail-closed and return 0.
+    // If no proteins, write fail-closed (rank1-only by contract) and return 0.
     if protein_p_values.is_empty() {
         for feat in features.iter_mut() {
-            feat.decoy_free_protein_q = Some(1.0);
+            if feat.core.rank != 1 {
+                // DF protein_q undefined for rank!=1; scrub to avoid leakage.
+                feat.decoy_free_protein_q = None;
+            } else {
+                feat.decoy_free_protein_q = Some(1.0);
+            }
         }
         return 0;
     }
 
     // Convert protein p-values -> protein q-values (DF-only output)
+    //
+    // Consistency fix: use the SAME Storey path as the DF PSM stream:
+    // - estimate pi0 from a cleaner reference subset
+    // - compute Storey q-values with fixed pi0
+    // - detect degeneracy and fallback (handled inside storey_q_value_with_pi0)
     let protein_q_values = match settings.type_ {
-        FdrType::Storey => stats::storey_q_value(&protein_p_values, settings.min_storey_n),
         FdrType::Bh => stats::bh_q_value(&protein_p_values),
+
+        FdrType::Storey => {
+            // Reference set for pi0 estimation: exclude contaminants + entrapment proteins.
+            // (Do NOT change entrapment validation—this only stabilizes pi0 estimation.)
+            let mut protein_p_ref: Vec<f64> = Vec::new();
+            for (key, &p) in protein_keys.iter().zip(protein_p_values.iter()) {
+                if is_contam_str(key) {
+                    continue;
+                }
+                if is_entrapment_str(key) {
+                    continue;
+                }
+                if p.is_finite() {
+                    protein_p_ref.push(p.clamp(0.0, 1.0).max(1e-300));
+                }
+            }
+
+            // Enforce the same minimum reference size guard you use elsewhere.
+            if protein_p_ref.len() < settings.min_storey_n {
+                stats::bh_q_value(&protein_p_values)
+            } else {
+                match estimate_pi0_from_reference_grid(&protein_p_ref, settings) {
+                    Some(pi0) => storey_q_value_with_pi0(&protein_p_values, pi0, settings),
+                    None => stats::bh_q_value(&protein_p_values),
+                }
+            }
+        }
     };
 
     // Map back: protein_key -> q
@@ -2321,8 +2249,14 @@ pub fn calculate_protein_q_df(
         best_q.insert(key, q as f32);
     }
 
-    // Write ONLY DF protein q (fail-closed if missing)
+    // Write ONLY DF protein q (rank1-only by contract; scrub others)
     for feat in features.iter_mut() {
+        if feat.core.rank != 1 {
+            // DF protein_q undefined for rank!=1; scrub to avoid leakage.
+            feat.decoy_free_protein_q = None;
+            continue;
+        }
+
         let protein_key = db[feat.core.peptide_idx].proteins(&db.decoy_tag, db.generate_decoys);
         let q = *best_q.get(&protein_key).unwrap_or(&1.0);
         feat.decoy_free_protein_q = Some(q);
