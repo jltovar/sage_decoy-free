@@ -1,271 +1,235 @@
 # Sage: Decoy-Free Edition (EXPERIMENTAL)
 
 > ⚠️ **Experimental fork.**
-> This is a research fork of the original [Sage search engine by Michael Lazear](https://github.com/lazear/sage).
-> APIs, configuration options, and statistical behavior may change as the decoy-free workflow is refined.
+> This is a research fork of the original [Sage search engine]().
+> APIs, configuration options, and statistical behavior may change as the decoy-free workflow is refined (**Currently not working LFQ, TMT, PIN output, annotate-matches output, parquet output**).
 
-This fork adds an explicit **decoy-free false discovery rate (FDR)** workflow alongside standard target–decoy competition (TDC). Instead of relying on the assumption that "decoys behave like targets," the decoy-free mode models **noise** using several statistical theories and **signal** using regularized machine learning and robust mixture modeling.
+This fork implements an explicit **decoy-free false discovery rate (FDR)** workflow. Instead of relying on the target–decoy competition (TDC) assumption that "decoys behave like targets," this mode models **noise** using the lower-ranked PSMs from the target database itself (Rank ).
 
-The primary motivation is **increased sensitivity and statistical power** for **ultra-low-input proteomics**, including single-cell and subcellular assays, where every additional confident peptide matters.
-
----
-
-## 1. Decoy-Free Search Mode: Concept
-
-In classic TDC, FDR is estimated by searching both **target** and **decoy** sequences and counting how often decoys "win." This works well but has limitations:
-
-- It assumes decoys mimic the null distribution perfectly.
-- It can be fragile in **small databases** or **extreme low-input** settings.
-- It ties discovery power directly to decoy design.
-
-The **decoy-free mode** in this fork instead uses **lower-ranked PSMs from the target database itself** to build a null model:
-
-- Rank 1 = candidate "signal" (best PSM per spectrum).
-- Ranks 2, 3, …, K = candidate "noise" used to estimate the null score distribution.
-
-From this null, the engine computes **p-values, q-values, and posterior error probabilities (PEPs)** without ever consulting a decoy database.
+The primary motivation is **increased sensitivity and statistical power** for ultra-low-input proteomics (e.g., single-cell), where constructing a balanced decoy database is statistically difficult and every confident peptide matters.
 
 ---
 
-## 2. High-Level Implementation
+## 1. Core Concept: The "Jury" System
 
-### 2.1 Augmented Ensemble Scoring
+The Decoy-Free mode treats the search engine as a **multi-model jury**. Instead of relying on a single statistical assumption, it employs a **consensus ensemble** of up to seven distinct experts.
 
-To reduce dependence on any single statistical assumption, the decoy-free workflow employs a **consensus ensemble** of four distinct estimators. The final significance (P-value) is derived by combining outputs from the first three models (Moments, MLE, Lower-Order) using the **Harmonic Mean P-value (HMP)**. The fourth model (MSFDR) contributes its probability estimate to the ensemble. The final Posterior Error Probability (PEP) is calculated utilizing an "Consensus Strategy", where the consensus Ensemble P-value serves directly as the PEP (PEP ≈ P-value). This ensures that if the machine learning expert (Nokoi) identifies a strong match, the error probability reflects that confidence, preventing pessimistic mixture models from overruling high-quality signal.
+### 1.1 The Null Model (Noise)
 
-1.  **Method of Moments (Gumbel)**
-    - Fits a Gumbel distribution to noise scores (ranks 2+) using empirical mean and variance.
-    - Fast, stable, and serves as a conservative "anchor" for the ensemble.
+The engine uses lower-ranked matches (Rank , default ) to estimate the null distribution (the score distribution of random matches).
 
-2.  **Maximum Likelihood Estimation (MLE)**
-    - Fits Gumbel parameters via likelihood maximization.
-    - More robust to outliers in the tail of the noise distribution.
+### 1.2 The Experts
 
-3.  **Lower-Order Statistics (Madej & Lam, 2023)**
-    - Regresses score against $-\psi(\text{rank})$ (negative Digamma) to exploit the exact theoretical decay of Gumbel order statistics.
-    - Fits an anchored intercept and slope from ranks $k = 2 \dots K$ to model the null governing rank-1.
-    -  Applies a relative multiplicity shift to account for spectrum-specific search space size without reconstructing an absolute location parameter.
-    -  Includes multiplicity attenuation, slope shrinkage, and safety caps to ensure numerical stability and prevent over-penalization in correlated open-search regimes.
+The ensemble combines evidence from three classes of models:
 
-4.  **Robust MSFDR Mixture Model (Peng et al., 2020)**
-    - A stability-hardened implementation of the Mix-Max-Score framework.
-    - Models the score distribution as a two-component mixture: **Gumbel (Null)** + **Skew-Normal (Target)**.
-    - Features **smart data-driven initialization**, **scale-invariant EM convergence** checks using relative (1e-4) and absolute (1e-6) tolerances on the average log-likelihood per point, and **safety clamps** to prevent model collapse on sparse data.
+1. **Parametric Base Models (Gumbel):**
+* **Moments:** Fits Gumbel parameters using the method of moments. Fast and conservative.
+* **MLE:** Fits Gumbel parameters using Maximum Likelihood Estimation. Robust to outliers in the noise tail.
+* **Lower-Order (LO):** A regression-based model (Madej & Lam, 2023) that exploits the theoretical decay of order statistics to predict Rank-1 behavior from lower ranks. This implementation uses a **relative multiplicity shift** and **slope stabilization** (blending with Moments) to handle open searches and sparse data.
 
-> **Scientific Idea:** The engine acts as a **multi-model jury**, preventing false discoveries if one model fits poorly while boosting sensitivity when models agree.
 
-#### 2.1.1 Lower-Order Multiplicity Correction & Stabilization
+2. **Mixture Models (MSFDR Family):**
+Derived from the work of Peng et al. (2020), this fork implements **three distinct variants** to handle different data regimes:
+* **Seeded (Legacy):** Uses a fixed null derived from the pool or LO model. Only the target component (Skew-Normal) is updated via EM.
+* **1SMix (Unanchored):** Initializes from the bottom/top slices of Rank-1 data and allows both the Null (Gumbel) and Target (Skew-Normal) to drift during EM training.
+* **2SMix (Anchored):** Uses the pure null pool (Ranks ) to strictly anchor the Null component, preventing it from absorbing signal in high-quality datasets.
 
-The Lower-Order model fits a regression line to the scores of lower-ranked matches (ranks 2, 3, etc.) to predict the expected distribution of the top rank.
-- **Anchored Relative Shift** Instead of recalculating parameters from scratch for every spectrum, this fork calculates a "global reference" search space size (the geometric median of candidate counts). For each individual spectrum, it then applies a relative shift to the score baseline. This shift is proportional to the difference between that spectrum's candidate count and the global reference.
-- **Multiplicity Attenuation** In open searches, candidate peptides are often highly correlated (e.g., the same peptide with different PTMs). Treating them as independent trials would over-penalize the score. This fork allows you to "dampen" this penalty using an attenuation factor ().
-- **Slope Stabilization** To prevent the model from becoming unstable on sparse data, the regression slope is partially blended with the more conservative "Moments" slope. Additionally, a "safety belt" cap is applied to ensure the slope never exceeds a safe multiple of the reference Moments slope.
-- **Ensemble Hijack Protection** In the ensemble mode, if the Lower-Order model produces a P-value that is drastically more optimistic (e.g., >1000x smaller) than the standard statistical models for a saturated spectrum, the system automatically falls back to the more conservative estimate to prevent false discoveries.
+
+3. **Machine Learning (Nokoi 2.0):**
+* **Algorithm:** L1-regularized Logistic Regression (Lasso) optimized via **FISTA** (Fast Iterative Shrinkage-Thresholding Algorithm).
+* **Scoring:** Generates probabilities .
+* **Calibration:** Calculates empirical p-values by comparing the ML score against the null distribution of lower-ranked matches.
+
+
 
 ---
 
-> **Scientific Note (Decoy-Free Lower-Order Calibration)**  
-> This fork applies a relative, anchored multiplicity correction rather than reconstructing an absolute location parameter from rank statistics.  
-> This avoids coordinate mismatches between digamma regression and log-multiplicity correction that can otherwise cause severe miscalibration.  
-> The implementation is validated using mirror tests, entrapment calibration, and ensemble stability diagnostics.
+## 2. Statistical Architecture
 
-### 2.2 Nokoi 2.0 Rescoring (Lasso/FISTA)
+### 2.1 Ensemble Combination
 
-The engine includes a native implementation of **Nokoi 2.0**, an on-the-fly machine learning rescoring engine tailored for decoy-free analysis:
+The outputs from all active experts are combined to form a single consensus result:
 
-- **Algorithm:** L1-regularized Logistic Regression (Lasso) optimized via **FISTA** (Fast Iterative Shrinkage-Thresholding Algorithm).
-- **Feature Selection:** Automatically selects relevant features (e.g., retention time alignment, ion mobility delta, intensity coverage) and zeros out noise features using L1 sparsity.
-- **Adaptive Training:** Uses **K-fold cross-validation** with **early stopping** to prevent overfitting on small datasets.
-- **Integration:** Nokoi probabilities are fed into the ensemble as an additional high-quality evidence stream.
-- **Robust Training:** Implements balanced sampling (1:1 positive/negative ratio) to prevent class imbalance from biasing the model, and utilizes the specific wide regularization grid proposed in the original Nokoi paper.
+* **P-Value Combination:** The default strategy is the **Cauchy Combination Test**, which is robust to strong dependencies between the expert models. Other options include Fisher, Brown (empirical covariance), and Sidak.
+* **PEP Combination:** Posterior Error Probabilities (PEPs) are combined using the **Geometric Mean**, which penalizes experts that are uncertain (near 0.5) while rewarding strong consensus.
 
-### 2.3 Isotonic Calibration (PAVA)
+### 2.2 Calibration & Q-Values
 
-Raw probabilities from the ensemble can sometimes be "jittery" due to local noise. This fork implements Isotonic Regression (PAVA) to enforce monotonicity on final P-values.
+* **Isotonic Calibration (PAVA):** Raw p-values from the ensemble and individual methods are calibrated using Isotonic Regression to enforce monotonicity (better scores  lower p-values).
+* **Q-Value Calculation:**
+* **Standard:** Uses the **Storey-Tibshirani** method (or Benjamini-Hochberg) to convert p-values to q-values.
+* **Mixture Models:** For the MSFDR variants (1SMix/2SMix), q-values are computed directly as the cumulative mean of the PEPs, sorted by model confidence.
 
-PAVA is applied for all ensemble and parametric modes, but is **skipped in pure Lower-Order mode** to preserve the intrinsic ordering of the digamma regression.
 
-- **Function:** Enforces monotonicity on the final P-values.
-- **Guarantee:** Ensures that a better matching score *always* results in an equal or better P-value/PEP.
-- **Result:** Smoother, more statistically valid FDR curves that respect the natural ordering of data.
+
+### 2.3 Fail-Closed Design
+
+The engine is designed to **fail closed**. If a model cannot be fit (e.g., due to sparse data or mathematical instability), it outputs `None` (missing) or a conservative default (p=1.0). It never "guesses" or extrapolates wildly.
 
 ---
 
-### 2.4 Adaptive FDR Control & Protein Inference
+## 3. Configuration
 
-#### Adaptive FDR (Storey–Tibshirani)
-The fork supports two procedures for converting P-values to Q-values:
-- **`bh` (Benjamini–Hochberg):** Standard, conservative ($\pi_0 = 1$).
-- **`storey` (Storey–Tibshirani):** Estimates the fraction of true nulls ($\hat{\pi}_0$) from the P-value distribution. This increases power in high-quality datasets by "reclaiming" true positives that BH would discard.
+Decoy-free mode is configured in your JSON file under the `fdr` key.
 
-#### Protein Inference (Fisher's Method)
-Peptide-level evidence is aggregated into protein-level confidence using **Fisher's Combined Probability Test**. This method sums the natural logarithms of the individual peptide p-values to create a single score that reflects the aggregate evidence for a protein. This allows proteins supported by multiple moderate-confidence peptides to be identified confidently.
+### 3.1 Recommended Defaults (JSON)
 
----
-
-## 3. Configuration & Usage
-
-Decoy-free mode is configured in your JSON file under the `fdr` key:
+These defaults enable the full ensemble (Seeded, 1SMix, 2SMix, Nokoi, and Base Models) with Cauchy combination.
 
 ```json
 "fdr": {
-    "mode": "decoy_free",
-    "peptide_fdr": 0.01,
-    "protein_fdr": 0.01,
-    "precursor_fdr": 0.05,
-    "min_null_rank": 4,
-    "max_null_rank": 50,
-    "min_null_size": 300,
-    "model_fit": "ensemble",
-    "type": "storey",
-    "min_storey_n": 300,
-    "kde_samples": 20000,
-    "lo_multiplicity_alpha": 0.50,
-    "lo_ln_ratio_cap": 6.9,
-    "lo_beta_blend_moments": 0.30,
-    "lo_beta_safety_mult": 0.60,
-    "purification_factor": 0.50,
-	"min_rank_count": 10
+  "mode": "decoy_free",
+  
+  // Thresholds
+  "peptide_fdr": 0.01,
+  "protein_fdr": 0.01,
+  "precursor_fdr": 0.05,
+
+  // Global Null Window (Ranks used for noise modeling)
+  "min_null_rank": 2,
+  "max_null_rank": 50,
+  "min_null_size": 300,
+  "purification_factor": 0.5,
+  "min_rank_count": 10,
+
+  // Global Strategy
+  "model_fit": "ensemble",
+  "type": "storey",
+  "protein_p_combine": "cauchy",
+  "ensemble_p_combiner": "cauchy",
+  "ensemble_pep_combiner": "geometric_mean",
+  "calibrate_per_method": true,
+
+  // Storey (Pi0) Tuning
+  "min_storey_n": 300,
+  "storey_pi0_clamp_min": 0.5,
+  "storey_pi0_clamp_max": 1.0,
+  "storey_lambda_min": 0.05,
+  "storey_lambda_max": 0.95,
+  "storey_lambda_step": 0.05,
+  "storey_lambda_min_for_agg": 0.5,
+  "storey_pi0_agg": "median",
+  "storey_degen_fallback": "bh",
+
+  // Base Models (Moments / MLE / Lower-Order)
+  "moments_min_null_rank": 4,
+  "moments_max_null_rank": 50,
+  "mle_min_null_rank": 4,
+  "mle_max_null_rank": 50,
+  "lower_order_min_null_rank": 4,
+  "lower_order_max_null_rank": 50,
+  "lo_rank_key": "lo_adjusted",
+  "lo_beta_blend_moments": 0.0,
+  "lo_beta_safety_mult": 4.72,
+
+  // MSFDR: Seeded (Legacy/Fixed)
+  "enable_msfdr_seeded": true,
+  "msfdr_min_null_rank": 4,
+  "msfdr_max_null_rank": 50,
+  "msfdr_seed_mode": "lo",
+  "msfdr_use_canonical_pep": true,
+
+  // MSFDR: 1SMix (Unanchored Mixture)
+  "enable_msfdr_1smix": true,
+  "msfdr1_smix_min_null_rank": 5,
+  "msfdr1_smix_max_null_rank": 50,
+  "msfdr1_top_frac_init": 0.2,
+  "msfdr1_bottom_frac_init": 0.5,
+  "msfdr1_beta_drift_mult": [0.9, 1.1],
+  "msfdr1_pi_clamp_min": 0.01,
+  "msfdr1_pi_clamp_max": 0.65,
+
+  // MSFDR: 2SMix (Anchored Mixture)
+  "enable_msfdr_2smix": true,
+  "msfdr2_smix_min_null_rank": 4,
+  "msfdr2_smix_max_null_rank": 50,
+  "msfdr2_beta_drift_mult": [0.5, 2.0],
+  "msfdr2_pi_clamp_min": 0.01,
+  "msfdr2_pi_clamp_max": 0.568,
+
+  // Mixture EM Settings (Global)
+  "mix_em_max_iter": 200,
+  "mix_em_tol": 1e-6,
+  "mix_anchor_incorrect": true,
+
+  // Nokoi (Machine Learning)
+  "nokoi_min_null_rank": 2,
+  "nokoi_max_null_rank": 7,
+  "nokoi_k_folds": 2,
+  "nokoi_pos_p_thresh": 0.000001,
+  "nokoi_pos_rule": "and"
 }
+
 ```
 
-### 3.1 Core Strategy (`mode`)
+### 3.2 Configuration Options Explained
 
-- `"tdc"` (**Default**): Standard Target–Decoy Competition.
-- `"decoy_free"`: **Decoy-free rank-null mode.** No decoy database is required.
+#### Global Strategies
 
-### 3.2 Thresholds (`*_fdr`)
+* **`model_fit`**:
+* `"ensemble"` (Recommended): Runs all enabled models and combines them.
+* `"moments"`, `"mle"`, `"lower_order"`, `"msfdr"`, `"nokoi"`: Runs only that specific model.
+* `"msfdr1_smix"`, `"msfdr2_smix"`: Runs specific mixture variants.
 
-- `peptide_fdr` (default: `0.01`): The primary gatekeeper. It serves two functions:
-1. Spectrum Filter: Discards any individual Spectrum Match (PSM) with a q-value above this threshold before peptide or protein inference begins.
-2. Peptide Reporting: Sets the maximum allowable q-value for a unique peptide sequence to be considered "discovered" in the final report. (Note: Setting this too low (e.g., 0.01) may aggressively prune "mediocre" spectra that could have otherwise supported protein inference.)
 
-- `protein_fdr` (default: `0.01`): The protein-level cutoff. After mapping the surviving PSMs (those that passed the peptide_fdr filter) to proteins, this threshold determines which proteins are statistically significant enough to be reported.
-- `precursor_fdr` (default: `0.01`): The MS1 noise filter (LFQ only). This validates chromatographic peaks by comparing them to "shadow" (decoy) peaks. Only MS1 features with a probability of being random noise lower than this threshold will be quantified.
+* **`type`**: `storey` (adaptive) or `bh` (conservative Benjamini-Hochberg).
+* **`ensemble_p_combiner`**: Strategy for combining p-values.
+* `"cauchy"`: Robust to correlation (Default).
+* `"fisher"`: Assumes independence.
+* `"brown"`: Adjusts for covariance.
+* `"sidak_minp"`, `"median_beta"`, `"stouffer"`.
 
-### 3.3 Tuning Parameters
 
-- `min_null_rank` (default: `2`): First rank used for null modeling.
-- `max_null_rank` (default: `5`): Last rank used for null modeling.
-- `min_null_size` (default: `100`): Minimum number of null scores required to attempt a fit.
-- `kde_samples` (default: `20000`): Controls the maximum number of data points used for Kernel Density Estimation (KDE) during P-value calculation in non-parametric modes (e.g., Moments, MLE).  Adjustment: Increase this value (e.g., to 50,000) for marginally higher precision at the cost of speed, or decrease it (e.g., to 5,000) for faster processing on low-memory systems.
-- `model_fit`:
-    - `"moments"`: Uses the Gumbel Method of Moments (fast, conservative).
-    - `"mle"`: Uses Gumbel Maximum Likelihood Estimation (robust to outliers).
-    - `"lower_order"`: Uses the Lower-Order Statistics regression (good for heavy tails).
-    - `"msfdr"`: Uses the Robust Mixture Model (Gumbel + Skew-Normal).
-    - `"nokoi"`: Uses the Linear Discriminant Analysis (LDA) p-value and q-value derived from ML-based rescoring.
-    - `"ensemble"`: (Recommended) Runs Moments, MLE, Lower-Order, and Robust MSFDR.
-- `type`:
-    - `"bh"`: Benjamini-Hochberg.
-    - `"storey"`: Storey-Tibshirani (requires `min_storey_n` samples).
+* **`protein_p_combine`**: Aggregation for protein inference.
+* `"cauchy"` (Default), `"fisher"`, `"sidak_minp"`.
 
-#### 3.3.1 Lower-Order Stabilization Parameters (Decoy-Free only)
 
-These parameters control multiplicity correction and stabilization of the Lower-Order model. They are most relevant for open searches and other highly correlated candidate spaces.
 
-- `lo_multiplicity_alpha` (default: `0.50`): Attenuates the multiplicity shift applied to spectra with unusually large candidate sets.  
-  - `1.0` = full theoretical shift  
-  - `< 1.0` = damped shift (recommended for correlated searches)
+#### MSFDR Variants
 
-- `lo_ln_ratio_cap` (default: `6.9`): Caps the multiplicity shift magnitude to prevent a single spectrum from dominating calibration.  
-  `6.9 ≈ ln(1000)`.
+* **`enable_msfdr_seeded`**: Uses a fixed null derived from LO or Moments. Best for stability.
+* **`enable_msfdr_1smix`**: Allows the null to drift. Good for datasets where the null pool might slightly mismatch the Rank-1 noise.
+* **`enable_msfdr_2smix`**: Uses the pure rank-null pool to anchor the model. Often the most accurate for high-quality data.
 
-- `lo_beta_blend_moments` (default: `0.30`): Shrinks the Lower-Order slope toward the Moments slope for stability on sparse or heavy-tailed nulls.  
-  - `0.0` = pure Lower-Order  
-  - higher values = more stabilization
+#### Nokoi (ML)
 
-- `lo_beta_safety_mult` (default: `0.60`): **Safety belt on the effective LO scale** relative to the Moments scale.  
-
-  **Why the default is < 1**: In open-search or PTM-heavy workflows, candidate matches are often highly correlated rather than independent trials. Without a safety cap, the Lower-Order model can become overly conservative, inflating P-values and killing true discoveries. The safety belt effectively clamps the regression slope so it never exceeds a specific multiple (default 0.60x) of the global Moments slope.  
-  The default `0.60` was selected because it yields stable entrapment calibration behavior across ISB18 and PXD001468 in this fork.  
-  Increase toward `1.0–1.5` only if your candidate sets behave closer to independent trials.
-  
-- `purification_factor` (default: `0.50`): Sensitivity Unlock. Excludes the top-tier Rank-1 PSMs from the null distribution fit to prevent real signal from contaminating the background model.
-
-- `min_rank_count` (default: `10`): The minimum PSMs required at a specific rank for inclusion in the Lower-Order regression. Lowering to 4–6 helps stabilize models in sparse datasets.
-
----
+* **`nokoi_pos_rule`**: How to select positive training examples.
+* `"and"`: Must be top-rank AND have low provisional p-value (Default).
+* `"or"`: Top-rank OR low p-value.
+* `"top_only"`, `"p_only"`.
 
 
 
 ---
 
-## 4. Decoy-Free Output & Column Definitions
+## 4. Output Columns
 
-When running in `decoy_free` mode, Sage maps its internal statistical calculations to the standard Sage output columns. This ensures that the results files (`results.sage.tsv`) remain compatible with existing downstream analysis tools.
+In `decoy_free` mode, the `results.sage.tsv` file includes specific columns for the ensemble results and detailed diagnostics for every expert method.
 
-### 4.1 Output Columns (Decoy-Free Mode)
+### 4.1 Consensus Outputs
 
-In Decoy-Free mode, the output TSV replaces standard Sage columns with explicit decoy-free metrics to avoid ambiguity.
-
-| Decoy-Free Column | Description |
+| Column | Description |
 | --- | --- |
-| `decoy_free_score` | A "Phred-scaled" score derived from the PEP (). Used for ranking. Higher is better. |
-| `decoy_free_pep` | The Posterior Error Probability (Local FDR). In Optimistic mode, this equals the Ensemble P-value. |
-| `decoy_free_p_value` | The raw consensus P-value derived from the 5-way ensemble. |
-| `decoy_free_q_value` | The PSM-level False Discovery Rate (FDR). |
-| `decoy_free_peptide_q` | The Peptide-level FDR. |
-| `decoy_free_protein_q` | The Protein-level FDR. Aggregated significance of the protein inference using Fisher's Method. |
-| `p_mom` / `p_mle` / `p_lo` | Individual P-values from the Moments, MLE, and Lower-Order statistical experts. |
-| `p_msfdr` / `p_nokoi` | Individual P-values from the Robust Mixture Model and Nokoi Machine Learning experts. |
+| `decoy_free_p_value` | The final combined p-value (e.g., via Cauchy combination). |
+| `decoy_free_pep` | The final combined PEP (e.g., via Geometric Mean). |
+| `decoy_free_q_value` | The PSM-level False Discovery Rate. |
+| `decoy_free_score` | A transformed score derived from the PEP (higher is better). |
+| `decoy_free_peptide_q` | Peptide-level FDR (min q-value for the sequence). |
+| `decoy_free_protein_q` | Protein-level FDR (aggregated via `protein_p_combine`). |
 
-> **Note on Compatibility:** While the output CSV uses these specific headers, the engine internally maps these values to standard structures during runtime. This ensures that internal Sage modules (Retention Time Prediction, Ion Mobility, and LFQ) automatically train on your Decoy-Free results without requiring external converters.
+### 4.2 Expert Diagnostics
 
+The output also contains the raw P, Q, and PEP values for every individual expert. These are useful for debugging why a specific spectrum was accepted or rejected.
 
-### 4.2 False Discovery Rate (FDR) Calculations
+* **P-values:** `p_mom`, `p_mle`, `p_lo`, `p_msfdr` (Seeded), `p_1smix`, `p_2smix`, `p_nokoi`.
+* **Q-values:** `q_mom`, `q_mle`, `q_lo`, `q_msfdr`, `q_1smix`, `q_2smix`, `q_nokoi`.
+* **PEPs:** `pep_mom`, `pep_mle`, `pep_lo`, `pep_msfdr`, `pep_1smix`, `pep_2smix`, `pep_nokoi`.
 
-The FDR columns in Sage Decoy-Free are dynamic. Their values change depending on the `model_fit` strategy selected in your configuration (e.g., `moments`, `mle`, `lower_order`, `msfdr`, `ensemble`).
-
-#### `decoy_free_q_value` (PSM-level FDR)
-
-- **Source:** Derived directly from the `decoy_free_p_value`.
-- **Dependency:** The underlying P-value changes based on the selected model:
-
-  - `ModelFit::Moments`: Uses the Gumbel Moments p-value.  
-  - `ModelFit::Mle`: Uses the Gumbel MLE p-value.
-  - `ModelFit::LowerOrder`: Uses the Lower-Order Statistics p-value (optimized for small sample sizes).
-  - `ModelFit::Msfdr`: Uses the **seeded null survival p-value** from the MSFDR model’s null component (Gumbel), while the mixture model is used to compute **PEP**.
-  - `ModelFit::Nokoi`: Uses the Linear Discriminant Analysis (LDA) p-value derived from ML-based rescoring.
-  - `ModelFit::Ensemble`: Calculates the Harmonic Mean of the parametric null models (Moments, MLE, Lower-Order). The MSFDR mixture model is **not included in the ensemble P-value** to avoid double-counting the seeded null. Instead, MSFDR is used exclusively to compute the Posterior Error Probability (PEP).
-
-- **Calculation:** After determining the raw P-value, the Benjamini–Hochberg (or Storey) procedure is applied globally to convert it into a Q-value (`spectrum_q`).
-
-#### `decoy_free_peptide_q` (Peptide-level FDR)
-
-- **Calculation:** Computed by taking the best (minimum) `decoy_free_q_value` observed for that peptide sequence across all scans. This is now calculated unconditionally for every search, ensuring valid peptide-level statistics are always available for LFQ.
-- **Dependency:** Improvements in spectrum-level modeling (e.g., Ensemble vs Moments) directly propagate to peptide-level confidence.
-
-#### `decoy_free_protein_q` (Protein-level FDR)
-
-- **Calculation:** Aggregates the `decoy_free_p_values` of all unique peptides assigned to a protein using **Fisher’s Method** for combining independent p-values.
-- **Dependency:** Strongly influenced by model choice. Sharper p-values from better models (e.g., Ensemble) improve discrimination during protein inference.
+> **Note:** If a method is disabled or fails to fit (fail-closed), its columns will contain `NaN` or empty values.
 
 ---
 
-
-## 5. Scientific Summary of This Fork
-
-In this experimental decoy-free fork, Sage is being developed into a **multi-model consensus engine** for proteomics discovery:
-
-- It **models noise** using multiple statistical frameworks:
-  - Extreme value theory (Gumbel via Moments and MLE),
-  - Rank-order theory (Lower-Order Statistics),
-  - Two-component mixtures (Robust MSFDR).
-
-- It **models signal** using:
-  - **Nokoi 2.0 (Lasso)**: Sparse, regularized machine learning.
-  - **Robust MSFDR**: Mixture modeling with Skew-Normal targets.
-
-- It **ensures validity** using:
-  - **Isotonic Calibration (PAVA)**: Enforcing monotonic probabilities.
-  - **Harmonic Mean P-values (HMP)**: Robust evidence combination.
-
-The overarching goal is a workflow that is **statistically principled**, **honest in outputs** (explicit NaNs for missing data), and **highly sensitive** for ultra-low-input regimes.
-
----
-
-## 6. References
+## 5. References
 
 Core decoy-free and lower-order modeling:
 
@@ -321,7 +285,7 @@ Classical combination and FDR methods:
 
 ---
 
-## 7. Status & Caveats
+## 6. Status & Caveats
 
 - This fork is **experimental** and intended for method development and research.
 - Always inspect log messages and output columns to confirm which models were applied.
