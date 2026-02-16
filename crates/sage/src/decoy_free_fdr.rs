@@ -1,77 +1,105 @@
+/* =============================================================================
+Decoy-Free (DF) FDR Contract — AUTHORITATIVE ORACLE (Phase 0 / Step 0.1)
+
+This comment is the invariants contract for Decoy-Free mode. If code and this
+contract disagree, the code is wrong.
+
+A) Rank constraint (HARD)
+-------------------------
+1) DF is rank==1 only.
+   - Any DF output (decoy_free_*) is defined ONLY for rank==1 PSMs.
+   - For rank!=1: ALL DF outputs AND ALL DF per-method outputs MUST be scrubbed
+     to None (no stale leakage).
+
+B) Output separation (HARD)
+---------------------------
+2) DF “final selected outputs” are ONLY the decoy_free_* streams:
+     decoy_free_p_value / decoy_free_pep / decoy_free_score / decoy_free_q_value
+     decoy_free_peptide_q / decoy_free_protein_q
+   All other DF family outputs are auxiliary streams and MUST NOT be treated as
+   “the answer”:
+     - p_msfdr / pep_msfdr / q_msfdr         (seeded / legacy stream)
+     - p_1smix / pep_1smix / q_1smix         (aux stream)
+     - p_2smix / pep_2smix / q_2smix         (aux stream)
+     - p_mom / pep_mom / q_mom, etc.         (aux expert streams)
+
+C) Q-value semantics for MSFDR variants (HARD)
+----------------------------------------------
+3) MSFDR variant q-values are ALWAYS PEP-derived cumulative means.
+   - q_1smix and q_2smix MUST be computed as:
+        q[k] = mean(pep[0..k]) after sorting by “quality” (best-first),
+     followed by a monotone (non-decreasing with worsening quality) pass.
+   - They MUST NOT use BH or Storey (regardless of settings.type_).
+   - (“seeded/legacy” q_msfdr is allowed to follow global settings.type_ only if
+      explicitly intended; q_1smix/q_2smix are NEVER BH/Storey.)
+
+D) Failure mode (FAIL-CLOSED; matches current implementation)
+-------------------------------------------------------------
+4) If DF engines do not exist (None) / fail to fit / do not run:
+   - All DF outputs must be cleared (None) to prevent stale leakage.
+   - Current implementation CLARIFICATION (intentional):
+       When engine fitting fails, rank==1 may be populated with conservative
+       defaults (p=1, pep=1, score=0, q=1, peptide_q=1, protein_q=1) so downstream
+       consumers fail-closed rather than treating missing values as permissive.
+     Rank!=1 MUST remain None always.
+
+E) Sorting key definition (“sorted by score”) (HARD)
+----------------------------------------------------
+5) Anywhere this module says “sorted by score/quality (best-first)”, the key is:
+   - For mixture q (q_1smix / q_2smix): sort by descending SCORE where:
+        SCORE = tev(feature) if present, else decoy_free_score.
+     (Higher SCORE means better evidence / earlier in the list.)
+   - For PAVA calibration of a chosen p-stream: sort by the method-aligned
+     “quality” key used in the calibration block (see the calibration section),
+     NOT by raw hyperscore unless that is explicitly selected (e.g., LO rank key).
+
+============================================================================= */
+
 use crate::database::IndexedDatabase;
-use crate::input::{EnsemblePCombiner, EnsemblePepCombiner, LoRankKey};
+use crate::input::{EnsemblePCombiner, EnsemblePepCombiner, LoRankKey, NokoiPosRule};
 use crate::input::{FdrSettings, FdrType, ModelFit};
 use crate::lfq::{Peak, PrecursorId};
 use crate::ml::lower_order::{
     fit_decoy_free_model, fit_gumbel_mle, fit_gumbel_moments, LowerOrderModel,
 };
+use crate::ml::msfdr::MsfdrParamTuple;
+use crate::ml::msfdr::{Msfdr1SmixModel, Msfdr2SmixModel, MsfdrSeededModel};
 use crate::ml::nokoi;
 use crate::ml::stats;
 use crate::scoring::DfFeature;
 use fnv::{FnvHashMap, FnvHashSet};
 use rayon::prelude::*;
-use statrs::consts::EULER_MASCHERONI;
-use statrs::distribution::{Continuous, ContinuousCDF, Gumbel};
+use statrs::distribution::{Beta, ContinuousCDF, Gumbel, Normal};
+use std::collections::BTreeMap;
 use std::sync::Arc;
 
 #[derive(Clone, Debug)]
 struct Rank1Computed {
     idx: usize,
+
     // per-method p's
     p_mom: f64,
     p_mle: f64,
     p_lo: f64,
-    p_msfdr: Option<f64>,
-    p_nokoi: Option<f64>,
-    // per-method peps
-    pep_mom: f64,
-    pep_mle: f64,
-    pep_lo: f64,
-    pep_msfdr: Option<f64>,
-    pep_nokoi: Option<f64>,
-    // final DF outputs
-    p_final: f64,
-    pep_final: f64,
-    df_score: f32,
-}
 
-// =============================================================================
-// Decoy-Free Lower-Order (LO) contract (Phase 0 / Step 0.1 — comment-only)
-// =============================================================================
-//
-// Purpose
-// -------
-// LO implements a charge-stratified “Top Null Model” (TNM) selection via minimum
-// BIC, and a set of per-charge Lower-Order Models (LOMs) fit on rank-null pools.
-//
-// Definitions (paper-aligned)
-// ---------------------------
-// - TNM (Top Null Model): a Gumbel(mu, beta) intended to model the top-scoring
-//   distribution (rank==1) for a given charge state.
-// - LOM (Lower-Order Model): regression fit using rank-null pool scores over
-//   ranks k=2..10 (paper default), per charge state.
-//
-// Selection / fitting rules (invariants)
-// --------------------------------------
-// 1) LO is charge-stratified.
-//    - All TNM/LOM fitting and selection are done independently per charge.
-//
-// 2) TNM selection considers exactly 4 candidates:
-//      (LR vs mean-β) × (MLE vs moments)
-//    - “LR”      : beta derived from lower-order regression strategy.
-//    - “mean-β”  : beta derived as the mean of β estimates from multiple LOM fits.
-//    - “MLE”     : mu (and beta when applicable) fitted by maximum likelihood.
-//    - “moments” : mu/beta fitted by method of moments.
-//
-// 3) TNM BIC is computed using ONLY rank==1 scores for that charge.
-//    - Candidate TNMs are compared by BIC on the charge-specific rank==1 set.
-//    - The selected TNM is the candidate with minimum BIC (for that charge).
-//
-// 4) LOMs are fit from the rank-null pool for that charge using ranks k=2..10
-//    (paper default), per charge.
-//    - The rank-null pool is charge-specific and excludes rank==1.
-//    - LOM fitting uses only ranks within the configured null-rank window.
-// =============================================================================
+    // MSFDR family p's (independent streams)
+    p_msfdr: Option<f64>, // seeded/legacy stream
+    p_1smix: Option<f64>,
+    p_2smix: Option<f64>,
+
+    p_nokoi: Option<f64>,
+
+    // MSFDR family peps (model-derived)
+    pep_msfdr: Option<f64>, // seeded/legacy stream
+    pep_1smix: Option<f64>,
+    pep_2smix: Option<f64>,
+
+    // Nokoi pep (from 1 - P(target))
+    pep_nokoi: Option<f64>,
+
+    // final DF p output (pep/score computed later, after lfdr mapping)
+    p_final: f64,
+}
 
 // =============================================================================
 // Helpers (math, calibration, parsing, diagnostics, and model fitting)
@@ -81,40 +109,6 @@ struct Rank1Computed {
 // 1) Low-level special functions + stable numeric primitives
 // -----------------------------------------------------------------------------
 
-fn erf_approx(x: f64) -> f64 {
-    let a1 = 0.254829592;
-    let a2 = -0.284496736;
-    let a3 = 1.421413741;
-    let a4 = -1.453152027;
-    let a5 = 1.061405429;
-    let p = 0.3275911;
-
-    let sign = if x < 0.0 { -1.0 } else { 1.0 };
-    let abs_x = x.abs().min(10.0);
-
-    let t = 1.0 / (1.0 + p * abs_x);
-    let y = 1.0 - (((((a5 * t + a4) * t) + a3) * t + a2) * t + a1) * t * (-abs_x * abs_x).exp();
-    sign * y
-}
-
-#[inline]
-fn log_add_exp(a: f64, b: f64) -> f64 {
-    if a.is_infinite() && a.is_sign_negative() {
-        return b;
-    }
-    if b.is_infinite() && b.is_sign_negative() {
-        return a;
-    }
-    if a.is_infinite() && a.is_sign_positive() {
-        return a;
-    }
-    if b.is_infinite() && b.is_sign_positive() {
-        return b;
-    }
-    let m = a.max(b);
-    m + ((a - m).exp() + (b - m).exp()).ln()
-}
-
 #[inline]
 fn neg_log10_p(p: f64) -> f64 {
     // “quality”: bigger is better
@@ -122,11 +116,11 @@ fn neg_log10_p(p: f64) -> f64 {
 }
 
 // -----------------------------------------------------------------------------
-// 1b) TEV normalization helper
+// 2) TEV normalization helper
 // -----------------------------------------------------------------------------
 //
-// We keep core.hyperscore unchanged.
-// For any Gumbel(mu,beta).sf(hyperscore), we compute TEV_norm = (hs - mu)/beta
+// Keep core.hyperscore unchanged.
+// For any Gumbel(mu,beta).sf(hyperscore), compute TEV_norm = (hs - mu)/beta
 // and evaluate sf(TEV_norm) under a standard Gumbel(0,1).
 //
 // This makes the sf(x) input a normalized TEV scale without changing outputs.
@@ -137,18 +131,6 @@ fn tev_norm_from_hyperscore(hs: f64, mu: f64, beta: f64) -> f64 {
         return f64::NEG_INFINITY; // yields sf ~ 1.0 (fail-closed)
     }
     (hs - mu) / beta
-}
-
-// -----------------------------------------------------------------------------
-// 2) Distributions / densities used by models (MSFDR target skew-normal)
-// -----------------------------------------------------------------------------
-
-fn skew_normal_pdf(x: f64, loc: f64, scale: f64, alpha: f64) -> f64 {
-    let scale = scale.max(1e-9);
-    let z = (x - loc) / scale;
-    let phi = (-(z * z) / 2.0).exp() / (2.0 * std::f64::consts::PI).sqrt();
-    let big_phi = 0.5 * (1.0 + erf_approx(alpha * z / std::f64::consts::SQRT_2));
-    (2.0 / scale) * phi * big_phi
 }
 
 // -----------------------------------------------------------------------------
@@ -240,6 +222,10 @@ fn combine_p_values(
     how: EnsemblePCombiner,
     brown_params: Option<stats::BrownParams>,
 ) -> f64 {
+    if pvals.is_empty() {
+        return 1.0;
+    }
+
     match how {
         EnsemblePCombiner::Hmp => stats::combine_hmp(pvals),
         EnsemblePCombiner::Fisher => stats::combine_fisher(pvals),
@@ -249,6 +235,11 @@ fn combine_p_values(
             }
             stats::combine_brown(pvals, brown_params)
         }
+
+        EnsemblePCombiner::Cauchy => combine_cauchy(pvals),
+        EnsemblePCombiner::MedianBeta => combine_median_beta(pvals),
+        EnsemblePCombiner::Stouffer => combine_stouffer(pvals),
+        EnsemblePCombiner::SidakMinP => combine_sidak_minp(pvals),
     }
 }
 
@@ -315,11 +306,11 @@ fn df_q_value(psm: &DfFeature) -> f32 {
 // -----------------------------------------------------------------------------
 //
 // Contract:
-// - We keep `core.hyperscore` UNCHANGED and treat it as the raw evidence score
+// - Keep `core.hyperscore` UNCHANGED and treat it as the raw evidence score
 //   produced by vanilla Sage ("hyperscore").
 // - The decoy-free null is modeled as Gumbel(mu, beta) over this raw hyperscore
 //   (fitted from the rank-null pool).
-// - Whenever we need a "TEV-normalized" input for survival evaluation, we compute:
+// - Whenever "TEV-normalized" input is needed for survival evaluation, compute:
 //       tev_norm = (hyperscore - mu) / beta
 //   and evaluate `sf(tev_norm)` under a STANDARD Gumbel(0, 1).
 //
@@ -335,6 +326,68 @@ fn tev(f: &DfFeature) -> Option<f64> {
     } else {
         None
     }
+}
+
+// -----------------------------------------------------------------------------
+// 6c) DF reset helper (critical): clear all DF + per-method outputs
+// -----------------------------------------------------------------------------
+
+#[inline(always)]
+fn clear_all_df_outputs(psm: &mut DfFeature, fail_closed_rank1: bool) {
+    // clear DF streams
+    psm.decoy_free_p_value = None;
+    psm.decoy_free_pep = None;
+    psm.decoy_free_score = None;
+    psm.decoy_free_q_value = None;
+    psm.decoy_free_peptide_q = None;
+    psm.decoy_free_protein_q = None;
+
+    // clear per-method p streams
+    psm.p_mom = None;
+    psm.p_mle = None;
+    psm.p_lo = None;
+    psm.p_msfdr = None;
+    psm.p_1smix = None;
+    psm.p_2smix = None;
+    psm.p_nokoi = None;
+
+    // clear per-method pep streams
+    psm.pep_mom = None;
+    psm.pep_mle = None;
+    psm.pep_lo = None;
+    psm.pep_msfdr = None;
+    psm.pep_1smix = None;
+    psm.pep_2smix = None;
+    psm.pep_nokoi = None;
+
+    // clear per-method q streams
+    psm.q_mom = None;
+    psm.q_mle = None;
+    psm.q_lo = None;
+    psm.q_msfdr = None;
+    psm.q_1smix = None;
+    psm.q_2smix = None;
+    psm.q_nokoi = None;
+
+    // If you want rank1 to be explicitly fail-closed (rather than None),
+    // populate rank1 with conservative defaults.
+    if fail_closed_rank1 && psm.core.rank == 1 {
+        psm.decoy_free_p_value = Some(1.0);
+        psm.decoy_free_pep = Some(1.0);
+        psm.decoy_free_score = Some(0.0);
+        psm.decoy_free_q_value = Some(1.0);
+        psm.decoy_free_peptide_q = Some(1.0);
+        psm.decoy_free_protein_q = Some(1.0);
+    }
+}
+
+// -----------------------------------------------------------------------------
+// 6d) DF rank-order “score” key (authoritative for "sorted by score")
+// -----------------------------------------------------------------------------
+
+#[inline(always)]
+fn df_rank_score(f: &DfFeature) -> f64 {
+    tev(f).unwrap_or_else(|| f.decoy_free_score.unwrap_or(0.0) as f64)
 }
 
 // -----------------------------------------------------------------------------
@@ -443,6 +496,27 @@ fn summarize_q(label: &str, qs_in: impl Iterator<Item = f32>) {
     log::info!(
         "DF DEBUG {}: n={} min={:.4e} p05={:.4e} med={:.4e} p95={:.4e} max={:.4e} frac<=0.01={:.4} frac==med={:.4}",
         label, n, min, p05, median, p95, max, frac_le_001, frac_eq_pi0ish
+    );
+}
+
+// -----------------------------------------------------------------------------
+// 9b) Model-fit diagnostics helpers (Step 4.2)
+// -----------------------------------------------------------------------------
+
+#[inline]
+fn log_fit_ok<T: std::fmt::Debug>(label: &str, model: &T) {
+    // Use Debug formatting so we don't depend on model field visibility.
+    // If msfdr.rs Debug includes pi/null/target params, you'll see them here.
+    log::info!("DF {} fit OK: {:?}", label, model);
+}
+
+#[inline]
+fn log_fit_failed_closed(label: &str) {
+    // "failed-closed" means the variant did not produce an engine (None)
+    // and the pipeline will proceed without writing that stream.
+    log::warn!(
+        "DF {} fit FAILED (None) — failing closed for this variant.",
+        label
     );
 }
 
@@ -583,6 +657,69 @@ fn storey_q_value_with_pi0(p_values: &[f64], pi0: f64, settings: &FdrSettings) -
 }
 
 // -----------------------------------------------------------------------------
+// 10b) P-value -> PEP proxy via local-FDR (Storey pi0 + histogram density)
+// -----------------------------------------------------------------------------
+//
+// Under the mixture model for p-values:
+//   f(p) = pi0 * 1 + (1 - pi0) * g(p)
+// local-fdr / PEP proxy:  lfdr(p) = P(null | p) = (pi0 * 1) / f(p) = pi0 / f(p)
+//
+// Estimate f(p) with a simple histogram density estimator on the method’s
+// rank-1 p-values (optionally filtered to a “reference set” for pi0 only).
+//
+// This produces a monotone-ish, bounded PEP proxy that is NOT equal to p.
+//
+fn hist_density_01(p: &[f64], bins: usize) -> Vec<f64> {
+    let bins = bins.max(20).min(2000);
+    let mut counts = vec![0usize; bins];
+    let mut n = 0usize;
+
+    for &x in p {
+        if !x.is_finite() {
+            continue;
+        }
+        let xx = x.clamp(0.0, 1.0);
+        // put p==1.0 into last bin
+        let mut b = (xx * (bins as f64)) as usize;
+        if b >= bins {
+            b = bins - 1;
+        }
+        counts[b] += 1;
+        n += 1;
+    }
+
+    if n == 0 {
+        return vec![1.0; bins]; // fail-closed: uniform density
+    }
+
+    let bin_w = 1.0 / (bins as f64);
+    counts
+        .into_iter()
+        .map(|c| {
+            // density estimate: count / (n * bin_w)
+            let d = (c as f64) / ((n as f64) * bin_w);
+            if d.is_finite() && d > 0.0 {
+                d
+            } else {
+                1.0
+            }
+        })
+        .collect()
+}
+
+#[inline]
+fn pep_from_p_lfdr(p: f64, pi0: f64, dens: &[f64]) -> f64 {
+    let bins = dens.len().max(1);
+    let pp = p.clamp(0.0, 1.0);
+    let mut b = (pp * (bins as f64)) as usize;
+    if b >= bins {
+        b = bins - 1;
+    }
+    let fhat = dens[b].max(1e-12); // avoid div-by-zero
+    (pi0 / fhat).clamp(0.0, 1.0).max(1e-300)
+}
+
+// -----------------------------------------------------------------------------
 // 11) Work set helper (rank-1 index list)
 // -----------------------------------------------------------------------------
 
@@ -655,10 +792,53 @@ fn log_rank1_composition(features: &[DfFeature], work: &WorkSet, db: &IndexedDat
 #[derive(Clone, Debug)]
 struct RankNullPool {
     // Null pool members (purified) are rank in [min_rank..=max_rank]
-    // We keep indices so other models (e.g., Nokoi) can reuse the same null pool.
+    // Keep indices so other models (e.g., Nokoi) can reuse the same null pool.
     fit_data: Vec<(u32, f64, u8)>, // (rank, hyperscore, charge)
     null_indices: Vec<usize>,      // indices into `features`, aligned with fit_data/scores
     scores: Vec<f64>,              // hyperscore scores for global moments/mle fit (aligned)
+}
+
+impl RankNullPool {
+    /// Return hyperscore values for pool members whose rank is in [min..=max].
+    /// Note: ranks are the original per-PSM hit rank used to build the global pool.
+    fn scores_in_window(&self, min: u32, max: u32) -> Vec<f64> {
+        self.fit_data
+            .iter()
+            .filter_map(|(rank, score, _charge)| {
+                if *rank >= min && *rank <= max {
+                    Some(*score)
+                } else {
+                    None
+                }
+            })
+            .collect()
+    }
+
+    /// Return (rank, hyperscore, charge) tuples for pool members whose rank is in [min..=max].
+    fn fit_data_in_window(&self, min: u32, max: u32) -> Vec<(u32, f64, u8)> {
+        self.fit_data
+            .iter()
+            .copied()
+            .filter(|(rank, _score, _charge)| *rank >= min && *rank <= max)
+            .collect()
+    }
+
+    /// Return indices into the original `features` slice for pool members whose rank is in [min..=max].
+    /// This is aligned with `fit_data`: `null_indices[i]` corresponds to `fit_data[i]`.
+    #[allow(dead_code)]
+    fn null_indices_in_window(&self, min: u32, max: u32) -> Vec<usize> {
+        self.fit_data
+            .iter()
+            .zip(self.null_indices.iter())
+            .filter_map(|((rank, _score, _charge), idx)| {
+                if *rank >= min && *rank <= max {
+                    Some(*idx)
+                } else {
+                    None
+                }
+            })
+            .collect()
+    }
 }
 
 #[derive(Clone)]
@@ -667,14 +847,19 @@ struct Engines {
     mom_mu: f64,
     mom_beta: f64,
 
+    // MLE fit (may fall back to moments if fail-closed)
     mle_mu: f64,
     mle_beta: f64,
+    mle_fit_ok: bool,
 
-    // LO parameters (charge-stratified TNM model; Step 2.2)
+    // LO parameters (charge-stratified TNM model)
     lo_model: LowerOrderModel,
+    lo_fit_ok: bool,
 
-    // optional engines
-    msfdr_model: Option<RobustMsfdrModel>,
+    // MSFDR variants (Phase 4.1)
+    msfdr_seeded: Option<MsfdrSeededModel>,
+    msfdr_1smix: Option<Msfdr1SmixModel>,
+    msfdr_2smix: Option<Msfdr2SmixModel>,
 
     // Nokoi outputs:
     // - nokoi_prob_target: raw model probability P(target) per feature index
@@ -695,7 +880,7 @@ fn build_rank_null_pool(
     let min_rank = settings.min_null_rank;
     let max_rank = settings.max_null_rank;
 
-    // --- PHASE 1: SOFT PURIFIED NULL (same logic we already wrote) ---
+    // --- SOFT PURIFIED NULL (same logic) ---
 
     // Build rank1_scores as (peptide_idx, hyperscore)
     let mut rank1_scores: Vec<(u32, f64)> = work
@@ -789,8 +974,123 @@ fn build_rank_null_pool(
 
 #[derive(Clone, Copy, Debug)]
 struct RunGates {
-    run_msfdr: bool,
+    run_msfdr_seeded: bool,
+    run_msfdr_1smix: bool,
+    run_msfdr_2smix: bool,
     run_nokoi: bool,
+}
+
+// --- MSFDR variant fit helpers ---
+
+#[inline]
+fn fit_msfdr_seeded(
+    rank1_scores: &[f64],
+    seed_mu: f64,
+    seed_beta: f64,
+    settings: &FdrSettings,
+) -> Option<MsfdrSeededModel> {
+    let iters = settings.mix_em_max_iter;
+    let pi_clamp = (settings.msfdr_pi_clamp_min, settings.msfdr_pi_clamp_max);
+    let top_frac_init = settings.msfdr1_top_frac_init;
+
+    MsfdrSeededModel::fit_rank1_seeded(
+        rank1_scores,
+        seed_mu,
+        seed_beta,
+        iters,
+        pi_clamp,
+        top_frac_init,
+    )
+}
+
+#[inline]
+fn fit_msfdr_1smix(
+    rank1_scores: &[f64],
+    pool_scores: &[f64],
+    settings: &FdrSettings,
+) -> Option<Msfdr1SmixModel> {
+    let iters = settings.mix_em_max_iter;
+    let pi_clamp = (settings.msfdr1_pi_clamp_min, settings.msfdr1_pi_clamp_max);
+    let top_frac_init = settings.msfdr1_top_frac_init;
+
+    // Capture drift settings
+    let mu_drift_abs = settings.msfdr1_mu_drift_abs;
+    let beta_drift_mult = settings.msfdr1_beta_drift_mult;
+
+    // Pool-based seed: fit gumbel moments from pool window.
+    let seed = {
+        let xs: Vec<f64> = pool_scores
+            .iter()
+            .copied()
+            .filter(|x| x.is_finite())
+            .collect();
+        if xs.len() < 20 {
+            None
+        } else {
+            let mean = xs.iter().sum::<f64>() / (xs.len() as f64);
+            let var = xs.iter().map(|v| (v - mean).powi(2)).sum::<f64>() / (xs.len() as f64);
+            let beta = ((6.0 * var).sqrt() / std::f64::consts::PI).max(1e-6);
+            let mu = mean - 0.5772156649015329_f64 * beta;
+
+            if mu.is_finite() && beta.is_finite() && beta > 0.0 {
+                Some((mu, beta))
+            } else {
+                None
+            }
+        }
+    };
+
+    if let Some((mu, beta)) = seed {
+        Msfdr1SmixModel::fit_rank1_with_null_seed(
+            rank1_scores,
+            iters,
+            pi_clamp,
+            mu,
+            beta,
+            top_frac_init,
+            mu_drift_abs,
+            beta_drift_mult,
+        )
+    } else {
+        // Fail-closed fallback: keep old behavior if pool seed is too small/noisy
+        let bottom_frac_init = settings.msfdr1_bottom_frac_init;
+        Msfdr1SmixModel::fit_rank1(
+            rank1_scores,
+            iters,
+            pi_clamp,
+            bottom_frac_init,
+            top_frac_init,
+            mu_drift_abs,
+            beta_drift_mult,
+        )
+    }
+}
+
+#[inline]
+fn fit_msfdr_2smix(
+    rank1_scores: &[f64],
+    pool_scores: &[f64],
+    settings: &FdrSettings,
+) -> Option<Msfdr2SmixModel> {
+    let iters = settings.mix_em_max_iter;
+    let pi_clamp = (settings.msfdr2_pi_clamp_min, settings.msfdr2_pi_clamp_max);
+
+    let top_frac_init = settings.msfdr1_top_frac_init;
+
+    let mix_anchor_incorrect = settings.mix_anchor_incorrect;
+    let beta_drift_mult = settings.msfdr2_beta_drift_mult;
+    let mu_drift_abs = settings.msfdr2_mu_drift_abs;
+
+    Msfdr2SmixModel::fit_rank1_with_pool(
+        rank1_scores,
+        pool_scores,
+        iters,
+        pi_clamp,
+        top_frac_init,
+        mix_anchor_incorrect,
+        beta_drift_mult,
+        mu_drift_abs,
+    )
 }
 
 // --- FIT/PREPARE ENGINES ---
@@ -801,19 +1101,54 @@ fn fit_engines(
     settings: &FdrSettings,
     gates: RunGates,
 ) -> Option<Engines> {
+    // ---------------------------------------------------------------------
+    // Fail-closed gating for per-method null windows (global threshold).
+    // ---------------------------------------------------------------------
+    let min_null_size = settings.min_null_size;
+
+    let window_ok = |method: &str, window_min: u32, window_max: u32, count: usize| -> bool {
+        if count < min_null_size {
+            log::warn!(
+                "DF fail-closed: {method}: null window [{window_min}..={window_max}] too small (n={count} < min_null_size={min_null_size}). Skipping.",
+            );
+            false
+        } else {
+            true
+        }
+    };
+
     // 1) Moments
-    let (mu_mom, beta_mom) = fit_gumbel_moments(&pool.scores);
+    let mom_scores = pool.scores_in_window(
+        settings.moments_min_null_rank,
+        settings.moments_max_null_rank,
+    );
+    if !window_ok(
+        "Moments",
+        settings.moments_min_null_rank,
+        settings.moments_max_null_rank,
+        mom_scores.len(),
+    ) {
+        // Moments are required for TEV normalization + Nokoi provisional p-gate.
+        return None;
+    }
+
+    let (mu_mom, beta_mom) = fit_gumbel_moments(&mom_scores);
     let moments_ok = mu_mom.is_finite() && beta_mom.is_finite() && beta_mom > 0.0;
     if !moments_ok {
+        log::warn!(
+            "DF fail-closed: Moments produced invalid params (mu={mu_mom}, beta={beta_mom}) using window [{}..={}].",
+            settings.moments_min_null_rank,
+            settings.moments_max_null_rank
+        );
         return None;
     }
 
     // Standard Gumbel for TEV-normalized sf inputs (used in Nokoi provisional p gate).
     let std_gumbel = Gumbel::new(0.0, 1.0).expect("standard gumbel");
 
-    // 2) LO: call the new fitter directly
+    // 2) LO: call the Lower Order fitter
     //
-    // Required by the new fitter:
+    // Required by the LO fitter:
     // - pool.fit_data:           full rank-null pool stream (rank, hyperscore, charge)
     // - rank1_scores_by_charge:  rank-1 stream (hyperscore, charge)
     let mut rank1_scores_by_charge: Vec<(f64, u8)> = Vec::with_capacity(work.rank1_indices.len());
@@ -826,11 +1161,32 @@ fn fit_engines(
         rank1_scores_by_charge.push((x, f.core.charge));
     }
 
-    // IMPORTANT: preserve your existing knobs, but apply them INSIDE the LO module
-    // as explicit (mu,beta) post-selection transforms (non-paper calibration levers).
+    // Apply existing settings inside the LO module as explicit (mu,beta) 
+    // post-selection transforms.
+    let lo_fit_data = pool.fit_data_in_window(
+        settings.lower_order_min_null_rank,
+        settings.lower_order_max_null_rank,
+    );
+
+    let lo_fit_ok = window_ok(
+        "LowerOrder",
+        settings.lower_order_min_null_rank,
+        settings.lower_order_max_null_rank,
+        lo_fit_data.len(),
+    );
+
+    let lo_fit_data_for_fit: Vec<(u32, f64, u8)> = if lo_fit_ok {
+        lo_fit_data
+    } else {
+        // Fail-closed: do not fit LO on an undersized window.
+        Vec::new()
+    };
+
     let lo_model = fit_decoy_free_model(
-        &pool.fit_data,
+        &lo_fit_data_for_fit,
         &rank1_scores_by_charge,
+        settings.lower_order_min_null_rank,
+        settings.lower_order_max_null_rank,
         settings.min_null_size,
         settings.min_rank_count,
         settings.lo_beta_blend_moments,
@@ -838,10 +1194,50 @@ fn fit_engines(
     );
 
     // 3) MLE
-    let (mu_mle, beta_mle) = fit_gumbel_mle(&pool.scores).unwrap_or((mu_mom, beta_mom));
+    let mle_scores = pool.scores_in_window(settings.mle_min_null_rank, settings.mle_max_null_rank);
 
-    // 4) MSFDR seeding (Phase 4.2)
-    // Minimal-delta option: keep MSFDR global, but choose the null seed source via settings.
+    let mut mle_fit_ok = false;
+    let (mu_mle, beta_mle) = if window_ok(
+        "MLE",
+        settings.mle_min_null_rank,
+        settings.mle_max_null_rank,
+        mle_scores.len(),
+    ) {
+        match fit_gumbel_mle(&mle_scores) {
+            Some((mu, beta)) if mu.is_finite() && beta.is_finite() && beta > 0.0 => {
+                mle_fit_ok = true;
+                (mu, beta)
+            }
+            _ => {
+                log::warn!(
+                    "DF fail-closed: MLE fit invalid using window [{}..={}]; falling back to Moments (and excluding MLE from Ensemble).",
+                    settings.mle_min_null_rank,
+                    settings.mle_max_null_rank
+                );
+                (mu_mom, beta_mom)
+            }
+        }
+    } else {
+        // Fail-closed: do not fit MLE; keep pipeline runnable via Moments fallback.
+        (mu_mom, beta_mom)
+    };
+
+    // 4) MSFDR: compute rank1_scores + pool_scores ONCE, then fit gated
+    //
+    // rank1_scores = rank1 hyperscores (finite)
+    // pool_scores  = pool.scores (already)
+    let rank1_scores: Vec<f64> = work
+        .rank1_indices
+        .iter()
+        .filter_map(|&i| tev(&features[i]))
+        .collect();
+
+    let msfdr2_pool = pool.scores_in_window(
+        settings.msfdr2_smix_min_null_rank,
+        settings.msfdr2_smix_max_null_rank,
+    );
+
+    // Seed source via settings (unchanged logic)
     let (seed_mu, seed_beta) = match settings.msfdr_seed_mode {
         crate::input::MsfdrSeedMode::Lo => lo_model.fallback_params,
         crate::input::MsfdrSeedMode::PoolMoments => (mu_mom, beta_mom),
@@ -849,13 +1245,67 @@ fn fit_engines(
     };
     let seed_beta = seed_beta.max(1e-9);
 
-    let msfdr_model = if gates.run_msfdr {
-        let target_scores: Vec<f64> = work
-            .rank1_indices
-            .iter()
-            .filter_map(|&i| tev(&features[i]))
-            .collect();
-        RobustMsfdrModel::fit(&target_scores, seed_mu, seed_beta)
+    // Fit variants gated (independent slots) + diagnostics (Step 4.2)
+
+    let msfdr_seeded = if gates.run_msfdr_seeded {
+        let m = fit_msfdr_seeded(&rank1_scores, seed_mu, seed_beta, settings);
+        match &m {
+            Some(model) => {
+                log_fit_ok("MSFDR seeded", model);
+                log::info!("MSFDR(seed) params: {}", model.param_tuple());
+            }
+            None => {
+                log_fit_failed_closed("MSFDR seeded");
+            }
+        }
+        m
+    } else {
+        None
+    };
+
+    let msfdr_1smix = if gates.run_msfdr_1smix {
+        let pool_scores_1smix = pool.scores_in_window(
+            settings.msfdr1_smix_min_null_rank,
+            settings.msfdr1_smix_max_null_rank,
+        );
+
+        let m = fit_msfdr_1smix(&rank1_scores, &pool_scores_1smix, settings);
+        match &m {
+            Some(model) => {
+                log_fit_ok("MSFDR 1smix", model);
+                log::info!("MSFDR(1smix) params: {}", model.param_tuple());
+            }
+            None => {
+                log_fit_failed_closed("MSFDR 1smix");
+            }
+        }
+        m
+    } else {
+        None
+    };
+
+    let msfdr_2smix = if gates.run_msfdr_2smix {
+        let m = if window_ok(
+            "MSFDR 2smix",
+            settings.msfdr2_smix_min_null_rank,
+            settings.msfdr2_smix_max_null_rank,
+            msfdr2_pool.len(),
+        ) {
+            fit_msfdr_2smix(&rank1_scores, &msfdr2_pool, settings)
+        } else {
+            None
+        };
+
+        match &m {
+            Some(model) => {
+                log_fit_ok("MSFDR 2smix", model);
+                log::info!("MSFDR(2smix) params: {}", model.param_tuple());
+            }
+            None => {
+                log_fit_failed_closed("MSFDR 2smix");
+            }
+        }
+        m
     } else {
         None
     };
@@ -868,6 +1318,21 @@ fn fit_engines(
 
     if run_nokoi {
         log::info!("Running Nokoi Rescoring ...");
+
+        // Fail-closed if Nokoi's selected null window is too small.
+        let nokoi_window_fit_data =
+            pool.fit_data_in_window(settings.nokoi_min_null_rank, settings.nokoi_max_null_rank);
+
+        if window_ok(
+            "Nokoi",
+            settings.nokoi_min_null_rank,
+            settings.nokoi_max_null_rank,
+            nokoi_window_fit_data.len(),
+        ) {
+            // Window size valid; proceed to positive selection and crossfit.
+        } else {
+            // Fail-closed: skip Nokoi entirely.
+        }
 
         // Positives:
         // rank==1 AND (hyperscore high enough OR provisional p-value check using moments null)
@@ -890,31 +1355,68 @@ fn fit_engines(
             f64::INFINITY
         };
 
-        // Provisional p-value threshold (moments null), used when hyperscore isn't in top slice.
-        let nokoi_pos_p_thresh: f64 = 0.01;
+        // Provisional p-value threshold (moments null), used by Nokoi positive selection.
+        let nokoi_pos_p_thresh: f64 = settings.nokoi_pos_p_thresh;
+        let nokoi_pos_rule: NokoiPosRule = settings.nokoi_pos_rule.clone();
 
-        let probs = nokoi::rescore_df(
+        let is_positive = |f: &DfFeature| -> bool {
+            if f.core.rank != 1 {
+                return false;
+            }
+
+            let x = match tev(f) {
+                Some(v) => v,
+                None => return false,
+            };
+
+            let top_hit = x >= pos_hyperscore_threshold;
+
+            let tev0 = tev_norm_from_hyperscore(x, mu_mom, beta_mom);
+            let p0 = std_gumbel.sf(tev0).clamp(0.0, 1.0).max(1e-300);
+            let p_hit = p0 <= nokoi_pos_p_thresh;
+
+            match nokoi_pos_rule {
+                NokoiPosRule::Or => top_hit || p_hit,
+                NokoiPosRule::And => top_hit && p_hit,
+                NokoiPosRule::TopOnly => top_hit,
+                NokoiPosRule::POnly => p_hit,
+            }
+        };
+
+        if log::log_enabled!(log::Level::Debug) {
+            let n_pos = features.iter().filter(|f| is_positive(f)).count();
+            let n_neg = features
+                .iter()
+                .filter(|f| {
+                    if is_positive(f) {
+                        return false;
+                    }
+                    let r = f.core.rank as u32;
+                    r >= settings.nokoi_min_null_rank && r <= settings.nokoi_max_null_rank
+                })
+                .count();
+
+            log::debug!(
+                "DF DEBUG Nokoi: pos_rule={:?} pos_hyperscore_threshold={:.6} nokoi_pos_p_thresh={:.6} min_null_rank={} max_null_rank={} n_pos={} n_neg={}",
+                nokoi_pos_rule,
+                pos_hyperscore_threshold,
+                nokoi_pos_p_thresh,
+                settings.min_null_rank,
+                settings.max_null_rank,
+                n_pos,
+                n_neg
+            );
+        }
+
+        let (probs, null_scores_oof) = nokoi::rescore_df_crossfit(
             features,
             0.01, // epsilon (same as before)
-            settings.min_null_rank,
-            settings.max_null_rank,
-            move |f: &DfFeature| {
-                if f.core.rank != 1 {
-                    return false;
-                }
-                let x = match tev(f) {
-                    Some(v) => v,
-                    None => return false,
-                };
-                if x >= pos_hyperscore_threshold {
-                    return true;
-                }
-                // provisional p-value check (moments null)
-                let tev = tev_norm_from_hyperscore(x, mu_mom, beta_mom);
-                let p0 = std_gumbel.sf(tev).clamp(0.0, 1.0).max(1e-300);
-                p0 <= nokoi_pos_p_thresh
-            },
-        )?; // returns P(target) per PSM index
+            settings.nokoi_min_null_rank,
+            settings.nokoi_max_null_rank,
+            settings.nokoi_k_folds,
+            is_positive,
+            &pool.null_indices,
+        )?; // (P(target) for all, OOF null scores for pool.null_indices)
 
         // Contract: probs must align 1:1 with `features`.
         if probs.len() != features.len() {
@@ -932,14 +1434,29 @@ fn fit_engines(
             }
             let prob_arc = Arc::new(prob);
 
-            // 2) Build null score distribution from the *rank-null pool* (purified)
-            let mut null_scores: Vec<f64> = Vec::with_capacity(pool.null_indices.len());
-            for &j in &pool.null_indices {
-                // Use Nokoi score = P(target) for null pool members
-                null_scores.push(prob_arc[j]);
-            }
+            // 2) Build null score distribution from out-of-fold predictions (non-circular)
+            let mut null_scores: Vec<f64> = null_scores_oof;
             null_scores.retain(|x| x.is_finite());
             null_scores.sort_by(|a, b| a.total_cmp(b));
+
+            if log::log_enabled!(log::Level::Debug) && !null_scores.is_empty() {
+                let n = null_scores.len();
+                let idx01 = ((n as f64 - 1.0) * 0.01).round() as usize;
+                let idx50 = ((n as f64 - 1.0) * 0.50).round() as usize;
+                let idx99 = ((n as f64 - 1.0) * 0.99).round() as usize;
+
+                let p01 = null_scores[idx01.min(n - 1)];
+                let p50 = null_scores[idx50.min(n - 1)];
+                let p99 = null_scores[idx99.min(n - 1)];
+
+                log::debug!(
+                    "DF DEBUG Nokoi null_scores quantiles: n_null={} p01={:.6} p50={:.6} p99={:.6}",
+                    n,
+                    p01,
+                    p50,
+                    p99
+                );
+            }
 
             if null_scores.len() < 10 {
                 log::warn!(
@@ -975,212 +1492,18 @@ fn fit_engines(
         mle_mu: mu_mle,
         mle_beta: beta_mle,
 
+        // keep the rest exactly as-is
+        mle_fit_ok,
         lo_model,
+        lo_fit_ok,
 
-        msfdr_model,
+        msfdr_seeded,
+        msfdr_1smix,
+        msfdr_2smix,
+
         nokoi_prob_target,
         nokoi_p_values,
     })
-}
-
-// --- ROBUST MSFDR MODEL ---
-#[derive(Clone, Debug)]
-struct RobustMsfdrModel {
-    null_loc: f64,
-    null_scale: f64,
-    target_mean: f64,
-    target_std: f64,
-    target_alpha: f64,
-    pi: f64,
-}
-
-impl RobustMsfdrModel {
-    pub fn fit(rank1_scores: &[f64], mu_in: f64, beta_in: f64) -> Option<Self> {
-        if rank1_scores.len() < 10 {
-            return None;
-        }
-
-        let init_null_loc = mu_in;
-        let init_null_scale = beta_in.max(1e-6);
-        let null_mean_approx = init_null_loc + EULER_MASCHERONI * init_null_scale;
-
-        let mut sorted_targets: Vec<f64> = rank1_scores
-            .iter()
-            .cloned()
-            .filter(|x| x.is_finite())
-            .collect();
-        if sorted_targets.len() < 10 {
-            return None;
-        }
-        sorted_targets.sort_by(|a, b| b.total_cmp(a));
-
-        let top_20 = (sorted_targets.len() as f64 * 0.2) as usize;
-        let top_slice = &sorted_targets[0..top_20.max(5).min(sorted_targets.len())];
-
-        let t_mean = top_slice.iter().sum::<f64>() / top_slice.len() as f64;
-        let t_var =
-            top_slice.iter().map(|s| (s - t_mean).powi(2)).sum::<f64>() / top_slice.len() as f64;
-        let t_std = t_var.sqrt().max(1e-6);
-
-        let n_total_finite = sorted_targets.len().max(1) as f64;
-        let n_better = sorted_targets
-            .iter()
-            .filter(|&&s| s > null_mean_approx)
-            .count();
-        let init_pi = (n_better as f64 / n_total_finite).clamp(0.05, 0.95);
-
-        let mut params = Self {
-            null_loc: init_null_loc,
-            null_scale: init_null_scale,
-            target_mean: t_mean,
-            target_std: t_std,
-            target_alpha: 2.0,
-            pi: init_pi,
-        };
-
-        let max_iters = 25;
-        let mut old_ll = -f64::INFINITY;
-
-        for iter in 0..max_iters {
-            let mut sum_z = 0.0;
-            let mut sum_z_x = 0.0;
-            let mut sum_z_xx = 0.0;
-            let mut new_ll = 0.0;
-            let mut n_used = 0usize;
-
-            if !params.null_loc.is_finite()
-                || !params.null_scale.is_finite()
-                || params.null_scale <= 0.0
-            {
-                return None;
-            }
-            let null_dist = match Gumbel::new(params.null_loc, params.null_scale) {
-                Ok(d) => d,
-                Err(_) => return None,
-            };
-            let pi = params.pi.clamp(0.01, 0.99);
-            let log_pi = pi.ln();
-            let log_1m_pi = (1.0 - pi).ln();
-
-            for &x in rank1_scores {
-                if !x.is_finite() {
-                    continue;
-                }
-                let f0 = null_dist.pdf(x).max(1e-300);
-                let f1 = skew_normal_pdf(
-                    x,
-                    params.target_mean,
-                    params.target_std,
-                    params.target_alpha,
-                )
-                .max(1e-300);
-                if !f0.is_finite() || !f1.is_finite() {
-                    continue;
-                }
-                let log_f0 = f0.ln();
-                let log_f1 = f1.ln();
-                let log_num = log_pi + log_f1;
-                let log_den = log_add_exp(log_1m_pi + log_f0, log_num);
-                if !log_den.is_finite() {
-                    continue;
-                }
-                let z = (log_num - log_den).exp();
-                if !z.is_finite() {
-                    continue;
-                }
-
-                sum_z += z;
-                sum_z_x += z * x;
-                sum_z_xx += z * x * x;
-                new_ll += log_den;
-                n_used += 1;
-            }
-
-            if n_used < 10 {
-                return None;
-            }
-            if sum_z < 1e-8 {
-                if iter == 0 {
-                    return None;
-                } else {
-                    break;
-                }
-            }
-            if !new_ll.is_finite() {
-                return None;
-            }
-
-            let avg_ll = new_ll / (n_used as f64);
-            let tol_rel = 1e-4;
-            let tol_abs = 1e-6;
-            if old_ll.is_finite() {
-                let delta = (avg_ll - old_ll).abs();
-                let scale = old_ll.abs().max(1.0);
-                if delta < tol_abs || (delta / scale) < tol_rel {
-                    break;
-                }
-            }
-            old_ll = avg_ll;
-
-            let n_total = n_used as f64;
-            params.pi = (sum_z / n_total).clamp(0.01, 0.99);
-            params.target_mean = sum_z_x / sum_z;
-            let var = (sum_z_xx / sum_z) - params.target_mean.powi(2);
-            if !var.is_finite() || var < 0.0 {
-                return None;
-            }
-            params.target_std = var.sqrt().max(1e-6);
-            if params.target_mean > t_mean {
-                params.target_alpha = (params.target_alpha + 0.1).min(10.0);
-            }
-        }
-
-        log::info!(
-            "Robust MSFDR: pi={:.2}, mean={:.2}",
-            params.pi,
-            params.target_mean
-        );
-        Some(params)
-    }
-
-    pub fn calculate_seeded_null_p(&self, x: f64) -> f64 {
-        // --- Guard against invalid inputs ---
-        if !x.is_finite() {
-            return 1.0;
-        }
-
-        // Avoid exact 0.0 p-values (later log / combination safety)
-        let std = Gumbel::new(0.0, 1.0).expect("standard gumbel");
-        let tev = tev_norm_from_hyperscore(x, self.null_loc, self.null_scale.max(1e-9));
-        std.sf(tev).clamp(0.0, 1.0).max(1e-300)
-    }
-
-    /// Mixture-model PEP: P(null | x)
-    /// Uses the fitted Gumbel null (f0) and skew-normal target (f1) with mixing pi.
-    pub fn calculate_pep(&self, x: f64) -> f64 {
-        if !x.is_finite() {
-            return 1.0;
-        }
-
-        let null_dist = match Gumbel::new(self.null_loc, self.null_scale.max(1e-9)) {
-            Ok(d) => d,
-            Err(_) => return 1.0,
-        };
-
-        let f0 = null_dist.pdf(x).max(1e-300);
-        let f1 =
-            skew_normal_pdf(x, self.target_mean, self.target_std, self.target_alpha).max(1e-300);
-
-        let pi = self.pi.clamp(0.01, 0.99);
-        let num = (1.0 - pi) * f0;
-        let den = num + pi * f1;
-
-        if den.is_finite() && den > 0.0 {
-            (num / den).clamp(0.0, 1.0)
-        } else {
-            1.0
-        }
-    }
 }
 
 // --- MAIN FUNCTION ---
@@ -1199,16 +1522,28 @@ pub fn calculate_q_values(
     let use_ensemble = matches!(settings.model_fit, ModelFit::Ensemble);
 
     // Centralized gating: only these methods are considered "ran" for output population.
-    // (We may still compute intermediate values for internal fallbacks, but we do NOT populate
+    // (Still compute intermediate values for internal fallbacks, but do NOT populate
     // per-method columns unless the method is enabled here.)
     let run_mom = use_ensemble || matches!(settings.model_fit, ModelFit::Moments);
     let run_mle = use_ensemble || matches!(settings.model_fit, ModelFit::Mle);
     let run_lo = use_ensemble || matches!(settings.model_fit, ModelFit::LowerOrder);
-    let run_msfdr = use_ensemble || matches!(settings.model_fit, ModelFit::Msfdr);
+
+    // MSFDR variants (independent gating; replaces any single run_msfdr flag)
+    let run_msfdr_seeded = matches!(settings.model_fit, ModelFit::Msfdr)
+        || (use_ensemble && settings.enable_msfdr_seeded);
+
+    let run_msfdr_1smix = matches!(settings.model_fit, ModelFit::Msfdr1Smix)
+        || (use_ensemble && settings.enable_msfdr_1smix);
+
+    let run_msfdr_2smix = matches!(settings.model_fit, ModelFit::Msfdr2Smix)
+        || (use_ensemble && settings.enable_msfdr_2smix);
+
     let run_nokoi = use_ensemble || matches!(settings.model_fit, ModelFit::Nokoi);
 
     let gates = RunGates {
-        run_msfdr,
+        run_msfdr_seeded,
+        run_msfdr_1smix,
+        run_msfdr_2smix,
         run_nokoi,
     };
 
@@ -1240,27 +1575,33 @@ pub fn calculate_q_values(
                 psm.p_mle = None;
                 psm.p_lo = None;
                 psm.p_msfdr = None;
+                psm.p_1smix = None;
+                psm.p_2smix = None;
                 psm.p_nokoi = None;
 
                 psm.pep_mom = None;
                 psm.pep_mle = None;
                 psm.pep_lo = None;
                 psm.pep_msfdr = None;
+                psm.pep_1smix = None;
+                psm.pep_2smix = None;
                 psm.pep_nokoi = None;
 
                 psm.q_mom = None;
                 psm.q_mle = None;
                 psm.q_lo = None;
                 psm.q_msfdr = None;
+                psm.q_1smix = None;
+                psm.q_2smix = None;
                 psm.q_nokoi = None;
 
-                // If you prefer “rank1 gets explicit 1.0 Some(...)”, we can re-add that here:
                 if psm.core.rank == 1 {
                     psm.decoy_free_p_value = Some(1.0);
                     psm.decoy_free_pep = Some(1.0);
                     psm.decoy_free_score = Some(0.0);
                     psm.decoy_free_q_value = Some(1.0);
                     psm.decoy_free_peptide_q = Some(1.0);
+                    psm.decoy_free_protein_q = Some(1.0);
                 }
             });
             return new_features;
@@ -1268,6 +1609,39 @@ pub fn calculate_q_values(
     };
 
     log::info!("DF: pool_size={}", pool.fit_data.len());
+
+    if log::log_enabled!(log::Level::Debug) {
+        log::debug!(
+            "DF DEBUG settings: min_null_rank={} max_null_rank={} min_null_size={} purification_factor={}",
+            settings.min_null_rank,
+            settings.max_null_rank,
+            settings.min_null_size,
+            settings.purification_factor
+        );
+
+        log::debug!(
+            "DF DEBUG pool sizes: fit_data.len()={} null_indices.len()={} scores.len()={}",
+            pool.fit_data.len(),
+            pool.null_indices.len(),
+            pool.scores.len()
+        );
+
+        // rank histogram over pool.fit_data
+        let mut rank_hist: BTreeMap<u32, usize> = BTreeMap::new();
+        for (r, _, _) in &pool.fit_data {
+            *rank_hist.entry(*r).or_insert(0) += 1;
+        }
+
+        // compact string: "4:123 5:456 ..."
+        let mut hist_s = String::new();
+        for (r, c) in rank_hist {
+            if !hist_s.is_empty() {
+                hist_s.push(' ');
+            }
+            hist_s.push_str(&format!("{}:{}", r, c));
+        }
+        log::debug!("DF DEBUG pool.fit_data rank histogram: {}", hist_s);
+    }
 
     // ==============================
     // Stage 2 — fit engines
@@ -1277,11 +1651,45 @@ pub fn calculate_q_values(
         None => {
             log::error!("Invalid null fit. FDR will fail closed.");
             new_features.par_iter_mut().for_each(|psm| {
-                set_df_q_value(psm, 1.0);
+                // CRITICAL: clear DF + per-method outputs to prevent stale leakage.
+                // Rank1 gets explicit fail-closed defaults.
+                clear_all_df_outputs(psm, true);
             });
             return new_features;
         }
     };
+
+    // ==============================
+    // Diagnostics: log model-fit success + key parameters
+    // ==============================
+    log::info!(
+        "DF fit summary: moments_null=(mu={:.6}, beta={:.6}) mle_null=(mu={:.6}, beta={:.6})",
+        engines.mom_mu,
+        engines.mom_beta,
+        engines.mle_mu,
+        engines.mle_beta
+    );
+
+    // LO: you at least have fallback params available; log them.
+    log::info!(
+        "DF fit summary: LO fallback_params=(mu={:.6}, beta={:.6})",
+        engines.lo_model.fallback_params.0,
+        engines.lo_model.fallback_params.1
+    );
+
+    // MSFDR variants: summarize presence + debug dump if present
+    match &engines.msfdr_seeded {
+        Some(m) => log_fit_ok("MSFDR seeded (engine present)", m),
+        None => log::info!("DF MSFDR seeded: engine absent (None)"),
+    }
+    match &engines.msfdr_1smix {
+        Some(m) => log_fit_ok("MSFDR 1smix (engine present)", m),
+        None => log::info!("DF MSFDR 1smix: engine absent (None)"),
+    }
+    match &engines.msfdr_2smix {
+        Some(m) => log_fit_ok("MSFDR 2smix (engine present)", m),
+        None => log::info!("DF MSFDR 2smix: engine absent (None)"),
+    }
 
     // --- CALCULATION LOOP ---
     // --- capture small config once for rayon closure ---
@@ -1299,12 +1707,24 @@ pub fn calculate_q_values(
     // Standard Gumbel for TEV-normalized sf inputs
     let std_gumbel = Gumbel::new(0.0, 1.0).expect("standard gumbel");
 
-    let msfdr_model = engines.msfdr_model.clone(); // Option<RobustMsfdrModel>
-    let nokoi_prob_target = engines.nokoi_prob_target.clone(); // Option<Arc<Vec<f64>>>
-    let nokoi_p_values = engines.nokoi_p_values.clone(); // Option<Arc<Vec<f64>>>
+    let msfdr_seeded = engines.msfdr_seeded.clone();
+    let msfdr_1smix = engines.msfdr_1smix.clone();
+    let msfdr_2smix = engines.msfdr_2smix.clone();
 
-    // Run-level "expert present" gates (keeps Brown-fit and PART A consistent)
-    let use_msfdr_expert = run_msfdr && msfdr_model.is_some();
+    let nokoi_prob_target = engines.nokoi_prob_target.clone();
+    let nokoi_p_values = engines.nokoi_p_values.clone();
+
+    // Expert inclusion gates for Ensemble:
+    // - Moments is required; if it fails, fit_engines() returns None earlier.
+    // - MLE/LO are included ONLY if they actually fit (not fallback-only).
+    let use_mle_expert = run_mle && engines.mle_fit_ok;
+    let use_lo_expert = run_lo && engines.lo_fit_ok;
+
+    // “expert present” gates (must match Brown fitting + Part A expert lists)
+    let use_seeded_expert = run_msfdr_seeded && msfdr_seeded.is_some();
+    let use_1smix_expert = run_msfdr_1smix && msfdr_1smix.is_some();
+    let use_2smix_expert = run_msfdr_2smix && msfdr_2smix.is_some();
+
     let use_nokoi_expert = run_nokoi && nokoi_p_values.is_some();
 
     // ---------------------------------------------------------
@@ -1348,23 +1768,35 @@ pub fn calculate_q_values(
                     }
 
                     // MLE
-                    if run_mle {
+                    if use_mle_expert {
                         let tev = tev_norm_from_hyperscore(x, mle_mu, mle_beta);
                         experts.push(std_gumbel.sf(tev).clamp(0.0, 1.0).max(1e-300));
                     }
 
                     // Lower-Order (LO) — global TNM only (no per-PSM ln_ratio shift)
-                    if run_lo {
+                    if use_lo_expert {
                         let charge = psm.core.charge;
                         experts.push(lo_model.p_value(x, charge).clamp(0.0, 1.0).max(1e-300));
                     }
 
-                    // MSFDR (only if present for this run)
-                    if use_msfdr_expert {
-                        let m = msfdr_model
+                    // MSFDR seeded / 1smix / 2smix (only if present for this run)
+                    if use_seeded_expert {
+                        let m = msfdr_seeded
                             .as_ref()
-                            .expect("use_msfdr_expert implies msfdr_model.is_some()");
-                        experts.push(m.calculate_seeded_null_p(x).clamp(0.0, 1.0).max(1e-300));
+                            .expect("use_seeded_expert implies msfdr_seeded.is_some()");
+                        experts.push(m.p_value(x).clamp(0.0, 1.0).max(1e-300));
+                    }
+                    if use_1smix_expert {
+                        let m = msfdr_1smix
+                            .as_ref()
+                            .expect("use_1smix_expert implies msfdr_1smix.is_some()");
+                        experts.push(m.p_value(x).clamp(0.0, 1.0).max(1e-300));
+                    }
+                    if use_2smix_expert {
+                        let m = msfdr_2smix
+                            .as_ref()
+                            .expect("use_2smix_expert implies msfdr_2smix.is_some()");
+                        experts.push(m.p_value(x).clamp(0.0, 1.0).max(1e-300));
                     }
 
                     // Nokoi (only if present for this run)
@@ -1398,7 +1830,7 @@ pub fn calculate_q_values(
         };
 
     // --- PART A: Compute in Parallel (Read-Only) ---
-    // We compute everything first and store it in a temporary list (rank1_out)
+    // Compute everything first and store it in a temporary list (rank1_out)
     let rank1_out: Vec<Rank1Computed> = work
         .rank1_indices
         .par_iter()
@@ -1430,14 +1862,38 @@ pub fn calculate_q_values(
             };
 
             // 3. Optional Models (MSFDR and Nokoi)
-            // STRICT compute gating: only compute when the method is enabled for this run
-            // AND the required model/vector is present.
-            let (p_msfdr, pep_msfdr) = if use_msfdr_expert {
-                let m = msfdr_model
+            // MSFDR (seeded / 1smix / 2smix): compute per-variant p/pep only if enabled+present.
+            let (p_msfdr, pep_msfdr) = if use_seeded_expert {
+                let m = msfdr_seeded
                     .as_ref()
-                    .expect("use_msfdr_expert implies msfdr_model.is_some()");
-                let p = m.calculate_seeded_null_p(x).clamp(0.0, 1.0).max(1e-300);
-                let pep = m.calculate_pep(x).clamp(0.0, 1.0).max(1e-300);
+                    .expect("use_seeded_expert implies msfdr_seeded.is_some()");
+                let pep = m.pep(x).clamp(0.0, 1.0).max(1e-300);
+                // Use actual null p-value for the p-stream, not PEP
+                let p = m.p_value(x).clamp(0.0, 1.0).max(1e-300);
+                (Some(p), Some(pep))
+            } else {
+                (None, None)
+            };
+
+            let (p_1smix, pep_1smix) = if use_1smix_expert {
+                let m = msfdr_1smix
+                    .as_ref()
+                    .expect("use_1smix_expert implies msfdr_1smix.is_some()");
+                let pep = m.pep(x).clamp(0.0, 1.0).max(1e-300);
+                // Use actual null p-value for the p-stream, not PEP
+                let p = m.p_value(x).clamp(0.0, 1.0).max(1e-300);
+                (Some(p), Some(pep))
+            } else {
+                (None, None)
+            };
+
+            let (p_2smix, pep_2smix) = if use_2smix_expert {
+                let m = msfdr_2smix
+                    .as_ref()
+                    .expect("use_2smix_expert implies msfdr_2smix.is_some()");
+                let pep = m.pep(x).clamp(0.0, 1.0).max(1e-300);
+                // Use actual null p-value for the p-stream, not PEP
+                let p = m.p_value(x).clamp(0.0, 1.0).max(1e-300);
                 (Some(p), Some(pep))
             } else {
                 (None, None)
@@ -1479,23 +1935,63 @@ pub fn calculate_q_values(
             if run_mom {
                 experts.push(p_mom);
             }
-            if run_mle {
-                experts.push(p_mle);
-            }
-            if run_lo {
-                experts.push(p_lo);
-            }
-            if use_msfdr_expert {
-                experts.push(p_msfdr.unwrap_or(1.0));
+            if use_mle_expert {
+				experts.push(p_mle);
+			}
+            if use_lo_expert {
+				experts.push(p_lo);
+			}
+            // MSFDR experts:
+            // - Single-method mode selects one variant (fail-closed if missing)
+            // - Ensemble can include any/all variants as independent experts
+            match settings.model_fit {
+                ModelFit::Msfdr => {
+                    if let Some(p) = p_msfdr {
+                        experts.push(p);
+                    }
+                }
+                ModelFit::Msfdr1Smix => {
+                    if let Some(p) = p_1smix {
+                        experts.push(p);
+                    }
+                }
+                ModelFit::Msfdr2Smix => {
+                    if let Some(p) = p_2smix {
+                        experts.push(p);
+                    }
+                }
+                ModelFit::Ensemble => {
+                    if use_seeded_expert {
+                        if let Some(p) = p_msfdr {
+                            experts.push(p);
+                        }
+                    }
+                    if use_1smix_expert {
+                        if let Some(p) = p_1smix {
+                            experts.push(p);
+                        }
+                    }
+                    if use_2smix_expert {
+                        if let Some(p) = p_2smix {
+                            experts.push(p);
+                        }
+                    }
+                }
+                _ => {}
             }
             if use_nokoi_expert {
-                experts.push(p_nokoi.unwrap_or(1.0));
+                if let Some(p) = p_nokoi {
+                    experts.push(p);
+                }
             }
 
             let p_final = if use_ensemble {
                 // If an expert didn't run / didn't produce p, it is simply absent.
                 // If somehow empty (shouldn't happen), fail-closed.
                 if experts.is_empty() {
+                    log::error!(
+                        "DF Ensemble fail-closed: no experts available after fit gating; returning p=1.0 for this PSM."
+                    );
                     1.0
                 } else {
                     combine_p_values(&experts, ensemble_p_combiner.clone(), brown_params)
@@ -1506,6 +2002,8 @@ pub fn calculate_q_values(
                     ModelFit::Mle => p_mle,
                     ModelFit::LowerOrder => p_lo,
                     ModelFit::Msfdr => p_msfdr.unwrap_or(1.0), // FAIL-CLOSED
+                    ModelFit::Msfdr1Smix => p_1smix.unwrap_or(1.0), // FAIL-CLOSED
+                    ModelFit::Msfdr2Smix => p_2smix.unwrap_or(1.0), // FAIL-CLOSED
                     ModelFit::Nokoi => p_nokoi.unwrap_or(1.0), // FAIL-CLOSED
                     _ => 1.0,                                  // FAIL-CLOSED
                 }
@@ -1513,133 +2011,298 @@ pub fn calculate_q_values(
             .clamp(0.0, 1.0)
             .max(1e-300);
 
-            // 5. PEP Calculation
-            // Step 3 contract:
-            // - null-only methods: pep == p (until we implement a real pep model)
-            // - MSFDR: use mixture pep
-            // - Nokoi: pep == p for now (until Step 6)
-            let pep_mom = p_mom;
-            let pep_mle = p_mle;
-            let pep_lo = p_lo;
-
-            let pep_final = if use_ensemble {
-                let mut pep_experts: Vec<f64> = Vec::new();
-                if run_mom {
-                    pep_experts.push(pep_mom);
-                }
-                if run_mle {
-                    pep_experts.push(pep_mle);
-                }
-                if run_lo {
-                    pep_experts.push(pep_lo);
-                }
-                if use_msfdr_expert {
-                    // pep_msfdr is only computed when use_msfdr_expert is true
-                    pep_experts.push(pep_msfdr.unwrap_or(1.0));
-                }
-                if run_nokoi {
-                    if let Some(v) = pep_nokoi {
-                        pep_experts.push(v);
-                    }
-                }
-
-                if pep_experts.is_empty() {
-                    1.0
-                } else {
-                    combine_peps(&pep_experts, ensemble_pep_combiner.clone())
-                }
-            } else {
-                match settings.model_fit {
-                    ModelFit::Moments => pep_mom,
-                    ModelFit::Mle => pep_mle,
-                    ModelFit::LowerOrder => pep_lo,
-                    ModelFit::Msfdr => pep_msfdr.unwrap_or(1.0), // FAIL-CLOSED
-                    ModelFit::Nokoi => pep_nokoi.unwrap_or(1.0), // FAIL-CLOSED
-                    _ => 1.0,                                    // FAIL-CLOSED
-                }
-            }
-            .clamp(0.0, 1.0)
-            .max(1e-300);
-
-            let df_score = (-10.0 * (pep_final).max(1e-15).log10()) as f32;
-
+            // 5) Final DF p (already computed above). PEP/score are computed later after lfdr mapping.
             Some(Rank1Computed {
                 idx,
                 p_mom,
                 p_mle,
                 p_lo,
+
+                // MSFDR family
                 p_msfdr,
+                p_1smix,
+                p_2smix,
+
                 p_nokoi,
-                pep_mom,
-                pep_mle,
-                pep_lo,
+
+                // MSFDR family peps (model-derived)
                 pep_msfdr,
+                pep_1smix,
+                pep_2smix,
+
+                // Nokoi pep
                 pep_nokoi,
+
                 p_final,
-                pep_final,
-                df_score,
             })
         })
         .collect();
 
+    // ---------------------------------------------------------
+    // PART A.5: Build PEP proxies for Moments/MLE/LO via local-FDR
+    // ---------------------------------------------------------
+    // Compute:
+    //  - pi0 from a clean reference subset (label==1, non-ENT, non-CONT)
+    //  - density f(p) from the method’s rank1 p-values (all rank1 for that method)
+    //  - pep(p) = pi0 / f(p)
+    //
+    // NOTE: This is intentionally *not* tied to PAVA calibration; PEP is a posterior proxy.
+    let pep_bins: usize = 200; // fixed, simple, stable
+
+    // Collect method p-vectors from rank1_out (aligned 1:1 with rank1_out)
+    let mut p_mom_all: Vec<f64> = Vec::new();
+    let mut p_mle_all: Vec<f64> = Vec::new();
+    let mut p_lo_all: Vec<f64> = Vec::new();
+
+    p_mom_all.reserve(rank1_out.len());
+    p_mle_all.reserve(rank1_out.len());
+    p_lo_all.reserve(rank1_out.len());
+
+    for r in &rank1_out {
+        p_mom_all.push(r.p_mom.clamp(0.0, 1.0).max(1e-300));
+        p_mle_all.push(r.p_mle.clamp(0.0, 1.0).max(1e-300));
+        p_lo_all.push(r.p_lo.clamp(0.0, 1.0).max(1e-300));
+    }
+
+    // Build reference membership per rank1_out entry (for pi0 only)
+    let mut is_ref: Vec<bool> = Vec::with_capacity(rank1_out.len());
+    for r in &rank1_out {
+        let f = &new_features[r.idx];
+        if f.core.label != 1 {
+            is_ref.push(false);
+            continue;
+        }
+        let prot = db[f.core.peptide_idx].proteins(&db.decoy_tag, db.generate_decoys);
+        is_ref.push(!is_contam_str(&prot) && !is_entrapment_str(&prot));
+    }
+
+    // Build reference p vectors for pi0 (method-specific)
+    let mut p_mom_ref: Vec<f64> = Vec::new();
+    let mut p_mle_ref: Vec<f64> = Vec::new();
+    let mut p_lo_ref: Vec<f64> = Vec::new();
+
+    for (k, &ref_ok) in is_ref.iter().enumerate() {
+        if !ref_ok {
+            continue;
+        }
+        p_mom_ref.push(p_mom_all[k]);
+        p_mle_ref.push(p_mle_all[k]);
+        p_lo_ref.push(p_lo_all[k]);
+    }
+
+    // Estimate pi0 per method (fallback to 1.0 if degenerate)
+    let pi0_mom = estimate_pi0_from_reference_grid(&p_mom_ref, settings)
+        .unwrap_or(1.0)
+        .clamp(0.0, 1.0);
+    let pi0_mle = estimate_pi0_from_reference_grid(&p_mle_ref, settings)
+        .unwrap_or(1.0)
+        .clamp(0.0, 1.0);
+    let pi0_lo = estimate_pi0_from_reference_grid(&p_lo_ref, settings)
+        .unwrap_or(1.0)
+        .clamp(0.0, 1.0);
+
+    // Density estimates from all rank1 p-values (method-specific)
+    let dens_mom = hist_density_01(&p_mom_all, pep_bins);
+    let dens_mle = hist_density_01(&p_mle_all, pep_bins);
+    let dens_lo = hist_density_01(&p_lo_all, pep_bins);
+
+    // PEP proxies aligned to rank1_out order
+    let pep_mom_vec: Vec<f64> = p_mom_all
+        .iter()
+        .map(|&p| pep_from_p_lfdr(p, pi0_mom, &dens_mom))
+        .collect();
+    let pep_mle_vec: Vec<f64> = p_mle_all
+        .iter()
+        .map(|&p| pep_from_p_lfdr(p, pi0_mle, &dens_mle))
+        .collect();
+    let pep_lo_vec: Vec<f64> = p_lo_all
+        .iter()
+        .map(|&p| pep_from_p_lfdr(p, pi0_lo, &dens_lo))
+        .collect();
+
     // --- PART B: Write back to new_features ---
-    // Now that Part A is finished, we have a list of updates.
-    // We can iterate and apply them without borrow conflicts.
-    for r in rank1_out {
+    for (j, r) in rank1_out.into_iter().enumerate() {
         let psm = &mut new_features[r.idx];
 
-        // Populate per-method outputs ONLY if the method is enabled by the centralized gate.
-        // (Otherwise leave as None to make "didn't run" unambiguous.)
+        // Write per-variant MSFDR fields ONLY if that variant is enabled+present this run.
+        // Reuse the same run-level gates as Part A (expert present gates).
+        let write_seeded = use_seeded_expert;
+        let write_1smix = use_1smix_expert;
+        let write_2smix = use_2smix_expert;
+
+        // --- per-method p outputs (unchanged) ---
         psm.p_mom = if run_mom { Some(r.p_mom as f32) } else { None };
         psm.p_mle = if run_mle { Some(r.p_mle as f32) } else { None };
         psm.p_lo = if run_lo { Some(r.p_lo as f32) } else { None };
 
-        psm.p_msfdr = if run_msfdr {
+        psm.p_msfdr = if write_seeded {
             r.p_msfdr.map(|v| v as f32)
         } else {
             None
         };
+        psm.p_1smix = if write_1smix {
+            r.p_1smix.map(|v| v as f32)
+        } else {
+            None
+        };
+        psm.p_2smix = if write_2smix {
+            r.p_2smix.map(|v| v as f32)
+        } else {
+            None
+        };
+
         psm.p_nokoi = if run_nokoi {
             r.p_nokoi.map(|v| v as f32)
         } else {
             None
         };
 
+        // --- per-method PEP outputs ---
+        // Moments/MLE/LO now get a local-FDR PEP proxy (NOT p-value reuse).
         psm.pep_mom = if run_mom {
-            Some(r.pep_mom as f32)
+            Some(pep_mom_vec[j] as f32)
         } else {
             None
         };
         psm.pep_mle = if run_mle {
-            Some(r.pep_mle as f32)
+            Some(pep_mle_vec[j] as f32)
         } else {
             None
         };
-        psm.pep_lo = if run_lo { Some(r.pep_lo as f32) } else { None };
+        psm.pep_lo = if run_lo {
+            Some(pep_lo_vec[j] as f32)
+        } else {
+            None
+        };
 
-        psm.pep_msfdr = if run_msfdr {
+        // MSFDR family peps remain model-derived
+        psm.pep_msfdr = if write_seeded {
             r.pep_msfdr.map(|v| v as f32)
         } else {
             None
         };
+        psm.pep_1smix = if write_1smix {
+            r.pep_1smix.map(|v| v as f32)
+        } else {
+            None
+        };
+        psm.pep_2smix = if write_2smix {
+            r.pep_2smix.map(|v| v as f32)
+        } else {
+            None
+        };
+
+        // Nokoi pep remains 1 - P(target)
         psm.pep_nokoi = if run_nokoi {
             r.pep_nokoi.map(|v| v as f32)
         } else {
             None
         };
 
-        // Final DF outputs ALWAYS populated (rank1-only by design)
-        set_df_p_value(psm, r.p_final as f32); // sets decoy_free_p_value
-        psm.decoy_free_pep = Some(r.pep_final as f32);
-        psm.decoy_free_score = Some(r.df_score);
+        // --- final DF outputs ---
+        // p_final computed in Part A, pep_final computed here using correct pep streams.
+        set_df_p_value(psm, r.p_final as f32);
+
+        let pep_final: f64 = if use_ensemble {
+            let mut pep_experts: Vec<f64> = Vec::new();
+
+            if run_mom {
+                pep_experts.push(pep_mom_vec[j]);
+            }
+            if run_mle {
+                pep_experts.push(pep_mle_vec[j]);
+            }
+            if run_lo {
+                pep_experts.push(pep_lo_vec[j]);
+            }
+
+            if use_seeded_expert {
+                if let Some(v) = r.pep_msfdr {
+                    pep_experts.push(v);
+                }
+            }
+            if use_1smix_expert {
+                if let Some(v) = r.pep_1smix {
+                    pep_experts.push(v);
+                }
+            }
+            if use_2smix_expert {
+                if let Some(v) = r.pep_2smix {
+                    pep_experts.push(v);
+                }
+            }
+
+            if run_nokoi {
+                if let Some(v) = r.pep_nokoi {
+                    pep_experts.push(v);
+                }
+            }
+
+            if pep_experts.is_empty() {
+                1.0
+            } else {
+                combine_peps(&pep_experts, ensemble_pep_combiner.clone())
+            }
+        } else {
+            match settings.model_fit {
+                ModelFit::Moments => pep_mom_vec[j],
+                ModelFit::Mle => pep_mle_vec[j],
+                ModelFit::LowerOrder => pep_lo_vec[j],
+
+                ModelFit::Msfdr => r.pep_msfdr.unwrap_or(1.0),
+                ModelFit::Msfdr1Smix => r.pep_1smix.unwrap_or(1.0),
+                ModelFit::Msfdr2Smix => r.pep_2smix.unwrap_or(1.0),
+
+                ModelFit::Nokoi => r.pep_nokoi.unwrap_or(1.0),
+
+                // Ensemble handled above; everything else fail-closed
+                _ => 1.0,
+            }
+        }
+        .clamp(0.0, 1.0)
+        .max(1e-300);
+
+        let df_score = (-10.0 * pep_final.max(1e-15).log10()) as f32;
+
+        psm.decoy_free_pep = Some(pep_final as f32);
+        psm.decoy_free_score = Some(df_score);
+
+        // Debug-build assertions for PEP streams (present-only)
+        #[cfg(debug_assertions)]
+        {
+            // Helper: assert pep is finite and in (0, 1]
+            let assert_pep = |name: &str, v: Option<f32>, idx: usize| {
+                if let Some(x) = v {
+                    debug_assert!(
+                        x.is_finite() && x > 0.0 && x <= 1.0,
+                        "DF ASSERT {} invalid at feature_idx={}: {}",
+                        name,
+                        idx,
+                        x
+                    );
+                }
+            };
+
+            let idx = r.idx;
+            assert_pep("decoy_free_pep", psm.decoy_free_pep, idx);
+            assert_pep("pep_mom", psm.pep_mom, idx);
+            assert_pep("pep_mle", psm.pep_mle, idx);
+            assert_pep("pep_lo", psm.pep_lo, idx);
+            assert_pep("pep_msfdr", psm.pep_msfdr, idx);
+            assert_pep("pep_1smix", psm.pep_1smix, idx);
+            assert_pep("pep_2smix", psm.pep_2smix, idx);
+            assert_pep("pep_nokoi", psm.pep_nokoi, idx);
+        }
     }
 
     // --- PART C: Clear Non-Rank1 (Cheap safety pass) ---
-    // We only compute/define DF outputs for rank==1. Anything else must be scrubbed
+    // Only compute/define DF outputs for rank==1. Anything else must be scrubbed
     // to avoid stale values leaking into downstream tables / plots.
     new_features.par_iter_mut().for_each(|psm| {
         if psm.core.rank != 1 {
-            // Rank!=1: DF outputs are undefined by contract; scrub to None (fail-closed via accessors).
+            // Rank!=1: DF outputs are undefined by contract; scrub EVERYTHING to None.
+
+            // --- final DF outputs (rank1-only) ---
             psm.decoy_free_p_value = None;
             psm.decoy_free_pep = None;
             psm.decoy_free_score = None;
@@ -1647,29 +2310,46 @@ pub fn calculate_q_values(
             psm.decoy_free_peptide_q = None;
             psm.decoy_free_protein_q = None;
 
-            // --- per-method p/pep/q outputs (rank1-only by design in Step 3) ---
+            // --- per-method p streams (rank1-only) ---
             psm.p_mom = None;
             psm.p_mle = None;
             psm.p_lo = None;
+
+            // --- MSFDR family p streams (HARD rank1-only) ---
             psm.p_msfdr = None;
+            psm.p_1smix = None;
+            psm.p_2smix = None;
+
             psm.p_nokoi = None;
 
+            // --- per-method pep streams (rank1-only) ---
             psm.pep_mom = None;
             psm.pep_mle = None;
             psm.pep_lo = None;
+
+            // --- MSFDR family pep streams (HARD rank1-only) ---
             psm.pep_msfdr = None;
+            psm.pep_1smix = None;
+            psm.pep_2smix = None;
+
             psm.pep_nokoi = None;
 
+            // --- per-method q streams (rank1-only) ---
             psm.q_mom = None;
             psm.q_mle = None;
             psm.q_lo = None;
+
+            // --- MSFDR family q streams (HARD rank1-only) ---
             psm.q_msfdr = None;
+            psm.q_1smix = None;
+            psm.q_2smix = None;
+
             psm.q_nokoi = None;
         }
     });
 
     // --- CALIBRATION (replaces old global hyperscore PAVA) ---
-    // We calibrate the *chosen* p-value (currently stored in spectrum_q / decoy_free_p_value)
+    // Calibrate the *chosen* p-value (rank1-only; stored in decoy_free_p_value)
     // using a ranking key appropriate to the chosen method.
     // This is the structural fix for LO conservatism when LO != hyperscore-ranked.
     {
@@ -1689,10 +2369,45 @@ pub fn calculate_q_values(
                 .collect()
         };
 
-        // LO rank-key helper aligned to LO p-value computation.
-        // Current LO implementation uses TEV ordering (larger TEV = better).
-        // If LO ranking ever changes, implement that change here.
-        let lo_rank_key = |f: &DfFeature| -> f64 { tev(f).unwrap_or(f64::NEG_INFINITY) };
+        // LO-adjusted ranking key: use LO evidence scale (-log10(p_lo)), larger = better.
+        // Fail-closed if p_lo is missing/non-finite.
+        let lo_rank_key = |f: &DfFeature| -> f64 {
+            match f.p_lo {
+                Some(p) => {
+                    let p = (p as f64).clamp(1e-300, 1.0);
+                    if p.is_finite() {
+                        -p.log10()
+                    } else {
+                        f64::NEG_INFINITY
+                    }
+                }
+                None => f64::NEG_INFINITY,
+            }
+        };
+
+        if log::log_enabled!(log::Level::Debug) {
+            // What the calibration block will actually use as its quality key.
+            let quality_desc = match settings.model_fit {
+                ModelFit::Moments | ModelFit::Mle => {
+                    "quality=tev(feature) (TEV-normalized hyperscore)"
+                }
+                ModelFit::LowerOrder => match settings.lo_rank_key {
+                    LoRankKey::Hyperscore => "quality=hyperscore",
+                    LoRankKey::LoAdjusted => "quality=-log10(p_lo) (LO evidence)",
+                },
+                ModelFit::Msfdr | ModelFit::Msfdr1Smix | ModelFit::Msfdr2Smix | ModelFit::Nokoi => {
+                    "quality=-log10(p_used)"
+                }
+                ModelFit::Ensemble => "quality=decoy_free_score",
+            };
+
+            log::debug!(
+                "DF DEBUG calibration(chosen): model_fit={:?} lo_rank_key={:?} {}",
+                settings.model_fit,
+                settings.lo_rank_key,
+                quality_desc
+            );
+        }
 
         // Build rows for chosen-output calibration.
         let rows: Vec<(f64, usize, f64)> = work
@@ -1707,8 +2422,10 @@ pub fn calculate_q_values(
                     ModelFit::Mle => f.p_mle.map(|v| v as f64)?,
                     ModelFit::LowerOrder => f.p_lo.map(|v| v as f64)?,
                     ModelFit::Msfdr => f.p_msfdr.map(|v| v as f64)?,
+                    ModelFit::Msfdr1Smix | ModelFit::Msfdr2Smix | ModelFit::Ensemble => {
+                        f.decoy_free_p_value.map(|v| v as f64)?
+                    }
                     ModelFit::Nokoi => f.p_nokoi.map(|v| v as f64)?,
-                    ModelFit::Ensemble => f.decoy_free_p_value.map(|v| v as f64)?, // p_final written earlier
                 };
 
                 // quality key: larger = better (sorted descending)
@@ -1721,7 +2438,9 @@ pub fn calculate_q_values(
                     },
 
                     // method-aligned ranking:
-                    ModelFit::Msfdr => neg_log10_p(p_used),
+                    ModelFit::Msfdr | ModelFit::Msfdr1Smix | ModelFit::Msfdr2Smix => {
+                        neg_log10_p(p_used)
+                    }
                     ModelFit::Nokoi => neg_log10_p(p_used),
 
                     // ensemble: use the ensemble’s own evidence scale (df_score is monotone w/ pep_final)
@@ -1757,8 +2476,21 @@ pub fn calculate_q_values(
                 .collect()
         };
 
-        // LO rank-key helper aligned to LO p-value computation (TEV ordering).
-        let lo_rank_key = |f: &DfFeature| -> f64 { tev(f).unwrap_or(f64::NEG_INFINITY) };
+        // LO-adjusted ranking key: use LO evidence scale (-log10(p_lo)), larger = better.
+        // Fail-closed if p_lo is missing/non-finite.
+        let lo_rank_key = |f: &DfFeature| -> f64 {
+            match f.p_lo {
+                Some(p) => {
+                    let p = (p as f64).clamp(1e-300, 1.0);
+                    if p.is_finite() {
+                        -p.log10()
+                    } else {
+                        f64::NEG_INFINITY
+                    }
+                }
+                None => f64::NEG_INFINITY,
+            }
+        };
 
         // Moments: rank by hyperscore
         {
@@ -1774,8 +2506,7 @@ pub fn calculate_q_values(
 
             for (i, pcal) in calibrate(rows) {
                 new_features[i].p_mom = Some(pcal as f32);
-                // null-only pep follows p (PepEqualsP for now)
-                new_features[i].pep_mom = Some(pcal as f32);
+                // IMPORTANT: do NOT overwrite pep_mom here; pep_mom is a local-FDR proxy, not p.
             }
         }
 
@@ -1793,8 +2524,20 @@ pub fn calculate_q_values(
 
             for (i, pcal) in calibrate(rows) {
                 new_features[i].p_mle = Some(pcal as f32);
-                new_features[i].pep_mle = Some(pcal as f32);
+                // IMPORTANT: do NOT overwrite pep_mle here; pep_mle is a local-FDR proxy, not p.
             }
+        }
+
+        if log::log_enabled!(log::Level::Debug) {
+            let desc = match settings.lo_rank_key {
+                LoRankKey::Hyperscore => "quality=hyperscore",
+                LoRankKey::LoAdjusted => "quality=-log10(p_lo) (LO evidence)",
+            };
+            log::debug!(
+                "DF DEBUG calibration(per-method LO): lo_rank_key={:?} {}",
+                settings.lo_rank_key,
+                desc
+            );
         }
 
         // LO: rank key is configurable (Hyperscore vs LO-adjusted)
@@ -1815,11 +2558,11 @@ pub fn calculate_q_values(
 
             for (i, pcal) in calibrate(rows) {
                 new_features[i].p_lo = Some(pcal as f32);
-                new_features[i].pep_lo = Some(pcal as f32);
+                // IMPORTANT: do NOT overwrite pep_lo here; pep_lo is a local-FDR proxy, not p.;
             }
         }
 
-        // MSFDR: rank by -log10(p_msfdr) (method-aligned)
+        // MSFDR (seeded stream): rank by -log10(p_msfdr) (method-aligned)
         {
             let rows: Vec<(f64, usize, f64)> = work
                 .rank1_indices
@@ -1834,6 +2577,46 @@ pub fn calculate_q_values(
             for (i, pcal) in calibrate(rows) {
                 new_features[i].p_msfdr = Some(pcal as f32);
                 // Keep msfdr PEP as the mixture PEP (do not overwrite pep_msfdr with pcal)
+            }
+        }
+
+        // MSFDR 1SMix: rank by -log10(p_1smix) (method-aligned)
+        {
+            let rows: Vec<(f64, usize, f64)> = work
+                .rank1_indices
+                .iter()
+                .filter_map(|&i| {
+                    let f = &new_features[i];
+                    let p = f.p_1smix? as f64;
+                    Some((neg_log10_p(p), i, p))
+                })
+                .collect();
+
+            for (i, pcal) in calibrate(rows) {
+                new_features[i].p_1smix = Some(pcal as f32);
+                // Calibration Rule:
+                // - OK to calibrate p_1smix
+                // - DO NOT overwrite pep_1smix (posterior probability)
+            }
+        }
+
+        // MSFDR 2SMix: rank by -log10(p_2smix) (method-aligned)
+        {
+            let rows: Vec<(f64, usize, f64)> = work
+                .rank1_indices
+                .iter()
+                .filter_map(|&i| {
+                    let f = &new_features[i];
+                    let p = f.p_2smix? as f64;
+                    Some((neg_log10_p(p), i, p))
+                })
+                .collect();
+
+            for (i, pcal) in calibrate(rows) {
+                new_features[i].p_2smix = Some(pcal as f32);
+                // PHASE 6 RULE:
+                // - OK to calibrate p_2smix
+                // - DO NOT overwrite pep_2smix (posterior probability)
             }
         }
 
@@ -1871,6 +2654,35 @@ pub fn calculate_q_values(
     log_rank1_composition(&new_features, &work, db);
     summarize_pvec("rank1_p (chosen stream, pre-q)", &rank1_p);
 
+    // Diagnostics for MSFDR 1SMix / 2SMix p streams (only if present)
+    {
+        let rank1_p_1smix: Vec<f64> = work
+            .rank1_indices
+            .iter()
+            .filter_map(|&i| {
+                new_features[i]
+                    .p_1smix
+                    .map(|v| (v as f64).clamp(0.0, 1.0).max(1e-300))
+            })
+            .collect();
+        if !rank1_p_1smix.is_empty() {
+            summarize_pvec("rank1_p_1smix (pre-q)", &rank1_p_1smix);
+        }
+
+        let rank1_p_2smix: Vec<f64> = work
+            .rank1_indices
+            .iter()
+            .filter_map(|&i| {
+                new_features[i]
+                    .p_2smix
+                    .map(|v| (v as f64).clamp(0.0, 1.0).max(1e-300))
+            })
+            .collect();
+        if !rank1_p_2smix.is_empty() {
+            summarize_pvec("rank1_p_2smix (pre-q)", &rank1_p_2smix);
+        }
+    }
+
     // Build a clean reference set for pi0: target label==1, excluding ENT + CONT.
     // This does NOT change entrapment validation later; it only makes pi0 estimation sane.
     let rank1_p_ref: Vec<f64> = work
@@ -1902,35 +2714,86 @@ pub fn calculate_q_values(
             .map(|&i| df_p_value(&new_features[i])),
     );
 
-    let q_values = match settings.type_ {
-        FdrType::Bh => stats::bh_q_value(&rank1_p),
-
-        FdrType::Storey => {
-            let pi0_opt = estimate_pi0_from_reference_grid(&rank1_p_ref, settings);
-
-            match pi0_opt {
-                Some(pi0) => {
-                    log::info!(
-                        "DF DEBUG Storey(grid): using pi0={:.4} from rank1_p_ref (m_ref={})",
-                        pi0,
-                        rank1_p_ref.len()
-                    );
-                    storey_q_value_with_pi0(&rank1_p, pi0, settings)
+    // ============================================================
+    // Chosen DF q-values for MSFDR variants are PEP-derived
+    // ============================================================
+    if matches!(
+        settings.model_fit,
+        ModelFit::Msfdr | ModelFit::Msfdr1Smix | ModelFit::Msfdr2Smix | ModelFit::Nokoi
+    ) {
+        // Build rows sorted by "quality" (best-first), then q[k]=mean(pep[0..k]) with monotone pass.
+        let mut rows: Vec<(f64, usize, f64)> = work
+            .rank1_indices
+            .iter()
+            .filter_map(|&i| {
+                let f = &new_features[i];
+                let pep = f.decoy_free_pep? as f64;
+                if !pep.is_finite() {
+                    return None;
                 }
-                None => {
-                    log::warn!(
-                        "DF DEBUG Storey(grid): degenerate pi0 on reference set (m_ref={}), falling back to BH for chosen stream.",
-                        rank1_p_ref.len()
-                    );
-                    stats::bh_q_value(&rank1_p)
+                let score_key = df_rank_score(f); // already defined/used elsewhere
+                Some((score_key, i, pep.clamp(0.0, 1.0).max(1e-300)))
+            })
+            .collect();
+
+        // best first
+        rows.sort_by(|a, b| b.0.total_cmp(&a.0));
+
+        // cumulative mean
+        let mut q_sorted: Vec<f64> = Vec::with_capacity(rows.len());
+        let mut cum = 0.0f64;
+        for (k, (_, _, pep)) in rows.iter().enumerate() {
+            cum += *pep;
+            q_sorted.push((cum / ((k + 1) as f64)).clamp(0.0, 1.0));
+        }
+
+        // enforce monotone non-decreasing with worsening quality
+        for i in (0..q_sorted.len().saturating_sub(1)).rev() {
+            q_sorted[i] = q_sorted[i].min(q_sorted[i + 1]);
+        }
+
+        // write back
+        for (k, (_score, feat_idx, _pep)) in rows.into_iter().enumerate() {
+            set_df_q_value(&mut new_features[feat_idx], q_sorted[k] as f32);
+        }
+    } else {
+        // Existing BH/Storey path for all other methods (including Ensemble)
+        let q_values = match settings.type_ {
+            FdrType::Bh => stats::bh_q_value(&rank1_p),
+
+            FdrType::Storey => {
+                let pi0_opt = estimate_pi0_from_reference_grid(&rank1_p_ref, settings);
+                match pi0_opt {
+                    Some(pi0) => storey_q_value_with_pi0(&rank1_p, pi0, settings),
+                    None => {
+                        log::warn!(
+							"DF DEBUG Storey(grid): degenerate pi0 on reference set (m_ref={}), falling back to BH for chosen stream.",
+							rank1_p_ref.len()
+						);
+                        stats::bh_q_value(&rank1_p)
+                    }
                 }
             }
-        }
-    };
+        };
 
-    for (&idx, q) in work.rank1_indices.iter().zip(q_values) {
-        set_df_q_value(&mut new_features[idx], q as f32);
-        new_features[idx].decoy_free_q_value = Some(q as f32);
+        for (&idx, q) in work.rank1_indices.iter().zip(q_values) {
+            set_df_q_value(&mut new_features[idx], q as f32);
+        }
+    }
+
+    // Phase 8: debug-build assertions for chosen DF q stream (present-only)
+    #[cfg(debug_assertions)]
+    {
+        for &i in &work.rank1_indices {
+            if let Some(q) = new_features[i].decoy_free_q_value {
+                debug_assert!(
+                    q.is_finite() && q > 0.0 && q <= 1.0,
+                    "DF ASSERT decoy_free_q_value invalid at feature_idx={}: {}",
+                    i,
+                    q
+                );
+            }
+        }
     }
 
     // --- POST-Q SUMMARIES (diagnostic) ---
@@ -1970,6 +2833,21 @@ pub fn calculate_q_values(
             })
             .map(|f| df_q_value(f)),
     );
+
+    // =========================================================================
+    // MSFDR 1SMix / 2SMix q-values are ALWAYS PEP-derived
+    // -------------------------------------------------------------------------
+    // Contract:
+    // - q_1smix / q_2smix NEVER use BH/Storey, regardless of settings.type_.
+    // - q_1smix / q_2smix are computed ONLY from the model-derived PEP streams
+    //   via cumulative mean after sorting by quality (best first).
+    // - Clear rank1 q_1smix/q_2smix first to prevent stale leakage on runs where
+    //   pep_1smix/pep_2smix are absent.
+    // =========================================================================
+    for &i in &work.rank1_indices {
+        new_features[i].q_1smix = None;
+        new_features[i].q_2smix = None;
+    }
 
     // --- PER-METHOD Q-VALUES (rank-1 only) ---
     // Compute q_* from each method's p_* vector.
@@ -2105,6 +2983,176 @@ pub fn calculate_q_values(
         new_features[i].q_nokoi = Some(q_nokoi_present[j] as f32);
     }
 
+    // Phase 8: debug-build assertions for per-method q streams (present-only)
+    #[cfg(debug_assertions)]
+    {
+        let assert_q = |name: &str, v: Option<f32>, idx: usize| {
+            if let Some(x) = v {
+                debug_assert!(
+                    x.is_finite() && x > 0.0 && x <= 1.0,
+                    "DF ASSERT {} invalid at feature_idx={}: {}",
+                    name,
+                    idx,
+                    x
+                );
+            }
+        };
+
+        for &i in &work.rank1_indices {
+            let f = &new_features[i];
+            assert_q("q_mom", f.q_mom, i);
+            assert_q("q_mle", f.q_mle, i);
+            assert_q("q_lo", f.q_lo, i);
+            assert_q("q_msfdr", f.q_msfdr, i);
+            assert_q("q_nokoi", f.q_nokoi, i);
+            // q_1smix/q_2smix asserted after mixture-q write below (next block)
+        }
+    }
+
+    // =========================================================================
+    // Mixture q-values for MSFDR 1SMix / 2SMix (PEP path)
+    //   q[k] = mean(pep[0..k]) after sorting by quality (best first)
+    //   sorted by score (best first): tev(feature) primary; fallback decoy_free_scoree
+    //   This computation is intentionally independent of settings.type_.
+    // =========================================================================
+    {
+        // Helper: compute cumulative-mean q over PEPs, sorted by quality desc.
+        // IMPORTANT: THIS MUST REMAIN PEP-ONLY.
+        // Do NOT replace with BH/Storey (even if settings.type_ changes).
+        // Returns (feature_idx, q) pairs..
+        let mixture_q_from_pep = |mut rows: Vec<(f64, usize, f64)>| -> Vec<(usize, f64)> {
+            if rows.is_empty() {
+                return Vec::new();
+            }
+
+            // best first
+            rows.sort_by(|a, b| b.0.total_cmp(&a.0));
+
+            // cumulative mean
+            let mut q_sorted: Vec<f64> = Vec::with_capacity(rows.len());
+            let mut cum = 0.0f64;
+            for (k, (_, _, pep)) in rows.iter().enumerate() {
+                cum += *pep;
+                let q = (cum / ((k + 1) as f64)).clamp(0.0, 1.0);
+                q_sorted.push(q);
+            }
+
+            // enforce monotone non-decreasing with worsening quality
+            for i in (0..q_sorted.len().saturating_sub(1)).rev() {
+                q_sorted[i] = q_sorted[i].min(q_sorted[i + 1]);
+            }
+
+            rows.into_iter()
+                .enumerate()
+                .map(|(k, (_quality, feat_idx, _pep))| (feat_idx, q_sorted[k]))
+                .collect()
+        };
+
+        // ---- 1SMix ----
+        let rows_1smix: Vec<(f64, usize, f64)> = work
+            .rank1_indices
+            .iter()
+            .filter_map(|&i| {
+                let f = &new_features[i];
+
+                // only where pep exists
+                let pep = f.pep_1smix? as f64;
+                if !pep.is_finite() {
+                    return None;
+                }
+
+                // Step 3.5: "sorted by score" means TEV (primary) else decoy_free_score
+                let score_key = df_rank_score(f);
+
+                Some((score_key, i, pep.clamp(0.0, 1.0)))
+            })
+            .collect();
+
+        for (i, q) in mixture_q_from_pep(rows_1smix) {
+            if new_features[i].core.rank == 1 && new_features[i].pep_1smix.is_some() {
+                new_features[i].q_1smix = Some(q as f32);
+            }
+        }
+
+        // ---- 2SMix ----
+        let rows_2smix: Vec<(f64, usize, f64)> = work
+            .rank1_indices
+            .iter()
+            .filter_map(|&i| {
+                let f = &new_features[i];
+
+                // only where pep exists
+                let pep = f.pep_2smix? as f64;
+                if !pep.is_finite() {
+                    return None;
+                }
+
+                // Step 3.5: "sorted by score" means TEV (primary) else decoy_free_score
+                let score_key = df_rank_score(f);
+
+                Some((score_key, i, pep.clamp(0.0, 1.0)))
+            })
+            .collect();
+
+        for (i, q) in mixture_q_from_pep(rows_2smix) {
+            if new_features[i].core.rank == 1 && new_features[i].pep_2smix.is_some() {
+                new_features[i].q_2smix = Some(q as f32);
+            }
+        }
+
+        // Phase 8: debug-build assertions for mixture q streams (present-only)
+        #[cfg(debug_assertions)]
+        {
+            for &i in &work.rank1_indices {
+                if let Some(q) = new_features[i].q_1smix {
+                    debug_assert!(
+                        q.is_finite() && q > 0.0 && q <= 1.0,
+                        "DF ASSERT q_1smix invalid at feature_idx={}: {}",
+                        i,
+                        q
+                    );
+                }
+                if let Some(q) = new_features[i].q_2smix {
+                    debug_assert!(
+                        q.is_finite() && q > 0.0 && q <= 1.0,
+                        "DF ASSERT q_2smix invalid at feature_idx={}: {}",
+                        i,
+                        q
+                    );
+                }
+            }
+        }
+    }
+
+    // Diagnostics for MSFDR 1SMix / 2SMix q streams (only if present)
+    {
+        let any_q_1smix = work
+            .rank1_indices
+            .iter()
+            .any(|&i| new_features[i].q_1smix.is_some());
+        if any_q_1smix {
+            summarize_q(
+                "POSTQ q_1smix (rank1, present-only)",
+                work.rank1_indices
+                    .iter()
+                    .filter_map(|&i| new_features[i].q_1smix),
+            );
+        }
+
+        let any_q_2smix = work
+            .rank1_indices
+            .iter()
+            .any(|&i| new_features[i].q_2smix.is_some());
+        if any_q_2smix {
+            summarize_q(
+                "POSTQ q_2smix (rank1, present-only)",
+                work.rank1_indices
+                    .iter()
+                    .filter_map(|&i| new_features[i].q_2smix),
+            );
+        }
+    }
+
     new_features
 }
 
@@ -2116,9 +3164,13 @@ pub fn calculate_peptide_q_df(
     let mut best_q: FnvHashMap<String, f32> = FnvHashMap::default();
 
     // DF aggregation contract:
-    // - rank1 only
+    // - rank==1 only
+    // - TARGETS ONLY for aggregation
     // - read ONLY decoy-free q stream
-    for feat in features.iter().filter(|f| f.core.rank == 1) {
+    for feat in features
+        .iter()
+        .filter(|f| f.core.rank == 1 && f.core.label == 1)
+    {
         let q = df_q_value(feat); // <-- DF stream accessor (decoy_free_q_value)
         let peptide = db[feat.core.peptide_idx].to_string();
 
@@ -2129,23 +3181,109 @@ pub fn calculate_peptide_q_df(
     }
 
     // Write ONLY DF peptide q (rank1-only by contract)
+    // - rank==1: populate decoy_free_peptide_q from best_q map (fail-closed to 1.0 if missing)
+    // - rank!=1: scrub decoy_free_peptide_q AND MSFDR family streams (hard rank1-only)
     for feat in features.iter_mut() {
-        if feat.core.rank != 1 {
-            // DF peptide_q is undefined for rank!=1; scrub to avoid leakage.
+        // Only rank==1 AND target rows get DF peptide q.
+        // Everything else must be scrubbed to None to prevent leakage / miscounting.
+        if feat.core.rank != 1 || feat.core.label != 1 {
             feat.decoy_free_peptide_q = None;
+
+            // MSFDR family (p/pep/q) must be None for non-rank1 (and we also keep them
+            // off non-target rows to avoid confusion/leakage in DF mode).
+            feat.p_msfdr = None;
+            feat.pep_msfdr = None;
+            feat.q_msfdr = None;
+
+            feat.p_1smix = None;
+            feat.pep_1smix = None;
+            feat.q_1smix = None;
+
+            feat.p_2smix = None;
+            feat.pep_2smix = None;
+            feat.q_2smix = None;
+
             continue;
         }
 
+        // rank==1, target
         let peptide = db[feat.core.peptide_idx].to_string();
-        if let Some(q) = best_q.get(&peptide) {
-            feat.decoy_free_peptide_q = Some(*q);
-        } else {
-            // If peptide never seen in rank1 (should be rare), fail-closed.
-            feat.decoy_free_peptide_q = Some(1.0);
-        }
+        let q = best_q.get(&peptide).copied().unwrap_or(1.0);
+        feat.decoy_free_peptide_q = Some(q);
     }
 
     best_q.values().filter(|&&q| q <= threshold).count()
+}
+
+fn combine_cauchy(p: &[f64]) -> f64 {
+    // Cauchy combination (robust under dependence)
+    // p_i in (0,1); clamp for numerical stability.
+    let m = p.len() as f64;
+    let mut t_sum = 0.0;
+    for &pi in p {
+        let pi = pi.clamp(0.0, 1.0).max(1e-300).min(1.0 - 1e-16);
+        t_sum += ((0.5 - pi) * std::f64::consts::PI).tan();
+    }
+    let t = t_sum / m;
+    let p_c = 0.5 - (t.atan() / std::f64::consts::PI);
+    p_c.clamp(0.0, 1.0).max(1e-300)
+}
+
+fn combine_sidak_minp(p: &[f64]) -> f64 {
+    // Sidak adjustment on min p: 1 - (1 - minP)^m
+    let m = p.len() as f64;
+    let pmin = p
+        .iter()
+        .copied()
+        .fold(1.0_f64, |a, b| a.min(b.clamp(0.0, 1.0).max(1e-300)));
+    let p = 1.0 - (1.0 - pmin).powf(m);
+    p.clamp(0.0, 1.0).max(1e-300)
+}
+
+fn combine_median_beta(p: &[f64]) -> f64 {
+    // Order-statistic consensus:
+    // Take the median p (lower-median for even m), then convert to a valid p-value via Beta CDF:
+    // U_(k) ~ Beta(k, m-k+1) under i.i.d. Uniform(0,1) null.
+    let m = p.len();
+    if m == 0 {
+        return 1.0;
+    }
+
+    let mut v: Vec<f64> = p
+        .iter()
+        .copied()
+        .map(|x| x.clamp(0.0, 1.0).max(1e-300).min(1.0 - 1e-16))
+        .collect();
+    v.sort_by(|a, b| a.partial_cmp(b).unwrap());
+
+    // lower-median for even m: k = (m+1)/2
+    let k: usize = (m + 1) / 2; // 1-based
+    let p_k = v[k - 1];
+
+    let a = k as f64;
+    let b = (m - k + 1) as f64;
+    let beta = Beta::new(a, b).unwrap();
+    beta.cdf(p_k).clamp(0.0, 1.0).max(1e-300)
+}
+
+fn combine_stouffer(p: &[f64]) -> f64 {
+    // Stouffer Z (equal weights):
+    // z_i = Phi^{-1}(1 - p_i), Z = mean(z_i) * sqrt(m), p = 1 - Phi(Z)
+    let m = p.len();
+    if m == 0 {
+        return 1.0;
+    }
+
+    let n01 = Normal::new(0.0, 1.0).unwrap();
+
+    let mut z_sum = 0.0;
+    for &pi in p {
+        let pi = pi.clamp(0.0, 1.0).max(1e-300).min(1.0 - 1e-16);
+        z_sum += n01.inverse_cdf(1.0 - pi);
+    }
+
+    let z = z_sum / (m as f64).sqrt();
+    (1.0 - n01.cdf(z)).clamp(0.0, 1.0).max(1e-300)
 }
 
 // DF aggregation/write-back contract: rank1-only; rank!=1 must be None to prevent stale leakage.
@@ -2158,17 +3296,26 @@ pub fn calculate_protein_q_df(
     let mut protein_peptide_map: FnvHashMap<String, FnvHashMap<String, f64>> =
         FnvHashMap::default();
 
-    for feat in features.iter().filter(|f| f.core.rank == 1) {
+    for feat in features
+        .iter()
+        .filter(|f| f.core.rank == 1 && f.core.label == 1)
+    {
         // DF aggregation contract: read ONLY decoy_free_p_value stream
         // Use accessor (fail-closed to 1.0), but SKIP if the underlying field is absent,
-        // so we don't inject conservative 1.0s into Fisher combining.
+        // so don't inject conservative 1.0s into Fisher combining.
         if feat.decoy_free_p_value.is_none() {
             continue;
         }
         let p = (df_p_value(feat) as f64).clamp(0.0, 1.0).max(1e-300);
 
-        let protein_key = db[feat.core.peptide_idx].proteins(&db.decoy_tag, db.generate_decoys);
-        let peptide_seq = db[feat.core.peptide_idx].to_string();
+        // Unique-only protein inference using the same source as TSV `num_proteins`
+        let peptide = &db[feat.core.peptide_idx];
+        if peptide.proteins.len() != 1 {
+            continue;
+        }
+
+        let protein_key = peptide.proteins(&db.decoy_tag, db.generate_decoys);
+        let peptide_seq = peptide.to_string();
 
         let peptide_map = protein_peptide_map.entry(protein_key).or_default();
         peptide_map
@@ -2188,7 +3335,13 @@ pub fn calculate_protein_q_df(
             continue;
         }
 
-        let combined_p = stats::combine_fisher(&p_vec).clamp(0.0, 1.0).max(1e-300);
+        let combined_p = match settings.protein_p_combine {
+            crate::input::ProteinPCombine::Fisher => {
+                stats::combine_fisher(&p_vec).clamp(0.0, 1.0).max(1e-300)
+            }
+            crate::input::ProteinPCombine::Cauchy => combine_cauchy(&p_vec),
+            crate::input::ProteinPCombine::SidakMinP => combine_sidak_minp(&p_vec),
+        };
         protein_keys.push(key);
         protein_p_values.push(combined_p);
     }
@@ -2196,9 +3349,20 @@ pub fn calculate_protein_q_df(
     // If no proteins, write fail-closed (rank1-only by contract) and return 0.
     if protein_p_values.is_empty() {
         for feat in features.iter_mut() {
-            if feat.core.rank != 1 {
-                // DF protein_q undefined for rank!=1; scrub to avoid leakage.
+            if feat.core.rank != 1 || feat.core.label != 1 {
                 feat.decoy_free_protein_q = None;
+
+                feat.p_msfdr = None;
+                feat.pep_msfdr = None;
+                feat.q_msfdr = None;
+
+                feat.p_1smix = None;
+                feat.pep_1smix = None;
+                feat.q_1smix = None;
+
+                feat.p_2smix = None;
+                feat.pep_2smix = None;
+                feat.q_2smix = None;
             } else {
                 feat.decoy_free_protein_q = Some(1.0);
             }
@@ -2251,9 +3415,21 @@ pub fn calculate_protein_q_df(
 
     // Write ONLY DF protein q (rank1-only by contract; scrub others)
     for feat in features.iter_mut() {
-        if feat.core.rank != 1 {
-            // DF protein_q undefined for rank!=1; scrub to avoid leakage.
+        if feat.core.rank != 1 || feat.core.label != 1 {
             feat.decoy_free_protein_q = None;
+
+            feat.p_msfdr = None;
+            feat.pep_msfdr = None;
+            feat.q_msfdr = None;
+
+            feat.p_1smix = None;
+            feat.pep_1smix = None;
+            feat.q_1smix = None;
+
+            feat.p_2smix = None;
+            feat.pep_2smix = None;
+            feat.q_2smix = None;
+
             continue;
         }
 

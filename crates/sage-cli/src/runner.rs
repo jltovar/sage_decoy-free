@@ -668,14 +668,29 @@ impl Runner {
                 }
             });
 
-            // 7. WRITE OUTPUTS (DF)
+            // 7. WRITE OUTPUTS (DF) — rank1-only, sorted for display
             if !parquet {
+                // Keep only rank == 1 in DF output
+                features.retain(|f| f.core.rank == 1);
+
+                // Sort:
+                //   1) decoy_free_q_value asc (None -> +inf)
+                //   2) hyperscore desc
+                //   3) poisson asc
+                features.par_sort_unstable_by(|a, b| {
+                    a.decoy_free_q_value
+                        .unwrap_or(f32::INFINITY)
+                        .total_cmp(&b.decoy_free_q_value.unwrap_or(f32::INFINITY))
+                        .then_with(|| b.core.hyperscore.total_cmp(&a.core.hyperscore))
+                        .then_with(|| a.core.poisson.total_cmp(&b.core.poisson))
+                });
+
                 self.parameters
                     .output_paths
                     .push(self.write_features_df(&features, &filenames)?);
 
                 if self.parameters.annotate_matches {
-                    // Cast to FeatureCore for fragments
+                    // Cast to FeatureCore for fragments (rank1-only, same ordering)
                     let cores: Vec<&FeatureCore> = features.iter().map(|f| &f.core).collect();
                     self.parameters
                         .output_paths
@@ -1144,23 +1159,33 @@ impl Runner {
         record.push_field(fmt_f32(feature.decoy_free_peptide_q).as_bytes());
         record.push_field(fmt_f32(feature.decoy_free_protein_q).as_bytes());
 
-        // Per-method diagnostics
+        // Per-method diagnostics (ordered to match headers)
+
+        // p_*
         record.push_field(fmt_f32(feature.p_mom).as_bytes());
         record.push_field(fmt_f32(feature.p_mle).as_bytes());
         record.push_field(fmt_f32(feature.p_lo).as_bytes());
         record.push_field(fmt_f32(feature.p_msfdr).as_bytes());
+        record.push_field(fmt_f32(feature.p_1smix).as_bytes());
+        record.push_field(fmt_f32(feature.p_2smix).as_bytes());
         record.push_field(fmt_f32(feature.p_nokoi).as_bytes());
 
+        // q_*
         record.push_field(fmt_f32(feature.q_mom).as_bytes());
         record.push_field(fmt_f32(feature.q_mle).as_bytes());
         record.push_field(fmt_f32(feature.q_lo).as_bytes());
         record.push_field(fmt_f32(feature.q_msfdr).as_bytes());
+        record.push_field(fmt_f32(feature.q_1smix).as_bytes());
+        record.push_field(fmt_f32(feature.q_2smix).as_bytes());
         record.push_field(fmt_f32(feature.q_nokoi).as_bytes());
 
+        // pep_*
         record.push_field(fmt_f32(feature.pep_mom).as_bytes());
         record.push_field(fmt_f32(feature.pep_mle).as_bytes());
         record.push_field(fmt_f32(feature.pep_lo).as_bytes());
         record.push_field(fmt_f32(feature.pep_msfdr).as_bytes());
+        record.push_field(fmt_f32(feature.pep_1smix).as_bytes());
+        record.push_field(fmt_f32(feature.pep_2smix).as_bytes());
         record.push_field(fmt_f32(feature.pep_nokoi).as_bytes());
 
         record
@@ -1219,20 +1244,29 @@ impl Runner {
             "decoy_free_q_value",
             "decoy_free_peptide_q",
             "decoy_free_protein_q",
+            // p_*
             "p_mom",
             "p_mle",
             "p_lo",
             "p_msfdr",
+            "p_1smix",
+            "p_2smix",
             "p_nokoi",
+            // q_*
             "q_mom",
             "q_mle",
             "q_lo",
             "q_msfdr",
+            "q_1smix",
+            "q_2smix",
             "q_nokoi",
+            // pep_*
             "pep_mom",
             "pep_mle",
             "pep_lo",
             "pep_msfdr",
+            "pep_1smix",
+            "pep_2smix",
             "pep_nokoi",
         ];
 

@@ -385,8 +385,6 @@ impl Input {
                 kde_samples: None,
 
                 // Decoy-Free Lower-Order (LO) robustness controls
-                lo_multiplicity_alpha: None,
-                lo_ln_ratio_cap: None,
                 lo_beta_blend_moments: None,
                 lo_beta_safety_mult: None,
 

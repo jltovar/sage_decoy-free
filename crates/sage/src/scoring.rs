@@ -158,7 +158,7 @@ pub struct DfFeature {
     #[serde(flatten)]
     pub core: FeatureCore,
 
-    // --- DECOY-FREE: 4 Core Columns ---
+    // --- DECOY-FREE: Core Columns ---
     #[serde(skip_serializing_if = "Option::is_none")]
     pub decoy_free_p_value: Option<f32>,
     #[serde(skip_serializing_if = "Option::is_none")]
@@ -197,13 +197,29 @@ pub struct DfFeature {
     #[serde(skip_serializing_if = "Option::is_none")]
     pub pep_lo: Option<f32>,
 
-    // MSFDR
+    // MSFDR (seeded / legacy)
     #[serde(skip_serializing_if = "Option::is_none")]
     pub p_msfdr: Option<f32>,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub q_msfdr: Option<f32>,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub pep_msfdr: Option<f32>,
+
+    // MSFDR (1-state mixture)
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub p_1smix: Option<f32>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub q_1smix: Option<f32>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub pep_1smix: Option<f32>,
+
+    // MSFDR (2-state mixture)
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub p_2smix: Option<f32>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub q_2smix: Option<f32>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub pep_2smix: Option<f32>,
 
     // Nokoi
     #[serde(skip_serializing_if = "Option::is_none")]
@@ -236,18 +252,31 @@ impl FeatureCore {
             decoy_free_q_value: None,
             decoy_free_peptide_q: None,
             decoy_free_protein_q: None,
+
             p_mom: None,
             q_mom: None,
             pep_mom: None,
+
             p_mle: None,
             q_mle: None,
             pep_mle: None,
+
             p_lo: None,
             q_lo: None,
             pep_lo: None,
+
             p_msfdr: None,
             q_msfdr: None,
             pep_msfdr: None,
+
+            p_1smix: None,
+            q_1smix: None,
+            pep_1smix: None,
+
+            p_2smix: None,
+            q_2smix: None,
+            pep_2smix: None,
+
             p_nokoi: None,
             q_nokoi: None,
             pep_nokoi: None,

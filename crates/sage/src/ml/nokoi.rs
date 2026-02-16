@@ -1,10 +1,14 @@
 use crate::scoring::{DfFeature, FeatureCore};
+use rand::rngs::StdRng;
 use rand::seq::SliceRandom;
 use rand::thread_rng;
+use rand::SeedableRng;
 use serde::{Deserialize, Serialize};
 use std::cmp::Ordering;
 
-/// Configuration for Nokoi Rescoring 2.0
+const NOKOI_CROSSFIT_SEED: u64 = 0x5EED_5EED_5EED_5EED;
+
+/// Configuration for Nokoi Rescoring
 #[derive(Clone, Serialize, Deserialize, Debug)]
 pub struct NokoiConfig {
     pub enabled: bool,
@@ -38,7 +42,6 @@ pub struct PsmData {
 }
 
 /// Extract features from a Sage Feature struct
-/// Implements the "High-Performance Feature Set" (~12 features)
 pub fn extract_features(feat: &FeatureCore) -> Vec<f64> {
     // Safety check for log transform
     let log_intensity = if feat.ms2_intensity > 0.0 {
@@ -232,8 +235,7 @@ impl LogisticRegression {
         // This is much better for finding the "sparsity sweet spot"
         // let lambdas: Vec<f64> = (0..5).map(|i| 1e-4 * 10f64.powi(i)).collect();
 
-        // Paper uses 2^-10 to 2^5.
-        // 2^-10 = 0.00097, 2^5 = 32.0.
+        // Log-spaced grid: 2^-10 to 2^5
         let lambdas: Vec<f64> = (-10..=5).map(|i| 2.0_f64.powi(i)).collect();
 
         // Use 3-fold CV for speed, or 5 if data allows
@@ -386,7 +388,7 @@ pub fn rescore(
     train_fdr: f32,
     is_positive: impl Fn(&FeatureCore) -> bool,
 ) -> Option<Vec<f64>> {
-    // Nokoi 2.0 Config
+    // Nokoi Config
     let config = NokoiConfig {
         enabled: true,
         train_fdr,
@@ -415,7 +417,7 @@ pub fn rescore(
             pos_psm.label = 1.0;
             positives.push(pos_psm);
         }
-        // Paper criteria for negative class: "rank2 PSMs" (or lower ranks)
+        // Negative class: rank > 1
         else if f.rank > 1 {
             negatives.push(psm.clone());
         }
@@ -424,8 +426,8 @@ pub fn rescore(
     }
 
     // --- Graceful Fallback for Low Data (<50) ---
-    // If we have fewer than 50 confident PSMs, ML training is unstable.
-    // Instead of failing, we return "probabilities" based on min-max scaled Hyperscore.
+    // If there are fewer than 50 confident PSMs, ML training is unstable.
+    // Instead of failing, return "probabilities" based on min-max scaled Hyperscore.
     let confident_count = positives.len();
     if confident_count < 50 {
         log::warn!(
@@ -467,10 +469,9 @@ pub fn rescore(
     }
 
     // 1. Feature Extraction
-    // --- Balanced Sampling  ---
-    // The paper explicitly creates a "balanced training data set" of 10k pos / 10k neg.
-    // Without this, the model will just predict "0.0" for everything because negatives
-    // vastly outnumber positives.
+    // --- Balanced Sampling ---
+    // Create a balanced training set (cap at 10k per class) to prevent
+    // model bias towards the majority negative class.
 
     let mut rng = thread_rng();
     positives.shuffle(&mut rng);
@@ -544,7 +545,7 @@ pub fn rescore_df(
     max_null_rank: u32,
     is_positive: impl Fn(&DfFeature) -> bool,
 ) -> Option<Vec<f64>> {
-    // Nokoi 2.0 Config (same defaults as `rescore`)
+    // Nokoi Config (same defaults as `rescore`)
     let config = NokoiConfig {
         enabled: true,
         train_fdr,
@@ -581,6 +582,17 @@ pub fn rescore_df(
         }
 
         all_data.push(psm);
+    }
+
+    if log::log_enabled!(log::Level::Debug) {
+        log::debug!(
+            "Nokoi DEBUG rescore_df: crossfit=OFF (current). min_null_rank={} max_null_rank={} positives={} negatives={} all={}",
+            min_null_rank,
+            max_null_rank,
+            positives.len(),
+            negatives.len(),
+            all_data.len()
+        );
     }
 
     // --- Graceful fallback for low data (match your existing behavior) ---
@@ -660,6 +672,15 @@ pub fn rescore_df(
 
     let sample_size = n_pos.min(n_neg).min(10_000);
 
+    if log::log_enabled!(log::Level::Debug) {
+        log::debug!(
+            "Nokoi DEBUG training sample_size={} (n_pos={} n_neg={})",
+            sample_size,
+            n_pos,
+            n_neg
+        );
+    }
+
     let mut training_data = Vec::with_capacity(sample_size * 2);
     training_data.extend_from_slice(&positives[0..sample_size]);
     training_data.extend_from_slice(&negatives[0..sample_size]);
@@ -703,6 +724,346 @@ pub fn rescore_df(
         .collect();
 
     Some(probabilities)
+}
+
+/// Decoy-free Nokoi cross-fit entry point:
+/// Returns:
+///  - prob_target_all: P(target) for every PSM index (aligned 1:1 with `features`)
+///  - null_scores_oof: out-of-fold P(target) for indices in `null_indices` (non-circular null dist)
+pub fn rescore_df_crossfit(
+    features: &[DfFeature],
+    train_fdr: f32,
+    min_null_rank: u32,
+    max_null_rank: u32,
+    k_folds: usize,
+    is_positive: impl Fn(&DfFeature) -> bool,
+    null_indices: &[usize],
+) -> Option<(Vec<f64>, Vec<f64>)> {
+    // ---- 0) Fast fallbacks for empty/low data ----
+    if features.is_empty() {
+        return None;
+    }
+
+    // Build positives + rank-window negatives (indices)
+    let mut positives_idx: Vec<usize> = Vec::new();
+    let mut negatives_idx: Vec<usize> = Vec::new();
+    for (i, f) in features.iter().enumerate() {
+        if is_positive(f) {
+            positives_idx.push(i);
+        } else {
+            let r = f.core.rank as u32;
+            if r >= min_null_rank && r <= max_null_rank {
+                negatives_idx.push(i);
+            }
+        }
+    }
+
+    if log::log_enabled!(log::Level::Debug) {
+        log::debug!(
+            "Nokoi DEBUG rescore_df_crossfit: min_null_rank={} max_null_rank={} k_folds={} positives_idx={} negatives_idx={} null_indices={}",
+            min_null_rank,
+            max_null_rank,
+            k_folds,
+            positives_idx.len(),
+            negatives_idx.len(),
+            null_indices.len()
+        );
+    }
+
+    // If too few positives/negatives, fall back to normalized hyperscore (same behavior as rescore_df)
+    // and return null_scores_oof from that score (safe; no circular training).
+    if positives_idx.len() < 50 || negatives_idx.len() < 50 {
+        log::warn!(
+            "Nokoi DF crossfit: insufficient data (pos={} neg={}) - falling back to normalized hyperscore",
+            positives_idx.len(),
+            negatives_idx.len()
+        );
+
+        let min_hs = features
+            .iter()
+            .map(|f| f.core.hyperscore as f64)
+            .fold(f64::INFINITY, f64::min);
+        let max_hs = features
+            .iter()
+            .map(|f| f.core.hyperscore as f64)
+            .fold(f64::NEG_INFINITY, f64::max);
+        let range = max_hs - min_hs;
+
+        let prob_all: Vec<f64> = if range == 0.0 {
+            vec![0.5; features.len()]
+        } else {
+            features
+                .iter()
+                .map(|f| ((f.core.hyperscore as f64 - min_hs) / range).clamp(0.0, 1.0))
+                .collect()
+        };
+
+        let mut null_oof: Vec<f64> = Vec::with_capacity(null_indices.len());
+        for &j in null_indices {
+            if j < prob_all.len() {
+                null_oof.push(prob_all[j]);
+            }
+        }
+        return Some((prob_all, null_oof));
+    }
+
+    // ---- 1) Cross-fit null candidate set: intersection of provided null_indices and rank-window negatives ----
+    let mut neg_mask = vec![false; features.len()];
+    for &i in &negatives_idx {
+        neg_mask[i] = true;
+    }
+
+    let mut null_cand: Vec<usize> = Vec::new();
+    for &j in null_indices {
+        if j < neg_mask.len() && neg_mask[j] {
+            null_cand.push(j);
+        }
+    }
+
+    if null_cand.len() < 50 {
+        log::warn!(
+            "Nokoi DF crossfit: too few null candidates after intersect ({} < 50) - falling back to normalized hyperscore",
+            null_cand.len()
+        );
+
+        let min_hs = features
+            .iter()
+            .map(|f| f.core.hyperscore as f64)
+            .fold(f64::INFINITY, f64::min);
+        let max_hs = features
+            .iter()
+            .map(|f| f.core.hyperscore as f64)
+            .fold(f64::NEG_INFINITY, f64::max);
+        let range = max_hs - min_hs;
+
+        let prob_all: Vec<f64> = if range == 0.0 {
+            vec![0.5; features.len()]
+        } else {
+            features
+                .iter()
+                .map(|f| ((f.core.hyperscore as f64 - min_hs) / range).clamp(0.0, 1.0))
+                .collect()
+        };
+
+        let mut null_oof: Vec<f64> = Vec::with_capacity(null_cand.len());
+        for &j in &null_cand {
+            null_oof.push(prob_all[j]);
+        }
+        return Some((prob_all, null_oof));
+    }
+
+    // Deterministic shuffle for folds
+    let k = k_folds.max(2).min(null_cand.len()); // cannot have more folds than items
+    let mut rng = StdRng::seed_from_u64(NOKOI_CROSSFIT_SEED);
+    null_cand.shuffle(&mut rng);
+
+    // Fold assignment by contiguous blocks
+    let fold_size = (null_cand.len() + k - 1) / k; // ceil
+    let mut folds: Vec<&[usize]> = Vec::with_capacity(k);
+    for i in 0..k {
+        let start = i * fold_size;
+        if start >= null_cand.len() {
+            break;
+        }
+        let end = ((i + 1) * fold_size).min(null_cand.len());
+        folds.push(&null_cand[start..end]);
+    }
+
+    // ---- 2) Helper: train a logistic model given pos indices + neg indices; return (model, means, stds) ----
+    let train_one = |pos_idx: &[usize],
+                     neg_idx: &[usize],
+                     seed: u64|
+     -> Option<(LogisticRegression, Vec<f64>, Vec<f64>)> {
+        // Nokoi config (same defaults as rescore_df)
+        let config = NokoiConfig {
+            enabled: true,
+            train_fdr,
+            learning_rate: 0.1,
+            epochs: 500,
+            l1_lambda: 0.005,
+            patience: 15,
+        };
+
+        // Build labeled PsmData pools
+        let mut pos: Vec<PsmData> = Vec::with_capacity(pos_idx.len());
+        let mut neg: Vec<PsmData> = Vec::with_capacity(neg_idx.len());
+
+        for &i in pos_idx {
+            let feat_vec = extract_features(&features[i].core);
+            pos.push(PsmData {
+                features: feat_vec,
+                label: 1.0,
+                original_idx: i,
+            });
+        }
+        for &i in neg_idx {
+            let feat_vec = extract_features(&features[i].core);
+            neg.push(PsmData {
+                features: feat_vec,
+                label: 0.0,
+                original_idx: i,
+            });
+        }
+
+        if pos.len() < 50 || neg.len() < 50 {
+            return None;
+        }
+
+        // Deterministic balanced sampling
+        let mut rng = StdRng::seed_from_u64(seed);
+        pos.shuffle(&mut rng);
+        neg.shuffle(&mut rng);
+
+        let sample_size = pos.len().min(neg.len()).min(10_000);
+        let mut training_data = Vec::with_capacity(sample_size * 2);
+        training_data.extend_from_slice(&pos[0..sample_size]);
+        training_data.extend_from_slice(&neg[0..sample_size]);
+        training_data.shuffle(&mut rng);
+
+        // Normalize (in-place) and capture means/stds
+        let (means, stds) = normalize_features(&mut training_data);
+
+        let n_features = training_data[0].features.len();
+        let mut model = LogisticRegression::new(n_features);
+        model.train_cv(&training_data, &config);
+
+        Some((model, means, stds))
+    };
+
+    // ---- 3) Cross-fit: out-of-fold predictions for null candidates ----
+    let mut null_scores_oof: Vec<f64> = Vec::with_capacity(null_cand.len());
+
+    for (fold_i, heldout) in folds.iter().enumerate() {
+        // Training negatives = null_cand excluding heldout
+        let mut train_neg: Vec<usize> =
+            Vec::with_capacity(null_cand.len().saturating_sub(heldout.len()));
+        // mark heldout for fast exclusion
+        let mut heldout_flag = vec![false; features.len()];
+        for &j in *heldout {
+            heldout_flag[j] = true;
+        }
+        for &j in &null_cand {
+            if !heldout_flag[j] {
+                train_neg.push(j);
+            }
+        }
+
+        if log::log_enabled!(log::Level::Debug) {
+            let overlap = train_neg.iter().filter(|&&x| heldout_flag[x]).count();
+            log::debug!(
+                "Nokoi DEBUG crossfit fold {}/{}: heldout={} train_neg={} overlap_check={}",
+                fold_i + 1,
+                folds.len(),
+                heldout.len(),
+                train_neg.len(),
+                overlap
+            );
+        }
+
+        let seed = NOKOI_CROSSFIT_SEED ^ (fold_i as u64).wrapping_mul(0x9E37_79B9_7F4A_7C15);
+        let (model, means, stds) = match train_one(&positives_idx, &train_neg, seed) {
+            Some(x) => x,
+            None => {
+                // If a fold cannot train (rare), skip OOF and fail closed later.
+                log::warn!(
+                    "Nokoi DF crossfit: fold {} could not train; skipping heldout",
+                    fold_i
+                );
+                continue;
+            }
+        };
+
+        // Predict on heldout (OOF) only
+        for &j in *heldout {
+            let mut x = extract_features(&features[j].core);
+            for t in 0..x.len() {
+                if stds[t] > 1e-9 {
+                    x[t] = (x[t] - means[t]) / stds[t];
+                } else {
+                    x[t] = 0.0;
+                }
+            }
+            let p = model.predict(&x);
+            null_scores_oof.push(p.clamp(0.0, 1.0));
+        }
+    }
+
+    // If cross-fit produced too few null scores, fail closed to hyperscore fallback
+    if null_scores_oof.len() < 50 {
+        log::warn!(
+            "Nokoi DF crossfit: insufficient OOF null scores ({} < 50) - falling back to normalized hyperscore",
+            null_scores_oof.len()
+        );
+
+        let min_hs = features
+            .iter()
+            .map(|f| f.core.hyperscore as f64)
+            .fold(f64::INFINITY, f64::min);
+        let max_hs = features
+            .iter()
+            .map(|f| f.core.hyperscore as f64)
+            .fold(f64::NEG_INFINITY, f64::max);
+        let range = max_hs - min_hs;
+
+        let prob_all: Vec<f64> = if range == 0.0 {
+            vec![0.5; features.len()]
+        } else {
+            features
+                .iter()
+                .map(|f| ((f.core.hyperscore as f64 - min_hs) / range).clamp(0.0, 1.0))
+                .collect()
+        };
+
+        let mut null_oof: Vec<f64> = Vec::with_capacity(null_cand.len());
+        for &j in &null_cand {
+            null_oof.push(prob_all[j]);
+        }
+        return Some((prob_all, null_oof));
+    }
+
+    // ---- 4) Final model for prob_target_all: train on all positives + ALL rank-window negatives ----
+    let seed_final = NOKOI_CROSSFIT_SEED ^ 0xF11A_1EED_1234_5678u64;
+    let (model, means, stds) = match train_one(&positives_idx, &negatives_idx, seed_final) {
+        Some(x) => x,
+        None => {
+            // fall back (should be extremely rare since we already passed size checks)
+            log::warn!("Nokoi DF crossfit: final model could not train; falling back to normalized hyperscore");
+            let min_hs = features
+                .iter()
+                .map(|f| f.core.hyperscore as f64)
+                .fold(f64::INFINITY, f64::min);
+            let max_hs = features
+                .iter()
+                .map(|f| f.core.hyperscore as f64)
+                .fold(f64::NEG_INFINITY, f64::max);
+            let range = max_hs - min_hs;
+
+            let prob_all: Vec<f64> = if range == 0.0 {
+                vec![0.5; features.len()]
+            } else {
+                features
+                    .iter()
+                    .map(|f| ((f.core.hyperscore as f64 - min_hs) / range).clamp(0.0, 1.0))
+                    .collect()
+            };
+            return Some((prob_all, null_scores_oof));
+        }
+    };
+
+    let mut prob_target_all: Vec<f64> = Vec::with_capacity(features.len());
+    for f in features {
+        let mut x = extract_features(&f.core);
+        for t in 0..x.len() {
+            if stds[t] > 1e-9 {
+                x[t] = (x[t] - means[t]) / stds[t];
+            } else {
+                x[t] = 0.0;
+            }
+        }
+        prob_target_all.push(model.predict(&x).clamp(0.0, 1.0));
+    }
+
+    Some((prob_target_all, null_scores_oof))
 }
 
 /// Convert Probabilities to P-values using ECDF of Negatives (Rank > 1)

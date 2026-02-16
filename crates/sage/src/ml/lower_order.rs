@@ -1,6 +1,4 @@
 //! Decoy-free Lower-Order (LO) model fitting utilities.
-//!
-//! Moved out of `decoy_free_fdr.rs` as part of Phase 1 refactor.
 
 use fnv::FnvHashMap;
 use statrs::consts::EULER_MASCHERONI;
@@ -135,7 +133,7 @@ pub(crate) fn fit_gumbel_mle(scores: &[f64]) -> Option<(f64, f64)> {
 
 /// BIC helper for TNM selection with fixed beta.
 ///
-/// Paper Eq. (7):  BIC = p * ln(N) - 2 * ln(L)
+/// Formula: BIC = p * ln(N) - 2 * ln(L)
 /// Here, p = 1 because beta is fixed and we optimize mu only.
 ///
 /// Uses a stable log-likelihood implementation; returns +INF on invalid inputs.
@@ -183,8 +181,8 @@ pub(crate) fn calculate_bic(mu: f64, beta: f64, top_scores: &[f64]) -> f64 {
 }
 
 // -----------------------------------------------------------------------------
-// PyLord-like charge filling rules
-// -----------------------------------------------------------------------------
+// Charge filling rules
+//
 //
 // Rules implemented:
 // 1) If charge 1 is missing but charge 2 exists: copy charge 2 into charge 1.
@@ -241,10 +239,10 @@ impl LowerOrderModel {
 
         // Internal gaps (or below-min / unknown charges)
         match self.charge_fill_mode {
-            // MinimalDelta: no nearest-neighbor fill for internal gaps
             ChargeFillMode::MinimalDelta => self.fallback_params,
 
-            // Closer PyLord behavior: only fill at query-time using closest fitted charge
+            // MinimalDelta: do NOT nearest-neighbor fill; rely on fallback_params.
+            // ClosestAvailable: only fill at query-time using closest fitted charge
             ChargeFillMode::ClosestAvailable => {
                 if self.fitted_charges_sorted.is_empty() {
                     return self.fallback_params;
@@ -290,11 +288,12 @@ impl LowerOrderModel {
 }
 
 // -----------------------------------------------------------------------------
-// Paper-faithful, charge-stratified TNM fitter
+// Charge-stratified TNM fitter
 // -----------------------------------------------------------------------------
 //
 // Inputs:
-// - rank-null pool stream: (rank, score, charge) for ranks 2..10
+// - rank-null pool stream: (rank, score, charge) for ranks in
+//   [lower_order_min_null_rank..=lower_order_max_null_rank] (clamped within global window)
 // - rank1 score stream:    (score, charge) for rank 1
 //
 // Output:
@@ -305,9 +304,11 @@ impl LowerOrderModel {
 // Notes:
 // - This function is intentionally self-contained (no FdrSettings dependency).
 // - All gating is per-charge using:
-//     min_null_size_per_charge  (total null size across ranks 2..10)
+//     min_null_size_per_charge  (total null size across ranks
+//                               [lower_order_min_null_rank..=lower_order_max_null_rank]
+//                               (clamped within global window))
 //     min_rank_count            (minimum per-rank count to fit a LOM at rank k)
-// - μ scan range is fixed to paper range: [0.05, 0.4].
+// - μ scan range is fixed to [0.05, 0.4].
 //
 
 #[derive(Clone, Copy, Debug)]
@@ -380,7 +381,7 @@ fn mu_grid_best_bic(beta: f64, top_scores: &[f64]) -> Option<(f64, f64)> {
 
 #[inline]
 fn mean_beta_highest_three(available: &[(u32, GumbelParams)]) -> Option<f64> {
-    // Paper: mean(beta_8, beta_9, beta_10) using available highest ranks if missing.
+	// Mean of the three highest available ranks.
     // Input is (rank_k, params) for ranks that were fit.
     let mut v: Vec<(u32, f64)> = available.iter().map(|(k, p)| (*k, p.beta)).collect();
     v.retain(|(_, b)| b.is_finite() && *b > 0.0);
@@ -394,25 +395,36 @@ fn mean_beta_highest_three(available: &[(u32, GumbelParams)]) -> Option<f64> {
     (mean.is_finite() && mean > 0.0).then_some(mean)
 }
 
-/// Phase 2 / Step 2.2 entrypoint
+/// Fits a charge-stratified Lower Order Model.
 ///
-/// Non-paper calibration knobs (Phase 3 / Step 3.4 carry-forward)
-/// --------------------------------------------------------------
+/// Calibration knobs
+/// -----------------
 /// These are optional, explicit post-selection transforms applied PER CHARGE
 /// AFTER the min-BIC TNM candidate is selected:
 /// - lo_beta_blend_moments:  blend selected beta toward global moments beta
 /// - lo_beta_safety_mult:    multiply beta by a safety factor
-///
-/// These knobs are intentionally not part of the paper; they exist solely
-/// as calibration levers.
 pub fn fit_decoy_free_model(
     rank_null_stream: &[(u32, f64, u8)],
     rank1_stream: &[(f64, u8)],
+    min_null_rank: u32,
+    max_null_rank: u32,
     min_null_size_per_charge: usize,
     min_rank_count: usize,
     lo_beta_blend_moments: f64,
     lo_beta_safety_mult: f64,
 ) -> LowerOrderModel {
+    if log::log_enabled!(log::Level::Debug) {
+        log::debug!(
+            "LO DEBUG fit: null-rank window [{min_null_rank}..={max_null_rank}]. rank_null_stream.len()={} rank1_stream.len()={} min_null_size_per_charge={} min_rank_count={} lo_beta_blend_moments={} lo_beta_safety_mult={}",
+            rank_null_stream.len(),
+            rank1_stream.len(),
+            min_null_size_per_charge,
+            min_rank_count,
+            lo_beta_blend_moments,
+            lo_beta_safety_mult
+        );
+    }
+
     // -------------------------
     // (A) Build per-charge datasets
     // -------------------------
@@ -422,7 +434,7 @@ pub fn fit_decoy_free_model(
     let mut pooled_null_scores: Vec<f64> = Vec::new();
 
     for &(rank, score, charge) in rank_null_stream {
-        if !(2..=10).contains(&rank) {
+        if rank < min_null_rank || rank > max_null_rank {
             continue;
         }
         if !score.is_finite() {
@@ -437,6 +449,23 @@ pub fn fit_decoy_free_model(
 
         *null_total_by_charge.entry(charge).or_insert(0) += 1;
         pooled_null_scores.push(score);
+    }
+
+    if log::log_enabled!(log::Level::Debug) {
+        let mut v: Vec<(u8, usize)> = null_total_by_charge.iter().map(|(z, n)| (*z, *n)).collect();
+        v.sort_by_key(|(z, _)| *z);
+        let mut s = String::new();
+        for (z, n) in v {
+            if !s.is_empty() {
+                s.push_str(", ");
+            }
+            s.push_str(&format!("z{}={}", z, n));
+        }
+        log::debug!("LO DEBUG null totals by charge (post rank filter): {}", s);
+        log::debug!(
+            "LO DEBUG pooled_null_scores.len()={}",
+            pooled_null_scores.len()
+        );
     }
 
     // top_scores[z] = Vec<f64>
@@ -462,12 +491,12 @@ pub fn fit_decoy_free_model(
             _ => continue,
         };
 
-        // Fit LOMs for k=2..10 (two estimator families)
+        // Fit LOMs for k in [min_null_rank..=max_null_rank] (two estimator families)
         // Here, per plan: LOM(k) is fit on the null scores for rank==k.
         let mut lom_mle: Vec<(u32, GumbelParams)> = Vec::new();
         let mut lom_mom: Vec<(u32, GumbelParams)> = Vec::new();
 
-        for k in 2u32..=10u32 {
+        for k in min_null_rank..=max_null_rank {
             let scores_k = match by_rank.get(&k) {
                 Some(v) if v.len() >= min_rank_count => v,
                 _ => continue,
@@ -628,7 +657,7 @@ pub fn fit_decoy_free_model(
 
         if let Some((mu, mut beta, _bic)) = best_charge {
             // ---------------------------------------------------------
-            // Non-paper calibration knobs (explicit, per-charge)
+            // Calibration knobs (explicit, per-charge)
             // Applied AFTER TNM selection (min-BIC) and BEFORE storage.
             // ---------------------------------------------------------
 
@@ -669,7 +698,7 @@ pub fn fit_decoy_free_model(
     };
 
     // -------------------------
-    // PyLord-like charge filling rules (fit-time + query-time)
+    // Charge filling rules (fit-time + query-time)
     // -------------------------
 
     // Rule: If charge 1 missing, copy charge 2 (if present)
