@@ -285,14 +285,6 @@ Classical combination and FDR methods:
 
 ---
 
-## 6. Status & Caveats
-
-- This fork is **experimental** and intended for method development and research.
-- Always inspect log messages and output columns to confirm which models were applied.
-- **Fail-Safe Design:** If statistical models cannot be fit (e.g., due to sparse data), the engine defaults to a probability of 1.0 (Fail-Closed). Additionally, Nokoi ML includes a graceful fallback for datasets with fewer than 50 confident PSMs, defaulting to normalized hyperscores to prevent unstable training.
-- If opening an issue, please include your `config.json` and a log excerpt showing the active `fdr.mode`.
-- Log messages report LO saturation diagnostics (frac_ln_clipped, frac_beta_capped) to assist calibration tuning.
-
 **Happy Hunting!**
 
 ---
