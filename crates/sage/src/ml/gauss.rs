@@ -33,10 +33,35 @@ impl Gauss {
 
         // If `left` is the identity matrix, then `right` contains
         // the solution to the system of equations
-        match g.left_solved() {
+        match g.left_solved_strict() {
             true => Some(g.right),
             false => None,
         }
+    }
+
+    pub fn solve_inner_vanilla(left: Matrix, right: Matrix, eps: f64) -> Option<Matrix> {
+        let mut g = Gauss { left, right };
+        g.fill_zero(eps);
+        g.echelon();
+        g.reduce();
+        g.backfill();
+
+        match g.left_solved_vanilla() {
+            true => Some(g.right),
+            false => None,
+        }
+    }
+
+    /// Vanilla-compatible solve (for TDC parity).
+    pub fn solve_vanilla_compat(left: Matrix, right: Matrix) -> Option<Matrix> {
+        let mut eps = 1E-8;
+        while eps <= 1.0 {
+            if let Some(mat) = Gauss::solve_inner_vanilla(left.clone(), right.clone(), eps) {
+                return Some(mat);
+            }
+            eps *= 10.0;
+        }
+        None
     }
 
     pub fn solve(left: Matrix, right: Matrix) -> Option<Matrix> {
@@ -63,7 +88,7 @@ impl Gauss {
     }
 
     // Is `left` an identity matrix, or else contains rows of all zeros?
-    fn left_solved(&self) -> bool {
+    fn left_solved_strict(&self) -> bool {
         let n = self.left.cols;
         // Off-diagonal tolerance: anything with magnitude > 1e-8 means "not solved"
         let off_diag_eps = 1e-8;
@@ -91,6 +116,36 @@ impl Gauss {
                         j,
                         x
                     );
+                    return false;
+                }
+            }
+        }
+        true
+    }
+
+    // Vanilla compatibility: off-diagonal check uses x > 1e-8 (NOT abs).
+    fn left_solved_vanilla(&self) -> bool {
+        let n = self.left.cols;
+        for i in 0..n {
+            for j in 0..n {
+                let x = self.left[(i, j)];
+                if i == j {
+                    if x != 1.0 && x != 0.0 {
+                        log::debug!(
+							"Finding solution to linear system failed: left side of matrix [{},{}] = {}",
+							i,
+							j,
+							x
+						);
+                        return false;
+                    }
+                } else if x > 1E-8 {
+                    log::debug!(
+						"Finding solution to linear system failed: left side of matrix [{},{}] = {}",
+						i,
+						j,
+						x
+					);
                     return false;
                 }
             }

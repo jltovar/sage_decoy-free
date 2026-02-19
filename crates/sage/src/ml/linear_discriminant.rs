@@ -1,15 +1,13 @@
 //! Linear Discriminant Analysis for FDR refinement
 
-use super::gauss::Gauss;
 use super::matrix::Matrix;
 use rayon::prelude::*;
 
 use crate::mass::Tolerance;
 use crate::scoring::{FeatureCore, TdcFeature};
 
+// Declare, so that we have compile time checking of matrix dimensions
 const FEATURES: usize = 20;
-
-#[allow(dead_code)]
 const FEATURE_NAMES: [&str; FEATURES] = [
     "rank",
     "charge",
@@ -33,200 +31,353 @@ const FEATURE_NAMES: [&str; FEATURES] = [
     "sqrt(delta_ims_model)",
 ];
 
-#[allow(dead_code)]
 struct Features<'a>(&'a [f64]);
 
 impl std::fmt::Debug for Features<'_> {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        f.debug_map()
-            .entries(FEATURE_NAMES.iter().zip(self.0))
-            .finish()
+        let mut map = f.debug_map();
+        for (i, name) in FEATURE_NAMES.iter().enumerate() {
+            map.entry(name, &self.0[i]);
+        }
+        map.finish()
     }
 }
 
-pub struct LinearDiscriminantAnalysis {
+// Vanilla-compatible Gauss-Jordan solver used ONLY for TDC/LDA.
+// IMPORTANT: We do NOT reuse crates/sage/src/ml/gauss.rs here because the DF fork
+// intentionally tightened the "identity" check (abs() on off-diagonals), which
+// changes LDA behavior vs vanilla. DF mode bypasses LDA anyway.
+#[derive(Debug)]
+struct GaussVanilla {
+    left: Matrix,
+    right: Matrix,
+}
+
+#[inline]
+fn swap_rows(m: &mut Matrix, i: usize, j: usize) {
+    for k in 0..m.cols {
+        let tmp = m[(i, k)];
+        m[(i, k)] = m[(j, k)];
+        m[(j, k)] = tmp;
+    }
+}
+
+impl GaussVanilla {
+    fn fill_zero(&mut self, eps: f64) {
+        for i in 0..self.left.cols {
+            self.left[(i, i)] += eps;
+        }
+    }
+
+    // Vanilla semantics: off-diagonal failure only if x > 1e-8 (NOT abs(x))
+    fn left_solved(&self) -> bool {
+        let n = self.left.cols;
+        for i in 0..n {
+            for j in 0..n {
+                let x = self.left[(i, j)];
+                if i == j {
+                    if x != 1.0 && x != 0.0 {
+                        log::debug!(
+                            "Finding solution to linear system failed: left side of matrix [{},{}] = {}",
+                            i, j, x
+                        );
+                        return false;
+                    }
+                } else if x > 1E-8 {
+                    log::debug!(
+                        "Finding solution to linear system failed: left side of matrix [{},{}] = {}",
+                        i, j, x
+                    );
+                    return false;
+                }
+            }
+        }
+        true
+    }
+
+    fn echelon(&mut self) {
+        let (m, n) = self.left.shape();
+        let mut h = 0;
+        let mut k = 0;
+
+        while h < m && k < n {
+            let mut max = (0, f64::MIN);
+            for i in h..m {
+                if self.left[(i, k)] >= max.1 {
+                    max = (i, self.left[(i, k)])
+                }
+            }
+            let i = max.0;
+            if self.left[(i, k)] == 0.0 {
+                k += 1;
+                continue;
+            }
+
+            if h != max.0 {
+                swap_rows(&mut self.left, h, i);
+                swap_rows(&mut self.right, h, i);
+            }
+
+            for i in h + 1..m {
+                let factor = self.left[(i, k)] / self.left[(h, k)];
+                self.left[(i, k)] = 0.0;
+                for j in k + 1..n {
+                    self.left[(i, j)] -= self.left[(h, j)] * factor;
+                }
+                for j in 0..self.right.cols {
+                    self.right[(i, j)] -= self.right[(h, j)] * factor;
+                }
+            }
+            h += 1;
+            k += 1;
+        }
+    }
+
+    fn reduce(&mut self) {
+        for i in (0..self.left.rows).rev() {
+            for j in 0..self.left.cols {
+                let x = self.left[(i, j)];
+                if x == 0.0 {
+                    continue;
+                }
+                for k in j..self.left.cols {
+                    self.left[(i, k)] /= x;
+                }
+                for k in 0..self.right.cols {
+                    self.right[(i, k)] /= x;
+                }
+                break;
+            }
+        }
+    }
+
+    fn backfill(&mut self) {
+        for i in (0..self.left.rows).rev() {
+            for j in 0..self.left.cols {
+                if self.left[(i, j)] == 0.0 {
+                    continue;
+                }
+                for k in 0..i {
+                    let factor = self.left[(k, j)] / self.left[(i, j)];
+                    for h in 0..self.left.cols {
+                        self.left[(k, h)] -= self.left[(i, h)] * factor;
+                    }
+                    for h in 0..self.right.cols {
+                        self.right[(k, h)] -= self.right[(i, h)] * factor;
+                    }
+                }
+                break;
+            }
+        }
+    }
+
+    fn solve_inner(left: Matrix, right: Matrix, eps: f64) -> Option<Matrix> {
+        let mut g = GaussVanilla { left, right };
+        g.fill_zero(eps);
+        g.echelon();
+        g.reduce();
+        g.backfill();
+        if g.left_solved() {
+            Some(g.right)
+        } else {
+            None
+        }
+    }
+
+    fn solve(left: Matrix, right: Matrix) -> Option<Matrix> {
+        let mut eps = 1E-8;
+        while eps <= 1.0 {
+            if let Some(mat) = GaussVanilla::solve_inner(left.clone(), right.clone(), eps) {
+                return Some(mat);
+            }
+            eps *= 10.0;
+        }
+        None
+    }
+}
+
+struct LinearDiscriminantAnalysis {
     eigenvector: Vec<f64>,
 }
 
 impl LinearDiscriminantAnalysis {
-    pub fn train(features: &Matrix, labels: &[bool]) -> Option<Self> {
-        assert_eq!(
-            features.rows,
-            labels.len(),
-            "Features and labels must have the same number of rows"
-        );
+    pub fn train(features: &Matrix, decoy: &[bool]) -> Option<LinearDiscriminantAnalysis> {
+        assert_eq!(features.rows, decoy.len());
 
-        let mut target_means = vec![0.0; features.cols];
-        let mut decoy_means = vec![0.0; features.cols];
-        let mut target_count = 0;
-        let mut decoy_count = 0;
+        // Calculate class means, and overall mean
+        let x_bar = features.mean();
+        let mut scatter_within = Matrix::zeros(features.cols, features.cols);
+        let mut scatter_between = Matrix::zeros(features.cols, features.cols);
 
-        for i in 0..features.rows {
-            // With the updated matrix.rs, row() yields &f64
-            let row = features.row(i);
-            if labels[i] {
-                target_count += 1;
-                for (j, val) in row.enumerate() {
-                    target_means[j] += *val;
-                }
-            } else {
-                decoy_count += 1;
-                for (j, val) in row.enumerate() {
-                    decoy_means[j] += *val;
+        let mut class_means = Vec::new();
+
+        for class in [true, false] {
+            let count = decoy.iter().filter(|&label| *label == class).count();
+
+            let class_data = (0..features.rows)
+                .zip(decoy)
+                .filter(|&(_, label)| *label == class)
+                .flat_map(|(row, _)| features.row(row).copied())
+                .collect::<Vec<f64>>();
+
+            let mut class_data = Matrix::new(class_data, count, features.cols);
+            let class_mean = class_data.mean();
+
+            for row in 0..class_data.rows {
+                for col in 0..class_data.cols {
+                    class_data[(row, col)] -= class_mean[col];
                 }
             }
-        }
 
-        if target_count < 2 || decoy_count < 2 {
-            log::warn!(
-                "LDA: Too few targets ({}) or decoys ({}) to train model",
-                target_count,
-                decoy_count
+            let cov = class_data.transpose().dot(&class_data) / class_data.rows as f64;
+            scatter_within += cov;
+
+            let diff = Matrix::col_vector(
+                class_mean
+                    .iter()
+                    .zip(x_bar.iter())
+                    .map(|(x, y)| x - y)
+                    .collect::<Vec<_>>(),
             );
-            return None;
+
+            scatter_between += diff.dot(&diff.transpose());
+            class_means.extend(class_mean);
         }
 
-        for i in 0..features.cols {
-            target_means[i] /= target_count as f64;
-            decoy_means[i] /= decoy_count as f64;
+        // Use overall mean as the initial vector for power method
+        let mut evec = GaussVanilla::solve(scatter_within, scatter_between)
+            .map(|mat| mat.power_method(&x_bar))?;
+
+        // Ensure Target class scores are higher than Decoy for consistent ranking
+        let class_means = Matrix::new(class_means, 2, features.cols);
+        let coef = class_means.dotv(&evec);
+        if coef[1] < coef[0] {
+            evec.iter_mut().for_each(|c| *c *= -1.0);
         }
 
-        let mut scatter_matrix = Matrix::zeros(features.cols, features.cols);
-
-        for i in 0..features.rows {
-            // row(i) yields &f64, so .cloned() -> f64 is correct for creating Vec<f64>
-            let row: Vec<f64> = features.row(i).cloned().collect();
-            let means = if labels[i] {
-                &target_means
-            } else {
-                &decoy_means
-            };
-
-            for j in 0..features.cols {
-                for k in 0..features.cols {
-                    let d1 = row[j] - means[j];
-                    let d2 = row[k] - means[k];
-                    scatter_matrix.data[j * features.cols + k] += d1 * d2;
-                }
-            }
-        }
-
-        let mean_diff: Vec<f64> = target_means
-            .iter()
-            .zip(decoy_means.iter())
-            .map(|(t, d)| t - d)
-            .collect();
-
-        // Convert mean_diff to column matrix for solve
-        let mean_diff_mat = Matrix::col_vector(mean_diff);
-        let eigenvector = Gauss::solve(scatter_matrix, mean_diff_mat)?;
-
-        // Unwrap matrix back to vec
-        Some(Self {
-            eigenvector: eigenvector.take(),
-        })
+        log::trace!("- linear model fit with {:?}", Features(&evec));
+        Some(LinearDiscriminantAnalysis { eigenvector: evec })
     }
 
     pub fn score(&self, features: &Matrix) -> Vec<f64> {
-        let eigen_mat = Matrix::col_vector(self.eigenvector.clone());
-        features.dot(&eigen_mat).take()
+        features.dotv(&self.eigenvector)
     }
-}
-
-fn standardize(features: &mut [f64], n_features: usize) {
-    for i in 0..n_features {
-        let mut mean = 0.0;
-        let mut variance = 0.0;
-        let mut count = 0.0;
-
-        for j in (i..features.len()).step_by(n_features) {
-            let x = features[j];
-            mean += x;
-            variance += x * x;
-            count += 1.0;
-        }
-
-        mean /= count;
-        variance = (variance / count) - (mean * mean);
-        let std_dev = variance.sqrt();
-
-        for j in (i..features.len()).step_by(n_features) {
-            features[j] = (features[j] - mean) / std_dev;
-        }
-    }
-}
-
-#[rustfmt::skip]
-fn embed(feature: &FeatureCore, precursor_tol: Tolerance) -> [f64; FEATURES] {
-    let delta_mass_model = match precursor_tol {
-        Tolerance::Ppm(_, _) => feature.delta_mass,
-        Tolerance::Da(_, _) => feature.expmass - feature.calcmass - feature.isotope_error,
-        Tolerance::Pct(_, _) => unreachable!("Pct tolerance should never be used on mz"),
-    };
-
-    [
-        (feature.rank as f64).ln_1p(),
-        feature.charge as f64,
-        feature.hyperscore.ln_1p(),
-        feature.delta_next.ln_1p(),
-        feature.delta_best.ln_1p(),
-        delta_mass_model as f64,
-        feature.isotope_error as f64,
-        feature.average_ppm as f64,
-        (-feature.poisson).ln_1p(),
-        feature.matched_intensity_pct.ln_1p() as f64,
-        (feature.matched_peaks as f64).ln_1p(),
-        (feature.longest_b as f64).ln_1p(),
-        (feature.longest_y as f64).ln_1p(),
-        feature.longest_y_pct as f64,
-        (feature.peptide_len as f64).ln_1p(),
-        feature.missed_cleavages as f64,
-        feature.rt as f64,
-        feature.ims as f64,
-        (feature.delta_rt_model as f64).clamp(0.001, 1.0).sqrt(),
-        (feature.delta_ims_model as f64).clamp(0.0, 1.0).sqrt(),
-    ]
 }
 
 pub fn score_psms(
-    features: &mut [TdcFeature],
+    scores: &mut [TdcFeature],
     precursor_tol: Tolerance,
     decoy_free: bool,
 ) -> Option<()> {
-    if features.is_empty() {
+    if scores.is_empty() {
         return None;
     }
 
+    // DF mode must not touch vanilla LDA/KDE
     if decoy_free {
         return Some(());
     }
 
-    log::info!("- fitting linear discriminant model...");
+    log::trace!("fitting linear discriminant model...");
 
-    let embedding: Vec<f64> = features
+    // Vanilla: decoys = label == -1
+    let decoys = scores
         .par_iter()
-        .flat_map(|feat| embed(&feat.core, precursor_tol))
-        .collect();
+        .map(|sc| sc.core.label == -1)
+        .collect::<Vec<_>>();
 
-    let mut matrix = Matrix::new(embedding, features.len(), FEATURES);
-    standardize(&mut matrix.data, FEATURES);
+    // Vanilla: mass_error depends on tolerance type
+    let mass_error = match precursor_tol {
+        Tolerance::Ppm(_, _) => |feat: &FeatureCore| feat.delta_mass as f64,
+        Tolerance::Pct(_, _) => unreachable!("Pct tolerance should never be used on mz"),
+        Tolerance::Da(_, _) => |feat: &FeatureCore| (feat.expmass - feat.calcmass) as f64,
+    };
 
-    let labels: Vec<bool> = features.iter().map(|feat| feat.core.label == 1).collect();
+    let (bw_adjust, bin_size) = match precursor_tol {
+        Tolerance::Ppm(lo, hi) => (2.0f64, (hi - lo).max(100.0)),
+        Tolerance::Pct(_, _) => unreachable!("Pct tolerance should never be used on mz"),
+        Tolerance::Da(lo, hi) => (0.1f64, (hi - lo).max(1000.0)),
+    };
 
-    let lda = LinearDiscriminantAnalysis::train(&matrix, &labels)?;
-    let scores = lda.score(&matrix);
+    let delta_mass = scores
+        .par_iter()
+        .map(|s| mass_error(&s.core))
+        .collect::<Vec<_>>();
 
-    log::info!("- calculating posterior error probabilities...");
-    let kde = super::kde::Builder::default().build(&scores, &labels);
+    // Vanilla: KDE mass model
+    let mass_model = super::kde::Builder::default()
+        .monotonic(false)
+        .bw_adjust(move |x| x * bw_adjust)
+        .bins(bin_size.ceil().abs() as usize)
+        .build(&delta_mass, &decoys);
 
-    features
+    // Vanilla: feature embedding (IMPORTANT: use aligned_rt)
+    let features = scores
+        .par_iter()
+        .flat_map_iter(|s| {
+            let perc = &s.core;
+
+            let poisson = match (-perc.poisson).ln_1p() {
+                x if x.is_finite() => x,
+                _ => 3.5,
+            };
+
+            let x: [f64; FEATURES] = [
+                (perc.rank as f64),
+                (perc.charge as f64),
+                (perc.hyperscore).ln_1p(),
+                (perc.delta_next).ln_1p(),
+                (perc.delta_best).ln_1p(),
+                mass_model.posterior_error(mass_error(perc)),
+                (perc.isotope_error as f64),
+                (perc.average_ppm as f64),
+                (poisson),
+                (perc.matched_intensity_pct as f64).ln_1p(),
+                (perc.matched_peaks as f64),
+                (perc.longest_b as f64).ln_1p(),
+                (perc.longest_y as f64).ln_1p(),
+                (perc.longest_y as f64 / perc.peptide_len as f64),
+                (perc.peptide_len as f64).ln_1p(),
+                (perc.missed_cleavages as f64),
+                (perc.aligned_rt as f64),
+                (perc.ims as f64),
+                (perc.delta_rt_model as f64).clamp(0.001, 0.999).sqrt(),
+                (perc.delta_ims_model as f64).clamp(0.001, 0.999).sqrt(),
+            ];
+            x
+        })
+        .collect::<Vec<_>>();
+
+    let features = Matrix::new(features, scores.len(), FEATURES);
+    let lda = LinearDiscriminantAnalysis::train(&features, &decoys)?;
+
+    if !lda.eigenvector.iter().all(|f| f.is_finite()) {
+        log::error!(
+            "linear model eigenvector includes NaN: this likely indicates a bug, please report!"
+        );
+        for row in 0..features.rows {
+            if features.row(row).any(|f| !f.is_finite()) {
+                let row = features.row(row).collect::<Vec<_>>();
+                log::error!("example feature vector with NaN: {:?}", row);
+                break;
+            }
+        }
+        return None;
+    }
+
+    let discriminants = lda.score(&features);
+
+    log::trace!("- fitting non-parametric model for posterior error probabilities");
+    let kde = super::kde::Builder::default().build(&discriminants, &decoys);
+
+    scores
         .par_iter_mut()
-        .zip(scores.into_par_iter())
-        .for_each(|(feat, score)| {
-            feat.discriminant_score = score as f32;
-            feat.posterior_error = kde.posterior_error(score).log10() as f32;
-            if feat.posterior_error.is_infinite() {
-                feat.posterior_error = -324.0;
+        .zip(&discriminants)
+        .for_each(|(perc, score)| {
+            perc.discriminant_score = *score as f32;
+            perc.posterior_error = kde.posterior_error(*score).log10() as f32;
+            if perc.posterior_error.is_infinite() {
+                perc.posterior_error = -324.0;
             }
         });
 

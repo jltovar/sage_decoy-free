@@ -34,6 +34,34 @@ pub fn predict(
     Some(())
 }
 
+/// Vanilla-compatible mobility prediction:
+/// - does NOT require ims > 0
+/// - does NOT require a minimum count
+/// - does NOT abort on zero variance
+/// This matches upstream Sage behavior, including degenerate r2/mse.
+pub fn predict_vanilla_compat(
+    db: &IndexedDatabase,
+    feats: &mut [FeatureCore],
+    filter: impl Fn(&FeatureCore) -> bool + Sync + Send,
+) -> Option<()> {
+    let lr = match MobilityModel::fit_vanilla_compat(db, feats, filter) {
+        Some(lr) => lr,
+        None => {
+            log::warn!("Mobility model failed to train");
+            return None;
+        }
+    };
+
+    feats.par_iter_mut().for_each(|feat| {
+        let ims = lr.predict_peptide(db, feat);
+        let bounded = ims.clamp(0.0, 2.0) as f32;
+        feat.predicted_ims = bounded;
+        feat.delta_ims_model = (feat.ims - bounded).abs();
+    });
+
+    Some(())
+}
+
 pub struct MobilityModel {
     beta: Vec<f64>,
     map: [usize; 26],
@@ -207,6 +235,64 @@ impl MobilityModel {
 
         let mse: f64 = sum_squared_error / predicted_im.len() as f64;
         let r2 = 1.0 - (sum_squared_error / ims_var);
+        log::info!("- fit mobility model, rsq = {}, mse = {}", r2, mse);
+        Some(Self {
+            beta: beta.take(),
+            map,
+            r2,
+        })
+    }
+
+    /// Vanilla-compatible fit:
+    /// matches upstream behavior (no ims>0 filter, no min-N check, no var==0 abort)
+    pub fn fit_vanilla_compat(
+        db: &IndexedDatabase,
+        training_set: &[FeatureCore],
+        filter: impl Fn(&FeatureCore) -> bool + Sync + Send,
+    ) -> Option<Self> {
+        let mut map = [0; 26];
+        for (idx, aa) in VALID_AA.iter().enumerate() {
+            map[(aa - b'A') as usize] = idx;
+        }
+
+        // NOTE: vanilla does not gate on ims > 0.0 here
+        let ims = training_set
+            .par_iter()
+            .filter(|feat| filter(*feat))
+            .map(|psm| psm.ims as f64)
+            .collect::<Vec<f64>>();
+
+        // Vanilla does not check ims.len() or variance before proceeding.
+        let ims_mean = ims.iter().sum::<f64>() / ims.len() as f64;
+        let ims_var = ims.iter().map(|v| (v - ims_mean).powi(2)).sum::<f64>();
+
+        let rt = Matrix::col_vector(ims);
+
+        let x = training_set
+            .par_iter()
+            .filter(|feat| filter(*feat))
+            .flat_map_iter(|psm| Self::embed(&db[psm.peptide_idx], &psm.charge, &map))
+            .collect::<Vec<_>>();
+
+        let rows = x.len() / FEATURES;
+        let features = Matrix::new(x, rows, FEATURES);
+
+        let f_t = features.transpose();
+        let cov = f_t.dot(&features);
+        let b = f_t.dot(&rt);
+
+        let beta = Gauss::solve_vanilla_compat(cov, b)?;
+
+        let predicted_im = features.dot(&beta).take();
+        let sum_squared_error = predicted_im
+            .iter()
+            .zip(rt.take())
+            .map(|(pred, act)| (pred - act).powi(2))
+            .sum::<f64>();
+
+        let mse: f64 = sum_squared_error / predicted_im.len() as f64;
+        let r2 = 1.0 - (sum_squared_error / ims_var);
+
         log::info!("- fit mobility model, rsq = {}, mse = {}", r2, mse);
         Some(Self {
             beta: beta.take(),

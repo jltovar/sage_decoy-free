@@ -1161,7 +1161,7 @@ fn fit_engines(
         rank1_scores_by_charge.push((x, f.core.charge));
     }
 
-    // Apply existing settings inside the LO module as explicit (mu,beta) 
+    // Apply existing settings inside the LO module as explicit (mu,beta)
     // post-selection transforms.
     let lo_fit_data = pool.fit_data_in_window(
         settings.lower_order_min_null_rank,

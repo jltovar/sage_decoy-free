@@ -488,10 +488,7 @@ impl From<FdrOptions> for FdrSettings {
 
         let nokoi_k_folds = options.nokoi_k_folds.unwrap_or(2).max(2).min(20);
 
-        let nokoi_pos_p_thresh = options
-            .nokoi_pos_p_thresh
-            .unwrap_or(1e-6)
-            .clamp(0.0, 1.0);
+        let nokoi_pos_p_thresh = options.nokoi_pos_p_thresh.unwrap_or(1e-6).clamp(0.0, 1.0);
 
         let nokoi_pos_rule = options.nokoi_pos_rule.unwrap_or(NokoiPosRule::And);
 
@@ -585,20 +582,14 @@ impl From<FdrOptions> for FdrSettings {
             .clamp(0.0, 1.0)
             .max(msfdr_pi_clamp_min);
 
-        let msfdr1_pi_clamp_min = options
-            .msfdr1_pi_clamp_min
-            .unwrap_or(0.01)
-            .clamp(0.0, 1.0);
+        let msfdr1_pi_clamp_min = options.msfdr1_pi_clamp_min.unwrap_or(0.01).clamp(0.0, 1.0);
         let msfdr1_pi_clamp_max = options
             .msfdr1_pi_clamp_max
             .unwrap_or(0.65)
             .clamp(0.0, 1.0)
             .max(msfdr1_pi_clamp_min);
 
-        let msfdr2_pi_clamp_min = options
-            .msfdr2_pi_clamp_min
-            .unwrap_or(0.01)
-            .clamp(0.0, 1.0);
+        let msfdr2_pi_clamp_min = options.msfdr2_pi_clamp_min.unwrap_or(0.01).clamp(0.0, 1.0);
         let msfdr2_pi_clamp_max = options
             .msfdr2_pi_clamp_max
             .unwrap_or(0.568)
@@ -741,9 +732,7 @@ impl From<FdrOptions> for FdrSettings {
 
             model_fit: options.model_fit.unwrap_or(ModelFit::Ensemble),
             type_: options.type_.unwrap_or(FdrType::Storey),
-            protein_p_combine: options
-                .protein_p_combine
-                .unwrap_or(ProteinPCombine::Cauchy),
+            protein_p_combine: options.protein_p_combine.unwrap_or(ProteinPCombine::Cauchy),
 
             min_storey_n: options.min_storey_n.unwrap_or(300),
             min_null_size: options.min_null_size.unwrap_or(300),

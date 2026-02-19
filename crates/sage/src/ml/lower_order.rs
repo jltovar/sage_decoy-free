@@ -381,7 +381,7 @@ fn mu_grid_best_bic(beta: f64, top_scores: &[f64]) -> Option<(f64, f64)> {
 
 #[inline]
 fn mean_beta_highest_three(available: &[(u32, GumbelParams)]) -> Option<f64> {
-	// Mean of the three highest available ranks.
+    // Mean of the three highest available ranks.
     // Input is (rank_k, params) for ranks that were fit.
     let mut v: Vec<(u32, f64)> = available.iter().map(|(k, p)| (*k, p.beta)).collect();
     v.retain(|(_, b)| b.is_finite() && *b > 0.0);

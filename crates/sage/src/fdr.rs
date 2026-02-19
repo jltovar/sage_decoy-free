@@ -212,7 +212,7 @@ pub fn picked_precursor<H: BuildHasher>(
     for score in scores.iter_mut().rev() {
         q_min = q_min.min(score.q);
         score.q = q_min;
-        if q_min <= 0.01 && !score.decoy {
+        if q_min <= 0.05 && !score.decoy {
             passing += 1;
         }
         precursor_q.insert((score.ix, score.decoy), score.q);

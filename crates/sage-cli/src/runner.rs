@@ -725,44 +725,46 @@ impl Runner {
                     .features
                     .par_sort_unstable_by(|a, b| a.poisson.total_cmp(&b.poisson));
 
-                // Stage A: compute the vanilla gate using a temporary TdcFeature view.
+                // --- TEMPORARY ML q-value gate (vanilla-style) ---
+                // qvalue::spectrum_q_value operates on TdcFeature, so compute it on a TdcFeature view.
                 let mut tmp_tdc: Vec<TdcFeature> = outputs
                     .features
                     .iter()
-                    .cloned() // clones FeatureCore
+                    .cloned() // FeatureCore: Clone
                     .map(FeatureCore::to_tdc) // consumes the cloned FeatureCore
                     .collect();
 
-                // ML qvalue is order-dependent; tmp_tdc is already in poisson-sorted order.
-                let _ = self.spectrum_fdr(&mut tmp_tdc);
+                // Computes spectrum_q on tmp_tdc (poisson-sorted order already).
+                sage_core::ml::qvalue::spectrum_q_value(&mut tmp_tdc);
 
-                // Build a membership set of PSM ids that pass the vanilla training gate.
+                // Select PSM ids that pass the vanilla RT/IMS training gate.
                 let selected_psm_ids: HashSet<usize> = tmp_tdc
                     .iter()
-                    .filter(|f| f.core.label == 1 && f.spectrum_q <= 0.01)
+                    .filter(|f| f.spectrum_q <= 0.01)
                     .map(|f| f.core.psm_id)
                     .collect();
 
-                // Stage B: train RT/IMS on FeatureCore using the vanilla-equivalent selector.
+                // Selector used by your forked RT/IMS APIs (required 3rd arg).
                 let selector =
                     |f: &FeatureCore| f.label == 1 && selected_psm_ids.contains(&f.psm_id);
 
-                let local = sage_core::ml::retention_alignment::global_alignment(
+                // --- RT alignment / models (fork requires selector arg) ---
+                let local = sage_core::ml::retention_alignment::global_alignment_vanilla_compat(
                     &mut outputs.features,
                     self.parameters.mzml_paths.len(),
-                    &selector,
+                    &selected_psm_ids,
                 );
 
-                let _ = sage_core::ml::retention_model::predict(
+                let _ = sage_core::ml::retention_model::predict_vanilla_compat(
                     &self.database,
                     &mut outputs.features,
-                    &selector,
+                    &selected_psm_ids,
                 );
 
-                let _ = sage_core::ml::mobility_model::predict(
+                let _ = sage_core::ml::mobility_model::predict_vanilla_compat(
                     &self.database,
                     &mut outputs.features,
-                    &selector,
+                    selector,
                 );
 
                 Some(local)
@@ -778,9 +780,6 @@ impl Runner {
                 .collect();
 
             // 3. RESTORE ORDER & RUN SPECTRUM FDR
-            // Restore canonical order by PSM ID before processing
-            features.par_sort_unstable_by_key(|f| f.core.psm_id);
-
             // LDA + Spectrum Q-Value
             let q_spectrum = self.spectrum_fdr(&mut features);
 

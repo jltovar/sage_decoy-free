@@ -86,6 +86,21 @@ pub struct Alignment {
     pub intercept: f32,
 }
 
+use std::collections::HashSet;
+
+pub fn global_alignment_vanilla_compat(
+    features: &mut [FeatureCore],
+    n_files: usize,
+    selected_psm_ids: &HashSet<usize>,
+) -> Vec<Alignment> {
+    global_alignment(features, n_files, |f: &FeatureCore| {
+        // Vanilla uses: label == 1 && spectrum_q <= 0.01
+        // In the fork, spectrum_q isn’t on FeatureCore, so we use the runner’s
+        // vanilla-style q-gate (selected_psm_ids) as the equivalent.
+        f.label == 1 && selected_psm_ids.contains(&f.psm_id)
+    })
+}
+
 pub fn global_alignment(
     features: &mut [FeatureCore],
     n_files: usize,
