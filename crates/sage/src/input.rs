@@ -217,10 +217,14 @@ pub struct FdrOptions {
     pub lower_order_min_null_rank: Option<u32>,
     pub lower_order_max_null_rank: Option<u32>,
 
-    // Decoy-Free Lower-Order (LO) robustness controls
-    pub lo_beta_blend_moments: Option<f64>,
-    pub lo_beta_safety_mult: Option<f64>,
-    pub lo_rank_key: Option<LoRankKey>,
+    // LO rank selection / modeling knobs (new; Phase 4 wiring sets defaults)
+    pub lo_rank_key: Option<LoRankKey>, // e.g. lo_adjusted vs hyperscore (existing)
+    pub lo_k_exclude_leq: Option<u32>,  // default 3
+    pub lo_k_default_min: Option<u32>,  // default 6
+    pub lo_k_default_max: Option<u32>,  // default 12
+    pub lo_rank_gof_max: Option<f64>,   // optional threshold; default None
+    pub lo_neff_enable: Option<bool>,   // default true
+    pub lo_eb_tau: Option<f64>,         // default ~0.02..0.05 (β units)
 
     // =========================================================================
     // E) MSFDR specific knobs
@@ -323,6 +327,13 @@ pub struct FdrSettings {
     // =========================================================================
     pub lower_order_min_null_rank: u32,
     pub lower_order_max_null_rank: u32,
+    pub lo_rank_key: LoRankKey,
+    pub lo_k_exclude_leq: u32,        // default 3
+    pub lo_k_default_min: u32,        // default 6
+    pub lo_k_default_max: u32,        // default 12
+    pub lo_rank_gof_max: Option<f64>, // optional; default None
+    pub lo_neff_enable: bool,         // default true
+    pub lo_eb_tau: f64,               // default ~0.02..0.05
 
     // =========================================================================
     // E) MSFDR specific resolved null window
@@ -373,13 +384,8 @@ pub struct FdrSettings {
     pub storey_degen_pi0_eps: f64,
     pub storey_degen_fallback: StoreyDegeneracyFallback,
 
-    // Decoy-Free Lower-Order (LO) robustness controls
-    pub lo_beta_blend_moments: f64,
-    pub lo_beta_safety_mult: f64,
-
     // Per-method calibration / ranking controls
     pub calibrate_per_method: bool,
-    pub lo_rank_key: LoRankKey,
 
     // Nokoi DF cross-fit calibration
     pub nokoi_k_folds: usize,
@@ -476,15 +482,14 @@ impl From<FdrOptions> for FdrSettings {
             .storey_degen_fallback
             .unwrap_or(StoreyDegeneracyFallback::Bh);
 
-        let lo_beta_blend_moments = options.lo_beta_blend_moments.unwrap_or(0.0).clamp(0.0, 1.0);
-
-        let lo_beta_safety_mult = match options.lo_beta_safety_mult {
-            Some(x) if x.is_finite() && x > 0.0 => x.clamp(0.1, 10.0),
-            _ => 4.72,
-        };
-
         let calibrate_per_method = options.calibrate_per_method.unwrap_or(true);
         let lo_rank_key = options.lo_rank_key.unwrap_or(LoRankKey::LoAdjusted);
+        let lo_k_exclude_leq = options.lo_k_exclude_leq.unwrap_or(3);
+        let lo_k_default_min = options.lo_k_default_min.unwrap_or(6);
+        let lo_k_default_max = options.lo_k_default_max.unwrap_or(12);
+        let lo_rank_gof_max = options.lo_rank_gof_max; // default None
+        let lo_neff_enable = options.lo_neff_enable.unwrap_or(true);
+        let lo_eb_tau = options.lo_eb_tau.unwrap_or(0.03);
 
         let nokoi_k_folds = options.nokoi_k_folds.unwrap_or(2).max(2).min(20);
 
@@ -659,8 +664,8 @@ impl From<FdrOptions> for FdrSettings {
         let (lower_order_min_null_rank, lower_order_max_null_rank) = resolve_window(
             options.lower_order_min_null_rank,
             options.lower_order_max_null_rank,
-            4,
-            50,
+            6,
+            12,
         );
 
         // MSFDR family defaults: rank2-only pool by default (2..2)
@@ -713,6 +718,13 @@ impl From<FdrOptions> for FdrSettings {
             // LowerOrder-specific resolved null window
             lower_order_min_null_rank,
             lower_order_max_null_rank,
+            lo_rank_key,
+            lo_k_exclude_leq,
+            lo_k_default_min,
+            lo_k_default_max,
+            lo_rank_gof_max,
+            lo_neff_enable,
+            lo_eb_tau,
 
             // MSFDR-specific resolved null window
             msfdr_min_null_rank,
@@ -751,11 +763,7 @@ impl From<FdrOptions> for FdrSettings {
             storey_degen_pi0_eps,
             storey_degen_fallback,
 
-            lo_beta_blend_moments,
-            lo_beta_safety_mult,
-
             calibrate_per_method,
-            lo_rank_key,
 
             nokoi_k_folds,
             nokoi_pos_p_thresh,

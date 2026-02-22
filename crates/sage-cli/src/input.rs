@@ -384,11 +384,15 @@ impl Input {
                 min_null_size: None,
                 kde_samples: None,
 
-                // Decoy-Free Lower-Order (LO) robustness controls
-                lo_beta_blend_moments: None,
-                lo_beta_safety_mult: None,
+                // Decoy-Free Lower-Order (LO) controls
+                lo_k_exclude_leq: None,
+                lo_k_default_min: None,
+                lo_k_default_max: None,
+                lo_rank_gof_max: None,
+                lo_neff_enable: None,
+                lo_eb_tau: None,
 
-                // New Controls (existing)
+                // Other Controls
                 purification_factor: None,
                 min_rank_count: None,
 

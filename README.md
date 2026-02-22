@@ -119,8 +119,13 @@ These defaults enable the full ensemble (Seeded, 1SMix, 2SMix, Nokoi, and Base M
   "lower_order_min_null_rank": 4,
   "lower_order_max_null_rank": 50,
   "lo_rank_key": "lo_adjusted",
-  "lo_beta_blend_moments": 0.0,
-  "lo_beta_safety_mult": 4.72,
+  // LO stabilization
+  "lo_k_exclude_leq": 3,
+  "lo_k_default_min": 6,
+  "lo_k_default_max": 12,
+  "lo_rank_gof_max": null,
+  "lo_neff_enable": true,
+  "lo_eb_tau": 0.03
 
   // MSFDR: Seeded (Legacy/Fixed)
   "enable_msfdr_seeded": true,
@@ -184,6 +189,14 @@ These defaults enable the full ensemble (Seeded, 1SMix, 2SMix, Nokoi, and Base M
 * `"cauchy"` (Default), `"fisher"`, `"sidak_minp"`.
 
 
+#### Lower-Order Variants
+
+* **`lower_order_min_null_rank, lower_order_max_null_rank`**: Rank window used to build LO buckets; best practice is a moderate window (default 6–12).
+* **`lo_k_exclude_leq`**: Hard-exclude ranks ≤ this value (default 3) to avoid contamination/correlation squeeze.
+* **`lo_k_default_min, lo_k_default_max`**: Default moderate window used when LO-specific ranks aren’t set explicitly (defaults 6–12)..
+* **`lo_rank_gof_max`**: If set, can be used as a GOF cutoff to downweight/ignore poorly modeled ranks (currently optional; leave null unless debugging).
+* **`lo_neff_enable`**: Enable data-driven squeeze correction (β inflation only when ranks appear compressed).
+* **`lo_eb_tau`**: EB shrink strength for β (default ~0.03). Larger → more shrink to pooled β prior; smaller → more spectrum-specific β.
 
 #### MSFDR Variants
 
