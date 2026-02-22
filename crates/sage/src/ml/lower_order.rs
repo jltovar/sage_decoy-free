@@ -462,6 +462,31 @@ impl LowerOrderModel {
     }
 }
 
+#[inline]
+fn mu_search_bounds(beta: f64, scores: &[f64]) -> Option<(f64, f64)> {
+    // Pick a robust μ range on the *same scale as scores*.
+    // Use percentiles if we can; otherwise use min/max.
+    let mut xs: Vec<f64> = scores.iter().copied().filter(|x| x.is_finite()).collect();
+    if xs.len() < 10 || !beta.is_finite() || beta <= 0.0 {
+        return None;
+    }
+    xs.sort_by(|a, b| a.partial_cmp(b).unwrap_or(std::cmp::Ordering::Equal));
+
+    let n = xs.len();
+    let p05 = xs[((0.05 * (n as f64 - 1.0)).round() as usize).min(n - 1)];
+    let p95 = xs[((0.95 * (n as f64 - 1.0)).round() as usize).min(n - 1)];
+
+    // Expand by a few beta to allow the null to shift.
+    let lo = p05 - 4.0 * beta;
+    let hi = p95 + 4.0 * beta;
+
+    if lo.is_finite() && hi.is_finite() && lo < hi {
+        Some((lo, hi))
+    } else {
+        None
+    }
+}
+
 // -----------------------------------------------------------------------------
 // Charge-stratified TNM fitter
 // -----------------------------------------------------------------------------
@@ -496,20 +521,19 @@ fn mu_grid_best_bic(beta: f64, top_scores: &[f64]) -> Option<(f64, f64)> {
         return None;
     }
 
-    const MU_MIN: f64 = 0.05;
-    const MU_MAX: f64 = 0.40;
     const MU_N: usize = 256;
 
-    let step = (MU_MAX - MU_MIN) / ((MU_N - 1) as f64);
+    let (mu_min, mu_max) = mu_search_bounds(beta, top_scores)?;
+    let step = (mu_max - mu_min) / ((MU_N - 1) as f64);
     if !step.is_finite() || step <= 0.0 {
         return None;
     }
 
-    let mut best_mu = MU_MIN;
+    let mut best_mu = mu_min;
     let mut best_bic = f64::INFINITY;
 
     for i in 0..MU_N {
-        let mu = MU_MIN + (i as f64) * step;
+        let mu = mu_min + (i as f64) * step;
         let bic = calculate_bic(mu, beta, top_scores);
         if bic < best_bic {
             best_bic = bic;
@@ -544,9 +568,32 @@ pub(crate) fn fit_joint_tev(
         return None;
     }
 
-    // Hard bounds aligned with your TNM scan domain.
-    const MU_MIN: f64 = 0.05;
-    const MU_MAX: f64 = 0.40;
+    let beta0 = if beta_init.is_finite() && beta_init > 0.0 {
+        beta_init
+    } else {
+        1.0
+    };
+
+    // Pool finite scores for μ-bound estimation
+    let mut pooled: Vec<f64> = Vec::new();
+    for b in buckets {
+        pooled.extend(b.scores.iter().copied().filter(|x| x.is_finite()));
+    }
+    if pooled.len() < 10 {
+        return None;
+    }
+
+    let (mut mu_min, mut mu_max) =
+        mu_search_bounds(beta0, &pooled).unwrap_or((pooled[0], pooled[pooled.len() - 1]));
+    if !(mu_min.is_finite() && mu_max.is_finite()) {
+        return None;
+    }
+    if mu_min > mu_max {
+        std::mem::swap(&mut mu_min, &mut mu_max);
+    }
+    if (mu_max - mu_min) <= 0.0 {
+        return None;
+    }
 
     // Count points (for diagnostics only).
     let mut n_points = 0usize;
@@ -554,15 +601,10 @@ pub(crate) fn fit_joint_tev(
         n_points += b.scores.len();
     }
 
-    let beta0 = if beta_init.is_finite() && beta_init > 0.0 {
-        beta_init
-    } else {
-        1.0
-    };
     let _mu0 = if mu_init.is_finite() {
-        mu_init.clamp(MU_MIN, MU_MAX)
+        mu_init.clamp(mu_min, mu_max)
     } else {
-        0.2
+        0.5 * (mu_min + mu_max)
     };
 
     // ----- coarse beta scan (2^[-6..+6]) -----
@@ -573,12 +615,14 @@ pub(crate) fn fit_joint_tev(
             continue;
         }
 
-        // μ grid across full bounds (coarse)
         const MU_N: usize = 96;
-        let mu_step = (MU_MAX - MU_MIN) / ((MU_N - 1) as f64);
+        let mu_step = (mu_max - mu_min) / ((MU_N - 1) as f64);
+        if !mu_step.is_finite() || mu_step <= 0.0 {
+            return None;
+        }
 
         for i in 0..MU_N {
-            let mu = MU_MIN + (i as f64) * mu_step;
+            let mu = mu_min + (i as f64) * mu_step;
             let nll = nll_joint(mu, beta, buckets);
             if !nll.is_finite() {
                 continue;
@@ -594,24 +638,21 @@ pub(crate) fn fit_joint_tev(
     let (mut mu_best, mut beta_best, mut nll_best) = best?;
 
     // ----- refinement around best -----
-    // Refine beta in log2 steps of 0.25 within ±2.0 (i.e., 2^(±2) = 4x)
     for q in -8..=8 {
         let beta = beta_best * 2.0f64.powf((q as f64) / 4.0);
         if !beta.is_finite() || beta <= 0.0 {
             continue;
         }
 
-        // Refine μ in a local window around current best.
         const MU_LOCAL_HALF_WIDTH: f64 = 0.05;
-        let lo = (mu_best - MU_LOCAL_HALF_WIDTH).clamp(MU_MIN, MU_MAX);
-        let hi = (mu_best + MU_LOCAL_HALF_WIDTH).clamp(MU_MIN, MU_MAX);
+        let lo = (mu_best - MU_LOCAL_HALF_WIDTH).clamp(mu_min, mu_max);
+        let hi = (mu_best + MU_LOCAL_HALF_WIDTH).clamp(mu_min, mu_max);
 
         const MU_N_LOCAL: usize = 81;
-        let mu_step = if MU_N_LOCAL > 1 {
-            (hi - lo) / ((MU_N_LOCAL - 1) as f64)
-        } else {
-            0.0
-        };
+        let mu_step = (hi - lo) / ((MU_N_LOCAL - 1) as f64);
+        if !mu_step.is_finite() || mu_step <= 0.0 {
+            continue;
+        }
 
         for i in 0..MU_N_LOCAL {
             let mu = lo + (i as f64) * mu_step;
@@ -628,7 +669,6 @@ pub(crate) fn fit_joint_tev(
     }
 
     // ----- crude se_beta from curvature (finite-difference in β) -----
-    // se_beta ≈ sqrt(1 / d2/dβ2 NLL) at optimum, if curvature > 0
     let eps = (beta_best.abs() * 0.01).max(1e-6);
     let nll_m = nll_joint(mu_best, beta_best - eps, buckets);
     let nll_0 = nll_joint(mu_best, beta_best, buckets);
@@ -844,6 +884,9 @@ pub fn fit_decoy_free_model(
     max_null_rank: u32,
     min_null_size_per_charge: usize,
     min_rank_count: usize,
+    lo_neff_enable: bool,
+    lo_rank_gof_max: Option<f64>,
+    lo_eb_tau: f64,
 ) -> LowerOrderModel {
     if log::log_enabled!(log::Level::Debug) {
         log::debug!(
@@ -1069,14 +1112,18 @@ pub fn fit_decoy_free_model(
         }
 
         // Data-driven squeeze correction (inflate β only when ranks are compressed)
-        let squeeze_factor = squeeze_factor_from_diags(&diags); // in (0,1], clamped
+        // If lo_neff_enable=false, disable squeeze correction entirely (squeeze_factor=1).
+        let squeeze_factor = if lo_neff_enable {
+            squeeze_factor_from_diags(&diags) // in (0,1], clamped
+        } else {
+            1.0
+        };
+
         let beta_corr = beta2 / squeeze_factor;
 
         if !beta_corr.is_finite() || beta_corr <= 0.0 {
             continue;
         }
-
-        let beta_hat = beta_corr;
 
         let max_pp = diags
             .iter()
@@ -1095,18 +1142,39 @@ pub fn fit_decoy_free_model(
 			);
         }
 
-        // Use existing 1-DOF BIC μ-grid using beta = beta_hat
-        // (this preserves your downstream TNM-selection semantics on rank-1 TS).
-        let beta_prior = beta0; // per-charge pooled-null prior (moments)
-        let se_beta = se2;
+        // Use existing 1-DOF BIC μ-grid, but DO NOT lock μ to a β that we later replace.
+        // We will re-optimize μ after EB shrinkage using the final β (Fix #1).
 
+        let beta_prior = beta0; // per-charge pooled-null prior (moments)
+
+        // Step 6.2/Fail-closed: if GOF is awful, ignore the joint-fit beta and fall back to beta_prior.
+        let gof_bad = lo_rank_gof_max
+            .map(|thr| max_pp.is_finite() && max_pp > thr)
+            .unwrap_or(false);
+
+        // beta_hat is the "pre-EB" beta used for initial μ selection.
+        // If GOF is bad, we force beta_hat = beta_prior and force strong shrink (se_beta=INF).
+        let beta_hat = if gof_bad { beta_prior } else { beta_corr };
+        let se_beta = if gof_bad { f64::INFINITY } else { se2 };
+
+        // Initial μ selection (will be re-done after EB using final β).
         let best_charge: Option<(f64, f64, f64, f64, f64)> = mu_grid_best_bic(beta_hat, ts)
             .map(|(mu_best, bic)| (mu_best, beta_hat, se_beta, beta_prior, bic));
         if best_charge.is_none() {
             continue;
         }
 
-        let (mu, mut beta, se_beta, beta_prior, _bic) = match best_charge {
+        if log::log_enabled!(log::Level::Debug) && gof_bad {
+            log::debug!(
+				"LO DEBUG charge={}: GOF max_pp={:.4} exceeds threshold {:?}; using beta_prior={:.6}",
+				charge,
+				max_pp,
+				lo_rank_gof_max,
+				beta_prior
+			);
+        }
+
+        let (_mu, mut beta, se_beta, beta_prior, _bic) = match best_charge {
             Some(t) => t,
             None => continue,
         };
@@ -1123,10 +1191,8 @@ pub fn fit_decoy_free_model(
             // w = se^2 / (se^2 + tau^2)
             // β_final = (1-w)*β_corr + w*β_prior
             //
-            // tau: shrink strength (exposed in JSON). For now, use a conservative default.
-            const LO_EB_TAU_DEFAULT: f64 = 0.03;
-
-            let tau = LO_EB_TAU_DEFAULT;
+            // tau: shrink strength (from JSON / settings)
+            let tau = lo_eb_tau;
 
             let se2 = if se_beta.is_finite() && se_beta > 0.0 {
                 se_beta
@@ -1162,9 +1228,15 @@ pub fn fit_decoy_free_model(
                 );
             }
 
-            // Final guard
-            if mu.is_finite() && beta.is_finite() && beta > 0.0 {
-                params_by_charge.insert(charge, (mu, beta));
+            // Re-optimize μ using the FINAL β (after EB shrinkage).
+            let mu_final = match mu_grid_best_bic(beta, ts) {
+                Some((m, _bic)) => m,
+                None => continue,
+            };
+
+            // Final guard + store
+            if mu_final.is_finite() && beta.is_finite() && beta > 0.0 {
+                params_by_charge.insert(charge, (mu_final, beta));
             }
         }
     }

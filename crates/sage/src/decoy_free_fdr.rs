@@ -1189,6 +1189,9 @@ fn fit_engines(
         settings.lower_order_max_null_rank,
         settings.min_null_size,
         settings.min_rank_count,
+        settings.lo_neff_enable,
+        settings.lo_rank_gof_max,
+        settings.lo_eb_tau,
     );
 
     // 3) MLE
