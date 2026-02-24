@@ -985,22 +985,34 @@ struct RunGates {
 #[inline]
 fn fit_msfdr_seeded(
     rank1_scores: &[f64],
-    seed_mu: f64,
-    seed_beta: f64,
+    pool_scores: &[f64],
     settings: &FdrSettings,
 ) -> Option<MsfdrSeededModel> {
     let iters = settings.mix_em_max_iter;
     let pi_clamp = (settings.msfdr_pi_clamp_min, settings.msfdr_pi_clamp_max);
     let top_frac_init = settings.msfdr1_top_frac_init;
 
-    MsfdrSeededModel::fit_rank1_seeded(
-        rank1_scores,
-        seed_mu,
-        seed_beta,
-        iters,
-        pi_clamp,
-        top_frac_init,
-    )
+    // Pool-based moments seed (same math pattern as 1smix seed block)
+    let xs: Vec<f64> = pool_scores
+        .iter()
+        .copied()
+        .filter(|x| x.is_finite())
+        .collect();
+    if xs.len() < 20 {
+        return None; // fail-closed
+    }
+
+    let mean = xs.iter().sum::<f64>() / (xs.len() as f64);
+    let var = xs.iter().map(|v| (v - mean).powi(2)).sum::<f64>() / (xs.len() as f64);
+
+    let beta = ((6.0 * var).sqrt() / std::f64::consts::PI).max(1e-9);
+    let mu = mean - 0.5772156649015329_f64 * beta;
+
+    if !mu.is_finite() || !beta.is_finite() || beta <= 0.0 {
+        return None;
+    }
+
+    MsfdrSeededModel::fit_rank1_seeded(rank1_scores, mu, beta, iters, pi_clamp, top_frac_init)
 }
 
 #[inline]
@@ -1233,26 +1245,36 @@ fn fit_engines(
         .filter_map(|&i| tev(&features[i]))
         .collect();
 
+    let msfdr_seed_pool =
+        pool.scores_in_window(settings.msfdr_min_null_rank, settings.msfdr_max_null_rank);
+
     let msfdr2_pool = pool.scores_in_window(
         settings.msfdr2_smix_min_null_rank,
         settings.msfdr2_smix_max_null_rank,
     );
 
-    // Seed source via settings (unchanged logic)
-    let (seed_mu, seed_beta) = match settings.msfdr_seed_mode {
-        crate::input::MsfdrSeedMode::Lo => lo_model.fallback_params,
-        crate::input::MsfdrSeedMode::PoolMoments => (mu_mom, beta_mom),
-        crate::input::MsfdrSeedMode::PoolMle => (mu_mle, beta_mle),
-    };
-    let seed_beta = seed_beta.max(1e-9);
-
     // Fit variants gated (independent slots) + diagnostics (Step 4.2)
-
     let msfdr_seeded = if gates.run_msfdr_seeded {
-        let m = fit_msfdr_seeded(&rank1_scores, seed_mu, seed_beta, settings);
+        let m = if window_ok(
+            "MSFDR seeded",
+            settings.msfdr_min_null_rank,
+            settings.msfdr_max_null_rank,
+            msfdr_seed_pool.len(),
+        ) {
+            fit_msfdr_seeded(&rank1_scores, &msfdr_seed_pool, settings)
+        } else {
+            None
+        };
+
         match &m {
             Some(model) => {
                 log_fit_ok("MSFDR seeded", model);
+                log::info!(
+                    "MSFDR(seed) pool window [{}..={}] n={}",
+                    settings.msfdr_min_null_rank,
+                    settings.msfdr_max_null_rank,
+                    msfdr_seed_pool.len()
+                );
                 log::info!("MSFDR(seed) params: {}", model.param_tuple());
             }
             None => {

@@ -45,17 +45,14 @@ pub enum ProteinPCombine {
 #[derive(Clone, Serialize, Deserialize, Debug, PartialEq, Eq)]
 #[serde(rename_all = "snake_case")]
 pub enum MsfdrSeedMode {
-    /// Default: seed MSFDR null from LO (best sensitivity when multiplicity matters)
-    Lo,
-    /// Seed MSFDR null from rank-null pool moments fit (more independent, often more conservative)
-    PoolMoments,
-    /// Seed MSFDR null from rank-null pool MLE fit (more independent, can be conservative/unstable)
-    PoolMle,
+    /// Seed MSFDR null directly from the rank-null pool window
+    /// [msfdr_min_null_rank..=msfdr_max_null_rank].
+    Pool,
 }
 
 impl Default for MsfdrSeedMode {
     fn default() -> Self {
-        MsfdrSeedMode::Lo
+        MsfdrSeedMode::Pool
     }
 }
 
@@ -234,7 +231,6 @@ pub struct FdrOptions {
 
     pub msfdr_use_canonical_pep: Option<bool>,
     pub msfdr_multistart: Option<usize>,
-    pub msfdr_seed_mode: Option<MsfdrSeedMode>,
 
     // =========================================================================
     // Mixture knobs (MSFDR 1smix / 2smix)
@@ -404,7 +400,6 @@ pub struct FdrSettings {
     // MSFDR controls
     pub msfdr_use_canonical_pep: bool,
     pub msfdr_multistart: usize,
-    pub msfdr_seed_mode: MsfdrSeedMode,
 
     // MSFDR init/drift knobs (needed by real models)
     pub msfdr1_bottom_frac_init: f64,
@@ -513,8 +508,6 @@ impl From<FdrOptions> for FdrSettings {
 
         // Keep small/safe; avoids pathological huge multistarts.
         let msfdr_multistart = options.msfdr_multistart.unwrap_or(3).clamp(1, 25);
-
-        let msfdr_seed_mode = options.msfdr_seed_mode.unwrap_or(MsfdrSeedMode::Lo);
 
         // --- MSFDR init/drift knobs ---
         let clamp_frac = |x: f64, default: f64| -> f64 {
@@ -668,7 +661,7 @@ impl From<FdrOptions> for FdrSettings {
             12,
         );
 
-        // MSFDR family defaults: rank2-only pool by default (2..2)
+        // MSFDR seeded null window defaults (clamped to global [min_null_rank..=max_null_rank])
         let (msfdr_min_null_rank, msfdr_max_null_rank) = resolve_window(
             options.msfdr_min_null_rank,
             options.msfdr_max_null_rank,
@@ -776,7 +769,6 @@ impl From<FdrOptions> for FdrSettings {
 
             msfdr_use_canonical_pep,
             msfdr_multistart,
-            msfdr_seed_mode,
 
             msfdr1_bottom_frac_init,
             msfdr1_top_frac_init,
