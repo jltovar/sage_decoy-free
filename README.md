@@ -79,6 +79,14 @@ These defaults enable the full ensemble (Seeded, 1SMix, 2SMix, Nokoi, and Base M
 ```json
 "fdr": {
   "mode": "decoy_free",
+    
+  // Global Strategy
+  "model_fit": "ensemble",
+  "type": "storey",
+  "protein_p_combine": "cauchy",
+  "ensemble_p_combiner": "cauchy",
+  "ensemble_pep_combiner": "geometric_mean",
+  "calibrate_per_method": true,
   
   // Thresholds
   "peptide_fdr": 0.01,
@@ -91,14 +99,11 @@ These defaults enable the full ensemble (Seeded, 1SMix, 2SMix, Nokoi, and Base M
   "min_null_size": 300,
   "purification_factor": 0.5,
   "min_rank_count": 10,
-
-  // Global Strategy
-  "model_fit": "ensemble",
-  "type": "storey",
-  "protein_p_combine": "cauchy",
-  "ensemble_p_combiner": "cauchy",
-  "ensemble_pep_combiner": "geometric_mean",
-  "calibrate_per_method": true,
+  
+  // Mixture EM Settings (Global)
+  "mix_em_max_iter": 200,
+  "mix_em_tol": 1e-6,
+  "mix_anchor_incorrect": true,
 
   // Storey (Pi0) Tuning
   "min_storey_n": 300,
@@ -111,15 +116,18 @@ These defaults enable the full ensemble (Seeded, 1SMix, 2SMix, Nokoi, and Base M
   "storey_pi0_agg": "median",
   "storey_degen_fallback": "bh",
 
-  // Base Models (Moments / MLE / Lower-Order)
-  "moments_min_null_rank": 4,
-  "moments_max_null_rank": 50,
+  // Moments
+  "moments_min_null_rank": 8,
+  "moments_max_null_rank": 8,
+  
+  // MLE
   "mle_min_null_rank": 4,
   "mle_max_null_rank": 50,
+
+  // Lower-Order
   "lower_order_min_null_rank": 4,
   "lower_order_max_null_rank": 50,
   "lo_rank_key": "lo_adjusted",
-  // LO stabilization
   "lo_k_exclude_leq": 3,
   "lo_k_default_min": 6,
   "lo_k_default_max": 12,
@@ -127,11 +135,10 @@ These defaults enable the full ensemble (Seeded, 1SMix, 2SMix, Nokoi, and Base M
   "lo_neff_enable": true,
   "lo_eb_tau": 0.03
 
-  // MSFDR: Seeded (Legacy/Fixed)
+  // MSFDR
   "enable_msfdr_seeded": true,
   "msfdr_min_null_rank": 4,
   "msfdr_max_null_rank": 50,
-  "msfdr_seed_mode": "lo",
   "msfdr_use_canonical_pep": true,
 
   // MSFDR: 1SMix (Unanchored Mixture)
@@ -151,11 +158,6 @@ These defaults enable the full ensemble (Seeded, 1SMix, 2SMix, Nokoi, and Base M
   "msfdr2_beta_drift_mult": [0.5, 2.0],
   "msfdr2_pi_clamp_min": 0.01,
   "msfdr2_pi_clamp_max": 0.568,
-
-  // Mixture EM Settings (Global)
-  "mix_em_max_iter": 200,
-  "mix_em_tol": 1e-6,
-  "mix_anchor_incorrect": true,
 
   // Nokoi (Machine Learning)
   "nokoi_min_null_rank": 2,
