@@ -644,7 +644,7 @@ pub(crate) fn fit_joint_tev(
             continue;
         }
 
-        const MU_LOCAL_HALF_WIDTH: f64 = 0.05;
+        const MU_LOCAL_HALF_WIDTH: f64 = 1.0;
         let lo = (mu_best - MU_LOCAL_HALF_WIDTH).clamp(mu_min, mu_max);
         let hi = (mu_best + MU_LOCAL_HALF_WIDTH).clamp(mu_min, mu_max);
 
