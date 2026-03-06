@@ -385,12 +385,11 @@ impl Input {
                 kde_samples: None,
 
                 // Decoy-Free Lower-Order (LO) controls
-                lo_k_exclude_leq: None,
-                lo_k_default_min: None,
-                lo_k_default_max: None,
-                lo_rank_gof_max: None,
-                lo_neff_enable: None,
-                lo_eb_tau: None,
+                lo_mode: None,
+                lo_lom_estimator: None,
+                lo_mean_beta_min_rank: None,
+                lo_mean_beta_count: None,
+                lo_lr_window_size: None,
 
                 // Other Controls
                 purification_factor: None,

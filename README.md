@@ -121,19 +121,21 @@ These defaults enable the full ensemble (Seeded, 1SMix, 2SMix, Nokoi, and Base M
   "moments_max_null_rank": 8,
   
   // MLE
-  "mle_min_null_rank": 4,
-  "mle_max_null_rank": 50,
+  "mle_min_null_rank": 11,
+  "mle_max_null_rank": 11,
 
   // Lower-Order
   "lower_order_min_null_rank": 4,
-  "lower_order_max_null_rank": 50,
+  "lower_order_max_null_rank": 10,
   "lo_rank_key": "lo_adjusted",
-  "lo_k_exclude_leq": 3,
-  "lo_k_default_min": 6,
-  "lo_k_default_max": 12,
-  "lo_rank_gof_max": null,
-  "lo_neff_enable": true,
-  "lo_eb_tau": 0.03
+  "lo_mode": "auto",
+  "lo_lom_estimator": "auto",
+  "lo_mean_beta_mode": "consecutive",
+  "lo_mean_beta_min_rank": 8,
+  "lo_mean_beta_count": 3,
+  "lo_lr_window_size": null,
+  "lo_stratify": "global",
+  "lo_score": "per_spectrum",
 
   // MSFDR
   "enable_msfdr_seeded": true,
@@ -171,7 +173,7 @@ These defaults enable the full ensemble (Seeded, 1SMix, 2SMix, Nokoi, and Base M
 
 ### 3.2 Configuration Options Explained
 
-#### Global Strategies
+#### Global parameters
 
 * **`model_fit`**:
 * `"ensemble"` (Recommended): Runs all enabled models and combines them.
@@ -191,16 +193,20 @@ These defaults enable the full ensemble (Seeded, 1SMix, 2SMix, Nokoi, and Base M
 * `"cauchy"` (Default), `"fisher"`, `"sidak_minp"`.
 
 
-#### Lower-Order Variants
+#### Lower-Order parameters
 
-* **`lower_order_min_null_rank, lower_order_max_null_rank`**: Rank window used to build LO buckets; best practice is a moderate window (default 6–12).
-* **`lo_k_exclude_leq`**: Hard-exclude ranks ≤ this value (default 3) to avoid contamination/correlation squeeze.
-* **`lo_k_default_min, lo_k_default_max`**: Default moderate window used when LO-specific ranks aren’t set explicitly (defaults 6–12)..
-* **`lo_rank_gof_max`**: If set, can be used as a GOF cutoff to downweight/ignore poorly modeled ranks (currently optional; leave null unless debugging).
-* **`lo_neff_enable`**: Enable data-driven squeeze correction (β inflation only when ranks appear compressed).
-* **`lo_eb_tau`**: EB shrink strength for β (default ~0.03). Larger → more shrink to pooled β prior; smaller → more spectrum-specific β.
+* **`lower_order_min_null_rank, lower_order_max_null_rank`**: Rank window (k = hit_rank) used to fit the lower-order TEV(k) series and derive the Rank-1 null parameters.
+* **`lo_rank_key`**: Which score stream LO models (`lo_adjusted` vs `hyperscore`).
+* **`lo_mode`**: Bridge from lower ranks (k≥2) to Rank-1 null (`auto`, `linear_regression`, `mean_beta`).
+* **`lo_lom_estimator`**: Lower-order per-rank estimator (`auto`, `mm`, `mle`) used to build the TEV(k) series.
+* **`lo_mean_beta_mode`**: How β is pooled for the Mean-β bridge (`consecutive`, `from_min_rank`).
+* **`lo_mean_beta_min_rank`**: First rank included in β pooling.
+* **`lo_mean_beta_count`**: Number of ranks included when `lo_mean_beta_mode="consecutive"`.
+* **`lo_lr_window_size`**: Optional window size for LR mode (set `null` to disable).
+* **`lo_stratify`**: LO stratification (`charge` fits per-charge buckets; `global` fits one shared bucket).
+* **`lo_score`**: LO score normalization (`raw` uses the selected score directly; `per_spectrum` centers each spectrum using the median score within the LO rank window).
 
-#### MSFDR Variants
+#### MSFDR parameters
 
 * **`enable_msfdr_seeded`**: Uses a fixed null derived from LO or Moments. Best for stability.
 * **`enable_msfdr_1smix`**: Allows the null to drift. Good for datasets where the null pool might slightly mismatch the Rank-1 noise.

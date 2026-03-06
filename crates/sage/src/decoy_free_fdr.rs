@@ -58,6 +58,7 @@ E) Sorting key definition (“sorted by score”) (HARD)
 use crate::database::IndexedDatabase;
 use crate::input::{EnsemblePCombiner, EnsemblePepCombiner, LoRankKey, NokoiPosRule};
 use crate::input::{FdrSettings, FdrType, ModelFit};
+use crate::input::{LoScore, LoStratify};
 use crate::lfq::{Peak, PrecursorId};
 use crate::ml::lower_order::{
     fit_decoy_free_model, fit_gumbel_mle, fit_gumbel_moments, LowerOrderModel,
@@ -788,14 +789,26 @@ fn log_rank1_composition(features: &[DfFeature], work: &WorkSet, db: &IndexedDat
     );
 }
 
+// -----------------------------------------------------------------------------
+// 13)
+// -----------------------------------------------------------------------------
+
+#[inline]
+fn lo_bucket_id(settings: &FdrSettings, charge: u8) -> u8 {
+    match settings.lo_stratify {
+        LoStratify::Charge => charge,
+        LoStratify::Global => 0u8,
+    }
+}
+
 // --- STAGE STRUCTS ---
 #[derive(Clone, Debug)]
 struct RankNullPool {
     // Null pool members (purified) are rank in [min_rank..=max_rank]
     // Keep indices so other models (e.g., Nokoi) can reuse the same null pool.
-    fit_data: Vec<(u32, f64, u8)>, // (rank, hyperscore, charge)
-    null_indices: Vec<usize>,      // indices into `features`, aligned with fit_data/scores
-    scores: Vec<f64>,              // hyperscore scores for global moments/mle fit (aligned)
+    fit_data: Vec<(u32, f64, u8, usize, String)>, // (rank, score, charge, file_id, spec_id)
+    null_indices: Vec<usize>, // indices into `features`, aligned with fit_data/scores
+    scores: Vec<f64>,         // hyperscore scores for global moments/mle fit (aligned)
 }
 
 impl RankNullPool {
@@ -804,7 +817,7 @@ impl RankNullPool {
     fn scores_in_window(&self, min: u32, max: u32) -> Vec<f64> {
         self.fit_data
             .iter()
-            .filter_map(|(rank, score, _charge)| {
+            .filter_map(|(rank, score, _charge, _file_id, _spec_id)| {
                 if *rank >= min && *rank <= max {
                     Some(*score)
                 } else {
@@ -815,11 +828,11 @@ impl RankNullPool {
     }
 
     /// Return (rank, hyperscore, charge) tuples for pool members whose rank is in [min..=max].
-    fn fit_data_in_window(&self, min: u32, max: u32) -> Vec<(u32, f64, u8)> {
+    fn fit_data_in_window(&self, min: u32, max: u32) -> Vec<(u32, f64, u8, usize, String)> {
         self.fit_data
             .iter()
-            .copied()
-            .filter(|(rank, _score, _charge)| *rank >= min && *rank <= max)
+            .cloned()
+            .filter(|(rank, _score, _charge, _file_id, _spec_id)| *rank >= min && *rank <= max)
             .collect()
     }
 
@@ -830,7 +843,7 @@ impl RankNullPool {
         self.fit_data
             .iter()
             .zip(self.null_indices.iter())
-            .filter_map(|((rank, _score, _charge), idx)| {
+            .filter_map(|((rank, _score, _charge, _file_id, _spec_id), idx)| {
                 if *rank >= min && *rank <= max {
                     Some(*idx)
                 } else {
@@ -852,8 +865,12 @@ struct Engines {
     mle_beta: f64,
     mle_fit_ok: bool,
 
-    // LO parameters (charge-stratified TNM model)
-    lo_model: LowerOrderModel,
+    // LO parameters (bucket-stratified TNM model)
+    lo_model: Option<LowerOrderModel>,
+
+    // Only populated when lo_score == PerSpectrum; key = (file_id, spec_id)
+    lo_centers: Option<FnvHashMap<(usize, String), f64>>,
+
     lo_fit_ok: bool,
 
     // MSFDR variants (Phase 4.1)
@@ -908,7 +925,7 @@ fn build_rank_null_pool(
         .map(|(idx, _)| *idx)
         .collect();
 
-    let mut fit_data: Vec<(u32, f64, u8)> = Vec::new();
+    let mut fit_data: Vec<(u32, f64, u8, usize, String)> = Vec::new();
     let mut null_indices: Vec<usize> = Vec::new();
 
     for (idx, psm) in features.iter().enumerate() {
@@ -923,7 +940,13 @@ fn build_rank_null_pool(
             Some(v) => v,
             None => continue,
         };
-        fit_data.push((r, s, psm.core.charge));
+        fit_data.push((
+            r,
+            s,
+            psm.core.charge,
+            psm.core.file_id,
+            psm.core.spec_id.clone(),
+        ));
         null_indices.push(idx);
     }
 
@@ -941,18 +964,24 @@ fn build_rank_null_pool(
                 Some(v) => v,
                 None => continue,
             };
-            fit_data.push((r, s, psm.core.charge));
+            fit_data.push((
+                r,
+                s,
+                psm.core.charge,
+                psm.core.file_id,
+                psm.core.spec_id.clone(),
+            ));
             null_indices.push(idx);
         }
     }
 
     // final safety (keep alignment between fit_data and null_indices)
-    let mut fit2: Vec<(u32, f64, u8)> = Vec::with_capacity(fit_data.len());
+    let mut fit2: Vec<(u32, f64, u8, usize, String)> = Vec::with_capacity(fit_data.len());
     let mut idx2: Vec<usize> = Vec::with_capacity(null_indices.len());
 
-    for (k, (r, s, z)) in fit_data.into_iter().enumerate() {
+    for (k, (r, s, z, file_id, spec_id)) in fit_data.into_iter().enumerate() {
         if s.is_finite() {
-            fit2.push((r, s, z));
+            fit2.push((r, s, z, file_id, spec_id));
             idx2.push(null_indices[k]);
         }
     }
@@ -963,7 +992,7 @@ fn build_rank_null_pool(
         return None;
     }
 
-    let scores: Vec<f64> = fit_data.iter().map(|(_, s, _)| *s).collect();
+    let scores: Vec<f64> = fit_data.iter().map(|(_, s, _, _, _)| *s).collect();
 
     Some(RankNullPool {
         fit_data,
@@ -1159,6 +1188,47 @@ fn fit_engines(
     let std_gumbel = Gumbel::new(0.0, 1.0).expect("standard gumbel");
 
     // 2) LO: call the Lower Order fitter
+
+    fn build_lo_per_spectrum_center(
+        features: &[DfFeature],
+        settings: &FdrSettings,
+    ) -> FnvHashMap<(usize, String), f64> {
+        // Key: (file_id, spec_id) -> median score in [min_rank..=max_rank] for that spectrum.
+        let min_k = settings.lower_order_min_null_rank;
+        let max_k = settings.lower_order_max_null_rank;
+
+        let mut buckets: FnvHashMap<(usize, String), Vec<f64>> = FnvHashMap::default();
+        for f in features {
+            let k = f.core.rank;
+            if k < min_k || k > max_k {
+                continue;
+            }
+            if let Some(x) = tev(f) {
+                buckets
+                    .entry((f.core.file_id, f.core.spec_id.clone()))
+                    .or_default()
+                    .push(x);
+            }
+        }
+
+        let mut centers: FnvHashMap<(usize, String), f64> = FnvHashMap::default();
+        for (key, mut xs) in buckets {
+            if xs.is_empty() {
+                continue;
+            }
+            xs.sort_by(|a, b| a.total_cmp(b));
+            let med = xs[xs.len() / 2];
+            centers.insert(key, med);
+        }
+        centers
+    }
+
+    let lo_centers = if settings.lo_score == LoScore::PerSpectrum {
+        Some(build_lo_per_spectrum_center(features, settings))
+    } else {
+        None
+    };
+
     //
     // Required by the LO fitter:
     // - pool.fit_data:           full rank-null pool stream (rank, hyperscore, charge)
@@ -1170,41 +1240,72 @@ fn fit_engines(
             Some(v) => v,
             None => continue,
         };
-        rank1_scores_by_charge.push((x, f.core.charge));
+        let bid = lo_bucket_id(settings, f.core.charge);
+        let x_lo = if let Some(ref centers) = lo_centers {
+            let key = (f.core.file_id, f.core.spec_id.clone());
+            if let Some(c) = centers.get(&key) {
+                x - *c
+            } else {
+                x
+            }
+        } else {
+            x
+        };
+        rank1_scores_by_charge.push((x_lo, bid));
     }
 
-    // Apply existing settings inside the LO module as explicit (mu,beta)
-    // post-selection transforms.
-    let lo_fit_data = pool.fit_data_in_window(
+    let lo_raw_fit_data = pool.fit_data_in_window(
         settings.lower_order_min_null_rank,
         settings.lower_order_max_null_rank,
     );
 
-    let lo_fit_ok = window_ok(
+    // Window-size gate (data availability only)
+    let lo_window_ok = window_ok(
         "LowerOrder",
         settings.lower_order_min_null_rank,
         settings.lower_order_max_null_rank,
-        lo_fit_data.len(),
+        lo_raw_fit_data.len(),
     );
 
-    let lo_fit_data_for_fit: Vec<(u32, f64, u8)> = if lo_fit_ok {
-        lo_fit_data
+    let lo_fit_data_for_fit: Vec<(u32, f64, u8)> = if lo_window_ok {
+        lo_raw_fit_data
+            .into_iter()
+            .map(|(k, x, charge, file_id, spec_id)| {
+                let x2 = if let Some(ref centers) = lo_centers {
+                    if let Some(c) = centers.get(&(file_id, spec_id)) {
+                        x - *c
+                    } else {
+                        x
+                    }
+                } else {
+                    x
+                };
+                (k, x2, lo_bucket_id(settings, charge))
+            })
+            .collect()
     } else {
         // Fail-closed: do not fit LO on an undersized window.
         Vec::new()
     };
 
-    let lo_model = fit_decoy_free_model(
+    // Fit LO
+    let lo_model: Option<LowerOrderModel> = fit_decoy_free_model(
         &lo_fit_data_for_fit,
         &rank1_scores_by_charge,
         settings.lower_order_min_null_rank,
         settings.lower_order_max_null_rank,
         settings.min_null_size,
         settings.min_rank_count,
-        settings.lo_neff_enable,
-        settings.lo_rank_gof_max,
-        settings.lo_eb_tau,
+        settings.lo_mode.clone(),
+        settings.lo_lom_estimator.clone(),
+        settings.lo_mean_beta_mode.clone(),
+        settings.lo_mean_beta_min_rank,
+        settings.lo_mean_beta_count,
+        settings.lo_lr_window_size,
     );
+
+    // Real “LO is usable” gate: must have enough data AND the model must exist
+    let lo_fit_ok = lo_window_ok && lo_model.is_some();
 
     // 3) MLE
     let mle_scores = pool.scores_in_window(settings.mle_min_null_rank, settings.mle_max_null_rank);
@@ -1515,9 +1616,9 @@ fn fit_engines(
         mle_mu: mu_mle,
         mle_beta: beta_mle,
 
-        // keep the rest exactly as-is
         mle_fit_ok,
         lo_model,
+        lo_centers,
         lo_fit_ok,
 
         msfdr_seeded,
@@ -1651,7 +1752,7 @@ pub fn calculate_q_values(
 
         // rank histogram over pool.fit_data
         let mut rank_hist: BTreeMap<u32, usize> = BTreeMap::new();
-        for (r, _, _) in &pool.fit_data {
+        for (r, _, _, _, _) in &pool.fit_data {
             *rank_hist.entry(*r).or_insert(0) += 1;
         }
 
@@ -1694,11 +1795,14 @@ pub fn calculate_q_values(
     );
 
     // LO: you at least have fallback params available; log them.
-    log::info!(
-        "DF fit summary: LO fallback_params=(mu={:.6}, beta={:.6})",
-        engines.lo_model.fallback_params.0,
-        engines.lo_model.fallback_params.1
-    );
+    match &engines.lo_model {
+        Some(m) => log::info!(
+            "DF fit summary: LO fallback_params=(mu={:.6}, beta={:.6})",
+            m.fallback_params.0,
+            m.fallback_params.1
+        ),
+        None => log::warn!("DF fail-closed: LO failed to fit (no fitted charges)."),
+    }
 
     // MSFDR variants: summarize presence + debug dump if present
     match &engines.msfdr_seeded {
@@ -1725,7 +1829,8 @@ pub fn calculate_q_values(
     let mle_mu = engines.mle_mu;
     let mle_beta = engines.mle_beta;
 
-    let lo_model = engines.lo_model.clone();
+    let lo_model = engines.lo_model.clone(); // Option<LowerOrderModel>
+    let lo_centers = engines.lo_centers.clone(); // Option<FnvHashMap<(usize, String), f64>>
 
     // Standard Gumbel for TEV-normalized sf inputs
     let std_gumbel = Gumbel::new(0.0, 1.0).expect("standard gumbel");
@@ -1798,8 +1903,29 @@ pub fn calculate_q_values(
 
                     // Lower-Order (LO) — global TNM only (no per-PSM ln_ratio shift)
                     if use_lo_expert {
-                        let charge = psm.core.charge;
-                        experts.push(lo_model.p_value(x, charge).clamp(0.0, 1.0).max(1e-300));
+                        let bid = lo_bucket_id(settings, psm.core.charge);
+
+                        let x_eval = if settings.lo_score == LoScore::PerSpectrum {
+                            if let Some(ref centers) = lo_centers {
+                                let key = (psm.core.file_id, psm.core.spec_id.clone());
+                                if let Some(c) = centers.get(&key) {
+                                    x - *c
+                                } else {
+                                    x
+                                }
+                            } else {
+                                x
+                            }
+                        } else {
+                            x
+                        };
+
+                        if let Some(ref m) = lo_model {
+                            experts.push(m.p_value(x_eval, bid).max(1e-300));
+                        } else {
+                            // LO requested but failed to fit => fail-closed
+                            experts.push(1.0);
+                        }
                     }
 
                     // MSFDR seeded / 1smix / 2smix (only if present for this run)
@@ -1877,12 +2003,25 @@ pub fn calculate_q_values(
             };
 
             // 2. Lower-Order (LO) adjustment (STRICT compute gating)
-            let p_lo = if run_lo {
-                let charge = psm.core.charge;
-                lo_model.p_value(x, charge).clamp(0.0, 1.0).max(1e-300)
-            } else {
-                1.0
-            };
+            let p_lo = if let Some(ref m) = lo_model {
+				let bid = lo_bucket_id(settings, psm.core.charge);
+
+				let x_eval = if settings.lo_score == LoScore::PerSpectrum {
+					if let Some(ref centers) = lo_centers {
+						let key = (psm.core.file_id, psm.core.spec_id.clone());
+						if let Some(c) = centers.get(&key) { x - *c } else { x }
+					} else {
+						x
+					}
+				} else {
+					x
+				};
+
+				m.p_value(x_eval, bid).max(1e-300)
+			} else {
+				// LO requested but failed -> fail-closed
+				1.0
+			};
 
             // 3. Optional Models (MSFDR and Nokoi)
             // MSFDR (seeded / 1smix / 2smix): compute per-variant p/pep only if enabled+present.

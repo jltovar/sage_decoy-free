@@ -2,7 +2,6 @@
 
 use fnv::FnvHashMap;
 use statrs::consts::EULER_MASCHERONI;
-use statrs::distribution::{ContinuousCDF, Gumbel};
 use statrs::function::gamma::ln_gamma;
 
 /// Method-of-moments Gumbel fit (mu, beta).
@@ -132,22 +131,6 @@ pub(crate) fn fit_gumbel_mle(scores: &[f64]) -> Option<(f64, f64)> {
     }
 }
 
-/// k-order TEV (Lower-Order) likelihood primitives.
-///
-/// We work in standardized coordinates z = (x - μ) / β.
-///
-/// For the k-th order statistic in the Gumbel max-domain (Poisson-process / TEV
-/// asymptotic form), define λ = exp(-z).
-///
-/// CDF  (paper Eq. 5 form):
-///   F_k(z) = exp(-λ) * Σ_{j=0..k-1} λ^j / j!
-///
-/// PDF  (paper Eq. 6 form; derivative of the above):
-///   f_k(z) = exp(-λ) * λ^k / (k-1)!
-///         = exp(-exp(-z) - k*z) / (k-1)!
-///
-/// These are used for joint (μ,β) fitting across ranks and for diagnostics.
-/// Numerical policy: return -INF on invalid inputs; clamp exponentials.
 #[inline]
 fn log_factorial_k_minus_1(k: u32) -> f64 {
     // (k-1)! = Γ(k)  => ln((k-1)!) = lnΓ(k)
@@ -157,169 +140,102 @@ fn log_factorial_k_minus_1(k: u32) -> f64 {
     ln_gamma(k as f64)
 }
 
-#[inline]
-fn log_factorial(n: u32) -> f64 {
-    // n! = Γ(n+1) => ln(n!) = lnΓ(n+1)
-    ln_gamma((n as f64) + 1.0)
-}
+// -----------------------------------------------------------------------------
+// Per-k LO estimators (PyLord-compatible)
+// -----------------------------------------------------------------------------
+//
+// Matches PyLord stat.py:
+//   MethodOfMoments().estimate_parameters(scores, hit_rank=k)
+//
+// scale  = sqrt( (E[X^2] - E[X]^2) / psi(k-1) )
+// location = E[X] - scale * (EulerGamma - H_{k-1})
+//
+// where:
+//   psi(m) = pi^2/6 - sum_{i=1..m} 1/i^2
+//   H_m    = sum_{i=1..m} 1/i
+//
 
 #[inline]
-fn log_sum_exp(vals: &[f64]) -> f64 {
-    if vals.is_empty() {
-        return f64::NEG_INFINITY;
-    }
-    let mut m = f64::NEG_INFINITY;
-    for &v in vals {
-        if v.is_finite() && v > m {
-            m = v;
-        }
-    }
-    if !m.is_finite() {
-        return f64::NEG_INFINITY;
+fn harmonic(m: u32) -> f64 {
+    if m == 0 {
+        return 0.0;
     }
     let mut s = 0.0f64;
-    for &v in vals {
-        if v.is_finite() {
-            s += (v - m).exp();
-        }
+    for i in 1..=m {
+        s += 1.0 / (i as f64);
     }
-    if s <= 0.0 || !s.is_finite() {
-        f64::NEG_INFINITY
+    s
+}
+
+#[inline]
+fn psi_tail(m: u32) -> f64 {
+    // psi(m) in PyLord = pi^2/6 - sum_{i=1..m} 1/i^2
+    // NOTE: This is NOT digamma; it's the trigamma tail identity used in the paper/PyLord.
+    let mut s = 0.0f64;
+    for i in 1..=m {
+        let ii = i as f64;
+        s += 1.0 / (ii * ii);
+    }
+    (std::f64::consts::PI * std::f64::consts::PI) / 6.0 - s
+}
+
+#[inline]
+pub(crate) fn fit_tev_k_moments(scores: &[f64], k: u32) -> Option<(f64, f64)> {
+    // k is hit_rank in PyLord. LO uses k>=2.
+    if k < 2 {
+        return None;
+    }
+    let xs: Vec<f64> = scores.iter().copied().filter(|x| x.is_finite()).collect();
+    if xs.len() < 2 {
+        return None;
+    }
+
+    let n = xs.len() as f64;
+    let mean = xs.iter().sum::<f64>() / n;
+    let second = xs.iter().map(|x| x * x).sum::<f64>() / n;
+    let var = second - mean * mean;
+    if !var.is_finite() || var <= 0.0 {
+        return None;
+    }
+
+    let denom = psi_tail(k - 1);
+    if !denom.is_finite() || denom <= 0.0 {
+        return None;
+    }
+
+    let beta = (var / denom).sqrt();
+    if !beta.is_finite() || beta <= 0.0 {
+        return None;
+    }
+
+    // EulerGamma in PyLord: euler_m = -digamma(1) = EulerMascheroni
+    let location = mean - beta * (EULER_MASCHERONI - harmonic(k - 1));
+    if location.is_finite() {
+        Some((location, beta))
     } else {
-        m + s.ln()
+        None
     }
 }
 
 #[inline]
-pub(crate) fn tev_k_order_logpdf(k: u32, z: f64) -> f64 {
-    if k == 0 || !z.is_finite() {
-        return f64::NEG_INFINITY;
+fn nll_tev_k(mu: f64, beta: f64, scores: &[f64], k: u32) -> f64 {
+    // Matches PyLord AsymptoticGumbelMLE.get_log_likelihood:
+    //
+    // likelihood = -n*log(beta*(k-1)!) - k*sum(z) - sum(exp(-z))
+    // returns -likelihood
+    //
+    // z = (x - mu)/beta
+    //
+    if !mu.is_finite() || !beta.is_finite() || beta <= 0.0 || k < 1 {
+        return f64::INFINITY;
     }
 
-    // exp(-z) can overflow if z << 0; clamp exponent argument.
-    let t = (-z).clamp(-745.0, 745.0);
-    let lambda = t.exp();
-    if !lambda.is_finite() {
-        return f64::NEG_INFINITY;
-    }
-
-    // log f_k(z) = -ln((k-1)!) - k*z - exp(-z)
     let lf = log_factorial_k_minus_1(k);
     if !lf.is_finite() {
-        return f64::NEG_INFINITY;
-    }
-
-    let logpdf = -lf - (k as f64) * z - lambda;
-    if logpdf.is_finite() {
-        logpdf
-    } else {
-        f64::NEG_INFINITY
-    }
-}
-
-#[inline]
-pub(crate) fn tev_k_order_logcdf(k: u32, z: f64) -> f64 {
-    if k == 0 || !z.is_finite() {
-        return f64::NEG_INFINITY;
-    }
-
-    // λ = exp(-z)
-    let t = (-z).clamp(-745.0, 745.0);
-    let lambda = t.exp();
-    if !lambda.is_finite() {
-        return f64::NEG_INFINITY;
-    }
-
-    // log Σ_{j=0..k-1} exp( j*ln(λ) - ln(j!) )
-    // But ln(λ) = -z, so term_j = -j*z - ln(j!)
-    let mut terms: Vec<f64> = Vec::with_capacity(k as usize);
-    for j in 0..k {
-        let lf = log_factorial(j);
-        if !lf.is_finite() {
-            return f64::NEG_INFINITY;
-        }
-        let term = -(j as f64) * z - lf;
-        terms.push(term);
-    }
-    let lse = log_sum_exp(&terms);
-    if !lse.is_finite() {
-        return f64::NEG_INFINITY;
-    }
-
-    // log F_k(z) = -λ + logsumexp(terms)
-    let logcdf = -lambda + lse;
-    if logcdf.is_finite() {
-        logcdf
-    } else {
-        f64::NEG_INFINITY
-    }
-}
-
-#[derive(Debug, Clone)]
-pub(crate) struct RankBucket {
-    pub k: u32,
-    pub scores: Vec<f64>,
-    pub weight: f64,
-}
-
-#[inline]
-pub(crate) fn nll_joint(mu: f64, beta: f64, buckets: &[RankBucket]) -> f64 {
-    if !mu.is_finite() || !beta.is_finite() || beta <= 0.0 {
-        return f64::INFINITY;
-    }
-    if buckets.is_empty() {
         return f64::INFINITY;
     }
 
-    let mut nll = 0.0f64;
-
-    for b in buckets {
-        if b.k == 0 || b.scores.is_empty() {
-            continue;
-        }
-        if !b.weight.is_finite() || b.weight <= 0.0 {
-            // Non-positive/invalid weights are treated as "ignore this bucket".
-            continue;
-        }
-
-        // weight_k * Σ_i [-log f_k(z_i)]
-        let mut bucket_nll = 0.0f64;
-        for &x in &b.scores {
-            if !x.is_finite() {
-                continue;
-            }
-            let z = (x - mu) / beta;
-            let lp = tev_k_order_logpdf(b.k, z);
-            if !lp.is_finite() {
-                return f64::INFINITY; // fail-closed for invalid regions
-            }
-            bucket_nll += -lp;
-        }
-
-        // If everything was non-finite, bucket_nll stays 0; that's ok.
-        nll += b.weight * bucket_nll;
-        if !nll.is_finite() {
-            return f64::INFINITY;
-        }
-    }
-
-    nll
-}
-
-/// BIC helper for TNM selection with fixed beta.
-///
-/// Formula: BIC = p * ln(N) - 2 * ln(L)
-/// Here, p = 1 because beta is fixed and we optimize mu only.
-///
-/// Uses a stable log-likelihood implementation; returns +INF on invalid inputs.
-#[inline]
-pub(crate) fn calculate_bic(mu: f64, beta: f64, top_scores: &[f64]) -> f64 {
-    const P: f64 = 1.0;
-
-    if !mu.is_finite() || !beta.is_finite() || beta <= 0.0 {
-        return f64::INFINITY;
-    }
-    let n = top_scores.len();
+    let n = scores.len();
     if n == 0 {
         return f64::INFINITY;
     }
@@ -329,30 +245,188 @@ pub(crate) fn calculate_bic(mu: f64, beta: f64, top_scores: &[f64]) -> f64 {
         return f64::INFINITY;
     }
 
-    // logpdf = -ln(beta) - z - exp(-z), z=(x-mu)/beta
-    let mut log_l = 0.0f64;
-    for &x in top_scores {
+    let mut sum_z = 0.0f64;
+    let mut sum_exp = 0.0f64;
+
+    for &x in scores {
         if !x.is_finite() {
             return f64::INFINITY;
         }
         let z = (x - mu) / beta;
-        let ez = (-z).exp();
+        if !z.is_finite() {
+            return f64::INFINITY;
+        }
+        sum_z += z;
+
+        // exp(-z) can overflow for large negative z, clamp exponent.
+        let t = (-z).clamp(-745.0, 745.0);
+        let ez = t.exp();
         if !ez.is_finite() {
             return f64::INFINITY;
         }
-        let logpdf = -ln_beta - z - ez;
-        if !logpdf.is_finite() {
-            return f64::INFINITY;
+        sum_exp += ez;
+    }
+
+    // -likelihood:
+    // n * ln(beta*(k-1)!) + k*sum(z) + sum(exp(-z))
+    let n_f = n as f64;
+    n_f * (ln_beta + lf) + (k as f64) * sum_z + sum_exp
+}
+
+#[inline]
+fn tev_cdf_asymptotic(z: f64, k: u32) -> f64 {
+    // Matches PyLord stat.py:
+    // cdf_asymptotic(z, k) = exp(-exp(-z)) * Σ_{m=0..k} exp(-m z)/m!
+    //
+    // Implemented via a stable recurrence:
+    // term_0 = 1
+    // term_m = term_{m-1} * exp(-z) / m
+    //
+    if !z.is_finite() || k < 1 {
+        return f64::NAN;
+    }
+
+    // t = exp(-z) with exponent clamp to avoid overflow
+    let t = (-z).clamp(-745.0, 745.0).exp();
+    if !t.is_finite() {
+        return f64::NAN;
+    }
+
+    // sum_{m=0..k} t^m / m!
+    let mut sum = 1.0f64;
+    let mut term = 1.0f64;
+    for m in 1..=k {
+        term *= t / (m as f64);
+        sum += term;
+    }
+
+    // exp(-t) * sum
+    let cdf = (-t).clamp(-745.0, 745.0).exp() * sum;
+    cdf.clamp(0.0, 1.0)
+}
+
+#[inline]
+fn mu_bounds_from_scores(beta0: f64, scores: &[f64]) -> Option<(f64, f64)> {
+    // Same spirit as your mu_search_bounds(): build a robust mu window on the score scale.
+    let mut xs: Vec<f64> = scores.iter().copied().filter(|x| x.is_finite()).collect();
+    if xs.len() < 10 || !beta0.is_finite() || beta0 <= 0.0 {
+        return None;
+    }
+    xs.sort_by(|a, b| a.partial_cmp(b).unwrap_or(std::cmp::Ordering::Equal));
+
+    let n = xs.len();
+    let p05 = xs[((0.05 * (n as f64 - 1.0)).round() as usize).min(n - 1)];
+    let p95 = xs[((0.95 * (n as f64 - 1.0)).round() as usize).min(n - 1)];
+
+    let lo = p05 - 4.0 * beta0;
+    let hi = p95 + 4.0 * beta0;
+
+    (lo.is_finite() && hi.is_finite() && lo < hi).then_some((lo, hi))
+}
+
+pub(crate) fn fit_tev_k_mle(scores: &[f64], k: u32) -> Option<(f64, f64)> {
+    if k < 2 {
+        return None;
+    }
+    let xs: Vec<f64> = scores.iter().copied().filter(|x| x.is_finite()).collect();
+    if xs.len() < 2 {
+        return None;
+    }
+
+    // Init from MM (PyLord uses mean/std, but MM is the best deterministic analog and
+    // keeps us in a sane region).
+    let (mu0, beta0) = fit_tev_k_moments(&xs, k)?;
+    if !mu0.is_finite() || !beta0.is_finite() || beta0 <= 0.0 {
+        return None;
+    }
+
+    let (mu_min, mu_max) = mu_bounds_from_scores(beta0, &xs).unwrap_or_else(|| {
+        // fallback to min/max if percentiles unavailable
+        let mut mn = f64::INFINITY;
+        let mut mx = f64::NEG_INFINITY;
+        for &v in &xs {
+            mn = mn.min(v);
+            mx = mx.max(v);
         }
-        log_l += logpdf;
+        (mn, mx)
+    });
+
+    // ----- coarse search -----
+    let mut best: Option<(f64, f64, f64)> = None; // (mu, beta, nll)
+
+    // beta grid around beta0 in log2 space (stable, scale-aware)
+    for p in -6..=6 {
+        let beta = beta0 * 2.0f64.powi(p);
+        if !beta.is_finite() || beta <= 0.0 {
+            continue;
+        }
+
+        const MU_N: usize = 96;
+        let step = (mu_max - mu_min) / ((MU_N - 1) as f64);
+        if !step.is_finite() || step <= 0.0 {
+            continue;
+        }
+
+        for i in 0..MU_N {
+            let mu = mu_min + (i as f64) * step;
+            let nll = nll_tev_k(mu, beta, &xs, k);
+            if !nll.is_finite() {
+                continue;
+            }
+            match best {
+                None => best = Some((mu, beta, nll)),
+                Some((_, _, best_nll)) if nll < best_nll => best = Some((mu, beta, nll)),
+                _ => {}
+            }
+        }
     }
 
-    let n_f64 = n as f64;
-    if !n_f64.is_finite() || n_f64 <= 0.0 {
-        return f64::INFINITY;
+    let (mut mu_best, mut beta_best, mut nll_best) = best?;
+
+    // ----- refinement -----
+    // refine beta log2 step=0.25 around current best, and mu local window
+    for q in -8..=8 {
+        let beta = beta_best * 2.0f64.powf((q as f64) / 4.0);
+        if !beta.is_finite() || beta <= 0.0 {
+            continue;
+        }
+
+        const MU_LOCAL_HALF_WIDTH: f64 = 4.0; // score units; local refinement
+        let lo = (mu_best - MU_LOCAL_HALF_WIDTH).clamp(mu_min, mu_max);
+        let hi = (mu_best + MU_LOCAL_HALF_WIDTH).clamp(mu_min, mu_max);
+
+        const MU_N_LOCAL: usize = 81;
+        let step = if MU_N_LOCAL > 1 {
+            (hi - lo) / ((MU_N_LOCAL - 1) as f64)
+        } else {
+            0.0
+        };
+        if !step.is_finite() {
+            continue;
+        }
+
+        for i in 0..MU_N_LOCAL {
+            let mu = lo + (i as f64) * step;
+            let nll = nll_tev_k(mu, beta, &xs, k);
+            if !nll.is_finite() {
+                continue;
+            }
+            if nll < nll_best {
+                mu_best = mu;
+                beta_best = beta;
+                nll_best = nll;
+            }
+        }
     }
 
-    (P * n_f64.ln()) - (2.0 * log_l)
+    (mu_best.is_finite() && beta_best.is_finite() && beta_best > 0.0)
+        .then_some((mu_best, beta_best))
+}
+
+#[derive(Debug, Clone)]
+pub(crate) struct RankBucket {
+    pub k: u32,
+    pub scores: Vec<f64>,
 }
 
 // -----------------------------------------------------------------------------
@@ -382,7 +456,7 @@ pub enum ChargeFillMode {
 // - Stores per-charge TNM (mu, beta) pairs.
 // - Provides p_value(score, charge) using the existing TEV-normalization path:
 //       tev_norm = (score - mu) / beta
-//       p = Gumbel(0,1).sf(tev_norm)
+//       p = 1 - TEV_CDF_asymptotic(z, k=1)
 // - Falls back to a global (mu, beta) when charge-specific params are absent.
 //
 
@@ -451,39 +525,16 @@ impl LowerOrderModel {
             return 1.0;
         }
 
-        let tev_norm = (score - mu) / beta;
+        let z = (score - mu) / beta;
 
-        let std = match Gumbel::new(0.0, 1.0) {
-            Ok(d) => d,
-            Err(_) => return 1.0,
-        };
+        // TEV(order=1) asymptotic CDF (PyLord): cdf = exp(-exp(-z)) * (1 + exp(-z))
+        let cdf = tev_cdf_asymptotic(z, 1);
+        if !cdf.is_finite() {
+            return 1.0; // fail-closed
+        }
 
-        std.sf(tev_norm).clamp(0.0, 1.0).max(1e-300)
-    }
-}
-
-#[inline]
-fn mu_search_bounds(beta: f64, scores: &[f64]) -> Option<(f64, f64)> {
-    // Pick a robust μ range on the *same scale as scores*.
-    // Use percentiles if we can; otherwise use min/max.
-    let mut xs: Vec<f64> = scores.iter().copied().filter(|x| x.is_finite()).collect();
-    if xs.len() < 10 || !beta.is_finite() || beta <= 0.0 {
-        return None;
-    }
-    xs.sort_by(|a, b| a.partial_cmp(b).unwrap_or(std::cmp::Ordering::Equal));
-
-    let n = xs.len();
-    let p05 = xs[((0.05 * (n as f64 - 1.0)).round() as usize).min(n - 1)];
-    let p95 = xs[((0.95 * (n as f64 - 1.0)).round() as usize).min(n - 1)];
-
-    // Expand by a few beta to allow the null to shift.
-    let lo = p05 - 4.0 * beta;
-    let hi = p95 + 4.0 * beta;
-
-    if lo.is_finite() && hi.is_finite() && lo < hi {
-        Some((lo, hi))
-    } else {
-        None
+        let p = (1.0 - cdf).clamp(0.0, 1.0);
+        p.max(1e-300)
     }
 }
 
@@ -512,349 +563,234 @@ fn mu_search_bounds(beta: f64, scores: &[f64]) -> Option<(f64, f64)> {
 //
 
 #[inline]
-fn mu_grid_best_bic(beta: f64, top_scores: &[f64]) -> Option<(f64, f64)> {
-    // Scan mu in [0.05, 0.4] and pick mu minimizing BIC (fixed beta).
-    if top_scores.is_empty() {
+fn mu_grid_best_bic_range(
+    beta: f64,
+    top_scores: &[f64],
+    mu_min: f64,
+    mu_max: f64,
+) -> Option<(f64, f64)> {
+    // Scan mu in [mu_min..mu_max] and pick mu minimizing TEV NLL at k=1 (fixed beta).
+    if top_scores.is_empty() || !beta.is_finite() || beta <= 0.0 {
         return None;
     }
-    if !beta.is_finite() || beta <= 0.0 {
+    if !mu_min.is_finite() || !mu_max.is_finite() || mu_min >= mu_max {
         return None;
     }
 
     const MU_N: usize = 256;
 
-    let (mu_min, mu_max) = mu_search_bounds(beta, top_scores)?;
     let step = (mu_max - mu_min) / ((MU_N - 1) as f64);
     if !step.is_finite() || step <= 0.0 {
         return None;
     }
 
     let mut best_mu = mu_min;
-    let mut best_bic = f64::INFINITY;
+    let mut best_nll = f64::INFINITY;
 
     for i in 0..MU_N {
         let mu = mu_min + (i as f64) * step;
-        let bic = calculate_bic(mu, beta, top_scores);
-        if bic < best_bic {
-            best_bic = bic;
+        let nll = nll_tev_k(mu, beta, top_scores, 1);
+        if nll < best_nll {
+            best_nll = nll;
             best_mu = mu;
         }
     }
 
-    best_bic.is_finite().then_some((best_mu, best_bic))
-}
-
-#[derive(Debug, Clone, Copy)]
-pub(crate) struct JointFitDiag {
-    pub n_buckets: usize,
-    pub n_points: usize,
-    pub best_nll: f64,
-}
-
-/// Stable, dependency-free optimizer for joint (μ,β) TEV-k fitting.
-///
-/// Strategy:
-/// - coarse scan over β in log-space around beta_init
-/// - for each β, grid-search μ (bounded)
-/// - local refinement around best (μ,β)
-///
-/// Returns (μ_hat, β_hat, se_beta, diag)
-pub(crate) fn fit_joint_tev(
-    mu_init: f64,
-    beta_init: f64,
-    buckets: &[RankBucket],
-) -> Option<(f64, f64, f64, JointFitDiag)> {
-    if buckets.is_empty() {
-        return None;
-    }
-
-    let beta0 = if beta_init.is_finite() && beta_init > 0.0 {
-        beta_init
-    } else {
-        1.0
-    };
-
-    // Pool finite scores for μ-bound estimation
-    let mut pooled: Vec<f64> = Vec::new();
-    for b in buckets {
-        pooled.extend(b.scores.iter().copied().filter(|x| x.is_finite()));
-    }
-    if pooled.len() < 10 {
-        return None;
-    }
-
-    let (mut mu_min, mut mu_max) =
-        mu_search_bounds(beta0, &pooled).unwrap_or((pooled[0], pooled[pooled.len() - 1]));
-    if !(mu_min.is_finite() && mu_max.is_finite()) {
-        return None;
-    }
-    if mu_min > mu_max {
-        std::mem::swap(&mut mu_min, &mut mu_max);
-    }
-    if (mu_max - mu_min) <= 0.0 {
-        return None;
-    }
-
-    // Count points (for diagnostics only).
-    let mut n_points = 0usize;
-    for b in buckets {
-        n_points += b.scores.len();
-    }
-
-    let _mu0 = if mu_init.is_finite() {
-        mu_init.clamp(mu_min, mu_max)
-    } else {
-        0.5 * (mu_min + mu_max)
-    };
-
-    // ----- coarse beta scan (2^[-6..+6]) -----
-    let mut best: Option<(f64, f64, f64)> = None; // (mu, beta, nll)
-    for p in -6..=6 {
-        let beta = beta0 * 2.0f64.powi(p);
-        if !beta.is_finite() || beta <= 0.0 {
-            continue;
-        }
-
-        const MU_N: usize = 96;
-        let mu_step = (mu_max - mu_min) / ((MU_N - 1) as f64);
-        if !mu_step.is_finite() || mu_step <= 0.0 {
-            return None;
-        }
-
-        for i in 0..MU_N {
-            let mu = mu_min + (i as f64) * mu_step;
-            let nll = nll_joint(mu, beta, buckets);
-            if !nll.is_finite() {
-                continue;
-            }
-            match best {
-                None => best = Some((mu, beta, nll)),
-                Some((_, _, best_nll)) if nll < best_nll => best = Some((mu, beta, nll)),
-                _ => {}
-            }
-        }
-    }
-
-    let (mut mu_best, mut beta_best, mut nll_best) = best?;
-
-    // ----- refinement around best -----
-    for q in -8..=8 {
-        let beta = beta_best * 2.0f64.powf((q as f64) / 4.0);
-        if !beta.is_finite() || beta <= 0.0 {
-            continue;
-        }
-
-        const MU_LOCAL_HALF_WIDTH: f64 = 1.0;
-        let lo = (mu_best - MU_LOCAL_HALF_WIDTH).clamp(mu_min, mu_max);
-        let hi = (mu_best + MU_LOCAL_HALF_WIDTH).clamp(mu_min, mu_max);
-
-        const MU_N_LOCAL: usize = 81;
-        let mu_step = (hi - lo) / ((MU_N_LOCAL - 1) as f64);
-        if !mu_step.is_finite() || mu_step <= 0.0 {
-            continue;
-        }
-
-        for i in 0..MU_N_LOCAL {
-            let mu = lo + (i as f64) * mu_step;
-            let nll = nll_joint(mu, beta, buckets);
-            if !nll.is_finite() {
-                continue;
-            }
-            if nll < nll_best {
-                mu_best = mu;
-                beta_best = beta;
-                nll_best = nll;
-            }
-        }
-    }
-
-    // ----- crude se_beta from curvature (finite-difference in β) -----
-    let eps = (beta_best.abs() * 0.01).max(1e-6);
-    let nll_m = nll_joint(mu_best, beta_best - eps, buckets);
-    let nll_0 = nll_joint(mu_best, beta_best, buckets);
-    let nll_p = nll_joint(mu_best, beta_best + eps, buckets);
-
-    let se_beta = if nll_m.is_finite() && nll_0.is_finite() && nll_p.is_finite() {
-        let d2 = (nll_p - 2.0 * nll_0 + nll_m) / (eps * eps);
-        if d2.is_finite() && d2 > 0.0 {
-            (1.0 / d2).sqrt()
-        } else {
-            f64::INFINITY
-        }
-    } else {
-        f64::INFINITY
-    };
-
-    let diag = JointFitDiag {
-        n_buckets: buckets.len(),
-        n_points,
-        best_nll: nll_best,
-    };
-
-    Some((mu_best, beta_best, se_beta, diag))
+    best_nll.is_finite().then_some((best_mu, best_nll))
 }
 
 #[inline]
-fn approx_pp_distance_tev_k(k: u32, scores: &[f64], mu: f64, beta: f64) -> f64 {
-    if k == 0 || scores.is_empty() || !mu.is_finite() || !beta.is_finite() || beta <= 0.0 {
-        return 1.0;
-    }
-
-    // Empirical CDF vs model CDF at sorted sample points.
-    // Use max |F_model(x_i) - i/n| as a KS-like P–P distance.
-    let mut xs: Vec<f64> = scores.iter().copied().filter(|x| x.is_finite()).collect();
-    if xs.is_empty() {
-        return 1.0;
-    }
-    xs.sort_by(|a, b| a.partial_cmp(b).unwrap_or(std::cmp::Ordering::Equal));
-
-    let n = xs.len() as f64;
-    let mut d = 0.0f64;
-
-    for (i, &x) in xs.iter().enumerate() {
-        let z = (x - mu) / beta;
-        let logcdf = tev_k_order_logcdf(k, z);
-        if !logcdf.is_finite() {
-            return 1.0;
-        }
-        let f_model = logcdf.exp().clamp(0.0, 1.0);
-        let f_emp = ((i + 1) as f64) / n;
-        let diff = (f_model - f_emp).abs();
-        if diff > d {
-            d = diff;
-        }
-    }
-    d.clamp(0.0, 1.0)
-}
-
-#[inline]
-fn median_finite(mut v: Vec<f64>) -> Option<f64> {
-    v.retain(|x| x.is_finite());
-    if v.is_empty() {
+fn ols_with_r(pairs: &[(f64, f64)]) -> Option<(f64, f64, f64)> {
+    // Fit beta = a*mu + b by OLS, and also return Pearson's r.
+    if pairs.len() < 2 {
         return None;
     }
-    v.sort_by(|a, b| a.partial_cmp(b).unwrap_or(std::cmp::Ordering::Equal));
-    let mid = v.len() / 2;
-    if v.len() % 2 == 1 {
-        Some(v[mid])
-    } else {
-        Some(0.5 * (v[mid - 1] + v[mid]))
-    }
-}
+    let n = pairs.len() as f64;
 
-#[inline]
-fn approx_squeeze_score(k: u32, buckets: &[RankBucket], mu: f64, beta: f64) -> Option<f64> {
-    // Monotone squeeze indicator:
-    // compare observed median gap between rank k and k+1 null scores
-    // to expected gap under the fitted TEV-k / TEV-(k+1) medians.
-    //
-    // squeeze_score in (0, +inf); smaller => more compression (more squeeze).
-    let b_k = buckets.iter().find(|b| b.k == k)?;
-    let b_k1 = buckets.iter().find(|b| b.k == k + 1)?;
+    let sum_x = pairs.iter().map(|(mu, _)| *mu).sum::<f64>();
+    let sum_y = pairs.iter().map(|(_, b)| *b).sum::<f64>();
+    let sum_xx = pairs.iter().map(|(mu, _)| mu * mu).sum::<f64>();
+    let sum_yy = pairs.iter().map(|(_, b)| b * b).sum::<f64>();
+    let sum_xy = pairs.iter().map(|(mu, b)| mu * b).sum::<f64>();
 
-    let med_k = median_finite(b_k.scores.clone())?;
-    let med_k1 = median_finite(b_k1.scores.clone())?;
-    let gap_obs = (med_k - med_k1).abs();
+    let denom_x = n * sum_xx - sum_x * sum_x;
+    let denom_y = n * sum_yy - sum_y * sum_y;
 
-    // Expected medians (approx): use model quantiles at p=0.5 via inverse by bisection.
-    // We only need a monotone indicator, so coarse bisection is fine.
-    let q = 0.5;
-    let z_k = approx_quantile_z(k, q)?;
-    let z_k1 = approx_quantile_z(k + 1, q)?;
-    let gap_exp = ((mu + beta * z_k) - (mu + beta * z_k1)).abs();
-
-    if gap_exp <= 0.0 || !gap_exp.is_finite() {
+    if !denom_x.is_finite() || denom_x.abs() < 1e-12 {
         return None;
     }
-    Some((gap_obs / gap_exp).clamp(0.0, 10.0))
+
+    let a = (n * sum_xy - sum_x * sum_y) / denom_x;
+    let b = (sum_y - a * sum_x) / n;
+
+    let mut r = 0.0;
+    if denom_y > 0.0 {
+        r = (n * sum_xy - sum_x * sum_y) / (denom_x * denom_y).sqrt();
+    }
+
+    (a.is_finite() && b.is_finite()).then_some((a, b, r))
 }
 
 #[inline]
-fn approx_quantile_z(k: u32, p: f64) -> Option<f64> {
-    if k == 0 || !(0.0..=1.0).contains(&p) {
+fn compute_mean_beta(
+    loms: &[(u32, f64, f64)],
+    start_rank: u32,
+    count: u32,
+    mode: &crate::input::LoMeanBetaMode,
+) -> Option<f64> {
+    if count < 1 {
         return None;
     }
-    // Solve F_k(z) = p by bisection on z in a safe range.
-    // For order statistics in Gumbel domain, z typically lives in [-20, +20].
-    let mut lo = -20.0f64;
-    let mut hi = 20.0f64;
 
-    for _ in 0..80 {
-        let mid = 0.5 * (lo + hi);
-        let logcdf = tev_k_order_logcdf(k, mid);
-        if !logcdf.is_finite() {
-            return None;
-        }
-        let f = logcdf.exp();
-        if f < p {
-            lo = mid;
-        } else {
-            hi = mid;
-        }
-    }
-    Some(0.5 * (lo + hi))
-}
-
-#[inline]
-fn weight_from_gof_and_squeeze(k: u32, gof: f64, squeeze: Option<f64>) -> f64 {
-    // GOF: d in [0,1], smaller is better.
-    // Map to weight via an exponential falloff: w_gof = exp(-a * d)
-    // Choose a moderate a so d=0.2 reduces weight meaningfully, but not to zero.
-    let a = 6.0;
-    let w_gof = (-a * gof.clamp(0.0, 1.0)).exp();
-
-    // Squeeze: ratio gap_obs/gap_exp. <1 => compression.
-    // Penalize early ranks if compressed. If squeeze is None, don't penalize.
-    let w_sq = match squeeze {
-        None => 1.0,
-        Some(r) => {
-            // If r >= 1, no squeeze penalty. If r < 1, downweight.
-            // Use r^b with b>1 to penalize strong compression.
-            let b = 2.5;
-            if r >= 1.0 {
-                1.0
-            } else {
-                r.clamp(0.0, 1.0).powf(b)
-            }
-        }
-    };
-
-    // Mild extra penalty for smallest admissible k (still within window)
-    // to reduce correlation squeeze influence.
-    let w_k = if k <= 6 { 0.85 } else { 1.0 };
-
-    (w_gof * w_sq * w_k).clamp(0.05, 1.0)
-}
-
-#[inline]
-fn squeeze_factor_from_diags(diags: &[(u32, f64, Option<f64>)]) -> f64 {
-    // diags entries are (k, gof, squeeze_ratio)
-    // squeeze_ratio ~ gap_obs / gap_exp; < 1 => compression.
-    //
-    // We aggregate using a robust statistic:
-    // - take the median of available squeeze ratios
-    // - clamp to [0.6..1.0] (never inflate beta by > ~1/0.6 ≈ 1.67x here)
-    //
-    // If no squeeze ratios exist, return 1.0 (no correction).
-    let mut rs: Vec<f64> = diags
+    let mut by_rank: Vec<(u32, f64)> = loms
         .iter()
-        .filter_map(|(_k, _gof, sq)| *sq)
-        .filter(|r| r.is_finite() && *r > 0.0)
+        .map(|(k, _mu, beta)| (*k, *beta))
+        .filter(|(_k, b)| b.is_finite() && *b > 0.0)
         .collect();
 
-    if rs.is_empty() {
-        return 1.0;
+    if by_rank.is_empty() {
+        return None;
+    }
+    by_rank.sort_by_key(|(k, _)| *k);
+
+    match mode {
+        crate::input::LoMeanBetaMode::All => {
+            // PyLord Mode: mean of ALL ranks >= start_rank
+            let valid: Vec<f64> = by_rank
+                .iter()
+                .filter(|(k, _)| *k >= start_rank)
+                .map(|(_, b)| *b)
+                .collect();
+            if valid.is_empty() {
+                return None;
+            }
+            let m = valid.iter().sum::<f64>() / (valid.len() as f64);
+            return (m.is_finite() && m > 0.0).then_some(m);
+        }
+        crate::input::LoMeanBetaMode::Consecutive => {
+            // Paper Mode: exact block of length `count`
+            let mut fast: Vec<f64> = Vec::new();
+            for k in start_rank..(start_rank + count) {
+                if let Some((_, b)) = by_rank.iter().find(|(rk, _)| *rk == k) {
+                    fast.push(*b);
+                } else {
+                    fast.clear();
+                    break;
+                }
+            }
+            if fast.len() == count as usize {
+                let m = fast.iter().sum::<f64>() / (count as f64);
+                return (m.is_finite() && m > 0.0).then_some(m);
+            }
+
+            // Fallback consecutive block scanner
+            let ranks: Vec<u32> = by_rank.iter().map(|(k, _)| *k).collect();
+            if ranks.len() < count as usize {
+                return None;
+            }
+
+            let mut best_block: Option<Vec<f64>> = None;
+            let mut best_gap: u32 = u32::MAX;
+
+            for i in 0..=(ranks.len() - count as usize) {
+                let window = &ranks[i..i + count as usize];
+                let min_k = window[0];
+                let max_k = window[window.len() - 1];
+                let expected_span = count - 1;
+                let gap = (max_k - min_k).saturating_sub(expected_span);
+
+                if gap < best_gap {
+                    let mut betas: Vec<f64> = Vec::with_capacity(count as usize);
+                    for k in min_k..=max_k {
+                        if let Some((_, b)) = by_rank.iter().find(|(rk, _)| *rk == k) {
+                            betas.push(*b);
+                        }
+                    }
+                    if betas.len() == count as usize {
+                        best_gap = gap;
+                        best_block = Some(betas);
+                        if best_gap == 0 {
+                            break;
+                        }
+                    }
+                }
+            }
+
+            let block = best_block?;
+            let m = block.iter().sum::<f64>() / (block.len() as f64);
+            (m.is_finite() && m > 0.0).then_some(m)
+        }
+    }
+}
+
+#[inline]
+fn eval_candidate_lr_range(
+    loms: &[(u32, f64, f64)], // (k, mu_k, beta_k)
+    top_scores: &[f64],
+    mu_scan_min: f64,
+    mu_scan_max: f64,
+    window_size: Option<u32>,
+) -> Option<(f64, f64, f64)> {
+    let pairs: Vec<(f64, f64)> = loms
+        .iter()
+        .map(|(_k, mu, beta)| (*mu, *beta))
+        .filter(|(mu, beta)| mu.is_finite() && beta.is_finite() && *beta > 0.0)
+        .collect();
+
+    if pairs.len() < 2 {
+        return None;
     }
 
-    rs.sort_by(|a, b| a.partial_cmp(b).unwrap_or(std::cmp::Ordering::Equal));
-    let mid = rs.len() / 2;
-    let med = if rs.len() % 2 == 1 {
-        rs[mid]
+    // PyLord Sliding Window + Pearson R logic
+    let (a, b) = if let Some(w) = window_size {
+        let w = w as usize;
+        if pairs.len() >= w {
+            let mut best_r_abs = -1.0;
+            let mut best_ab = None;
+            for i in 0..=(pairs.len() - w) {
+                let slice = &pairs[i..i + w];
+                if let Some((a_cand, b_cand, r)) = ols_with_r(slice) {
+                    let r_abs = r.abs();
+                    if r_abs > best_r_abs {
+                        best_r_abs = r_abs;
+                        best_ab = Some((a_cand, b_cand));
+                    }
+                }
+            }
+            best_ab.or_else(|| ols_with_r(&pairs).map(|(a, b, _)| (a, b)))?
+        } else {
+            ols_with_r(&pairs).map(|(a, b, _)| (a, b))?
+        }
     } else {
-        0.5 * (rs[mid - 1] + rs[mid])
+        ols_with_r(&pairs).map(|(a, b, _)| (a, b))?
     };
 
-    med.clamp(0.6, 1.0)
+    const MU_N: usize = 256;
+    if !mu_scan_min.is_finite() || !mu_scan_max.is_finite() || mu_scan_min >= mu_scan_max {
+        return None;
+    }
+    let step = (mu_scan_max - mu_scan_min) / ((MU_N - 1) as f64);
+
+    let mut best: Option<(f64, f64, f64)> = None;
+
+    for i in 0..MU_N {
+        let mu = mu_scan_min + (i as f64) * step;
+        let beta = a * mu + b;
+        if !beta.is_finite() || beta <= 0.0 {
+            continue;
+        }
+        let nll = nll_tev_k(mu, beta, top_scores, 1);
+        if !nll.is_finite() {
+            continue;
+        }
+        match best {
+            None => best = Some((mu, beta, nll)),
+            Some((_, _, best_nll)) if nll < best_nll => best = Some((mu, beta, nll)),
+            _ => {}
+        }
+    }
+
+    best
 }
 
 /// Fits a charge-stratified Lower Order Model.
@@ -862,20 +798,16 @@ fn squeeze_factor_from_diags(diags: &[(u32, f64, Option<f64>)]) -> f64 {
 /// LO fitting contract (Decoy-Free)
 /// --------------------------------
 /// This module fits a charge-stratified Target Null Model (TNM) and uses it to
-/// produce rank-1 p-values (downstream interface remains unchanged: TNM is a
-/// Gumbel(μ, β) used only for rank-1 scoring).
+/// produce rank-1 p-values.
 ///
-/// Refactor target (for correctness):
-/// - Fit TNM parameters (μ, β) *per charge* by jointly fitting k-order TEV
-///   distributions for ranks k within the configured LO null-rank window.
-/// - Use moderate k with adaptive weighting to downweight ranks exhibiting
-///   correlation squeeze and/or poor goodness-of-fit.
-/// - Replace any fixed "blend with moments" behavior with Empirical-Bayes
-///   shrinkage on β using uncertainty from the joint fit.
-/// - Optionally apply an N_eff / correlation-squeeze correction that inflates β
-///   only when diagnostics indicate rank compression.
-/// - Preserve the external behavior: output TNM as Gumbel(μ, β) for rank-1
-///   p-values; no changes to downstream consumers.
+/// Implementation Details (PyLord-Matched):
+/// - Fits LOM parameters (μ_k, β_k) per charge for ranks k within the
+///   configured LO null-rank window using Method of Moments (MM) and/or MLE.
+/// - Derives Rank 1 TNM candidates using Linear Regression and/or Mean-β modes.
+/// - Evaluates candidates over a configured μ scan range.
+/// - Selects the best candidate via Bayesian Information Criterion (BIC).
+/// - Strict fail-closed semantics: if a TNM cannot be reliably fit for a charge,
+///   no identifications will be produced for that charge via the LO stream.
 ///
 pub fn fit_decoy_free_model(
     rank_null_stream: &[(u32, f64, u8)],
@@ -884,10 +816,13 @@ pub fn fit_decoy_free_model(
     max_null_rank: u32,
     min_null_size_per_charge: usize,
     min_rank_count: usize,
-    lo_neff_enable: bool,
-    lo_rank_gof_max: Option<f64>,
-    lo_eb_tau: f64,
-) -> LowerOrderModel {
+    lo_mode: crate::input::LoMode,
+    lo_lom_estimator: crate::input::LoLomEstimator,
+    lo_mean_beta_mode: crate::input::LoMeanBetaMode,
+    lo_mean_beta_min_rank: u32,
+    lo_mean_beta_count: u32,
+    lo_lr_window_size: Option<u32>,
+) -> Option<LowerOrderModel> {
     if log::log_enabled!(log::Level::Debug) {
         log::debug!(
 			"LO DEBUG fit: null-rank window [{min_null_rank}..={max_null_rank}]. rank_null_stream.len()={} rank1_stream.len()={} min_null_size_per_charge={} min_rank_count={}",
@@ -983,11 +918,7 @@ pub fn fit_decoy_free_model(
 
             pooled_charge_null.extend_from_slice(&scores);
 
-            buckets.push(RankBucket {
-                k,
-                scores,
-                weight: 1.0,
-            });
+            buckets.push(RankBucket { k, scores });
         }
 
         // Need at least something to proceed; otherwise skip this charge
@@ -995,264 +926,215 @@ pub fn fit_decoy_free_model(
             continue;
         }
 
-        // ---- Adaptive k admissibility (bounded) ----
-        // Default policy:
-        // - exclude k <= 3 (contamination / correlation squeeze zone)
-        // - avoid very large k when support is sparse (conditioning bias / thin buckets)
-        const K_EXCLUDE_LEQ_DEFAULT: u32 = 3;
+        // --- PYLORD KDE CUTOFF REPLICATION ---
+        // PyLord uses Kernel Density Estimation (KDE) to find the "dip" between
+        // the nulls and targets, filtering out the targets before evaluating BIC.
+        let mut temp_ts = ts.to_vec();
+        temp_ts.sort_unstable_by(|a, b| a.total_cmp(b));
 
-        // Define "very large k" relative to the available bucket count.
-        // If we only have a few usable buckets, we restrict to a modest upper tail.
-        let bucket_count_pre = buckets.len();
+        let cutoff = if temp_ts.len() > 10 {
+            // 1. Initialize KDE
+            // PyLord hardcodes bw=0.05. We initialize the Kde struct and override its bandwidth.
+            let mut kde = crate::ml::kde::Kde::new(&temp_ts, |bw| bw);
+            kde.bandwidth = 0.05;
 
-        // Remove k <= 3 by default
-        buckets.retain(|b| b.k > K_EXCLUDE_LEQ_DEFAULT);
+            // 2. Evaluate over a grid of 256 points (just like PyLord's 2**8)
+            let min_val = temp_ts[0];
+            let max_val = temp_ts[temp_ts.len() - 1];
+            let grid_size = 256;
+            let step = (max_val - min_val) / (grid_size as f64 - 1.0);
 
-        if buckets.is_empty() {
-            continue;
-        }
+            let mut pdf_vals = Vec::with_capacity(grid_size);
+            for i in 0..grid_size {
+                let x = min_val + (i as f64) * step;
+                pdf_vals.push((x, kde.pdf(x)));
+            }
 
-        // If buckets are sparse, cap k to avoid large-k conditioning artifacts.
-        // Heuristic: if we have < 6 buckets, cap at min(K_max, 12) (unless the user's max is smaller).
-        // If we have < 4 buckets, cap at min(K_max, 10).
-        let k_cap = if bucket_count_pre < 4 {
-            10u32
-        } else if bucket_count_pre < 6 {
-            12u32
+            // 3. Find the first local minimum (dip) in the density curve
+            let mut dip_x = None;
+            for i in 1..(grid_size - 1) {
+                if pdf_vals[i].1 < pdf_vals[i - 1].1 && pdf_vals[i].1 < pdf_vals[i + 1].1 {
+                    dip_x = Some(pdf_vals[i].0);
+                    break;
+                }
+            }
+
+            // 4. PyLord fallback: If no dip is found, use the median of the scores
+            dip_x.unwrap_or_else(|| temp_ts[temp_ts.len() / 2])
         } else {
-            // If we have decent support, do not impose an extra cap here.
-            max_null_rank
+            f64::INFINITY
         };
 
-        if k_cap < max_null_rank {
-            buckets.retain(|b| b.k <= k_cap);
-        }
-
-        if buckets.len() < 2 {
-            // Not enough ranks to identify a joint (μ,β) fit robustly.
-            continue;
-        }
-
-        if log::log_enabled!(log::Level::Debug) {
-            log::debug!(
-                "LO DEBUG charge={}: buckets used (k:count) = [{}]",
-                charge,
-                buckets
-                    .iter()
-                    .map(|b| format!("{}:{}", b.k, b.scores.len()))
-                    .collect::<Vec<_>>()
-                    .join(",")
-            );
-        };
-
-        // ---- Joint (μ,β) fit via TEV-k NLL (stable grid + refinement) ----
-        let (_mu0, beta0) = fit_gumbel_moments(&pooled_charge_null);
-        let beta0 = if beta0.is_finite() && beta0 > 0.0 {
-            beta0
+        let filtered_ts_data: Vec<f64> = ts.iter().copied().filter(|&x| x <= cutoff).collect();
+        let ts_slice = if filtered_ts_data.len() >= min_rank_count {
+            &filtered_ts_data
         } else {
-            1.0
+            ts // fallback to full rank 1 if cutoff is inexplicably aggressive
         };
 
-        // μ init: prefer rank-1 TS μ-grid at beta0, else midpoint.
-        let mu0 = mu_grid_best_bic(beta0, ts)
-            .map(|(m, _bic)| m)
-            .unwrap_or(0.2);
+        // --- PYLORD DYNAMIC MU BOUNDS ---
+        // PyLord dynamically sets the mu search bounds based on the mean of the
+        // filtered null-pocket (ts_slice), rather than using fixed boundaries.
+        // From PyLord optimization_modes.py: bounds = [(0.1 * initial_guess, 1.5 * initial_guess)]
+        let ts_mean = ts_slice.iter().sum::<f64>() / ts_slice.len().max(1) as f64;
+        let dyn_mu_min = 0.1 * ts_mean;
+        let dyn_mu_max = 1.5 * ts_mean;
 
-        // Pass 1: uniform weights
-        for b in buckets.iter_mut() {
-            b.weight = 1.0;
-        }
+        // ---------------------------------------------------------------------
+        // Paper/PyLord LO: per-k LOM fits (MM + MLE) and TNM selection by BIC
+        // ---------------------------------------------------------------------
 
-        let (mu1, beta1, _se1, _diag1) = match fit_joint_tev(mu0, beta0, &buckets) {
-            Some(v) => v,
-            None => continue,
-        };
+        // 1) Build LOM tables for each estimator family
+        // Each entry: (k, mu_k, beta_k)
+        let mut lom_mm: Vec<(u32, f64, f64)> = Vec::new();
+        let mut lom_mle: Vec<(u32, f64, f64)> = Vec::new();
 
-        if !beta1.is_finite() || beta1 <= 0.0 {
-            continue;
-        }
+        for b in &buckets {
+            let k = b.k;
+            if k < min_null_rank || k > max_null_rank {
+                continue;
+            }
+            if b.scores.len() < min_rank_count {
+                continue;
+            }
 
-        // Compute diagnostics with an immutable borrow first (avoids E0502).
-        let diags: Vec<(u32, f64, Option<f64>)> = buckets
-            .iter()
-            .map(|b| {
-                let gof = approx_pp_distance_tev_k(b.k, &b.scores, mu1, beta1);
-                let squeeze = approx_squeeze_score(b.k, &buckets, mu1, beta1);
-                (b.k, gof, squeeze)
-            })
-            .collect();
+            if let Some((mu_k, beta_k)) = fit_tev_k_moments(&b.scores, k) {
+                if mu_k.is_finite() && beta_k.is_finite() && beta_k > 0.0 {
+                    lom_mm.push((k, mu_k, beta_k));
+                }
+            }
 
-        // Now assign weights with a mutable borrow.
-        for b in buckets.iter_mut() {
-            if let Some((_, gof, squeeze)) = diags.iter().find(|(k, _, _)| *k == b.k) {
-                b.weight = weight_from_gof_and_squeeze(b.k, *gof, *squeeze);
-            } else {
-                b.weight = 1.0;
+            if let Some((mu_k, beta_k)) = fit_tev_k_mle(&b.scores, k) {
+                if mu_k.is_finite() && beta_k.is_finite() && beta_k > 0.0 {
+                    lom_mle.push((k, mu_k, beta_k));
+                }
             }
         }
 
-        // Pass 2: refit with diagnostic weights
-        let (_mu2, beta2, se2, diag2) = match fit_joint_tev(mu1, beta1, &buckets) {
-            Some(v) => v,
-            None => continue,
-        };
-
-        if log::log_enabled!(log::Level::Debug) {
-            log::debug!(
-                "LO DEBUG charge={}: joint-fit diag: n_buckets={} n_points={} best_nll={:.3}",
-                charge,
-                diag2.n_buckets,
-                diag2.n_points,
-                diag2.best_nll
-            );
+        // Need enough points to do anything
+        if lom_mm.len() < 2 && lom_mle.len() < 2 {
+            continue; // fail-closed per charge
         }
 
-        if !beta2.is_finite() || beta2 <= 0.0 {
-            continue;
-        }
+        // ---------------------------------------------------------------------
+        // PyLord Candidate Tournament (Respecting Config Knobs)
+        // ---------------------------------------------------------------------
+        let use_mm = matches!(
+            lo_lom_estimator,
+            crate::input::LoLomEstimator::Auto | crate::input::LoLomEstimator::Mm
+        );
+        let use_mle = matches!(
+            lo_lom_estimator,
+            crate::input::LoLomEstimator::Auto | crate::input::LoLomEstimator::Mle
+        );
+        let use_lr = matches!(
+            lo_mode,
+            crate::input::LoMode::Auto | crate::input::LoMode::LinearRegression
+        );
+        let use_mean = matches!(
+            lo_mode,
+            crate::input::LoMode::Auto | crate::input::LoMode::MeanBeta
+        );
 
-        // Data-driven squeeze correction (inflate β only when ranks are compressed)
-        // If lo_neff_enable=false, disable squeeze correction entirely (squeeze_factor=1).
-        let squeeze_factor = if lo_neff_enable {
-            squeeze_factor_from_diags(&diags) // in (0,1], clamped
-        } else {
-            1.0
-        };
+        let mut candidates = Vec::new();
 
-        let beta_corr = beta2 / squeeze_factor;
-
-        if !beta_corr.is_finite() || beta_corr <= 0.0 {
-            continue;
-        }
-
-        let max_pp = diags
-            .iter()
-            .map(|(_k, gof, _sq)| *gof)
-            .fold(0.0_f64, |a, b| a.max(b));
-
-        if log::log_enabled!(log::Level::Debug) {
-            log::debug!(
-				"LO DEBUG charge={}: beta pass1={:.6} pass2={:.6} max_pp={:.4} squeeze_factor={:.4} beta_corr={:.6}",
-				charge,
-				beta1,
-				beta2,
-				max_pp,
-				squeeze_factor,
-				beta_corr
-			);
-        }
-
-        // Use existing 1-DOF BIC μ-grid, but DO NOT lock μ to a β that we later replace.
-        // We will re-optimize μ after EB shrinkage using the final β (Fix #1).
-
-        let beta_prior = beta0; // per-charge pooled-null prior (moments)
-
-        // Step 6.2/Fail-closed: if GOF is awful, ignore the joint-fit beta and fall back to beta_prior.
-        let gof_bad = lo_rank_gof_max
-            .map(|thr| max_pp.is_finite() && max_pp > thr)
-            .unwrap_or(false);
-
-        // beta_hat is the "pre-EB" beta used for initial μ selection.
-        // If GOF is bad, we force beta_hat = beta_prior and force strong shrink (se_beta=INF).
-        let beta_hat = if gof_bad { beta_prior } else { beta_corr };
-        let se_beta = if gof_bad { f64::INFINITY } else { se2 };
-
-        // Initial μ selection (will be re-done after EB using final β).
-        let best_charge: Option<(f64, f64, f64, f64, f64)> = mu_grid_best_bic(beta_hat, ts)
-            .map(|(mu_best, bic)| (mu_best, beta_hat, se_beta, beta_prior, bic));
-        if best_charge.is_none() {
-            continue;
-        }
-
-        if log::log_enabled!(log::Level::Debug) && gof_bad {
-            log::debug!(
-				"LO DEBUG charge={}: GOF max_pp={:.4} exceeds threshold {:?}; using beta_prior={:.6}",
-				charge,
-				max_pp,
-				lo_rank_gof_max,
-				beta_prior
-			);
-        }
-
-        let (_mu, mut beta, se_beta, beta_prior, _bic) = match best_charge {
-            Some(t) => t,
-            None => continue,
-        };
-        {
-            // ---------------------------------------------------------
-            // Calibration knobs (explicit, per-charge)
-            // Applied AFTER TNM selection (min-BIC) and BEFORE storage.
-            // ---------------------------------------------------------
-
-            // ---- Empirical-Bayes β shrinkage (variance-weighted) ----
-            // beta is currently β_corr (already squeeze-corrected).
-            // beta_prior is the pooled-null moments β for this charge.
-            //
-            // w = se^2 / (se^2 + tau^2)
-            // β_final = (1-w)*β_corr + w*β_prior
-            //
-            // tau: shrink strength (from JSON / settings)
-            let tau = lo_eb_tau;
-
-            let se2 = if se_beta.is_finite() && se_beta > 0.0 {
-                se_beta
-            } else {
-                // If curvature is unusable, shrink strongly toward prior (fail-closed)
-                f64::INFINITY
-            };
-
-            let w = if se2.is_infinite() {
-                1.0
-            } else {
-                let se2_sq = se2 * se2;
-                let tau_sq = tau * tau;
-                (se2_sq / (se2_sq + tau_sq)).clamp(0.0, 1.0)
-            };
-
-            let beta_corr = beta;
-            let mut beta_final = (1.0 - w) * beta_corr + w * beta_prior;
-
-            if !beta_final.is_finite() || beta_final <= 0.0 {
-                beta_final = beta_corr; // last-resort fallback
-            }
-
-            beta = beta_final;
-
-            if log::log_enabled!(log::Level::Debug) {
-                log::debug!(
-                    "LO DEBUG charge={}: EB shrink w={:.4} beta_prior={:.6} beta_final={:.6}",
-                    charge,
-                    w,
-                    beta_prior,
-                    beta
-                );
-            }
-
-            // Re-optimize μ using the FINAL β (after EB shrinkage).
-            let mu_final = match mu_grid_best_bic(beta, ts) {
-                Some((m, _bic)) => m,
-                None => continue,
-            };
-
-            // Final guard + store
-            if mu_final.is_finite() && beta.is_finite() && beta > 0.0 {
-                params_by_charge.insert(charge, (mu_final, beta));
+        // 2) Linear regression TNM candidates
+        if use_lr && use_mm {
+            if let Some(cand) = eval_candidate_lr_range(
+                &lom_mm,
+                ts_slice,
+                dyn_mu_min, // <--- Dynamic Bound
+                dyn_mu_max, // <--- Dynamic Bound
+                lo_lr_window_size,
+            ) {
+                // PyLord sanity check: ignore mathematically collapsed betas
+                if cand.1 > 0.1 {
+                    candidates.push(("LR/MM", cand));
+                }
             }
         }
+        if use_lr && use_mle {
+            if let Some(cand) = eval_candidate_lr_range(
+                &lom_mle,
+                ts_slice,
+                dyn_mu_min, // <--- Dynamic Bound
+                dyn_mu_max, // <--- Dynamic Bound
+                lo_lr_window_size,
+            ) {
+                if cand.1 > 0.1 {
+                    candidates.push(("LR/MLE", cand));
+                }
+            }
+        }
+
+        // 3) Mean-β TNM candidates
+        if use_mean && use_mm {
+            if let Some(beta_mean) = compute_mean_beta(
+                &lom_mm,
+                lo_mean_beta_min_rank,
+                lo_mean_beta_count,
+                &lo_mean_beta_mode,
+            ) {
+                if let Some((mu, nll)) =
+                    mu_grid_best_bic_range(beta_mean, ts_slice, dyn_mu_min, dyn_mu_max)
+                {
+                    if beta_mean > 0.1 {
+                        candidates.push(("MeanB/MM", (mu, beta_mean, nll)));
+                    }
+                }
+            }
+        }
+        if use_mean && use_mle {
+            if let Some(beta_mean) = compute_mean_beta(
+                &lom_mle,
+                lo_mean_beta_min_rank,
+                lo_mean_beta_count,
+                &lo_mean_beta_mode,
+            ) {
+                if let Some((mu, nll)) =
+                    mu_grid_best_bic_range(beta_mean, ts_slice, dyn_mu_min, dyn_mu_max)
+                {
+                    if beta_mean > 0.1 {
+                        candidates.push(("MeanB/MM", (mu, beta_mean, nll)));
+                    }
+                }
+            }
+        }
+
+        // 4) Pick best by smallest BIC
+        let best_cand = candidates
+            .into_iter()
+            .min_by(|(_, (_, _, nll_a)), (_, (_, _, nll_b))| {
+                nll_a
+                    .partial_cmp(nll_b)
+                    .unwrap_or(std::cmp::Ordering::Equal)
+            });
+
+        // 5) Fail-closed: no finite candidate => skip charge
+        let (mu_final, beta_final) = match best_cand {
+            Some((name, t)) => {
+                log::info!(
+					"LO DEBUG charge {charge}: best TNM candidate = {name} (mu={:.4}, beta={:.4}, nll={:.4}) | ranks: MM={}, MLE={}",
+					t.0, t.1, t.2, lom_mm.len(), lom_mle.len()
+				);
+                (t.0, t.1)
+            }
+            None => {
+                log::warn!("LO DEBUG charge {charge}: all TNM candidates failed.");
+                continue;
+            }
+        };
+
+        params_by_charge.insert(charge, (mu_final, beta_final));
     }
 
     // -------------------------
     // Fallback params (global)
     // -------------------------
-    let fallback_params = {
-        // Prefer a pooled moments fit on the pooled null scores.
-        let (mu, beta) = fit_gumbel_moments(&pooled_null_scores);
-        if mu.is_finite() && beta.is_finite() && beta > 0.0 {
-            (mu, beta)
-        } else {
-            (f64::NAN, f64::NAN)
-        }
-    };
+    // Fail-closed: LO must not fall back to any other model (including pooled moments).
+    // If a charge is missing params, resolve_params() will return fallback_params, and
+    // p_value() will return 1.0 when mu/beta are NaN.
+    let fallback_params = (f64::NAN, f64::NAN);
 
     // -------------------------
     // Charge filling rules (fit-time + query-time)
@@ -1270,13 +1152,207 @@ pub fn fit_decoy_free_model(
     fitted_charges_sorted.sort_unstable();
     let max_fitted_charge: u8 = fitted_charges_sorted.last().copied().unwrap_or(0);
 
-    LowerOrderModel {
+    if params_by_charge.is_empty() {
+        return None;
+    }
+
+    Some(LowerOrderModel {
         params_by_charge,
         fallback_params,
-
-        // Default policy: MinimalDelta (no internal gap nearest-neighbor fill)
         charge_fill_mode: ChargeFillMode::MinimalDelta,
         fitted_charges_sorted,
         max_fitted_charge,
+    })
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    // Simple deterministic RNG (no external deps)
+    #[derive(Clone)]
+    struct XorShift64 {
+        state: u64,
+    }
+    impl XorShift64 {
+        fn new(seed: u64) -> Self {
+            Self { state: seed.max(1) }
+        }
+        fn next_u64(&mut self) -> u64 {
+            let mut x = self.state;
+            x ^= x << 13;
+            x ^= x >> 7;
+            x ^= x << 17;
+            self.state = x;
+            x
+        }
+        fn next_f64(&mut self) -> f64 {
+            // (0,1)
+            let u = self.next_u64();
+            let v = ((u >> 11) as f64) / ((1u64 << 53) as f64);
+            v.clamp(1e-12, 1.0 - 1e-12)
+        }
+    }
+
+    fn sample_gumbel(mu: f64, beta: f64, u: f64) -> f64 {
+        // inverse CDF: x = mu - beta * ln(-ln(u))
+        mu - beta * (-u.ln()).ln()
+    }
+
+    fn sample_kth_largest_gumbel(
+        mu: f64,
+        beta: f64,
+        n: usize,
+        k: usize,
+        rng: &mut XorShift64,
+    ) -> f64 {
+        // Draw n iid Gumbel, return k-th largest (1-indexed k)
+        let mut xs: Vec<f64> = (0..n)
+            .map(|_| sample_gumbel(mu, beta, rng.next_f64()))
+            .collect();
+        xs.sort_by(|a, b| b.partial_cmp(a).unwrap()); // descending
+        xs[(k - 1).min(xs.len() - 1)]
+    }
+
+    #[test]
+    fn lo_estimators_recover_reasonable_params_and_selection_is_finite() {
+        // Synthetic parameters
+        let mu_true = 15.0;
+        let beta_true = 3.0;
+
+        // Simulate "null" scores at a given hit rank k from N candidates
+        let n_candidates = 2000usize;
+        let k = 8usize;
+        let n_samples = 4000usize;
+
+        let mut rng = XorShift64::new(0xC0FFEE);
+
+        let mut scores: Vec<f64> = Vec::with_capacity(n_samples);
+        for _ in 0..n_samples {
+            scores.push(sample_kth_largest_gumbel(
+                mu_true,
+                beta_true,
+                n_candidates,
+                k,
+                &mut rng,
+            ));
+        }
+
+        // Moments estimator should be finite
+        let (mu_mm, beta_mm) = fit_gumbel_moments(&scores);
+        assert!(mu_mm.is_finite());
+        assert!(beta_mm.is_finite());
+        assert!(beta_mm > 0.0);
+
+        // TEV-k moments/MLE should be finite (paper/PyLord helpers)
+        let (mu_k_mm, beta_k_mm) = fit_tev_k_moments(&scores, k as u32).expect("tev-k moments");
+        assert!(mu_k_mm.is_finite());
+        assert!(beta_k_mm.is_finite());
+        assert!(beta_k_mm > 0.0);
+
+        let (mu_k_mle, beta_k_mle) = fit_tev_k_mle(&scores, k as u32).expect("tev-k mle");
+        assert!(mu_k_mle.is_finite());
+        assert!(beta_k_mle.is_finite());
+        assert!(beta_k_mle > 0.0);
+
+        // Loose sanity: we shouldn't be orders of magnitude off
+        assert!((beta_k_mm / beta_true) > 0.2 && (beta_k_mm / beta_true) < 5.0);
+        assert!((beta_k_mle / beta_true) > 0.2 && (beta_k_mle / beta_true) < 5.0);
+
+        // LR/Meanβ selection should produce finite candidates
+        let loms = vec![
+            (8u32, mu_k_mm, beta_k_mm),
+            (9u32, mu_k_mm + 0.1, beta_k_mm * 1.02),
+            (10u32, mu_k_mm + 0.2, beta_k_mm * 1.05),
+        ];
+        let top_scores = scores.clone(); // stand-in; just need non-empty
+
+        let lr = eval_candidate_lr_range(&loms, &top_scores, 0.05, 0.40);
+        assert!(lr.is_some());
+
+        let mb = mean_beta_from_consecutive_low_orders(&loms, 8, 3);
+        assert!(mb.is_some());
+    }
+
+    #[test]
+    fn pylord_parity_tev_cdf_asymptotic_matches_known_values() {
+        // These expected values are from PyLord's:
+        //   cdf_asymptotic(x, mu=0, beta=1, hit_rank=k)
+        // evaluated at x=z (i.e., z = (x-mu)/beta).
+        //
+        // PyLord formula:
+        //   cdf = exp(-exp(-z)) * Σ_{m=0..k} exp(-m z) / m!
+        //
+        // We hardcode a few representative (z,k) points.
+        let cases: &[(f64, u32, f64)] = &[
+            (-1.0, 1, 0.24536211457932974),
+            (0.0, 1, 0.7357588823428847),
+            (0.0, 3, 0.9810118431238462),
+            (1.0, 1, 0.9468470075989289),
+            (1.0, 3, 0.9994303649203736),
+        ];
+
+        for &(z, k, expected) in cases {
+            let got = tev_cdf_asymptotic(z, k);
+            assert!(
+                got.is_finite(),
+                "tev_cdf_asymptotic produced non-finite value for z={z}, k={k}"
+            );
+            let err = (got - expected).abs();
+            assert!(
+                err < 1e-12,
+                "tev_cdf_asymptotic mismatch for z={z}, k={k}: got={got:.16e}, expected={expected:.16e}, err={err:.3e}",
+            );
+        }
+    }
+
+    #[test]
+    fn pylord_parity_nll_tev_k_matches_asymptotic_gumbel_mle_k1() {
+        // PyLord stat.py:
+        // AsymptoticGumbelMLE.get_log_likelihood(log_params):
+        //
+        //   location, scale = exp(log_params) + 1e-10
+        //   z = (scores - location)/scale
+        //   factorial_term = factorial(hit_rank - 1)
+        //   likelihood = -n*log(scale*factorial) - hit_rank*sum(z) - sum(exp(-z))
+        //   return -likelihood     # negative log-likelihood
+        //
+        // Our nll_tev_k(mu,beta,ts,k) should match for k=1.
+        let scores: [f64; 4] = [10.0, 11.0, 12.0, 13.5];
+        let mu = 11.2;
+        let beta = 2.3;
+        let k = 1u32;
+
+        // Expected value computed from the PyLord formula above (k=1 => factorial(0)=1).
+        let expected_nll = 7.920672765212197_f64;
+
+        let got = nll_tev_k(mu, beta, &scores, k);
+        assert!(
+            got.is_finite(),
+            "nll_tev_k returned non-finite value: {got}"
+        );
+        let err = (got - expected_nll).abs();
+        assert!(
+            err < 1e-12,
+            "nll_tev_k mismatch: got={got:.16e}, expected={expected_nll:.16e}, err={err:.3e}",
+        );
+
+        // Extra guard: re-compute the PyLord closed-form here and compare again.
+        let n = scores.len() as f64;
+        let factorial = 1.0_f64; // factorial(k-1) = factorial(0) = 1
+        let mut sum_z = 0.0;
+        let mut sum_exp_neg_z = 0.0;
+        for &x in &scores {
+            let z = (x - mu) / beta;
+            sum_z += z;
+            sum_exp_neg_z += (-z).exp();
+        }
+        let pylord_nll = n * (beta * factorial).ln() + (k as f64) * sum_z + sum_exp_neg_z;
+
+        let err2 = (got - pylord_nll).abs();
+        assert!(
+            err2 < 1e-12,
+            "nll_tev_k does not match reconstructed PyLord NLL: got={got:.16e}, pylord={pylord_nll:.16e}, err={err2:.3e}"
+        );
     }
 }

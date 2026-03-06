@@ -60,6 +60,14 @@ impl Default for MsfdrSeedMode {
 // Decoy-free tuning knobs (configuration surface)
 // ---------------------------------------------------------------------------
 
+#[derive(Clone, Serialize, Deserialize, Debug, Default, PartialEq, Eq)]
+#[serde(rename_all = "snake_case")]
+pub enum LoMeanBetaMode {
+    #[default]
+    Consecutive, // Original paper behavior (n consecutive ranks)
+    All, // PyLord behavior (all ranks >= min_rank)
+}
+
 /// How to rank/monotonize LO-derived values.
 /// - hyperscore: sort by hyperscore (legacy)
 /// - lo_adjusted: sort by LO-adjusted evidence (recommended; fixes LO + PAVA mismatch)
@@ -69,6 +77,43 @@ pub enum LoRankKey {
     #[default]
     Hyperscore,
     LoAdjusted,
+}
+
+#[derive(Clone, Serialize, Deserialize, Debug, Default, PartialEq, Eq)]
+#[serde(rename_all = "snake_case")]
+pub enum LoMode {
+    #[default]
+    Auto, // evaluate both TNM constructions; pick best BIC
+    LinearRegression,
+    MeanBeta,
+}
+
+#[derive(Clone, Serialize, Deserialize, Debug, Default, PartialEq, Eq)]
+#[serde(rename_all = "snake_case")]
+pub enum LoLomEstimator {
+    #[default]
+    Auto, // evaluate MM and MLE; pick best BIC
+    Mm,
+    Mle,
+}
+
+#[derive(Clone, Serialize, Deserialize, Debug, Default, PartialEq, Eq)]
+#[serde(rename_all = "snake_case")]
+pub enum LoStratify {
+    Global,
+    #[default]
+    Charge,
+}
+
+#[derive(Clone, Serialize, Deserialize, Debug, Default, PartialEq, Eq)]
+#[serde(rename_all = "snake_case")]
+pub enum LoScore {
+    /// Use existing tev(f) selection (hyperscore vs lo_adjusted) — no extra normalization.
+    #[default]
+    Raw,
+
+    /// PyLord-style per-spectrum normalization (implemented in decoy_free_fdr.rs).
+    PerSpectrum,
 }
 
 /// How Nokoi defines the "positive" class in DF mode.
@@ -214,14 +259,22 @@ pub struct FdrOptions {
     pub lower_order_min_null_rank: Option<u32>,
     pub lower_order_max_null_rank: Option<u32>,
 
-    // LO rank selection / modeling knobs (new; Phase 4 wiring sets defaults)
-    pub lo_rank_key: Option<LoRankKey>, // e.g. lo_adjusted vs hyperscore (existing)
-    pub lo_k_exclude_leq: Option<u32>,  // default 3
-    pub lo_k_default_min: Option<u32>,  // default 6
-    pub lo_k_default_max: Option<u32>,  // default 12
-    pub lo_rank_gof_max: Option<f64>,   // optional threshold; default None
-    pub lo_neff_enable: Option<bool>,   // default true
-    pub lo_eb_tau: Option<f64>,         // default ~0.02..0.05 (β units)
+    // LO (paper/PyLord) controls
+    pub lo_rank_key: Option<LoRankKey>, // unchanged: output rank key (lo_adjusted vs hyperscore)
+    pub lo_mode: Option<LoMode>,        // auto | linear_regression | mean_beta
+    pub lo_lom_estimator: Option<LoLomEstimator>, // auto | mm | mle
+
+    // PyLord parity knobs
+    pub lo_stratify: Option<LoStratify>, // default Charge
+    pub lo_score: Option<LoScore>,       // default Raw
+
+    // Mean-β scheme controls (paper defaults: min_rank=8, count=3)
+    pub lo_mean_beta_mode: Option<LoMeanBetaMode>, // default consecutive
+    pub lo_mean_beta_min_rank: Option<u32>,        // default 8
+    pub lo_mean_beta_count: Option<u32>,           // default 3
+
+    // (Optional) if you later implement PyLord sliding-window LR selection
+    pub lo_lr_window_size: Option<u32>, // default None (disabled)
 
     // =========================================================================
     // E) MSFDR specific knobs
@@ -324,12 +377,19 @@ pub struct FdrSettings {
     pub lower_order_min_null_rank: u32,
     pub lower_order_max_null_rank: u32,
     pub lo_rank_key: LoRankKey,
-    pub lo_k_exclude_leq: u32,        // default 3
-    pub lo_k_default_min: u32,        // default 6
-    pub lo_k_default_max: u32,        // default 12
-    pub lo_rank_gof_max: Option<f64>, // optional; default None
-    pub lo_neff_enable: bool,         // default true
-    pub lo_eb_tau: f64,               // default ~0.02..0.05
+
+    // LO (paper/PyLord) settings
+    pub lo_mode: LoMode,
+    pub lo_lom_estimator: LoLomEstimator,
+
+    // PyLord parity settings
+    pub lo_stratify: LoStratify, // Charge | Global
+    pub lo_score: LoScore,       // Raw | PerSpectrum
+
+    pub lo_mean_beta_mode: LoMeanBetaMode,
+    pub lo_mean_beta_min_rank: u32,
+    pub lo_mean_beta_count: u32,
+    pub lo_lr_window_size: Option<u32>,
 
     // =========================================================================
     // E) MSFDR specific resolved null window
@@ -479,12 +539,20 @@ impl From<FdrOptions> for FdrSettings {
 
         let calibrate_per_method = options.calibrate_per_method.unwrap_or(true);
         let lo_rank_key = options.lo_rank_key.unwrap_or(LoRankKey::LoAdjusted);
-        let lo_k_exclude_leq = options.lo_k_exclude_leq.unwrap_or(3);
-        let lo_k_default_min = options.lo_k_default_min.unwrap_or(6);
-        let lo_k_default_max = options.lo_k_default_max.unwrap_or(12);
-        let lo_rank_gof_max = options.lo_rank_gof_max; // default None
-        let lo_neff_enable = options.lo_neff_enable.unwrap_or(true);
-        let lo_eb_tau = options.lo_eb_tau.unwrap_or(0.03);
+        let lo_mode = options.lo_mode.unwrap_or(LoMode::Auto);
+        let lo_lom_estimator = options.lo_lom_estimator.unwrap_or(LoLomEstimator::Auto);
+
+        // PyLord parity knobs (defaults)
+        let lo_stratify = options.lo_stratify.unwrap_or(LoStratify::Charge);
+        let lo_score = options.lo_score.unwrap_or(LoScore::Raw);
+
+        let lo_mean_beta_mode = options
+            .lo_mean_beta_mode
+            .unwrap_or(LoMeanBetaMode::Consecutive);
+        let lo_mean_beta_min_rank = options.lo_mean_beta_min_rank.unwrap_or(8).max(2);
+        let lo_mean_beta_count = options.lo_mean_beta_count.unwrap_or(3).clamp(1, 10);
+
+        let lo_lr_window_size = options.lo_lr_window_size;
 
         let nokoi_k_folds = options.nokoi_k_folds.unwrap_or(2).max(2).min(20);
 
@@ -693,47 +761,24 @@ impl From<FdrOptions> for FdrSettings {
 
         Self {
             mode: options.mode.unwrap_or(FdrMode::DecoyFree),
+
+            precursor_fdr: options.precursor_fdr.unwrap_or(0.01),
             peptide_fdr: options.peptide_fdr.unwrap_or(0.01),
             protein_fdr: options.protein_fdr.unwrap_or(0.01),
-            precursor_fdr: options.precursor_fdr.unwrap_or(0.05),
+
             // Global null window (superset pool builder)
             min_null_rank,
             max_null_rank,
 
-            // Moments-specific resolved null window
-            moments_min_null_rank,
-            moments_max_null_rank,
+            // Global parameters
+            purification_factor,
+            min_rank_count,
 
-            // MLE-specific resolved null window
-            mle_min_null_rank,
-            mle_max_null_rank,
-
-            // LowerOrder-specific resolved null window
-            lower_order_min_null_rank,
-            lower_order_max_null_rank,
-            lo_rank_key,
-            lo_k_exclude_leq,
-            lo_k_default_min,
-            lo_k_default_max,
-            lo_rank_gof_max,
-            lo_neff_enable,
-            lo_eb_tau,
-
-            // MSFDR-specific resolved null window
-            msfdr_min_null_rank,
-            msfdr_max_null_rank,
-
-            // MSFDR1_Smix-specific resolved null window
-            msfdr1_smix_min_null_rank,
-            msfdr1_smix_max_null_rank,
-
-            // MSFDR2_Smix-specific resolved null window
-            msfdr2_smix_min_null_rank,
-            msfdr2_smix_max_null_rank,
-
-            // Nokoi-specific resolved null window
-            nokoi_min_null_rank,
-            nokoi_max_null_rank,
+            mix_em_max_iter,
+            mix_em_tol,
+            mix_pi_clamp_min,
+            mix_pi_clamp_max,
+            mix_anchor_incorrect,
 
             model_fit: options.model_fit.unwrap_or(ModelFit::Ensemble),
             type_: options.type_.unwrap_or(FdrType::Storey),
@@ -757,46 +802,68 @@ impl From<FdrOptions> for FdrSettings {
             storey_degen_fallback,
 
             calibrate_per_method,
-
-            nokoi_k_folds,
-            nokoi_pos_p_thresh,
-            nokoi_pos_rule,
-
             null_only_pep_mode,
 
-            ensemble_p_combiner,
-            ensemble_pep_combiner,
+            // Moments-specific resolved null window
+            moments_min_null_rank,
+            moments_max_null_rank,
 
+            // MLE-specific resolved null window
+            mle_min_null_rank,
+            mle_max_null_rank,
+
+            // LowerOrder-specific resolved null window
+            lower_order_min_null_rank,
+            lower_order_max_null_rank,
+            lo_rank_key,
+            lo_mode,
+            lo_lom_estimator,
+            lo_stratify,
+            lo_score,
+            lo_mean_beta_mode,
+            lo_mean_beta_min_rank,
+            lo_mean_beta_count,
+            lo_lr_window_size,
+
+            // MSFDR-specific resolved null window
+            enable_msfdr_seeded,
+            msfdr_min_null_rank,
+            msfdr_max_null_rank,
             msfdr_use_canonical_pep,
             msfdr_multistart,
+            msfdr_pi_clamp_min,
+            msfdr_pi_clamp_max,
 
+            // MSFDR1_Smix-specific resolved null window
+            enable_msfdr_1smix,
+            msfdr1_smix_min_null_rank,
+            msfdr1_smix_max_null_rank,
             msfdr1_bottom_frac_init,
             msfdr1_top_frac_init,
             msfdr1_beta_drift_mult,
             msfdr1_mu_drift_abs,
+            msfdr1_pi_clamp_min,
+            msfdr1_pi_clamp_max,
+
+            // MSFDR2_Smix-specific resolved null window
+            enable_msfdr_2smix,
+            msfdr2_smix_min_null_rank,
+            msfdr2_smix_max_null_rank,
             msfdr2_beta_drift_mult,
             msfdr2_mu_drift_abs,
             msfdr2_top_frac_init,
-
-            enable_msfdr_seeded,
-            enable_msfdr_1smix,
-            enable_msfdr_2smix,
-
-            mix_em_max_iter,
-            mix_em_tol,
-            mix_pi_clamp_min,
-            mix_pi_clamp_max,
-            mix_anchor_incorrect,
-
-            msfdr_pi_clamp_min,
-            msfdr_pi_clamp_max,
-            msfdr1_pi_clamp_min,
-            msfdr1_pi_clamp_max,
             msfdr2_pi_clamp_min,
             msfdr2_pi_clamp_max,
 
-            purification_factor,
-            min_rank_count,
+            // Nokoi-specific resolved null window
+            nokoi_min_null_rank,
+            nokoi_max_null_rank,
+            nokoi_k_folds,
+            nokoi_pos_p_thresh,
+            nokoi_pos_rule,
+
+            ensemble_p_combiner,
+            ensemble_pep_combiner,
         }
     }
 }
