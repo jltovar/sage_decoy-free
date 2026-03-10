@@ -225,22 +225,24 @@ These defaults enable the full ensemble (Seeded, 1SMix, 2SMix, Nokoi, and Base M
 * **`nokoi_k_folds`**: Number of folds used for Nokoi cross-fit null calibration.
 * **`nokoi_l1_lambda_min, nokoi_l1_lambda_max, nokoi_l1_lambda_steps`**: Log-spaced search grid for the L1 regularization penalty used during Nokoi CV training.
 * **`Recommended Nokoi profile: smaller / fragile / low-input datasets`**:
-
+```json
 "nokoi_min_null_rank": 2,
 "nokoi_max_null_rank": 9,
 "nokoi_k_folds": 2,
 "nokoi_l1_lambda_min": 1e-4,
 "nokoi_l1_lambda_max": 1e-1,
 "nokoi_l1_lambda_steps": 10
+```
 
 * **`Recommended Nokoi profile: larger / more stable datasets`**:
-
+```json
 "nokoi_min_null_rank": 2,
 "nokoi_max_null_rank": 7,
 "nokoi_k_folds": 5,
 "nokoi_l1_lambda_min": 1e-4,
 "nokoi_l1_lambda_max": 1.0,
 "nokoi_l1_lambda_steps": 15
+```
 
 
 ---
