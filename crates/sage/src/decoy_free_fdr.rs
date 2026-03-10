@@ -56,7 +56,7 @@ E) Sorting key definition (“sorted by score”) (HARD)
 ============================================================================= */
 
 use crate::database::IndexedDatabase;
-use crate::input::{EnsemblePCombiner, EnsemblePepCombiner, LoRankKey, NokoiPosRule};
+use crate::input::{EnsemblePCombiner, EnsemblePepCombiner, LoRankKey};
 use crate::input::{FdrSettings, FdrType, ModelFit};
 use crate::input::{LoScore, LoStratify};
 use crate::lfq::{Peak, PrecursorId};
@@ -1184,9 +1184,6 @@ fn fit_engines(
         return None;
     }
 
-    // Standard Gumbel for TEV-normalized sf inputs (used in Nokoi provisional p gate).
-    let std_gumbel = Gumbel::new(0.0, 1.0).expect("standard gumbel");
-
     // 2) LO: call the Lower Order fitter
 
     fn build_lo_per_spectrum_center(
@@ -1443,168 +1440,162 @@ fn fit_engines(
     if run_nokoi {
         log::info!("Running Nokoi Rescoring ...");
 
-        // Fail-closed if Nokoi's selected null window is too small.
         let nokoi_window_fit_data =
             pool.fit_data_in_window(settings.nokoi_min_null_rank, settings.nokoi_max_null_rank);
 
-        if window_ok(
+        let nokoi_window_ok = window_ok(
             "Nokoi",
             settings.nokoi_min_null_rank,
             settings.nokoi_max_null_rank,
             nokoi_window_fit_data.len(),
-        ) {
-            // Window size valid; proceed to positive selection and crossfit.
+        );
+
+        if !nokoi_window_ok {
+            log::warn!(
+                "Nokoi disabled: invalid/too-small null window [{}..={}], count={}",
+                settings.nokoi_min_null_rank,
+                settings.nokoi_max_null_rank,
+                nokoi_window_fit_data.len()
+            );
         } else {
-            // Fail-closed: skip Nokoi entirely.
-        }
+            // Independent Nokoi positives:
+            // rank==1 AND hyperscore in purified top slice
+            let mut rank1_hs: Vec<f64> = work
+                .rank1_indices
+                .iter()
+                .filter_map(|&i| tev(&features[i]))
+                .collect();
 
-        // Positives:
-        // rank==1 AND (hyperscore high enough OR provisional p-value check using moments null)
-        //
-        // "high enough" threshold uses the same purification logic style:
-        // top_k = round(purification_factor * n_rank1), clamped to [5, n_rank1]
-        let mut rank1_hs: Vec<f64> = work
-            .rank1_indices
-            .iter()
-            .filter_map(|&i| tev(&features[i]))
-            .collect();
-
-        let pos_hyperscore_threshold: f64 = if rank1_hs.len() >= 10 {
-            rank1_hs.sort_by(|a, b| b.total_cmp(a));
-            let top_k = ((rank1_hs.len() as f64) * settings.purification_factor).round() as usize;
-            let top_k = top_k.max(5).min(rank1_hs.len());
-            rank1_hs[top_k - 1]
-        } else {
-            // If too few rank1, rely on provisional p-value only
-            f64::INFINITY
-        };
-
-        // Provisional p-value threshold (moments null), used by Nokoi positive selection.
-        let nokoi_pos_p_thresh: f64 = settings.nokoi_pos_p_thresh;
-        let nokoi_pos_rule: NokoiPosRule = settings.nokoi_pos_rule.clone();
-
-        let is_positive = |f: &DfFeature| -> bool {
-            if f.core.rank != 1 {
-                return false;
-            }
-
-            let x = match tev(f) {
-                Some(v) => v,
-                None => return false,
+            let pos_hyperscore_threshold: f64 = if rank1_hs.len() >= 10 {
+                rank1_hs.sort_by(|a, b| b.total_cmp(a));
+                let top_k =
+                    ((rank1_hs.len() as f64) * settings.purification_factor).round() as usize;
+                let top_k = top_k.max(5).min(rank1_hs.len());
+                rank1_hs[top_k - 1]
+            } else {
+                f64::INFINITY
             };
 
-            let top_hit = x >= pos_hyperscore_threshold;
+            let is_positive = |f: &DfFeature| -> bool {
+                if f.core.rank != 1 {
+                    return false;
+                }
 
-            let tev0 = tev_norm_from_hyperscore(x, mu_mom, beta_mom);
-            let p0 = std_gumbel.sf(tev0).clamp(0.0, 1.0).max(1e-300);
-            let p_hit = p0 <= nokoi_pos_p_thresh;
+                let x = match tev(f) {
+                    Some(v) => v,
+                    None => return false,
+                };
 
-            match nokoi_pos_rule {
-                NokoiPosRule::Or => top_hit || p_hit,
-                NokoiPosRule::And => top_hit && p_hit,
-                NokoiPosRule::TopOnly => top_hit,
-                NokoiPosRule::POnly => p_hit,
-            }
-        };
+                x >= pos_hyperscore_threshold
+            };
 
-        if log::log_enabled!(log::Level::Debug) {
-            let n_pos = features.iter().filter(|f| is_positive(f)).count();
-            let n_neg = features
-                .iter()
-                .filter(|f| {
-                    if is_positive(f) {
-                        return false;
-                    }
-                    let r = f.core.rank as u32;
-                    r >= settings.nokoi_min_null_rank && r <= settings.nokoi_max_null_rank
-                })
-                .count();
-
-            log::debug!(
-                "DF DEBUG Nokoi: pos_rule={:?} pos_hyperscore_threshold={:.6} nokoi_pos_p_thresh={:.6} min_null_rank={} max_null_rank={} n_pos={} n_neg={}",
-                nokoi_pos_rule,
-                pos_hyperscore_threshold,
-                nokoi_pos_p_thresh,
-                settings.min_null_rank,
-                settings.max_null_rank,
-                n_pos,
-                n_neg
-            );
-        }
-
-        let (probs, null_scores_oof) = nokoi::rescore_df_crossfit(
-            features,
-            0.01, // epsilon (same as before)
-            settings.nokoi_min_null_rank,
-            settings.nokoi_max_null_rank,
-            settings.nokoi_k_folds,
-            is_positive,
-            &pool.null_indices,
-        )?; // (P(target) for all, OOF null scores for pool.null_indices)
-
-        // Contract: probs must align 1:1 with `features`.
-        if probs.len() != features.len() {
-            log::error!(
-                "Nokoi probabilities not aligned: probs.len()={} features.len()={}. Disabling Nokoi.",
-                probs.len(),
-                features.len()
-            );
-        } else {
-            // 1) Save raw P(target) (for pep_nokoi = 1 - P(target))
-            let mut prob = probs;
-            for v in &mut prob {
-                let vv = if v.is_finite() { *v } else { 0.0 };
-                *v = vv.clamp(0.0, 1.0);
-            }
-            let prob_arc = Arc::new(prob);
-
-            // 2) Build null score distribution from out-of-fold predictions (non-circular)
-            let mut null_scores: Vec<f64> = null_scores_oof;
-            null_scores.retain(|x| x.is_finite());
-            null_scores.sort_by(|a, b| a.total_cmp(b));
-
-            if log::log_enabled!(log::Level::Debug) && !null_scores.is_empty() {
-                let n = null_scores.len();
-                let idx01 = ((n as f64 - 1.0) * 0.01).round() as usize;
-                let idx50 = ((n as f64 - 1.0) * 0.50).round() as usize;
-                let idx99 = ((n as f64 - 1.0) * 0.99).round() as usize;
-
-                let p01 = null_scores[idx01.min(n - 1)];
-                let p50 = null_scores[idx50.min(n - 1)];
-                let p99 = null_scores[idx99.min(n - 1)];
+            if log::log_enabled!(log::Level::Debug) {
+                let n_pos = features.iter().filter(|f| is_positive(f)).count();
+                let n_neg = features
+                    .iter()
+                    .filter(|f| {
+                        if is_positive(f) {
+                            return false;
+                        }
+                        let r = f.core.rank as u32;
+                        r >= settings.nokoi_min_null_rank && r <= settings.nokoi_max_null_rank
+                    })
+                    .count();
 
                 log::debug!(
-                    "DF DEBUG Nokoi null_scores quantiles: n_null={} p01={:.6} p50={:.6} p99={:.6}",
-                    n,
-                    p01,
-                    p50,
-                    p99
+                    "DF DEBUG Nokoi: pos_hyperscore_threshold={:.6} nokoi_min_null_rank={} nokoi_max_null_rank={} n_pos={} n_neg={} l1_lambda_min={:.6e} l1_lambda_max={:.6e} l1_lambda_steps={}",
+                    pos_hyperscore_threshold,
+                    settings.nokoi_min_null_rank,
+                    settings.nokoi_max_null_rank,
+                    n_pos,
+                    n_neg,
+                    settings.nokoi_l1_lambda_min,
+                    settings.nokoi_l1_lambda_max,
+                    settings.nokoi_l1_lambda_steps
                 );
             }
 
-            if null_scores.len() < 10 {
-                log::warn!(
-                    "Nokoi: rank-null pool too small for null calibration (n_null={}); disabling Nokoi p-values.",
-                    null_scores.len()
-                );
-                // still keep probabilities for pep
-                nokoi_prob_target = Some(prob_arc);
+            let nokoi_config = nokoi::NokoiConfig {
+                enabled: true,
+                train_fdr: 0.01,
+                learning_rate: 0.1,
+                epochs: 500,
+                patience: 15,
+                l1_lambda: settings.nokoi_l1_lambda_min,
+                l1_lambda_min: settings.nokoi_l1_lambda_min,
+                l1_lambda_max: settings.nokoi_l1_lambda_max,
+                l1_lambda_steps: settings.nokoi_l1_lambda_steps,
+            };
+
+            if let Some((probs, null_scores_oof)) = nokoi::rescore_df_crossfit(
+                features,
+                &nokoi_config,
+                settings.nokoi_min_null_rank,
+                settings.nokoi_max_null_rank,
+                settings.nokoi_k_folds,
+                is_positive,
+                &pool.null_indices,
+            ) {
+                if probs.len() != features.len() {
+                    log::error!(
+                        "Nokoi probabilities not aligned: probs.len()={} features.len()={}. Disabling Nokoi.",
+                        probs.len(),
+                        features.len()
+                    );
+                } else {
+                    let mut prob = probs;
+                    for v in &mut prob {
+                        let vv = if v.is_finite() { *v } else { 0.0 };
+                        *v = vv.clamp(0.0, 1.0);
+                    }
+                    let prob_arc = Arc::new(prob);
+
+                    let mut null_scores: Vec<f64> = null_scores_oof;
+                    null_scores.retain(|x| x.is_finite());
+                    null_scores.sort_by(|a, b| a.total_cmp(b));
+
+                    if log::log_enabled!(log::Level::Debug) && !null_scores.is_empty() {
+                        let n = null_scores.len();
+                        let idx01 = ((n as f64 - 1.0) * 0.01).round() as usize;
+                        let idx50 = ((n as f64 - 1.0) * 0.50).round() as usize;
+                        let idx99 = ((n as f64 - 1.0) * 0.99).round() as usize;
+
+                        let p01 = null_scores[idx01.min(n - 1)];
+                        let p50 = null_scores[idx50.min(n - 1)];
+                        let p99 = null_scores[idx99.min(n - 1)];
+
+                        log::debug!(
+                            "DF DEBUG Nokoi null_scores quantiles: n_null={} p01={:.6} p50={:.6} p99={:.6}",
+                            n,
+                            p01,
+                            p50,
+                            p99
+                        );
+                    }
+
+                    if null_scores.len() < 10 {
+                        log::warn!(
+                            "Nokoi: rank-null pool too small for null calibration (n_null={}); disabling Nokoi p-values.",
+                            null_scores.len()
+                        );
+                        nokoi_prob_target = Some(prob_arc);
+                    } else {
+                        let mut p_all = vec![1.0f64; features.len()];
+                        for (i, &pt) in prob_arc.iter().enumerate() {
+                            p_all[i] = empirical_p_from_null_ge(&null_scores, pt);
+                        }
+
+                        for v in &mut p_all {
+                            let vv = if v.is_finite() { *v } else { 1.0 };
+                            *v = vv.clamp(0.0, 1.0).max(1e-300);
+                        }
+
+                        nokoi_prob_target = Some(prob_arc);
+                        nokoi_p_values = Some(Arc::new(p_all));
+                    }
+                }
             } else {
-                // 3) Compute p-values for all PSMs using that null
-                // Higher prob_target = better => smaller p (tail on >=)
-                let mut p_all = vec![1.0f64; features.len()];
-                for (i, &pt) in prob_arc.iter().enumerate() {
-                    p_all[i] = empirical_p_from_null_ge(&null_scores, pt);
-                }
-
-                // sanitize/clamp once
-                for v in &mut p_all {
-                    let vv = if v.is_finite() { *v } else { 1.0 };
-                    *v = vv.clamp(0.0, 1.0).max(1e-300);
-                }
-
-                nokoi_prob_target = Some(prob_arc);
-                nokoi_p_values = Some(Arc::new(p_all));
+                log::warn!("Nokoi disabled: crossfit training/calibration failed closed.");
             }
         }
     }

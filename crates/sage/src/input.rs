@@ -340,9 +340,10 @@ pub struct FdrOptions {
     // Nokoi DF cross-fit calibration
     pub nokoi_k_folds: Option<usize>,
 
-    // Nokoi DF positive selection knobs
-    pub nokoi_pos_p_thresh: Option<f64>,
-    pub nokoi_pos_rule: Option<NokoiPosRule>,
+    // Nokoi L1 lambda grid (JSON-exposed)
+    pub nokoi_l1_lambda_min: Option<f64>,
+    pub nokoi_l1_lambda_max: Option<f64>,
+    pub nokoi_l1_lambda_steps: Option<usize>,
 }
 
 #[derive(Clone, Serialize, Debug)]
@@ -446,9 +447,10 @@ pub struct FdrSettings {
     // Nokoi DF cross-fit calibration
     pub nokoi_k_folds: usize,
 
-    // Nokoi DF positive selection knobs
-    pub nokoi_pos_p_thresh: f64,
-    pub nokoi_pos_rule: NokoiPosRule,
+    // Nokoi L1 lambda grid
+    pub nokoi_l1_lambda_min: f64,
+    pub nokoi_l1_lambda_max: f64,
+    pub nokoi_l1_lambda_steps: usize,
 
     // Null-only PEP strategy (Moments/MLE/LO)
     pub null_only_pep_mode: NullOnlyPepMode,
@@ -556,9 +558,14 @@ impl From<FdrOptions> for FdrSettings {
 
         let nokoi_k_folds = options.nokoi_k_folds.unwrap_or(2).max(2).min(20);
 
-        let nokoi_pos_p_thresh = options.nokoi_pos_p_thresh.unwrap_or(1e-6).clamp(0.0, 1.0);
+        let nokoi_l1_lambda_min = options.nokoi_l1_lambda_min.unwrap_or(1e-4).max(1e-12);
 
-        let nokoi_pos_rule = options.nokoi_pos_rule.unwrap_or(NokoiPosRule::And);
+        let nokoi_l1_lambda_max = options
+            .nokoi_l1_lambda_max
+            .unwrap_or(1e-1)
+            .max(nokoi_l1_lambda_min);
+
+        let nokoi_l1_lambda_steps = options.nokoi_l1_lambda_steps.unwrap_or(10).clamp(1, 100);
 
         let null_only_pep_mode = options
             .null_only_pep_mode
@@ -859,8 +866,9 @@ impl From<FdrOptions> for FdrSettings {
             nokoi_min_null_rank,
             nokoi_max_null_rank,
             nokoi_k_folds,
-            nokoi_pos_p_thresh,
-            nokoi_pos_rule,
+            nokoi_l1_lambda_min,
+            nokoi_l1_lambda_max,
+            nokoi_l1_lambda_steps,
 
             ensemble_p_combiner,
             ensemble_pep_combiner,

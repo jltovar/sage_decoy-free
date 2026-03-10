@@ -37,8 +37,14 @@ Derived from the work of Peng et al. (2020), this fork implements **three distin
 
 3. **Machine Learning (Nokoi 2.0):**
 * **Algorithm:** L1-regularized Logistic Regression (Lasso) optimized via **FISTA** (Fast Iterative Shrinkage-Thresholding Algorithm).
-* **Scoring:** Generates probabilities .
-* **Calibration:** Calculates empirical p-values by comparing the ML score against the null distribution of lower-ranked matches.
+* **Training Labels:** In decoy-free mode, Nokoi uses **high-confidence Rank-1 PSMs as positives** and **lower-ranked target-database PSMs as negatives**.
+* **Independence:** Nokoi is configured to be **independent of the parametric methods**. It does **not** require a provisional p-value gate from the Moments/MLE models to define positives.
+* **Cross-fit Null Calibration:** Nokoi can produce out-of-fold null scores from the lower-rank pool and convert `P(target)` into empirical p-values without circular reuse of the same null examples.
+* **Fail-Closed Behavior:** If the positive class, negative class, or null calibration pool is too small, Nokoi is **disabled** rather than silently falling back to another score.
+* **Regularization Tuning:** The L1 penalty is selected by cross-validation using a JSON-configurable lambda grid:
+  * `nokoi_l1_lambda_min`
+  * `nokoi_l1_lambda_max`
+  * `nokoi_l1_lambda_steps`
 
 
 
@@ -163,10 +169,11 @@ These defaults enable the full ensemble (Seeded, 1SMix, 2SMix, Nokoi, and Base M
 
   // Nokoi (Machine Learning)
   "nokoi_min_null_rank": 2,
-  "nokoi_max_null_rank": 7,
+  "nokoi_max_null_rank": 5,
   "nokoi_k_folds": 2,
-  "nokoi_pos_p_thresh": 0.000001,
-  "nokoi_pos_rule": "and"
+  "nokoi_l1_lambda_min": 1e-4,
+  "nokoi_l1_lambda_max": 1e-1,
+  "nokoi_l1_lambda_steps": 10
 }
 
 ```
@@ -214,11 +221,26 @@ These defaults enable the full ensemble (Seeded, 1SMix, 2SMix, Nokoi, and Base M
 
 #### Nokoi (ML)
 
-* **`nokoi_pos_rule`**: How to select positive training examples.
-* `"and"`: Must be top-rank AND have low provisional p-value (Default).
-* `"or"`: Top-rank OR low p-value.
-* `"top_only"`, `"p_only"`.
+* **`nokoi_min_null_rank, nokoi_max_null_rank`**: Rank window used to define Nokoi’s negative class in decoy-free mode..
+* **`nokoi_k_folds`**: Number of folds used for Nokoi cross-fit null calibration.
+* **`nokoi_l1_lambda_min, nokoi_l1_lambda_max, nokoi_l1_lambda_steps`**: Log-spaced search grid for the L1 regularization penalty used during Nokoi CV training.
+* **`Recommended Nokoi profile: smaller / fragile / low-input datasets`**:
 
+"nokoi_min_null_rank": 2,
+"nokoi_max_null_rank": 9,
+"nokoi_k_folds": 2,
+"nokoi_l1_lambda_min": 1e-4,
+"nokoi_l1_lambda_max": 1e-1,
+"nokoi_l1_lambda_steps": 10
+
+* **`Recommended Nokoi profile: larger / more stable datasets`**:
+
+"nokoi_min_null_rank": 2,
+"nokoi_max_null_rank": 7,
+"nokoi_k_folds": 5,
+"nokoi_l1_lambda_min": 1e-4,
+"nokoi_l1_lambda_max": 1.0,
+"nokoi_l1_lambda_steps": 15
 
 
 ---

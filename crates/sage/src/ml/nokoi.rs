@@ -13,11 +13,19 @@ const NOKOI_CROSSFIT_SEED: u64 = 0x5EED_5EED_5EED_5EED;
 pub struct NokoiConfig {
     pub enabled: bool,
     pub train_fdr: f32,
-    // Hyperparameters
+
+    // Optimizer hyperparameters
     pub learning_rate: f64,
     pub epochs: usize,
-    pub l1_lambda: f64,  // L1 (Lasso) Regularization
-    pub patience: usize, // Early stopping patience
+    pub patience: usize,
+
+    // Initial/fallback single-lambda value used by direct training calls
+    pub l1_lambda: f64,
+
+    // CV-tuned lambda grid
+    pub l1_lambda_min: f64,
+    pub l1_lambda_max: f64,
+    pub l1_lambda_steps: usize,
 }
 
 impl Default for NokoiConfig {
@@ -26,9 +34,12 @@ impl Default for NokoiConfig {
             enabled: false,
             train_fdr: 0.01,
             learning_rate: 0.1,
-            epochs: 250,      // Reduced default because FISTA converges faster
-            l1_lambda: 0.001, // L1 usually requires smaller lambda than L2
-            patience: 10,     // Stop if no improvement for 10 epochs
+            epochs: 250,
+            patience: 10,
+            l1_lambda: 0.001,
+            l1_lambda_min: 1e-4,
+            l1_lambda_max: 1e-1,
+            l1_lambda_steps: 10,
         }
     }
 }
@@ -230,30 +241,42 @@ impl LogisticRegression {
             return;
         }
 
-        // --- Log-Spaced Lambda Grid ---
-        // Search orders of magnitude: [1e-4, 1e-3, 1e-2, 1e-1, 1.0]
-        // This is much better for finding the "sparsity sweet spot"
-        // let lambdas: Vec<f64> = (0..5).map(|i| 1e-4 * 10f64.powi(i)).collect();
+        // Build log-spaced lambda grid from config
+        let steps = config.l1_lambda_steps.max(1);
+        let lambda_min = config.l1_lambda_min.max(1e-12);
+        let lambda_max = config.l1_lambda_max.max(lambda_min);
 
-        // Log-spaced grid: 2^-10 to 2^5
-        let lambdas: Vec<f64> = (-10..=5).map(|i| 2.0_f64.powi(i)).collect();
+        let mut lambdas = Vec::with_capacity(steps);
+        let min_log = lambda_min.log10();
+        let max_log = lambda_max.log10();
+        let step = if steps > 1 {
+            (max_log - min_log) / (steps as f64 - 1.0)
+        } else {
+            0.0
+        };
 
-        // Use 3-fold CV for speed, or 5 if data allows
+        for i in 0..steps {
+            lambdas.push(10.0_f64.powf(min_log + step * (i as f64)));
+        }
+
         let k_folds = if n_samples >= 100 { 5 } else { 3 };
 
-        let mut best_lambda = 0.001;
+        let mut best_lambda = lambda_min;
         let mut best_loss = f64::INFINITY;
 
         log::info!(
-            "Nokoi: Tuning L1 Lambda via {}-fold CV with Early Stopping...",
-            k_folds
+            "Nokoi: Tuning L1 Lambda via {}-fold CV (range {:.6e} .. {:.6e}, steps={})...",
+            k_folds,
+            lambda_min,
+            lambda_max,
+            steps
         );
 
         for &lambda in &lambdas {
             let mut total_loss = 0.0;
+            let mut fold_collapsed = false;
 
             for fold in 0..k_folds {
-                // Split Data for this Fold
                 let start = fold * n_samples / k_folds;
                 let end = (fold + 1) * n_samples / k_folds;
 
@@ -272,10 +295,25 @@ impl LogisticRegression {
                 let final_loss =
                     fold_model.train_with_early_stopping(&train_set, &val_set, config, lambda);
 
+                let nonzero_features = fold_model
+                    .weights
+                    .iter()
+                    .filter(|&&w| w.abs() > 1e-6)
+                    .count();
+
+                if nonzero_features == 0 {
+                    fold_collapsed = true;
+                    break;
+                }
+
                 total_loss += final_loss;
             }
 
-            let avg_loss = total_loss / k_folds as f64;
+            let avg_loss = if fold_collapsed {
+                f64::INFINITY
+            } else {
+                total_loss / k_folds as f64
+            };
 
             if avg_loss < best_loss {
                 best_loss = avg_loss;
@@ -283,18 +321,24 @@ impl LogisticRegression {
             }
         }
 
-        log::info!(
-            "Nokoi: Best L1 Lambda = {:.5} (Loss: {:.4})",
-            best_lambda,
-            best_loss
-        );
+        if !best_loss.is_finite() {
+            log::warn!(
+                "Nokoi: all CV lambdas collapsed the model; defaulting to lowest lambda {:.6e}",
+                lambda_min
+            );
+            best_lambda = lambda_min;
+        } else {
+            log::info!(
+                "Nokoi: Best L1 Lambda = {:.6e} (Loss: {:.6})",
+                best_lambda,
+                best_loss
+            );
+        }
 
-        // 3. Final Fit on All Data
         let split_idx = (n_samples as f64 * 0.8) as usize;
         let (train, val) = data.split_at(split_idx);
         self.train_with_early_stopping(train, val, config, best_lambda);
 
-        // Inspect weights to see what was zeroed out
         let nonzero_features = self.weights.iter().filter(|&&w| w.abs() > 1e-6).count();
         log::info!(
             "Nokoi: Final model selected {}/{} features.",
@@ -394,8 +438,11 @@ pub fn rescore(
         train_fdr,
         learning_rate: 0.1,
         epochs: 500,
-        l1_lambda: 0.005, // Initial guess, but train_cv will explore better grid
         patience: 15,
+        l1_lambda: 0.005,
+        l1_lambda_min: 1e-4,
+        l1_lambda_max: 1e-1,
+        l1_lambda_steps: 10,
     };
 
     // 1. Separate Positives and Negatives
@@ -551,8 +598,11 @@ pub fn rescore_df(
         train_fdr,
         learning_rate: 0.1,
         epochs: 500,
-        l1_lambda: 0.005,
         patience: 15,
+        l1_lambda: 0.005,
+        l1_lambda_min: 1e-4,
+        l1_lambda_max: 1e-1,
+        l1_lambda_steps: 10,
     };
 
     // 1) Build positives/negatives + all_data (predict on everything)
@@ -732,7 +782,7 @@ pub fn rescore_df(
 ///  - null_scores_oof: out-of-fold P(target) for indices in `null_indices` (non-circular null dist)
 pub fn rescore_df_crossfit(
     features: &[DfFeature],
-    train_fdr: f32,
+    config: &NokoiConfig,
     min_null_rank: u32,
     max_null_rank: u32,
     k_folds: usize,
@@ -770,41 +820,13 @@ pub fn rescore_df_crossfit(
         );
     }
 
-    // If too few positives/negatives, fall back to normalized hyperscore (same behavior as rescore_df)
-    // and return null_scores_oof from that score (safe; no circular training).
     if positives_idx.len() < 50 || negatives_idx.len() < 50 {
         log::warn!(
-            "Nokoi DF crossfit: insufficient data (pos={} neg={}) - falling back to normalized hyperscore",
+            "Nokoi DF crossfit: insufficient data (pos={} neg={}) - disabling Nokoi (fail-closed)",
             positives_idx.len(),
             negatives_idx.len()
         );
-
-        let min_hs = features
-            .iter()
-            .map(|f| f.core.hyperscore as f64)
-            .fold(f64::INFINITY, f64::min);
-        let max_hs = features
-            .iter()
-            .map(|f| f.core.hyperscore as f64)
-            .fold(f64::NEG_INFINITY, f64::max);
-        let range = max_hs - min_hs;
-
-        let prob_all: Vec<f64> = if range == 0.0 {
-            vec![0.5; features.len()]
-        } else {
-            features
-                .iter()
-                .map(|f| ((f.core.hyperscore as f64 - min_hs) / range).clamp(0.0, 1.0))
-                .collect()
-        };
-
-        let mut null_oof: Vec<f64> = Vec::with_capacity(null_indices.len());
-        for &j in null_indices {
-            if j < prob_all.len() {
-                null_oof.push(prob_all[j]);
-            }
-        }
-        return Some((prob_all, null_oof));
+        return None;
     }
 
     // ---- 1) Cross-fit null candidate set: intersection of provided null_indices and rank-window negatives ----
@@ -822,34 +844,10 @@ pub fn rescore_df_crossfit(
 
     if null_cand.len() < 50 {
         log::warn!(
-            "Nokoi DF crossfit: too few null candidates after intersect ({} < 50) - falling back to normalized hyperscore",
+            "Nokoi DF crossfit: too few null candidates after intersect ({} < 50) - disabling Nokoi (fail-closed)",
             null_cand.len()
         );
-
-        let min_hs = features
-            .iter()
-            .map(|f| f.core.hyperscore as f64)
-            .fold(f64::INFINITY, f64::min);
-        let max_hs = features
-            .iter()
-            .map(|f| f.core.hyperscore as f64)
-            .fold(f64::NEG_INFINITY, f64::max);
-        let range = max_hs - min_hs;
-
-        let prob_all: Vec<f64> = if range == 0.0 {
-            vec![0.5; features.len()]
-        } else {
-            features
-                .iter()
-                .map(|f| ((f.core.hyperscore as f64 - min_hs) / range).clamp(0.0, 1.0))
-                .collect()
-        };
-
-        let mut null_oof: Vec<f64> = Vec::with_capacity(null_cand.len());
-        for &j in &null_cand {
-            null_oof.push(prob_all[j]);
-        }
-        return Some((prob_all, null_oof));
+        return None;
     }
 
     // Deterministic shuffle for folds
@@ -874,16 +872,6 @@ pub fn rescore_df_crossfit(
                      neg_idx: &[usize],
                      seed: u64|
      -> Option<(LogisticRegression, Vec<f64>, Vec<f64>)> {
-        // Nokoi config (same defaults as rescore_df)
-        let config = NokoiConfig {
-            enabled: true,
-            train_fdr,
-            learning_rate: 0.1,
-            epochs: 500,
-            l1_lambda: 0.005,
-            patience: 15,
-        };
-
         // Build labeled PsmData pools
         let mut pos: Vec<PsmData> = Vec::with_capacity(pos_idx.len());
         let mut neg: Vec<PsmData> = Vec::with_capacity(neg_idx.len());
@@ -915,6 +903,10 @@ pub fn rescore_df_crossfit(
         neg.shuffle(&mut rng);
 
         let sample_size = pos.len().min(neg.len()).min(10_000);
+        if sample_size == 0 {
+            return None;
+        }
+
         let mut training_data = Vec::with_capacity(sample_size * 2);
         training_data.extend_from_slice(&pos[0..sample_size]);
         training_data.extend_from_slice(&neg[0..sample_size]);
@@ -925,7 +917,7 @@ pub fn rescore_df_crossfit(
 
         let n_features = training_data[0].features.len();
         let mut model = LogisticRegression::new(n_features);
-        model.train_cv(&training_data, &config);
+        model.train_cv(&training_data, config);
 
         Some((model, means, stds))
     };
