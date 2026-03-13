@@ -132,28 +132,15 @@ pub enum NokoiPosRule {
     POnly,
 }
 
-/// How to combine p-values in ensemble mode.
-#[derive(Clone, Serialize, Deserialize, Debug, Default, PartialEq, Eq)]
-#[serde(rename_all = "snake_case")]
-pub enum EnsemblePCombiner {
-    #[default]
-    Hmp,
-    Fisher,
-    Brown,
-    Cauchy,     // robust under dependence
-    MedianBeta, // order-statistic consensus (median via Beta CDF)
-    Stouffer,   // Z-combination (equal weights)
-    SidakMinP,  // Sidak-adjusted min-p (multiplicity-controlled)
-}
-
 /// How to combine PEPs in ensemble mode.
 #[derive(Clone, Serialize, Deserialize, Debug, Default, PartialEq, Eq)]
 #[serde(rename_all = "snake_case")]
 pub enum EnsemblePepCombiner {
     #[default]
-    LogitMean,
+    Median,
+    TrimmedMean,
+    Max,
     Mean,
-    GeometricMean,
 }
 
 /// Mandatory PEP derivation for null-only methods (Moments/MLE/LO).
@@ -238,7 +225,6 @@ pub struct FdrOptions {
     pub calibrate_per_method: Option<bool>,
 
     // Ensemble combination choices (global controls; used by ModelFit::Ensemble)
-    pub ensemble_p_combiner: Option<EnsemblePCombiner>,
     pub ensemble_pep_combiner: Option<EnsemblePepCombiner>,
 
     // =========================================================================
@@ -310,6 +296,7 @@ pub struct FdrOptions {
 
     // MSFDR init/drift knobs (needed by real models)
     pub msfdr1_bottom_frac_init: Option<f64>, // default 0.7
+    pub msfdr_seeded_top_frac_init: Option<f64>, // default 0.2
     pub msfdr1_top_frac_init: Option<f64>,    // default 0.2
 
     // Expose drift clamps for MSFDR1
@@ -326,7 +313,10 @@ pub struct FdrOptions {
     pub msfdr2_mu_drift_abs: Option<f64>,           // default 5.0
     pub msfdr2_top_frac_init: Option<f64>, // default = msfdr1_top_frac_init (optional but clean)
 
-    // MSFDR gates (Ensemble uses these; explicit model_fit variants override gates)
+    // Ensemble expert gates (Ensemble uses these; explicit model_fit variants override gates)
+    pub enable_moments: Option<bool>,      // default true
+    pub enable_mle: Option<bool>,          // default true
+    pub enable_lower_order: Option<bool>,  // default true
     pub enable_msfdr_seeded: Option<bool>, // default true
     pub enable_msfdr_1smix: Option<bool>,  // default true
     pub enable_msfdr_2smix: Option<bool>,  // default true
@@ -456,7 +446,6 @@ pub struct FdrSettings {
     pub null_only_pep_mode: NullOnlyPepMode,
 
     // Ensemble combination choices
-    pub ensemble_p_combiner: EnsemblePCombiner,
     pub ensemble_pep_combiner: EnsemblePepCombiner,
 
     // MSFDR controls
@@ -464,18 +453,22 @@ pub struct FdrSettings {
     pub msfdr_multistart: usize,
 
     // MSFDR init/drift knobs (needed by real models)
-    pub msfdr1_bottom_frac_init: f64,
+    pub msfdr_seeded_top_frac_init: f64,
     pub msfdr1_top_frac_init: f64,
+    pub msfdr1_bottom_frac_init: f64,
     pub msfdr1_beta_drift_mult: (f64, f64),
     pub msfdr1_mu_drift_abs: f64,
     pub msfdr2_beta_drift_mult: (f64, f64),
     pub msfdr2_mu_drift_abs: f64,
     pub msfdr2_top_frac_init: f64, // optional but clean
 
-    // MSFDR gates (Ensemble uses these; explicit model_fit variants override gates)
-    pub enable_msfdr_seeded: bool,
-    pub enable_msfdr_1smix: bool,
-    pub enable_msfdr_2smix: bool,
+    // Ensemble expert gates (Ensemble uses these; explicit model_fit variants override gates)
+    pub enable_moments: bool,      // default true
+    pub enable_mle: bool,          // default true
+    pub enable_lower_order: bool,  // default true
+    pub enable_msfdr_seeded: bool, // default true
+    pub enable_msfdr_1smix: bool,  // default true
+    pub enable_msfdr_2smix: bool,  // default true
 
     // Mixture knobs (MSFDR 1smix / 2smix)
     pub mix_em_max_iter: usize,
@@ -571,13 +564,9 @@ impl From<FdrOptions> for FdrSettings {
             .null_only_pep_mode
             .unwrap_or(NullOnlyPepMode::PepFromQHeuristic);
 
-        let ensemble_p_combiner = options
-            .ensemble_p_combiner
-            .unwrap_or(EnsemblePCombiner::Cauchy);
-
         let ensemble_pep_combiner = options
             .ensemble_pep_combiner
-            .unwrap_or(EnsemblePepCombiner::GeometricMean);
+            .unwrap_or(EnsemblePepCombiner::Median);
 
         let msfdr_use_canonical_pep = options.msfdr_use_canonical_pep.unwrap_or(true);
 
@@ -592,6 +581,9 @@ impl From<FdrOptions> for FdrSettings {
                 default
             }
         };
+
+        let msfdr_seeded_top_frac_init =
+            clamp_frac(options.msfdr_seeded_top_frac_init.unwrap_or(0.20), 0.20);
 
         let msfdr1_bottom_frac_init =
             clamp_frac(options.msfdr1_bottom_frac_init.unwrap_or(0.50), 0.50);
@@ -623,7 +615,10 @@ impl From<FdrOptions> for FdrSettings {
             _ => 0.5,
         };
 
-        // MSFDR enable flags (used by Ensemble gating; explicit model_fit overrides later)
+        // Ensemble expert gates (Ensemble uses these; explicit model_fit variants override gates)
+        let enable_moments = options.enable_moments.unwrap_or(true);
+        let enable_mle = options.enable_mle.unwrap_or(true);
+        let enable_lower_order = options.enable_lower_order.unwrap_or(true);
         let enable_msfdr_seeded = options.enable_msfdr_seeded.unwrap_or(true);
         let enable_msfdr_1smix = options.enable_msfdr_1smix.unwrap_or(true);
         let enable_msfdr_2smix = options.enable_msfdr_2smix.unwrap_or(true);
@@ -812,14 +807,17 @@ impl From<FdrOptions> for FdrSettings {
             null_only_pep_mode,
 
             // Moments-specific resolved null window
+            enable_moments,
             moments_min_null_rank,
             moments_max_null_rank,
 
             // MLE-specific resolved null window
+            enable_mle,
             mle_min_null_rank,
             mle_max_null_rank,
 
             // LowerOrder-specific resolved null window
+            enable_lower_order,
             lower_order_min_null_rank,
             lower_order_max_null_rank,
             lo_rank_key,
@@ -834,6 +832,7 @@ impl From<FdrOptions> for FdrSettings {
 
             // MSFDR-specific resolved null window
             enable_msfdr_seeded,
+            msfdr_seeded_top_frac_init,
             msfdr_min_null_rank,
             msfdr_max_null_rank,
             msfdr_use_canonical_pep,
@@ -870,7 +869,6 @@ impl From<FdrOptions> for FdrSettings {
             nokoi_l1_lambda_max,
             nokoi_l1_lambda_steps,
 
-            ensemble_p_combiner,
             ensemble_pep_combiner,
         }
     }

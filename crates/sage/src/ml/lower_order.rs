@@ -1267,10 +1267,10 @@ mod tests {
         ];
         let top_scores = scores.clone(); // stand-in; just need non-empty
 
-        let lr = eval_candidate_lr_range(&loms, &top_scores, 0.05, 0.40);
+        let lr = eval_candidate_lr_range(&loms, &top_scores, 0.05, 0.40, None);
         assert!(lr.is_some());
 
-        let mb = mean_beta_from_consecutive_low_orders(&loms, 8, 3);
+        let mb = compute_mean_beta(&loms, 8, 3, &crate::input::LoMeanBetaMode::Consecutive);
         assert!(mb.is_some());
     }
 

@@ -138,6 +138,7 @@ impl MsfdrSeededModel {
         mu_in: f64,
         beta_in: f64,
         iters: usize,
+        em_tol: f64,
         pi_clamp: (f64, f64),
         top_frac_init: f64,
     ) -> Option<Self> {
@@ -208,7 +209,7 @@ impl MsfdrSeededModel {
             }
 
             let avg_ll = ll / (sorted.len() as f64);
-            if prev_ll.is_finite() && (avg_ll - prev_ll).abs() < 1e-6 {
+            if prev_ll.is_finite() && (avg_ll - prev_ll).abs() < em_tol {
                 break;
             }
             prev_ll = avg_ll;
@@ -321,6 +322,7 @@ impl Msfdr1SmixModel {
     pub fn fit_rank1(
         rank1_scores: &[f64],
         iters: usize,
+        em_tol: f64,
         pi_clamp: (f64, f64),
         bottom_frac_init: f64,
         top_frac_init: f64,
@@ -452,7 +454,7 @@ impl Msfdr1SmixModel {
             }
 
             let avg_ll = ll / (n as f64);
-            if prev_ll.is_finite() && (avg_ll - prev_ll).abs() < 1e-6 {
+            if prev_ll.is_finite() && (avg_ll - prev_ll).abs() < em_tol {
                 break;
             }
             prev_ll = avg_ll;
@@ -502,6 +504,7 @@ impl Msfdr1SmixModel {
     pub fn fit_rank1_with_null_seed(
         rank1_scores: &[f64],
         iters: usize,
+        em_tol: f64,
         pi_clamp: (f64, f64),
         null_loc_seed: f64,
         null_scale_seed: f64,
@@ -585,7 +588,7 @@ impl Msfdr1SmixModel {
             }
 
             let avg_ll = ll / (n as f64);
-            if prev_ll.is_finite() && (avg_ll - prev_ll).abs() < 1e-6 {
+            if prev_ll.is_finite() && (avg_ll - prev_ll).abs() < em_tol {
                 break;
             }
             prev_ll = avg_ll;
@@ -709,6 +712,7 @@ impl Msfdr2SmixModel {
         rank1_scores: &[f64],
         pool_scores: &[f64],
         iters: usize,
+        em_tol: f64,
         pi_clamp: (f64, f64),
         top_frac_init: f64,
         mix_anchor_incorrect: bool,
@@ -795,7 +799,7 @@ impl Msfdr2SmixModel {
             }
 
             let avg_ll = ll / (n as f64);
-            if prev_ll.is_finite() && (avg_ll - prev_ll).abs() < 1e-6 {
+            if prev_ll.is_finite() && (avg_ll - prev_ll).abs() < em_tol {
                 break;
             }
             prev_ll = avg_ll;
@@ -1021,6 +1025,7 @@ mod tests {
             /*mu_in*/ 0.0,
             /*beta_in*/ 1.0,
             /*iters*/ 50,
+            /*em_tol*/ 1e-6,
             /*pi_clamp*/ (0.01, 0.99),
             /*top_frac_init*/ 0.2,
         )
@@ -1047,6 +1052,7 @@ mod tests {
         let m = Msfdr1SmixModel::fit_rank1(
             &xs,
             /*iters*/ 100,
+            /*em_tol*/ 1e-6,
             /*pi_clamp*/ (0.01, 0.99),
             /*bottom_frac_init*/ 0.7,
             /*top_frac_init*/ 0.2,
@@ -1077,6 +1083,7 @@ mod tests {
             &xs,
             &pool,
             /*iters*/ 100,
+            /*em_tol*/ 1e-6,
             /*pi_clamp*/ (0.01, 0.99),
             /*top_frac_init*/ 0.2,
             /*mix_anchor_incorrect*/ true, // anchored (null fixed to pool)
@@ -1106,7 +1113,7 @@ mod tests {
     #[test]
     fn p_value_is_generally_nonincreasing_in_x_for_seeded() {
         let xs = synthetic_rank1_scores();
-        let m = MsfdrSeededModel::fit_rank1_seeded(&xs, 0.0, 1.0, 50, (0.01, 0.99), 0.2)
+        let m = MsfdrSeededModel::fit_rank1_seeded(&xs, 0.0, 1.0, 50, 1e-6, (0.01, 0.99), 0.2)
             .expect("seeded model should fit");
 
         let g = grid(-5.0, 10.0, 801);
@@ -1133,8 +1140,9 @@ mod tests {
     #[test]
     fn p_value_is_generally_nonincreasing_in_x_for_onesmix() {
         let xs = synthetic_rank1_scores();
-        let m = Msfdr1SmixModel::fit_rank1(&xs, 100, (0.01, 0.99), 0.7, 0.2)
-            .expect("1Smix model should fit");
+        let m =
+            Msfdr1SmixModel::fit_rank1(&xs, 100, 1e-6, (0.01, 0.99), 0.7, 0.2, 0.5, (0.8, 1.25))
+                .expect("1Smix model should fit");
 
         let g = grid(-5.0, 10.0, 801);
         let mut prev = m.p_value(g[0]);
@@ -1163,6 +1171,7 @@ mod tests {
             &xs,
             &pool,
             100,
+            1e-6,
             (0.01, 0.99),
             0.2,
             true,
@@ -1199,7 +1208,7 @@ mod tests {
         // Seeded requires xs.len() >= 10 (after finite filtering)
         let too_small_9: Vec<f64> = (0..9).map(|i| i as f64).collect();
         assert!(
-            MsfdrSeededModel::fit_rank1_seeded(&too_small_9, 0.0, 1.0, 50, (0.01, 0.99), 0.2)
+            MsfdrSeededModel::fit_rank1_seeded(&too_small_9, 0.0, 1.0, 50, 1e-6, (0.01, 0.99), 0.2)
                 .is_none(),
             "seeded fit should return None for <10 rank1 scores"
         );
@@ -1207,7 +1216,17 @@ mod tests {
         // 1Smix requires xs.len() >= 20
         let too_small_19: Vec<f64> = (0..19).map(|i| i as f64).collect();
         assert!(
-            Msfdr1SmixModel::fit_rank1(&too_small_19, 50, (0.01, 0.99), 0.7, 0.2).is_none(),
+            Msfdr1SmixModel::fit_rank1(
+                &too_small_19,
+                50,
+                1e-6,
+                (0.01, 0.99),
+                0.7,
+                0.2,
+                0.5,
+                (0.8, 1.25)
+            )
+            .is_none(),
             "1Smix fit should return None for <20 rank1 scores"
         );
 
@@ -1219,6 +1238,7 @@ mod tests {
                 &rank1_19,
                 &pool_50,
                 50,
+                1e-6,
                 (0.01, 0.99),
                 0.2,
                 true,
@@ -1236,6 +1256,7 @@ mod tests {
                 &rank1_50,
                 &pool_19,
                 50,
+                1e-6,
                 (0.01, 0.99),
                 0.2,
                 true,
@@ -1257,12 +1278,15 @@ mod tests {
         let pool = synthetic_pool_scores();
 
         let seeded =
-            MsfdrSeededModel::fit_rank1_seeded(&xs, 0.0, 1.0, 50, (0.01, 0.99), 0.2).unwrap();
-        let onesmix = Msfdr1SmixModel::fit_rank1(&xs, 100, (0.01, 0.99), 0.7, 0.2).unwrap();
+            MsfdrSeededModel::fit_rank1_seeded(&xs, 0.0, 1.0, 50, 1e-6, (0.01, 0.99), 0.2).unwrap();
+        let onesmix =
+            Msfdr1SmixModel::fit_rank1(&xs, 100, 1e-6, (0.01, 0.99), 0.7, 0.2, 0.5, (0.8, 1.25))
+                .unwrap();
         let twosmix = Msfdr2SmixModel::fit_rank1_with_pool(
             &xs,
             &pool,
             100,
+            1e-6,
             (0.01, 0.99),
             0.2,
             true,

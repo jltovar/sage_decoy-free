@@ -472,41 +472,14 @@ pub fn rescore(
         all_data.push(psm); // We predict on everything later
     }
 
-    // --- Graceful Fallback for Low Data (<50) ---
-    // If there are fewer than 50 confident PSMs, ML training is unstable.
-    // Instead of failing, return "probabilities" based on min-max scaled Hyperscore.
+    // --- Fail-closed for Low Data (<50) to prevent unstable ML training ---
     let confident_count = positives.len();
     if confident_count < 50 {
         log::warn!(
-            "Nokoi: Too few positives ({} < 50) - falling back to normalized hyperscore",
+            "Nokoi DF: Too few positives ({} < 50) - failing closed",
             confident_count
         );
-
-        if features.is_empty() {
-            return None;
-        }
-
-        let min_hs = features
-            .iter()
-            .map(|f| f.hyperscore as f64)
-            .fold(f64::INFINITY, f64::min);
-        let max_hs = features
-            .iter()
-            .map(|f| f.hyperscore as f64)
-            .fold(f64::NEG_INFINITY, f64::max);
-        let range = max_hs - min_hs;
-
-        if range == 0.0 {
-            // Edge case: all scores identical
-            return Some(vec![0.5; features.len()]);
-        }
-
-        let probabilities: Vec<f64> = features
-            .iter()
-            .map(|f| (f.hyperscore as f64 - min_hs) / range)
-            .collect();
-
-        return Some(probabilities);
+        return None;
     } else if confident_count < 100 {
         // Between 50 and 100, we proceed but warn
         log::warn!(
@@ -577,6 +550,15 @@ pub fn rescore(
         .map(|sample| model.predict(&sample.features))
         .collect();
 
+    if probabilities.len() != features.len() {
+        log::warn!("Nokoi DF: output length mismatch. Failing closed.");
+        return None;
+    }
+    if probabilities.iter().any(|p| !p.is_finite()) {
+        log::warn!("Nokoi DF: output contains non-finite probabilities. Failing closed.");
+        return None;
+    }
+
     Some(probabilities)
 }
 
@@ -645,38 +627,14 @@ pub fn rescore_df(
         );
     }
 
-    // --- Graceful fallback for low data (match your existing behavior) ---
+    // --- Fail-closed for low data to prevent unstable ML training ---
     let confident_count = positives.len();
     if confident_count < 50 {
         log::warn!(
-            "Nokoi DF: Too few positives ({} < 50) - falling back to normalized hyperscore",
+            "Nokoi: Too few positives ({} < 50) - failing closed",
             confident_count
         );
-
-        if features.is_empty() {
-            return None;
-        }
-
-        let min_hs = features
-            .iter()
-            .map(|f| f.core.hyperscore as f64)
-            .fold(f64::INFINITY, f64::min);
-        let max_hs = features
-            .iter()
-            .map(|f| f.core.hyperscore as f64)
-            .fold(f64::NEG_INFINITY, f64::max);
-        let range = max_hs - min_hs;
-
-        if range == 0.0 {
-            return Some(vec![0.5; features.len()]);
-        }
-
-        let probabilities: Vec<f64> = features
-            .iter()
-            .map(|f| (f.core.hyperscore as f64 - min_hs) / range)
-            .collect();
-
-        return Some(probabilities);
+        return None;
     } else if confident_count < 100 {
         log::warn!(
             "Nokoi DF: Low training data ({}), model may vary.",
@@ -692,32 +650,13 @@ pub fn rescore_df(
     let n_pos = positives.len();
     let n_neg = negatives.len();
 
-    // If negatives are too few, fail closed to fallback hyperscore behavior (consistent + safe)
+    // If negatives are too few, fail closed.
     if n_neg < 50 {
         log::warn!(
-            "Nokoi DF: Too few negatives from rank window ({} < 50) - falling back to normalized hyperscore",
+            "Nokoi DF: Too few negatives from rank window ({} < 50) - failing closed",
             n_neg
         );
-        if features.is_empty() {
-            return None;
-        }
-        let min_hs = features
-            .iter()
-            .map(|f| f.core.hyperscore as f64)
-            .fold(f64::INFINITY, f64::min);
-        let max_hs = features
-            .iter()
-            .map(|f| f.core.hyperscore as f64)
-            .fold(f64::NEG_INFINITY, f64::max);
-        let range = max_hs - min_hs;
-        if range == 0.0 {
-            return Some(vec![0.5; features.len()]);
-        }
-        let probabilities: Vec<f64> = features
-            .iter()
-            .map(|f| (f.core.hyperscore as f64 - min_hs) / range)
-            .collect();
-        return Some(probabilities);
+        return None;
     }
 
     let sample_size = n_pos.min(n_neg).min(10_000);
@@ -772,6 +711,19 @@ pub fn rescore_df(
         .iter()
         .map(|sample| model.predict(&sample.features))
         .collect();
+
+    if probabilities.len() != features.len() {
+        log::warn!(
+            "Nokoi: output length mismatch ({} vs {}). Failing closed.",
+            probabilities.len(),
+            features.len()
+        );
+        return None;
+    }
+    if probabilities.iter().any(|p| !p.is_finite()) {
+        log::warn!("Nokoi: output contains non-finite probabilities. Failing closed.");
+        return None;
+    }
 
     Some(probabilities)
 }
@@ -980,37 +932,13 @@ pub fn rescore_df_crossfit(
         }
     }
 
-    // If cross-fit produced too few null scores, fail closed to hyperscore fallback
+    // If cross-fit produced too few null scores, fail closed.
     if null_scores_oof.len() < 50 {
         log::warn!(
-            "Nokoi DF crossfit: insufficient OOF null scores ({} < 50) - falling back to normalized hyperscore",
+            "Nokoi DF crossfit: insufficient OOF null scores ({} < 50) - failing closed",
             null_scores_oof.len()
         );
-
-        let min_hs = features
-            .iter()
-            .map(|f| f.core.hyperscore as f64)
-            .fold(f64::INFINITY, f64::min);
-        let max_hs = features
-            .iter()
-            .map(|f| f.core.hyperscore as f64)
-            .fold(f64::NEG_INFINITY, f64::max);
-        let range = max_hs - min_hs;
-
-        let prob_all: Vec<f64> = if range == 0.0 {
-            vec![0.5; features.len()]
-        } else {
-            features
-                .iter()
-                .map(|f| ((f.core.hyperscore as f64 - min_hs) / range).clamp(0.0, 1.0))
-                .collect()
-        };
-
-        let mut null_oof: Vec<f64> = Vec::with_capacity(null_cand.len());
-        for &j in &null_cand {
-            null_oof.push(prob_all[j]);
-        }
-        return Some((prob_all, null_oof));
+        return None;
     }
 
     // ---- 4) Final model for prob_target_all: train on all positives + ALL rank-window negatives ----
@@ -1018,27 +946,8 @@ pub fn rescore_df_crossfit(
     let (model, means, stds) = match train_one(&positives_idx, &negatives_idx, seed_final) {
         Some(x) => x,
         None => {
-            // fall back (should be extremely rare since we already passed size checks)
-            log::warn!("Nokoi DF crossfit: final model could not train; falling back to normalized hyperscore");
-            let min_hs = features
-                .iter()
-                .map(|f| f.core.hyperscore as f64)
-                .fold(f64::INFINITY, f64::min);
-            let max_hs = features
-                .iter()
-                .map(|f| f.core.hyperscore as f64)
-                .fold(f64::NEG_INFINITY, f64::max);
-            let range = max_hs - min_hs;
-
-            let prob_all: Vec<f64> = if range == 0.0 {
-                vec![0.5; features.len()]
-            } else {
-                features
-                    .iter()
-                    .map(|f| ((f.core.hyperscore as f64 - min_hs) / range).clamp(0.0, 1.0))
-                    .collect()
-            };
-            return Some((prob_all, null_scores_oof));
+            log::warn!("Nokoi DF crossfit: final model could not train - failing closed");
+            return None;
         }
     };
 
@@ -1053,6 +962,23 @@ pub fn rescore_df_crossfit(
             }
         }
         prob_target_all.push(model.predict(&x).clamp(0.0, 1.0));
+    }
+
+    if prob_target_all.len() != features.len() {
+        log::warn!("Nokoi DF crossfit: output length mismatch. Failing closed.");
+        return None;
+    }
+    if prob_target_all.iter().any(|p| !p.is_finite()) {
+        log::warn!("Nokoi DF crossfit: output contains non-finite probabilities. Failing closed.");
+        return None;
+    }
+    if null_scores_oof.is_empty() {
+        log::warn!("Nokoi DF crossfit: OOF null scores array is empty. Failing closed.");
+        return None;
+    }
+    if null_scores_oof.iter().any(|p| !p.is_finite()) {
+        log::warn!("Nokoi DF crossfit: OOF null scores contain non-finite values. Failing closed.");
+        return None;
     }
 
     Some((prob_target_all, null_scores_oof))
