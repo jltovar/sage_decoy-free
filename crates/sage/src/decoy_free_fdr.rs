@@ -66,7 +66,7 @@ use crate::ml::lower_order::{
 use crate::ml::msfdr::{Msfdr1SmixModel, Msfdr2SmixModel, MsfdrSeededModel};
 use crate::ml::nokoi;
 use crate::ml::stats;
-use crate::scoring::DfFeature;
+use crate::scoring::{DfFeature, TdcFeature};
 use fnv::{FnvHashMap, FnvHashSet};
 use rayon::prelude::*;
 use statrs::distribution::{ContinuousCDF, Gumbel};
@@ -580,17 +580,10 @@ fn is_entrapment_str(proteins: &str) -> bool {
 }
 
 #[derive(Clone, Copy, Debug, Default)]
-pub struct DfEntrapmentCounts {
+pub struct EntrapmentCounts {
     pub psms: usize,
     pub peptides: usize,
     pub proteins: usize,
-}
-
-pub fn has_entrapment_proteins(db: &IndexedDatabase) -> bool {
-    db.peptides.iter().any(|pep| {
-        let protein_key = pep.proteins(&db.decoy_tag, db.generate_decoys);
-        is_entrapment_str(&protein_key)
-    })
 }
 
 pub fn calculate_entrapment_counts_df(
@@ -598,8 +591,8 @@ pub fn calculate_entrapment_counts_df(
     db: &IndexedDatabase,
     peptide_fdr: f32,
     protein_fdr: f32,
-) -> DfEntrapmentCounts {
-    let mut counts = DfEntrapmentCounts::default();
+) -> EntrapmentCounts {
+    let mut counts = EntrapmentCounts::default();
     let mut peptide_set: FnvHashSet<String> = FnvHashSet::default();
     let mut protein_set: FnvHashSet<String> = FnvHashSet::default();
 
@@ -622,9 +615,7 @@ pub fn calculate_entrapment_counts_df(
             peptide_set.insert(peptide.to_string());
         }
 
-        // Keep protein counting consistent with current DF protein inference:
-        // unique-only peptides contribute to protein-level discovery.
-        if peptide.proteins.len() == 1 && feat.decoy_free_protein_q.unwrap_or(1.0) <= protein_fdr {
+        if feat.decoy_free_protein_q.unwrap_or(1.0) <= protein_fdr {
             protein_set.insert(protein_key);
         }
     }
@@ -632,6 +623,60 @@ pub fn calculate_entrapment_counts_df(
     counts.peptides = peptide_set.len();
     counts.proteins = protein_set.len();
     counts
+}
+
+pub fn calculate_entrapment_counts_tdc(
+    features: &[TdcFeature],
+    db: &IndexedDatabase,
+    spectrum_fdr: f32,
+    peptide_fdr: f32,
+    protein_fdr: f32,
+) -> EntrapmentCounts {
+    let mut counts = EntrapmentCounts::default();
+    let mut peptide_set: FnvHashSet<String> = FnvHashSet::default();
+    let mut protein_set: FnvHashSet<String> = FnvHashSet::default();
+
+    for feat in features
+        .iter()
+        .filter(|f| f.core.rank == 1 && f.core.label == 1)
+    {
+        let peptide = &db[feat.core.peptide_idx];
+        let protein_key = peptide.proteins(&db.decoy_tag, db.generate_decoys);
+
+        if !is_entrapment_str(&protein_key) {
+            continue;
+        }
+
+        if feat.spectrum_q <= spectrum_fdr {
+            counts.psms += 1;
+        }
+
+        if feat.peptide_q <= peptide_fdr {
+            peptide_set.insert(peptide.to_string());
+        }
+
+        if feat.protein_q <= protein_fdr {
+            protein_set.insert(protein_key);
+        }
+    }
+
+    counts.peptides = peptide_set.len();
+    counts.proteins = protein_set.len();
+    counts
+}
+
+#[derive(Clone, Copy, Debug, Default)]
+pub struct DfEntrapmentCounts {
+    pub psms: usize,
+    pub peptides: usize,
+    pub proteins: usize,
+}
+
+pub fn has_entrapment_proteins(db: &IndexedDatabase) -> bool {
+    db.peptides.iter().any(|pep| {
+        let protein_key = pep.proteins(&db.decoy_tag, db.generate_decoys);
+        is_entrapment_str(&protein_key)
+    })
 }
 
 // -----------------------------------------------------------------------------
