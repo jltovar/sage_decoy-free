@@ -621,7 +621,7 @@ impl Runner {
             );
 
             // 5. PEPTIDE / PROTEIN AGGREGATION (DF)
-            let q_peptide = sage_core::decoy_free_fdr::calculate_peptide_q_df(
+            let (q_peptide, _ent_peptide) = sage_core::decoy_free_fdr::calculate_peptide_q_df(
                 &mut features,
                 &self.database,
                 fdr_settings.peptide_fdr,
@@ -639,6 +639,38 @@ impl Runner {
                 fdr_settings.peptide_fdr * 100.0
             );
             log::info!("discovered {} target proteins (Decoy-Free)", q_protein);
+
+            let emit_entrapment_counts = match fdr_settings.entrapment_report {
+                sage_core::input::EntrapmentReportMode::Off => false,
+                sage_core::input::EntrapmentReportMode::On => true,
+                sage_core::input::EntrapmentReportMode::Auto => {
+                    sage_core::decoy_free_fdr::has_entrapment_proteins(&self.database)
+                }
+            };
+
+            if emit_entrapment_counts {
+                let ent = sage_core::decoy_free_fdr::calculate_entrapment_counts_df(
+                    &features,
+                    &self.database,
+                    fdr_settings.peptide_fdr,
+                    fdr_settings.protein_fdr,
+                );
+
+                log::info!(
+                    "discovered {} entrapment peptide-spectrum matches at {}% FDR (Decoy-Free)",
+                    ent.psms,
+                    fdr_settings.peptide_fdr * 100.0
+                );
+                log::info!(
+                    "discovered {} entrapment peptides at {}% FDR (Decoy-Free)",
+                    ent.peptides,
+                    fdr_settings.peptide_fdr * 100.0
+                );
+                log::info!(
+                    "discovered {} entrapment proteins (Decoy-Free)",
+                    ent.proteins
+                );
+            }
 
             // 6. LFQ (DF)
             let areas = alignments.as_ref().and_then(|alignments_ref| {

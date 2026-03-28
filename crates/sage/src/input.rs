@@ -42,6 +42,20 @@ pub enum ProteinPCombine {
     SidakMinP,
 }
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum EntrapmentReportMode {
+    Off,
+    Auto,
+    On,
+}
+
+impl Default for EntrapmentReportMode {
+    fn default() -> Self {
+        Self::Auto
+    }
+}
+
 #[derive(Clone, Serialize, Deserialize, Debug, PartialEq, Eq)]
 #[serde(rename_all = "snake_case")]
 pub enum MsfdrSeedMode {
@@ -141,6 +155,13 @@ pub enum EnsemblePepCombiner {
     TrimmedMean,
     Max,
     Mean,
+    WeightedMean,
+    WeightedMedian,
+    WinsorizedMean,
+    Quantile,
+    TopKMean,
+    GeometricMean,
+    LogitMean,
 }
 
 /// Mandatory PEP derivation for null-only methods (Moments/MLE/LO).
@@ -183,6 +204,7 @@ pub struct FdrOptions {
     pub peptide_fdr: Option<f32>,
     pub protein_fdr: Option<f32>,
     pub precursor_fdr: Option<f32>,
+    pub entrapment_report: Option<EntrapmentReportMode>,
 
     // Global null window (superset pool builder)
     pub min_null_rank: Option<u32>,
@@ -226,6 +248,21 @@ pub struct FdrOptions {
 
     // Ensemble combination choices (global controls; used by ModelFit::Ensemble)
     pub ensemble_pep_combiner: Option<EnsemblePepCombiner>,
+
+    // Shared robust-combiner knobs
+    pub ensemble_pep_trim_frac: Option<f64>, // default 0.20, clamp [0.0, 0.49]
+    pub ensemble_pep_quantile: Option<f64>,  // default 0.50, clamp [0.0, 1.0]
+    pub ensemble_pep_top_k: Option<usize>,   // default 2, clamp >= 1
+    pub ensemble_pep_logit_eps: Option<f64>, // default 1e-6, clamp [1e-12, 1e-2]
+
+    // Static per-expert weights (used by weighted_mean / weighted_median)
+    pub ensemble_weight_moments: Option<f64>, // default 1.0
+    pub ensemble_weight_mle: Option<f64>,     // default 1.0
+    pub ensemble_weight_lower_order: Option<f64>, // default 1.0
+    pub ensemble_weight_msfdr_seeded: Option<f64>, // default 1.0
+    pub ensemble_weight_msfdr_1smix: Option<f64>, // default 1.0
+    pub ensemble_weight_msfdr_2smix: Option<f64>, // default 1.0
+    pub ensemble_weight_nokoi: Option<f64>,   // default 1.0
 
     // =========================================================================
     // B) Moments specific knobs
@@ -346,6 +383,9 @@ pub struct FdrSettings {
     pub protein_fdr: f32,
     pub precursor_fdr: f32,
 
+    #[serde(default)]
+    pub entrapment_report: EntrapmentReportMode,
+
     // Global null window (superset pool builder)
     pub min_null_rank: u32,
     pub max_null_rank: u32,
@@ -448,6 +488,21 @@ pub struct FdrSettings {
     // Ensemble combination choices
     pub ensemble_pep_combiner: EnsemblePepCombiner,
 
+    // Shared robust-combiner knobs
+    pub ensemble_pep_trim_frac: f64,
+    pub ensemble_pep_quantile: f64,
+    pub ensemble_pep_top_k: usize,
+    pub ensemble_pep_logit_eps: f64,
+
+    // Static per-expert weights
+    pub ensemble_weight_moments: f64,
+    pub ensemble_weight_mle: f64,
+    pub ensemble_weight_lower_order: f64,
+    pub ensemble_weight_msfdr_seeded: f64,
+    pub ensemble_weight_msfdr_1smix: f64,
+    pub ensemble_weight_msfdr_2smix: f64,
+    pub ensemble_weight_nokoi: f64,
+
     // MSFDR controls
     pub msfdr_use_canonical_pep: bool,
     pub msfdr_multistart: usize,
@@ -492,7 +547,51 @@ pub struct FdrSettings {
 
 impl From<FdrOptions> for FdrSettings {
     fn from(options: FdrOptions) -> Self {
-        // --- Storey / pi0 knobs ---
+        // ---------------------------------------------------------------------
+        // Local helpers
+        // ---------------------------------------------------------------------
+        let clamp_weight = |w: Option<f64>| -> f64 {
+            match w {
+                Some(x) if x.is_finite() && x >= 0.0 => x,
+                _ => 1.0,
+            }
+        };
+
+        let clamp_frac = |x: f64, default: f64| -> f64 {
+            if x.is_finite() {
+                x.clamp(0.01, 0.99)
+            } else {
+                default
+            }
+        };
+
+        // ---------------------------------------------------------------------
+        // A) Global knobs
+        // ---------------------------------------------------------------------
+        let mode = options.mode.unwrap_or(FdrMode::DecoyFree);
+        let precursor_fdr = options.precursor_fdr.unwrap_or(0.01);
+        let peptide_fdr = options.peptide_fdr.unwrap_or(0.01);
+        let protein_fdr = options.protein_fdr.unwrap_or(0.01);
+        let entrapment_report = options
+            .entrapment_report
+            .unwrap_or(EntrapmentReportMode::Auto);
+
+        let model_fit = options.model_fit.unwrap_or(ModelFit::Ensemble);
+        let type_ = options.type_.unwrap_or(FdrType::Storey);
+        let protein_p_combine = options.protein_p_combine.unwrap_or(ProteinPCombine::Cauchy);
+
+        let min_storey_n = options.min_storey_n.unwrap_or(300);
+        let min_null_size = options.min_null_size.unwrap_or(300);
+        let kde_samples = options.kde_samples.unwrap_or(50_000);
+
+        let purification_factor = options.purification_factor.unwrap_or(0.50).clamp(0.0, 0.9);
+        let min_rank_count = options.min_rank_count.unwrap_or(10);
+
+        let calibrate_per_method = options.calibrate_per_method.unwrap_or(true);
+
+        // ---------------------------------------------------------------------
+        // A.1) Storey / pi0 tuning knobs
+        // ---------------------------------------------------------------------
         let storey_pi0_clamp_min = options.storey_pi0_clamp_min.unwrap_or(0.50).clamp(0.0, 1.0);
 
         let storey_pi0_clamp_max = options
@@ -518,7 +617,9 @@ impl From<FdrOptions> for FdrSettings {
 
         let storey_pi0_agg = options.storey_pi0_agg.unwrap_or(StoreyPi0Agg::Median);
 
-        // --- Storey degeneracy knobs ---
+        // ---------------------------------------------------------------------
+        // A.2) Storey degeneracy knobs
+        // ---------------------------------------------------------------------
         let storey_degen_same_as_median_frac = options
             .storey_degen_same_as_median_frac
             .unwrap_or(0.90)
@@ -532,150 +633,16 @@ impl From<FdrOptions> for FdrSettings {
             .storey_degen_fallback
             .unwrap_or(StoreyDegeneracyFallback::Bh);
 
-        let calibrate_per_method = options.calibrate_per_method.unwrap_or(true);
-        let lo_rank_key = options.lo_rank_key.unwrap_or(LoRankKey::LoAdjusted);
-        let lo_mode = options.lo_mode.unwrap_or(LoMode::Auto);
-        let lo_lom_estimator = options.lo_lom_estimator.unwrap_or(LoLomEstimator::Auto);
-
-        // PyLord parity knobs (defaults)
-        let lo_stratify = options.lo_stratify.unwrap_or(LoStratify::Charge);
-        let lo_score = options.lo_score.unwrap_or(LoScore::Raw);
-
-        let lo_mean_beta_mode = options
-            .lo_mean_beta_mode
-            .unwrap_or(LoMeanBetaMode::Consecutive);
-        let lo_mean_beta_min_rank = options.lo_mean_beta_min_rank.unwrap_or(8).max(2);
-        let lo_mean_beta_count = options.lo_mean_beta_count.unwrap_or(3).clamp(1, 10);
-
-        let lo_lr_window_size = options.lo_lr_window_size;
-
-        let nokoi_k_folds = options.nokoi_k_folds.unwrap_or(2).max(2).min(20);
-
-        let nokoi_l1_lambda_min = options.nokoi_l1_lambda_min.unwrap_or(1e-4).max(1e-12);
-
-        let nokoi_l1_lambda_max = options
-            .nokoi_l1_lambda_max
-            .unwrap_or(1e-1)
-            .max(nokoi_l1_lambda_min);
-
-        let nokoi_l1_lambda_steps = options.nokoi_l1_lambda_steps.unwrap_or(10).clamp(1, 100);
-
+        // ---------------------------------------------------------------------
+        // A.3) Null-only PEP strategy
+        // ---------------------------------------------------------------------
         let null_only_pep_mode = options
             .null_only_pep_mode
             .unwrap_or(NullOnlyPepMode::PepFromQHeuristic);
 
-        let ensemble_pep_combiner = options
-            .ensemble_pep_combiner
-            .unwrap_or(EnsemblePepCombiner::Median);
-
-        let msfdr_use_canonical_pep = options.msfdr_use_canonical_pep.unwrap_or(true);
-
-        // Keep small/safe; avoids pathological huge multistarts.
-        let msfdr_multistart = options.msfdr_multistart.unwrap_or(3).clamp(1, 25);
-
-        // --- MSFDR init/drift knobs ---
-        let clamp_frac = |x: f64, default: f64| -> f64 {
-            if x.is_finite() {
-                x.clamp(0.01, 0.99)
-            } else {
-                default
-            }
-        };
-
-        let msfdr_seeded_top_frac_init =
-            clamp_frac(options.msfdr_seeded_top_frac_init.unwrap_or(0.20), 0.20);
-
-        let msfdr1_bottom_frac_init =
-            clamp_frac(options.msfdr1_bottom_frac_init.unwrap_or(0.50), 0.50);
-
-        let msfdr1_top_frac_init = clamp_frac(options.msfdr1_top_frac_init.unwrap_or(0.20), 0.20);
-
-        let msfdr1_beta_drift_mult = match options.msfdr1_beta_drift_mult {
-            Some((a, b)) if a.is_finite() && b.is_finite() && a > 0.0 && b >= a => (a, b),
-            _ => (0.9, 1.1),
-        };
-
-        let msfdr1_mu_drift_abs = match options.msfdr1_mu_drift_abs {
-            Some(x) if x.is_finite() && x >= 0.0 => x,
-            _ => 0.5,
-        };
-
-        let msfdr2_top_frac_init = clamp_frac(
-            options.msfdr2_top_frac_init.unwrap_or(msfdr1_top_frac_init),
-            msfdr1_top_frac_init,
-        );
-
-        let msfdr2_beta_drift_mult = match options.msfdr2_beta_drift_mult {
-            Some((a, b)) if a.is_finite() && b.is_finite() && a > 0.0 && b >= a => (a, b),
-            _ => (0.5, 2.0),
-        };
-
-        let msfdr2_mu_drift_abs = match options.msfdr2_mu_drift_abs {
-            Some(x) if x.is_finite() && x >= 0.0 => x,
-            _ => 0.5,
-        };
-
-        // Ensemble expert gates (Ensemble uses these; explicit model_fit variants override gates)
-        let enable_moments = options.enable_moments.unwrap_or(true);
-        let enable_mle = options.enable_mle.unwrap_or(true);
-        let enable_lower_order = options.enable_lower_order.unwrap_or(true);
-        let enable_msfdr_seeded = options.enable_msfdr_seeded.unwrap_or(true);
-        let enable_msfdr_1smix = options.enable_msfdr_1smix.unwrap_or(true);
-        let enable_msfdr_2smix = options.enable_msfdr_2smix.unwrap_or(true);
-
-        // Mixture knobs
-        let mix_em_max_iter = options.mix_em_max_iter.unwrap_or(200).clamp(1, 10_000);
-
-        let mix_em_tol = match options.mix_em_tol {
-            Some(x) if x.is_finite() && x > 0.0 => x,
-            _ => 1e-6,
-        };
-
-        let mix_pi_clamp_min = options.mix_pi_clamp_min.unwrap_or(0.01).clamp(0.0, 1.0);
-
-        let mix_pi_clamp_max = options
-            .mix_pi_clamp_max
-            .unwrap_or(0.565)
-            .clamp(0.0, 1.0)
-            .max(mix_pi_clamp_min);
-
-        // --- Specific clamps (fallback to global mix_pi_clamp) ---
-        let msfdr_pi_clamp_min = options
-            .msfdr_pi_clamp_min
-            .unwrap_or(mix_pi_clamp_min)
-            .clamp(0.0, 1.0);
-        let msfdr_pi_clamp_max = options
-            .msfdr_pi_clamp_max
-            .unwrap_or(mix_pi_clamp_max)
-            .clamp(0.0, 1.0)
-            .max(msfdr_pi_clamp_min);
-
-        let msfdr1_pi_clamp_min = options.msfdr1_pi_clamp_min.unwrap_or(0.01).clamp(0.0, 1.0);
-        let msfdr1_pi_clamp_max = options
-            .msfdr1_pi_clamp_max
-            .unwrap_or(0.65)
-            .clamp(0.0, 1.0)
-            .max(msfdr1_pi_clamp_min);
-
-        let msfdr2_pi_clamp_min = options.msfdr2_pi_clamp_min.unwrap_or(0.01).clamp(0.0, 1.0);
-        let msfdr2_pi_clamp_max = options
-            .msfdr2_pi_clamp_max
-            .unwrap_or(0.568)
-            .clamp(0.0, 1.0)
-            .max(msfdr2_pi_clamp_min);
-
-        // Default true; only meaningful for 2smix
-        let mix_anchor_incorrect = options.mix_anchor_incorrect.unwrap_or(true);
-
-        let purification_factor = options.purification_factor.unwrap_or(0.50).clamp(0.0, 0.9);
-        let min_rank_count = options.min_rank_count.unwrap_or(10);
-
         // ---------------------------------------------------------------------
-        // Per-method null windows: resolve defaults, swap if inverted, clamp to
-        // the global [min_null_rank..=max_null_rank] window.
+        // A.4) Global null window (superset pool builder)
         // ---------------------------------------------------------------------
-
-        // Global superset pool window (also normalized if user inverted it)
         let (min_null_rank, max_null_rank) = {
             let a = options.min_null_rank.unwrap_or(2);
             let b = options.max_null_rank.unwrap_or(50);
@@ -695,16 +662,13 @@ impl From<FdrOptions> for FdrSettings {
             let mut mn = opt_min.unwrap_or(default_min);
             let mut mx = opt_max.unwrap_or(default_max);
 
-            // Swap if user inverted
             if mn > mx {
                 std::mem::swap(&mut mn, &mut mx);
             }
 
-            // Clamp to global window
             mn = mn.clamp(min_null_rank, max_null_rank);
             mx = mx.clamp(min_null_rank, max_null_rank);
 
-            // Repair if clamp caused inversion
             if mn > mx {
                 mn = mn.clamp(min_null_rank, max_null_rank);
                 mx = mn;
@@ -713,7 +677,11 @@ impl From<FdrOptions> for FdrSettings {
             (mn, mx)
         };
 
-        // Paper-default windows (per your spec)
+        // ---------------------------------------------------------------------
+        // B) Moments specific resolved null window
+        // ---------------------------------------------------------------------
+        let enable_moments = options.enable_moments.unwrap_or(true);
+
         let (moments_min_null_rank, moments_max_null_rank) = resolve_window(
             options.moments_min_null_rank,
             options.moments_max_null_rank,
@@ -721,8 +689,18 @@ impl From<FdrOptions> for FdrSettings {
             50,
         );
 
+        // ---------------------------------------------------------------------
+        // C) MLE specific resolved null window
+        // ---------------------------------------------------------------------
+        let enable_mle = options.enable_mle.unwrap_or(true);
+
         let (mle_min_null_rank, mle_max_null_rank) =
             resolve_window(options.mle_min_null_rank, options.mle_max_null_rank, 4, 50);
+
+        // ---------------------------------------------------------------------
+        // D) LowerOrder specific resolved null window + LO knobs
+        // ---------------------------------------------------------------------
+        let enable_lower_order = options.enable_lower_order.unwrap_or(true);
 
         let (lower_order_min_null_rank, lower_order_max_null_rank) = resolve_window(
             options.lower_order_min_null_rank,
@@ -731,13 +709,92 @@ impl From<FdrOptions> for FdrSettings {
             12,
         );
 
-        // MSFDR seeded null window defaults (clamped to global [min_null_rank..=max_null_rank])
+        let lo_rank_key = options.lo_rank_key.unwrap_or(LoRankKey::LoAdjusted);
+        let lo_mode = options.lo_mode.unwrap_or(LoMode::Auto);
+        let lo_lom_estimator = options.lo_lom_estimator.unwrap_or(LoLomEstimator::Auto);
+        let lo_stratify = options.lo_stratify.unwrap_or(LoStratify::Charge);
+        let lo_score = options.lo_score.unwrap_or(LoScore::Raw);
+
+        let lo_mean_beta_mode = options
+            .lo_mean_beta_mode
+            .unwrap_or(LoMeanBetaMode::Consecutive);
+
+        let lo_mean_beta_min_rank = options.lo_mean_beta_min_rank.unwrap_or(8).max(2);
+        let lo_mean_beta_count = options.lo_mean_beta_count.unwrap_or(3).clamp(1, 10);
+        let lo_lr_window_size = options.lo_lr_window_size;
+
+        // ---------------------------------------------------------------------
+        // E) MSFDR specific resolved null window + knobs
+        // ---------------------------------------------------------------------
+        let enable_msfdr_seeded = options.enable_msfdr_seeded.unwrap_or(true);
+
         let (msfdr_min_null_rank, msfdr_max_null_rank) = resolve_window(
             options.msfdr_min_null_rank,
             options.msfdr_max_null_rank,
             4,
             50,
         );
+
+        let msfdr_use_canonical_pep = options.msfdr_use_canonical_pep.unwrap_or(true);
+        let msfdr_multistart = options.msfdr_multistart.unwrap_or(3).clamp(1, 25);
+
+        let msfdr_seeded_top_frac_init =
+            clamp_frac(options.msfdr_seeded_top_frac_init.unwrap_or(0.20), 0.20);
+
+        // ---------------------------------------------------------------------
+        // Mixture knobs (shared)
+        // ---------------------------------------------------------------------
+        let mix_em_max_iter = options.mix_em_max_iter.unwrap_or(200).clamp(1, 10_000);
+
+        let mix_em_tol = match options.mix_em_tol {
+            Some(x) if x.is_finite() && x > 0.0 => x,
+            _ => 1e-6,
+        };
+
+        let mix_pi_clamp_min = options.mix_pi_clamp_min.unwrap_or(0.01).clamp(0.0, 1.0);
+
+        let mix_pi_clamp_max = options
+            .mix_pi_clamp_max
+            .unwrap_or(0.565)
+            .clamp(0.0, 1.0)
+            .max(mix_pi_clamp_min);
+
+        let mix_anchor_incorrect = options.mix_anchor_incorrect.unwrap_or(true);
+
+        // ---------------------------------------------------------------------
+        // Specific pi clamps
+        // ---------------------------------------------------------------------
+        let msfdr_pi_clamp_min = options
+            .msfdr_pi_clamp_min
+            .unwrap_or(mix_pi_clamp_min)
+            .clamp(0.0, 1.0);
+
+        let msfdr_pi_clamp_max = options
+            .msfdr_pi_clamp_max
+            .unwrap_or(mix_pi_clamp_max)
+            .clamp(0.0, 1.0)
+            .max(msfdr_pi_clamp_min);
+
+        let msfdr1_pi_clamp_min = options.msfdr1_pi_clamp_min.unwrap_or(0.01).clamp(0.0, 1.0);
+
+        let msfdr1_pi_clamp_max = options
+            .msfdr1_pi_clamp_max
+            .unwrap_or(0.65)
+            .clamp(0.0, 1.0)
+            .max(msfdr1_pi_clamp_min);
+
+        let msfdr2_pi_clamp_min = options.msfdr2_pi_clamp_min.unwrap_or(0.01).clamp(0.0, 1.0);
+
+        let msfdr2_pi_clamp_max = options
+            .msfdr2_pi_clamp_max
+            .unwrap_or(0.568)
+            .clamp(0.0, 1.0)
+            .max(msfdr2_pi_clamp_min);
+
+        // ---------------------------------------------------------------------
+        // F) MSFDR1_Smix specific resolved null window + knobs
+        // ---------------------------------------------------------------------
+        let enable_msfdr_1smix = options.enable_msfdr_1smix.unwrap_or(true);
 
         let (msfdr1_smix_min_null_rank, msfdr1_smix_max_null_rank) = resolve_window(
             options.msfdr1_smix_min_null_rank,
@@ -746,6 +803,26 @@ impl From<FdrOptions> for FdrSettings {
             50,
         );
 
+        let msfdr1_bottom_frac_init =
+            clamp_frac(options.msfdr1_bottom_frac_init.unwrap_or(0.50), 0.50);
+
+        let msfdr1_top_frac_init = clamp_frac(options.msfdr1_top_frac_init.unwrap_or(0.20), 0.20);
+
+        let msfdr1_beta_drift_mult = match options.msfdr1_beta_drift_mult {
+            Some((a, b)) if a.is_finite() && b.is_finite() && a > 0.0 && b >= a => (a, b),
+            _ => (0.9, 1.1),
+        };
+
+        let msfdr1_mu_drift_abs = match options.msfdr1_mu_drift_abs {
+            Some(x) if x.is_finite() && x >= 0.0 => x,
+            _ => 0.5,
+        };
+
+        // ---------------------------------------------------------------------
+        // G) MSFDR2_Smix specific resolved null window + knobs
+        // ---------------------------------------------------------------------
+        let enable_msfdr_2smix = options.enable_msfdr_2smix.unwrap_or(true);
+
         let (msfdr2_smix_min_null_rank, msfdr2_smix_max_null_rank) = resolve_window(
             options.msfdr2_smix_min_null_rank,
             options.msfdr2_smix_max_null_rank,
@@ -753,7 +830,24 @@ impl From<FdrOptions> for FdrSettings {
             50,
         );
 
-        // Nokoi negative class defaults: ranks 2..5
+        let msfdr2_top_frac_init = clamp_frac(
+            options.msfdr2_top_frac_init.unwrap_or(msfdr1_top_frac_init),
+            msfdr1_top_frac_init,
+        );
+
+        let msfdr2_beta_drift_mult = match options.msfdr2_beta_drift_mult {
+            Some((a, b)) if a.is_finite() && b.is_finite() && a > 0.0 && b >= a => (a, b),
+            _ => (0.5, 2.0),
+        };
+
+        let msfdr2_mu_drift_abs = match options.msfdr2_mu_drift_abs {
+            Some(x) if x.is_finite() && x >= 0.0 => x,
+            _ => 0.5,
+        };
+
+        // ---------------------------------------------------------------------
+        // H) Nokoi specific resolved null window + knobs
+        // ---------------------------------------------------------------------
         let (nokoi_min_null_rank, nokoi_max_null_rank) = resolve_window(
             options.nokoi_min_null_rank,
             options.nokoi_max_null_rank,
@@ -761,35 +855,132 @@ impl From<FdrOptions> for FdrSettings {
             7,
         );
 
-        Self {
-            mode: options.mode.unwrap_or(FdrMode::DecoyFree),
+        let nokoi_k_folds = options.nokoi_k_folds.unwrap_or(2).clamp(2, 20);
+        let nokoi_l1_lambda_min = options.nokoi_l1_lambda_min.unwrap_or(1e-4).max(1e-12);
 
-            precursor_fdr: options.precursor_fdr.unwrap_or(0.01),
-            peptide_fdr: options.peptide_fdr.unwrap_or(0.01),
-            protein_fdr: options.protein_fdr.unwrap_or(0.01),
+        let nokoi_l1_lambda_max = options
+            .nokoi_l1_lambda_max
+            .unwrap_or(1e-1)
+            .max(nokoi_l1_lambda_min);
+
+        let nokoi_l1_lambda_steps = options.nokoi_l1_lambda_steps.unwrap_or(10).clamp(1, 100);
+
+        // ---------------------------------------------------------------------
+        // Ensemble combination choices + weights
+        // ---------------------------------------------------------------------
+        let ensemble_pep_combiner = options
+            .ensemble_pep_combiner
+            .unwrap_or(EnsemblePepCombiner::Median);
+
+        let ensemble_pep_trim_frac = options
+            .ensemble_pep_trim_frac
+            .unwrap_or(0.20)
+            .clamp(0.0, 0.49);
+
+        let ensemble_pep_quantile = options
+            .ensemble_pep_quantile
+            .unwrap_or(0.50)
+            .clamp(0.0, 1.0);
+
+        let ensemble_pep_top_k = options.ensemble_pep_top_k.unwrap_or(2).max(1);
+
+        let ensemble_pep_logit_eps = options
+            .ensemble_pep_logit_eps
+            .unwrap_or(1e-6)
+            .clamp(1e-12, 1e-2);
+
+        let ensemble_weight_moments = clamp_weight(options.ensemble_weight_moments);
+        let ensemble_weight_mle = clamp_weight(options.ensemble_weight_mle);
+        let ensemble_weight_lower_order = clamp_weight(options.ensemble_weight_lower_order);
+        let ensemble_weight_msfdr_seeded = clamp_weight(options.ensemble_weight_msfdr_seeded);
+        let ensemble_weight_msfdr_1smix = clamp_weight(options.ensemble_weight_msfdr_1smix);
+        let ensemble_weight_msfdr_2smix = clamp_weight(options.ensemble_weight_msfdr_2smix);
+        let ensemble_weight_nokoi = clamp_weight(options.ensemble_weight_nokoi);
+
+        // ---------------------------------------------------------------------
+        // Build resolved settings in the same exact order as FdrSettings
+        // ---------------------------------------------------------------------
+        Self {
+            // =========================================================================
+            // A) Global knobs
+            // =========================================================================
+            mode,
+            peptide_fdr,
+            protein_fdr,
+            precursor_fdr,
+            entrapment_report,
 
             // Global null window (superset pool builder)
             min_null_rank,
             max_null_rank,
 
-            // Global parameters
-            purification_factor,
-            min_rank_count,
+            // =========================================================================
+            // B) Moments specific resolved null window
+            // =========================================================================
+            moments_min_null_rank,
+            moments_max_null_rank,
 
-            mix_em_max_iter,
-            mix_em_tol,
-            mix_pi_clamp_min,
-            mix_pi_clamp_max,
-            mix_anchor_incorrect,
+            // =========================================================================
+            // C) MLE specific resolved null window
+            // =========================================================================
+            mle_min_null_rank,
+            mle_max_null_rank,
 
-            model_fit: options.model_fit.unwrap_or(ModelFit::Ensemble),
-            type_: options.type_.unwrap_or(FdrType::Storey),
-            protein_p_combine: options.protein_p_combine.unwrap_or(ProteinPCombine::Cauchy),
+            // =========================================================================
+            // D) LowerOrder specific resolved null window
+            // =========================================================================
+            lower_order_min_null_rank,
+            lower_order_max_null_rank,
+            lo_rank_key,
 
-            min_storey_n: options.min_storey_n.unwrap_or(300),
-            min_null_size: options.min_null_size.unwrap_or(300),
-            kde_samples: options.kde_samples.unwrap_or(50_000),
+            // LO (paper/PyLord) settings
+            lo_mode,
+            lo_lom_estimator,
 
+            // PyLord parity settings
+            lo_stratify,
+            lo_score,
+
+            lo_mean_beta_mode,
+            lo_mean_beta_min_rank,
+            lo_mean_beta_count,
+            lo_lr_window_size,
+
+            // =========================================================================
+            // E) MSFDR specific resolved null window
+            // =========================================================================
+            msfdr_min_null_rank,
+            msfdr_max_null_rank,
+
+            // =========================================================================
+            // F) MSFDR1_Smix specific resolved null window
+            // =========================================================================
+            msfdr1_smix_min_null_rank,
+            msfdr1_smix_max_null_rank,
+
+            // =========================================================================
+            // G) MSFDR2_Smix specific resolved null window
+            // =========================================================================
+            msfdr2_smix_min_null_rank,
+            msfdr2_smix_max_null_rank,
+
+            // =========================================================================
+            // H) Nokoi specific resolved null window
+            // =========================================================================
+            nokoi_min_null_rank,
+            nokoi_max_null_rank,
+
+            // Global model selection + FDR type
+            model_fit,
+            type_,
+            protein_p_combine,
+
+            // Configurable Safety Brakes
+            min_storey_n,
+            min_null_size,
+            kde_samples,
+
+            // Storey/π0 tuning knobs
             storey_pi0_clamp_min,
             storey_pi0_clamp_max,
             storey_lambda_min,
@@ -798,78 +989,84 @@ impl From<FdrOptions> for FdrSettings {
             storey_lambda_min_for_agg,
             storey_pi0_agg,
 
+            // Storey degeneracy detector knobs
             storey_degen_same_as_median_frac,
             storey_degen_eps,
             storey_degen_pi0_eps,
             storey_degen_fallback,
 
+            // Per-method calibration / ranking controls
             calibrate_per_method,
-            null_only_pep_mode,
 
-            // Moments-specific resolved null window
-            enable_moments,
-            moments_min_null_rank,
-            moments_max_null_rank,
-
-            // MLE-specific resolved null window
-            enable_mle,
-            mle_min_null_rank,
-            mle_max_null_rank,
-
-            // LowerOrder-specific resolved null window
-            enable_lower_order,
-            lower_order_min_null_rank,
-            lower_order_max_null_rank,
-            lo_rank_key,
-            lo_mode,
-            lo_lom_estimator,
-            lo_stratify,
-            lo_score,
-            lo_mean_beta_mode,
-            lo_mean_beta_min_rank,
-            lo_mean_beta_count,
-            lo_lr_window_size,
-
-            // MSFDR-specific resolved null window
-            enable_msfdr_seeded,
-            msfdr_seeded_top_frac_init,
-            msfdr_min_null_rank,
-            msfdr_max_null_rank,
-            msfdr_use_canonical_pep,
-            msfdr_multistart,
-            msfdr_pi_clamp_min,
-            msfdr_pi_clamp_max,
-
-            // MSFDR1_Smix-specific resolved null window
-            enable_msfdr_1smix,
-            msfdr1_smix_min_null_rank,
-            msfdr1_smix_max_null_rank,
-            msfdr1_bottom_frac_init,
-            msfdr1_top_frac_init,
-            msfdr1_beta_drift_mult,
-            msfdr1_mu_drift_abs,
-            msfdr1_pi_clamp_min,
-            msfdr1_pi_clamp_max,
-
-            // MSFDR2_Smix-specific resolved null window
-            enable_msfdr_2smix,
-            msfdr2_smix_min_null_rank,
-            msfdr2_smix_max_null_rank,
-            msfdr2_beta_drift_mult,
-            msfdr2_mu_drift_abs,
-            msfdr2_top_frac_init,
-            msfdr2_pi_clamp_min,
-            msfdr2_pi_clamp_max,
-
-            // Nokoi-specific resolved null window
-            nokoi_min_null_rank,
-            nokoi_max_null_rank,
+            // Nokoi DF cross-fit calibration
             nokoi_k_folds,
+
+            // Nokoi L1 lambda grid
             nokoi_l1_lambda_min,
             nokoi_l1_lambda_max,
             nokoi_l1_lambda_steps,
 
+            // Null-only PEP strategy (Moments/MLE/LO)
+            null_only_pep_mode,
+
+            // Ensemble combination choices
             ensemble_pep_combiner,
+
+            // Shared robust-combiner knobs
+            ensemble_pep_trim_frac,
+            ensemble_pep_quantile,
+            ensemble_pep_top_k,
+            ensemble_pep_logit_eps,
+
+            // Static per-expert weights
+            ensemble_weight_moments,
+            ensemble_weight_mle,
+            ensemble_weight_lower_order,
+            ensemble_weight_msfdr_seeded,
+            ensemble_weight_msfdr_1smix,
+            ensemble_weight_msfdr_2smix,
+            ensemble_weight_nokoi,
+
+            // MSFDR controls
+            msfdr_use_canonical_pep,
+            msfdr_multistart,
+
+            // MSFDR init/drift knobs (needed by real models)
+            msfdr_seeded_top_frac_init,
+            msfdr1_top_frac_init,
+            msfdr1_bottom_frac_init,
+            msfdr1_beta_drift_mult,
+            msfdr1_mu_drift_abs,
+            msfdr2_beta_drift_mult,
+            msfdr2_mu_drift_abs,
+            msfdr2_top_frac_init,
+
+            // Ensemble expert gates (Ensemble uses these; explicit model_fit variants override gates)
+            enable_moments,
+            enable_mle,
+            enable_lower_order,
+            enable_msfdr_seeded,
+            enable_msfdr_1smix,
+            enable_msfdr_2smix,
+
+            // Mixture knobs (MSFDR 1smix / 2smix)
+            mix_em_max_iter,
+            mix_em_tol,
+            mix_pi_clamp_min,
+            mix_pi_clamp_max,
+            mix_anchor_incorrect,
+
+            // --- Specific clamps ---
+            msfdr_pi_clamp_min,
+            msfdr_pi_clamp_max,
+            msfdr1_pi_clamp_min,
+            msfdr1_pi_clamp_max,
+            msfdr2_pi_clamp_min,
+            msfdr2_pi_clamp_max,
+
+            // Rank-null pool construction controls
+            purification_factor,
+            min_rank_count,
         }
     }
 }

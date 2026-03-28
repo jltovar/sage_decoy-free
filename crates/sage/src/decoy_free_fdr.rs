@@ -174,7 +174,7 @@ fn isotonic_regression_increasing(p_values: &mut [f64]) {
 }
 
 // -----------------------------------------------------------------------------
-// 4) Simple statistics helpers (median / trimmed mean)
+// 4) Simple statistics helpers (median / trimmed / winsor / quantile / weights)
 // -----------------------------------------------------------------------------
 
 fn median_f64(mut v: Vec<f64>) -> Option<f64> {
@@ -194,15 +194,20 @@ fn median_f64(mut v: Vec<f64>) -> Option<f64> {
     }
 }
 
+fn mean_f64(v: &[f64]) -> Option<f64> {
+    if v.is_empty() {
+        return None;
+    }
+    let m = v.iter().sum::<f64>() / (v.len() as f64);
+    m.is_finite().then_some(m)
+}
+
 fn trimmed_mean(v: &mut [f64], trim_frac: f64) -> Option<f64> {
     if v.is_empty() {
         return None;
     }
     v.sort_by(|a, b| a.total_cmp(b));
     let n = v.len();
-    if n == 0 {
-        return None;
-    }
     let t = ((trim_frac.clamp(0.0, 0.49)) * (n as f64)).floor() as usize;
     let lo = t;
     let hi = n.saturating_sub(t);
@@ -210,19 +215,188 @@ fn trimmed_mean(v: &mut [f64], trim_frac: f64) -> Option<f64> {
         return None;
     }
     let slice = &v[lo..hi];
-    let mean = slice.iter().sum::<f64>() / (slice.len() as f64);
-    mean.is_finite().then_some(mean)
+    mean_f64(slice)
+}
+
+fn winsorized_mean(v: &mut [f64], trim_frac: f64) -> Option<f64> {
+    if v.is_empty() {
+        return None;
+    }
+    v.sort_by(|a, b| a.total_cmp(b));
+    let n = v.len();
+    let t = ((trim_frac.clamp(0.0, 0.49)) * (n as f64)).floor() as usize;
+    if t == 0 {
+        return mean_f64(v);
+    }
+    if 2 * t >= n {
+        return None;
+    }
+
+    let lo_val = v[t];
+    let hi_val = v[n - t - 1];
+
+    let mut acc = 0.0;
+    for (i, &x) in v.iter().enumerate() {
+        let y = if i < t {
+            lo_val
+        } else if i >= n - t {
+            hi_val
+        } else {
+            x
+        };
+        acc += y;
+    }
+
+    let m = acc / (n as f64);
+    m.is_finite().then_some(m)
+}
+
+fn quantile_f64(mut v: Vec<f64>, q: f64) -> Option<f64> {
+    if v.is_empty() {
+        return None;
+    }
+    v.retain(|x| x.is_finite());
+    if v.is_empty() {
+        return None;
+    }
+    v.sort_by(|a, b| a.total_cmp(b));
+
+    let n = v.len();
+    if n == 1 {
+        return Some(v[0]);
+    }
+
+    let q = q.clamp(0.0, 1.0);
+    let pos = q * ((n - 1) as f64);
+    let lo = pos.floor() as usize;
+    let hi = pos.ceil() as usize;
+
+    if lo == hi {
+        Some(v[lo])
+    } else {
+        let w = pos - (lo as f64);
+        Some(v[lo] * (1.0 - w) + v[hi] * w)
+    }
+}
+
+fn top_k_mean(mut v: Vec<f64>, k: usize) -> Option<f64> {
+    if v.is_empty() {
+        return None;
+    }
+    v.retain(|x| x.is_finite());
+    if v.is_empty() {
+        return None;
+    }
+    v.sort_by(|a, b| a.total_cmp(b)); // lower PEP is better
+    let kk = k.max(1).min(v.len());
+    mean_f64(&v[..kk])
+}
+
+fn geometric_mean(v: &[f64]) -> Option<f64> {
+    if v.is_empty() {
+        return None;
+    }
+    let mut acc = 0.0;
+    for &x in v {
+        if !x.is_finite() || x <= 0.0 {
+            return None;
+        }
+        acc += x.ln();
+    }
+    let g = (acc / (v.len() as f64)).exp();
+    g.is_finite().then_some(g)
+}
+
+fn logit_mean(v: &[f64], eps: f64) -> Option<f64> {
+    if v.is_empty() {
+        return None;
+    }
+    let eps = eps.clamp(1e-12, 1e-2);
+    let mut acc = 0.0;
+    for &x in v {
+        if !x.is_finite() {
+            return None;
+        }
+        let p = x.clamp(eps, 1.0 - eps);
+        acc += (p / (1.0 - p)).ln();
+    }
+    let z = acc / (v.len() as f64);
+    let p = 1.0 / (1.0 + (-z).exp());
+    p.is_finite().then_some(p)
+}
+
+fn normalize_weighted_pairs(peps: &[f64], weights: &[f64]) -> Vec<(f64, f64)> {
+    let mut pairs: Vec<(f64, f64)> = peps
+        .iter()
+        .copied()
+        .zip(weights.iter().copied())
+        .filter(|(p, w)| p.is_finite() && w.is_finite() && *w >= 0.0)
+        .map(|(p, w)| (p.clamp(1e-300, 1.0), w))
+        .collect();
+
+    if pairs.is_empty() {
+        return Vec::new();
+    }
+
+    let sum_w: f64 = pairs.iter().map(|(_, w)| *w).sum();
+    if sum_w <= 0.0 || !sum_w.is_finite() {
+        let eq = 1.0 / (pairs.len() as f64);
+        for (_, w) in &mut pairs {
+            *w = eq;
+        }
+        return pairs;
+    }
+
+    for (_, w) in &mut pairs {
+        *w /= sum_w;
+    }
+    pairs
+}
+
+fn weighted_mean(peps: &[f64], weights: &[f64]) -> Option<f64> {
+    let pairs = normalize_weighted_pairs(peps, weights);
+    if pairs.is_empty() {
+        return None;
+    }
+    let m = pairs.iter().map(|(p, w)| p * w).sum::<f64>();
+    m.is_finite().then_some(m)
+}
+
+fn weighted_median(peps: &[f64], weights: &[f64]) -> Option<f64> {
+    let mut pairs = normalize_weighted_pairs(peps, weights);
+    if pairs.is_empty() {
+        return None;
+    }
+
+    pairs.sort_by(|a, b| a.0.total_cmp(&b.0));
+
+    let mut cdf = 0.0;
+    for (p, w) in pairs {
+        cdf += w;
+        if cdf >= 0.5 {
+            return Some(p);
+        }
+    }
+    Some(1.0)
 }
 
 // -----------------------------------------------------------------------------
 // 5) Ensemble combiner (PEPs only)
 // -----------------------------------------------------------------------------
-fn combine_peps(peps: &[f64], how: EnsemblePepCombiner) -> f64 {
+fn combine_peps(
+    peps: &[f64],
+    weights: &[f64],
+    how: EnsemblePepCombiner,
+    trim_frac: f64,
+    quantile: f64,
+    top_k: usize,
+    logit_eps: f64,
+) -> f64 {
     if peps.is_empty() {
         return 1.0;
     }
 
-    let mut valid_peps: Vec<f64> = peps
+    let valid_peps: Vec<f64> = peps
         .iter()
         .copied()
         .filter(|p| p.is_finite())
@@ -235,12 +409,46 @@ fn combine_peps(peps: &[f64], how: EnsemblePepCombiner) -> f64 {
 
     match how {
         EnsemblePepCombiner::Median => median_f64(valid_peps).unwrap_or(1.0),
-        EnsemblePepCombiner::TrimmedMean => trimmed_mean(&mut valid_peps, 0.20).unwrap_or(1.0),
-        EnsemblePepCombiner::Max => valid_peps.into_iter().fold(0.0_f64, |a, b| a.max(b)),
-        EnsemblePepCombiner::Mean => {
-            let m = valid_peps.iter().sum::<f64>() / (valid_peps.len() as f64);
-            m.clamp(1e-300, 1.0)
+
+        EnsemblePepCombiner::TrimmedMean => {
+            let mut tmp = valid_peps;
+            trimmed_mean(&mut tmp, trim_frac).unwrap_or(1.0)
         }
+
+        EnsemblePepCombiner::Max => valid_peps.into_iter().fold(0.0_f64, |a, b| a.max(b)),
+
+        EnsemblePepCombiner::Mean => mean_f64(&valid_peps).unwrap_or(1.0).clamp(1e-300, 1.0),
+
+        EnsemblePepCombiner::WeightedMean => weighted_mean(&valid_peps, weights)
+            .unwrap_or(1.0)
+            .clamp(1e-300, 1.0),
+
+        EnsemblePepCombiner::WeightedMedian => weighted_median(&valid_peps, weights)
+            .unwrap_or(1.0)
+            .clamp(1e-300, 1.0),
+
+        EnsemblePepCombiner::WinsorizedMean => {
+            let mut tmp = valid_peps;
+            winsorized_mean(&mut tmp, trim_frac)
+                .unwrap_or(1.0)
+                .clamp(1e-300, 1.0)
+        }
+
+        EnsemblePepCombiner::Quantile => quantile_f64(valid_peps, quantile)
+            .unwrap_or(1.0)
+            .clamp(1e-300, 1.0),
+
+        EnsemblePepCombiner::TopKMean => top_k_mean(valid_peps, top_k)
+            .unwrap_or(1.0)
+            .clamp(1e-300, 1.0),
+
+        EnsemblePepCombiner::GeometricMean => geometric_mean(&valid_peps)
+            .unwrap_or(1.0)
+            .clamp(1e-300, 1.0),
+
+        EnsemblePepCombiner::LogitMean => logit_mean(&valid_peps, logit_eps)
+            .unwrap_or(1.0)
+            .clamp(1e-300, 1.0),
     }
 }
 
@@ -369,6 +577,61 @@ fn is_contam_str(proteins: &str) -> bool {
 #[inline]
 fn is_entrapment_str(proteins: &str) -> bool {
     proteins.contains("|Ent_") || proteins.contains("Ent_")
+}
+
+#[derive(Clone, Copy, Debug, Default)]
+pub struct DfEntrapmentCounts {
+    pub psms: usize,
+    pub peptides: usize,
+    pub proteins: usize,
+}
+
+pub fn has_entrapment_proteins(db: &IndexedDatabase) -> bool {
+    db.peptides.iter().any(|pep| {
+        let protein_key = pep.proteins(&db.decoy_tag, db.generate_decoys);
+        is_entrapment_str(&protein_key)
+    })
+}
+
+pub fn calculate_entrapment_counts_df(
+    features: &[DfFeature],
+    db: &IndexedDatabase,
+    peptide_fdr: f32,
+    protein_fdr: f32,
+) -> DfEntrapmentCounts {
+    let mut counts = DfEntrapmentCounts::default();
+    let mut peptide_set: FnvHashSet<String> = FnvHashSet::default();
+    let mut protein_set: FnvHashSet<String> = FnvHashSet::default();
+
+    for feat in features
+        .iter()
+        .filter(|f| f.core.rank == 1 && f.core.label == 1)
+    {
+        let peptide = &db[feat.core.peptide_idx];
+        let protein_key = peptide.proteins(&db.decoy_tag, db.generate_decoys);
+
+        if !is_entrapment_str(&protein_key) {
+            continue;
+        }
+
+        if feat.decoy_free_q_value.unwrap_or(1.0) <= peptide_fdr {
+            counts.psms += 1;
+        }
+
+        if feat.decoy_free_peptide_q.unwrap_or(1.0) <= peptide_fdr {
+            peptide_set.insert(peptide.to_string());
+        }
+
+        // Keep protein counting consistent with current DF protein inference:
+        // unique-only peptides contribute to protein-level discovery.
+        if peptide.proteins.len() == 1 && feat.decoy_free_protein_q.unwrap_or(1.0) <= protein_fdr {
+            protein_set.insert(protein_key);
+        }
+    }
+
+    counts.peptides = peptide_set.len();
+    counts.proteins = protein_set.len();
+    counts
 }
 
 // -----------------------------------------------------------------------------
@@ -1660,6 +1923,18 @@ pub fn calculate_q_values(
     // --- CALCULATION LOOP ---
     // --- capture small config once for rayon closure ---
     let ensemble_pep_combiner = settings.ensemble_pep_combiner.clone();
+    let ensemble_pep_trim_frac = settings.ensemble_pep_trim_frac;
+    let ensemble_pep_quantile = settings.ensemble_pep_quantile;
+    let ensemble_pep_top_k = settings.ensemble_pep_top_k;
+    let ensemble_pep_logit_eps = settings.ensemble_pep_logit_eps;
+
+    let ensemble_weight_moments = settings.ensemble_weight_moments;
+    let ensemble_weight_mle = settings.ensemble_weight_mle;
+    let ensemble_weight_lower_order = settings.ensemble_weight_lower_order;
+    let ensemble_weight_msfdr_seeded = settings.ensemble_weight_msfdr_seeded;
+    let ensemble_weight_msfdr_1smix = settings.ensemble_weight_msfdr_1smix;
+    let ensemble_weight_msfdr_2smix = settings.ensemble_weight_msfdr_2smix;
+    let ensemble_weight_nokoi = settings.ensemble_weight_nokoi;
 
     let mom_params = engines.mom_params;
     let mle_params = engines.mle_params;
@@ -2042,39 +2317,55 @@ pub fn calculate_q_values(
 
         let pep_final: f64 = if use_ensemble {
             let mut pep_experts: Vec<f64> = Vec::new();
+            let mut pep_weights: Vec<f64> = Vec::new();
 
             if use_mom_expert {
                 pep_experts.push(pep_mom_vec[j]);
+                pep_weights.push(ensemble_weight_moments);
             }
             if use_mle_expert {
                 pep_experts.push(pep_mle_vec[j]);
+                pep_weights.push(ensemble_weight_mle);
             }
             if use_lo_expert {
                 pep_experts.push(pep_lo_vec[j]);
+                pep_weights.push(ensemble_weight_lower_order);
             }
 
             if use_seeded_expert {
                 if let Some(v) = r.pep_msfdr {
                     pep_experts.push(v);
+                    pep_weights.push(ensemble_weight_msfdr_seeded);
                 }
             }
             if use_1smix_expert {
                 if let Some(v) = r.pep_1smix {
                     pep_experts.push(v);
+                    pep_weights.push(ensemble_weight_msfdr_1smix);
                 }
             }
             if use_2smix_expert {
                 if let Some(v) = r.pep_2smix {
                     pep_experts.push(v);
+                    pep_weights.push(ensemble_weight_msfdr_2smix);
                 }
             }
             if use_nokoi_expert {
                 if let Some(v) = r.pep_nokoi {
                     pep_experts.push(v);
+                    pep_weights.push(ensemble_weight_nokoi);
                 }
             }
 
-            combine_peps(&pep_experts, ensemble_pep_combiner.clone())
+            combine_peps(
+                &pep_experts,
+                &pep_weights,
+                ensemble_pep_combiner.clone(),
+                ensemble_pep_trim_frac,
+                ensemble_pep_quantile,
+                ensemble_pep_top_k,
+                ensemble_pep_logit_eps,
+            )
         } else {
             match settings.model_fit {
                 ModelFit::Moments => {
@@ -2981,59 +3272,130 @@ pub fn calculate_peptide_q_df(
     features: &mut [DfFeature],
     db: &IndexedDatabase,
     threshold: f32,
-) -> usize {
-    let mut best_q: FnvHashMap<String, f32> = FnvHashMap::default();
+) -> (usize, usize) {
+    // 1. Detect if the chosen stream is PEP-native or P-value native
+    // (This mirrors the exact robustness from calculate_protein_q_df)
+    let is_pep_native = features
+        .iter()
+        .find(|f| f.core.rank == 1)
+        .map(|f| f.decoy_free_p_value.is_none())
+        .unwrap_or(false);
 
-    // DF aggregation contract:
-    // - rank==1 only
-    // - TARGETS ONLY for aggregation
-    // - read ONLY decoy-free q stream
+    // Maps peptide sequence -> (best_evidence_score, is_entrapment)
+    let mut peptide_evidence_map: FnvHashMap<String, (f64, bool)> = FnvHashMap::default();
+
+    // 2. Collect the BEST PSM evidence per peptide
     for feat in features
         .iter()
         .filter(|f| f.core.rank == 1 && f.core.label == 1)
     {
-        let q = df_q_value(feat); // <-- DF stream accessor (decoy_free_q_value)
-        let peptide = db[feat.core.peptide_idx].to_string();
+        let val = if is_pep_native {
+            feat.decoy_free_pep
+        } else {
+            feat.decoy_free_p_value
+        };
 
-        best_q
+        let v = match val {
+            Some(x) => (x as f64).clamp(0.0, 1.0).max(1e-300),
+            None => continue,
+        };
+
+        let peptide = db[feat.core.peptide_idx].to_string();
+        let prot = db[feat.core.peptide_idx].proteins(&db.decoy_tag, db.generate_decoys);
+        let is_ent = is_entrapment_str(&prot);
+
+        // For both PEP and P-value, lower is better. Take the min (best).
+        peptide_evidence_map
             .entry(peptide)
-            .and_modify(|v| *v = v.min(q))
-            .or_insert(q);
+            .and_modify(|(best_v, _)| *best_v = best_v.min(v))
+            .or_insert((v, is_ent));
     }
 
-    // Write ONLY DF peptide q (rank1-only by contract)
-    // - rank==1: populate decoy_free_peptide_q from best_q map (fail-closed to 1.0 if missing)
-    // - rank!=1: scrub decoy_free_peptide_q AND MSFDR family streams (hard rank1-only)
+    let mut peptide_keys = Vec::with_capacity(peptide_evidence_map.len());
+    let mut peptide_combined_vals = Vec::with_capacity(peptide_evidence_map.len());
+    let mut is_ent_flags = Vec::with_capacity(peptide_evidence_map.len());
+
+    for (peptide, (v, is_ent)) in peptide_evidence_map {
+        peptide_keys.push(peptide);
+        peptide_combined_vals.push(v);
+        is_ent_flags.push(is_ent);
+    }
+
+    // 3. Recalculate Peptide Q-values
+    let q_values = if is_pep_native {
+        // PEP-native path: cumulative mean
+        let mut rows: Vec<(f64, usize)> = peptide_combined_vals
+            .iter()
+            .copied()
+            .enumerate()
+            .map(|(i, pep)| (pep, i))
+            .collect();
+
+        rows.sort_by(|a, b| a.0.total_cmp(&b.0));
+
+        let mut q_sorted: Vec<f64> = Vec::with_capacity(rows.len());
+        let mut cum = 0.0f64;
+        for (k, &(pep, _)) in rows.iter().enumerate() {
+            cum += pep;
+            q_sorted.push((cum / ((k + 1) as f64)).clamp(0.0, 1.0));
+        }
+
+        for i in (0..q_sorted.len().saturating_sub(1)).rev() {
+            q_sorted[i] = q_sorted[i].min(q_sorted[i + 1]);
+        }
+
+        let mut out = vec![1.0f64; rows.len()];
+        for (k, &(_, orig_idx)) in rows.iter().enumerate() {
+            out[orig_idx] = q_sorted[k];
+        }
+        out
+    } else {
+        // P-value native path: Benjamini-Hochberg over the peptides
+        crate::ml::stats::bh_q_value(&peptide_combined_vals)
+    };
+
+    // 4. Map back to features and count
+    let mut best_q: FnvHashMap<String, (f32, bool)> = FnvHashMap::default();
+    for i in 0..peptide_keys.len() {
+        best_q.insert(
+            peptide_keys[i].clone(),
+            (q_values[i] as f32, is_ent_flags[i]),
+        );
+    }
+
     for feat in features.iter_mut() {
-        // Only rank==1 AND target rows get DF peptide q.
-        // Everything else must be scrubbed to None to prevent leakage / miscounting.
         if feat.core.rank != 1 || feat.core.label != 1 {
             feat.decoy_free_peptide_q = None;
-
-            // MSFDR family (p/pep/q) must be None for non-rank1 (and we also keep them
-            // off non-target rows to avoid confusion/leakage in DF mode).
             feat.p_msfdr = None;
             feat.pep_msfdr = None;
             feat.q_msfdr = None;
-
             feat.p_1smix = None;
             feat.pep_1smix = None;
             feat.q_1smix = None;
-
             feat.p_2smix = None;
             feat.pep_2smix = None;
             feat.q_2smix = None;
-
             continue;
         }
 
-        // rank==1, target
         let peptide = db[feat.core.peptide_idx].to_string();
-        let q = best_q.get(&peptide).copied().unwrap_or(1.0);
+        let q = best_q.get(&peptide).map(|v| v.0).unwrap_or(1.0);
         feat.decoy_free_peptide_q = Some(q);
     }
 
-    best_q.values().filter(|&&q| q <= threshold).count()
+    let mut targets = 0usize;
+    let mut ents = 0usize;
+
+    for &(q, is_ent) in best_q.values() {
+        if q <= threshold {
+            targets += 1;
+            if is_ent {
+                ents += 1;
+            }
+        }
+    }
+
+    (targets, ents)
 }
 
 fn combine_cauchy(p: &[f64]) -> f64 {
