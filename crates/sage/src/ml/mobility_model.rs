@@ -10,12 +10,19 @@ use crate::peptide::Peptide;
 use crate::scoring::FeatureCore;
 use rayon::prelude::*;
 
+#[derive(Clone, Debug, Default)]
+pub struct ImsDiagnostics {
+    pub training_n: usize,
+    pub r2: f64,
+    pub mse: f64,
+}
+
 /// Try to fit an ion mobility prediction model
 pub fn predict(
     db: &IndexedDatabase,
     feats: &mut [FeatureCore],
     filter: impl Fn(&FeatureCore) -> bool + Sync + Send,
-) -> Option<()> {
+) -> Option<ImsDiagnostics> {
     let lr = match MobilityModel::fit(db, feats, filter) {
         Some(lr) => lr,
         None => {
@@ -31,7 +38,11 @@ pub fn predict(
         feat.delta_ims_model = (feat.ims - bounded).abs();
     });
 
-    Some(())
+    Some(ImsDiagnostics {
+        training_n: lr.training_n,
+        r2: lr.r2,
+        mse: lr.mse,
+    })
 }
 
 /// Vanilla-compatible mobility prediction:
@@ -43,7 +54,7 @@ pub fn predict_vanilla_compat(
     db: &IndexedDatabase,
     feats: &mut [FeatureCore],
     filter: impl Fn(&FeatureCore) -> bool + Sync + Send,
-) -> Option<()> {
+) -> Option<ImsDiagnostics> {
     let lr = match MobilityModel::fit_vanilla_compat(db, feats, filter) {
         Some(lr) => lr,
         None => {
@@ -59,13 +70,19 @@ pub fn predict_vanilla_compat(
         feat.delta_ims_model = (feat.ims - bounded).abs();
     });
 
-    Some(())
+    Some(ImsDiagnostics {
+        training_n: lr.training_n,
+        r2: lr.r2,
+        mse: lr.mse,
+    })
 }
 
 pub struct MobilityModel {
     beta: Vec<f64>,
     map: [usize; 26],
     pub r2: f64,
+    pub mse: f64,
+    pub training_n: usize,
 }
 
 const BULKY_AA_IDXS: [usize; 6] = [
@@ -240,6 +257,8 @@ impl MobilityModel {
             beta: beta.take(),
             map,
             r2,
+            mse,
+            training_n: rows,
         })
     }
 
@@ -298,6 +317,8 @@ impl MobilityModel {
             beta: beta.take(),
             map,
             r2,
+            mse,
+            training_n: rows,
         })
     }
 

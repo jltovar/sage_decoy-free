@@ -559,8 +559,56 @@ impl LowerOrderModel {
 //                               [lower_order_min_null_rank..=lower_order_max_null_rank]
 //                               (clamped within global window))
 //     min_rank_count            (minimum per-rank count to fit a LOM at rank k)
-// - μ scan range is fixed to [0.05, 0.4].
+// - μ scan range is data-driven:
+//     * PyLord-style [0.1 * mean, 1.5 * mean] when the score scale is positive
+//     * score-range fallback when the score scale is centered / near-zero / negative
 //
+
+#[inline]
+fn robust_mu_bounds(top_scores: &[f64]) -> Option<(f64, f64)> {
+    if top_scores.is_empty() {
+        return None;
+    }
+
+    let finite: Vec<f64> = top_scores
+        .iter()
+        .copied()
+        .filter(|x| x.is_finite())
+        .collect();
+    if finite.is_empty() {
+        return None;
+    }
+
+    let n = finite.len() as f64;
+    let mean = finite.iter().sum::<f64>() / n;
+    let min_x = finite
+        .iter()
+        .copied()
+        .min_by(|a, b| a.total_cmp(b))
+        .unwrap();
+    let max_x = finite
+        .iter()
+        .copied()
+        .max_by(|a, b| a.total_cmp(b))
+        .unwrap();
+
+    // PyLord-like branch when the score scale is plainly positive.
+    if mean.is_finite() && mean > 0.0 {
+        let lo = 0.1 * mean;
+        let hi = 1.5 * mean;
+        if lo.is_finite() && hi.is_finite() && lo < hi {
+            return Some((lo, hi));
+        }
+    }
+
+    // Fallback branch for centered / near-zero / negative score scales.
+    let span = (max_x - min_x).abs().max(1e-3);
+    let pad = (0.1 * span).max(1e-3);
+    let lo = min_x - pad;
+    let hi = max_x + pad;
+
+    (lo.is_finite() && hi.is_finite() && lo < hi).then_some((lo, hi))
+}
 
 #[inline]
 fn mu_grid_best_bic_range(
@@ -819,18 +867,20 @@ pub fn fit_decoy_free_model(
     lo_mode: crate::input::LoMode,
     lo_lom_estimator: crate::input::LoLomEstimator,
     lo_mean_beta_mode: crate::input::LoMeanBetaMode,
-    lo_mean_beta_min_rank: u32,
-    lo_mean_beta_count: u32,
-    lo_lr_window_size: Option<u32>,
 ) -> Option<LowerOrderModel> {
+    let lo_mean_beta_min_rank = min_null_rank;
+    let lo_mean_beta_count = max_null_rank
+        .saturating_sub(min_null_rank)
+        .saturating_add(1);
+    let lo_lr_window_size = Some(lo_mean_beta_count);
+
     if log::log_enabled!(log::Level::Debug) {
         log::debug!(
-			"LO DEBUG fit: null-rank window [{min_null_rank}..={max_null_rank}]. rank_null_stream.len()={} rank1_stream.len()={} min_null_size_per_charge={} min_rank_count={}",
-			rank_null_stream.len(),
-			rank1_stream.len(),
-			min_null_size_per_charge,
-			min_rank_count
-		);
+            "LO DEBUG derived subwindow controls: mean_beta_start={} mean_beta_count={} lr_window_size={:?}",
+            lo_mean_beta_min_rank,
+            lo_mean_beta_count,
+            lo_lr_window_size
+        );
     }
 
     // -------------------------
@@ -972,13 +1022,17 @@ pub fn fit_decoy_free_model(
             ts // fallback to full rank 1 if cutoff is inexplicably aggressive
         };
 
-        // --- PYLORD DYNAMIC MU BOUNDS ---
-        // PyLord dynamically sets the mu search bounds based on the mean of the
-        // filtered null-pocket (ts_slice), rather than using fixed boundaries.
-        // From PyLord optimization_modes.py: bounds = [(0.1 * initial_guess, 1.5 * initial_guess)]
-        let ts_mean = ts_slice.iter().sum::<f64>() / ts_slice.len().max(1) as f64;
-        let dyn_mu_min = 0.1 * ts_mean;
-        let dyn_mu_max = 1.5 * ts_mean;
+        // --- ROBUST PYLORD-STYLE MU BOUNDS ---
+        // Use PyLord-style mean-based bounds when the score scale is positive.
+        // Fall back to score-range bounds when the score scale is centered,
+        // near zero, or negative.
+        let (dyn_mu_min, dyn_mu_max) = match robust_mu_bounds(ts_slice) {
+            Some(bounds) => bounds,
+            None => {
+                log::warn!("LO DEBUG charge {charge}: could not derive finite mu bounds.");
+                continue;
+            }
+        };
 
         // ---------------------------------------------------------------------
         // Paper/PyLord LO: per-k LOM fits (MM + MLE) and TNM selection by BIC
@@ -1043,12 +1097,11 @@ pub fn fit_decoy_free_model(
             if let Some(cand) = eval_candidate_lr_range(
                 &lom_mm,
                 ts_slice,
-                dyn_mu_min, // <--- Dynamic Bound
-                dyn_mu_max, // <--- Dynamic Bound
+                dyn_mu_min,
+                dyn_mu_max,
                 lo_lr_window_size,
             ) {
-                // PyLord sanity check: ignore mathematically collapsed betas
-                if cand.1 > 0.1 {
+                if cand.0.is_finite() && cand.1.is_finite() && cand.1 > 0.0 && cand.2.is_finite() {
                     candidates.push(("LR/MM", cand));
                 }
             }
@@ -1057,11 +1110,11 @@ pub fn fit_decoy_free_model(
             if let Some(cand) = eval_candidate_lr_range(
                 &lom_mle,
                 ts_slice,
-                dyn_mu_min, // <--- Dynamic Bound
-                dyn_mu_max, // <--- Dynamic Bound
+                dyn_mu_min,
+                dyn_mu_max,
                 lo_lr_window_size,
             ) {
-                if cand.1 > 0.1 {
+                if cand.0.is_finite() && cand.1.is_finite() && cand.1 > 0.0 && cand.2.is_finite() {
                     candidates.push(("LR/MLE", cand));
                 }
             }
@@ -1075,11 +1128,13 @@ pub fn fit_decoy_free_model(
                 lo_mean_beta_count,
                 &lo_mean_beta_mode,
             ) {
-                if let Some((mu, nll)) =
-                    mu_grid_best_bic_range(beta_mean, ts_slice, dyn_mu_min, dyn_mu_max)
-                {
-                    if beta_mean > 0.1 {
-                        candidates.push(("MeanB/MM", (mu, beta_mean, nll)));
+                if beta_mean.is_finite() && beta_mean > 0.0 {
+                    if let Some((mu, nll)) =
+                        mu_grid_best_bic_range(beta_mean, ts_slice, dyn_mu_min, dyn_mu_max)
+                    {
+                        if mu.is_finite() && nll.is_finite() {
+                            candidates.push(("MeanB/MM", (mu, beta_mean, nll)));
+                        }
                     }
                 }
             }
@@ -1091,11 +1146,13 @@ pub fn fit_decoy_free_model(
                 lo_mean_beta_count,
                 &lo_mean_beta_mode,
             ) {
-                if let Some((mu, nll)) =
-                    mu_grid_best_bic_range(beta_mean, ts_slice, dyn_mu_min, dyn_mu_max)
-                {
-                    if beta_mean > 0.1 {
-                        candidates.push(("MeanB/MM", (mu, beta_mean, nll)));
+                if beta_mean.is_finite() && beta_mean > 0.0 {
+                    if let Some((mu, nll)) =
+                        mu_grid_best_bic_range(beta_mean, ts_slice, dyn_mu_min, dyn_mu_max)
+                    {
+                        if mu.is_finite() && nll.is_finite() {
+                            candidates.push(("MeanB/MLE", (mu, beta_mean, nll)));
+                        }
                     }
                 }
             }

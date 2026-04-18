@@ -132,6 +132,7 @@ pub struct FeatureCore {
     pub missed_cleavages: u8,
     pub matched_intensity_pct: f32,
     pub scored_candidates: u32,
+    pub spectrum_p_value: f64,
     pub poisson: f64,
     pub ms2_intensity: f32,
     pub fragments: Option<Fragments>,
@@ -171,6 +172,80 @@ pub struct DfFeature {
     pub decoy_free_peptide_q: Option<f32>,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub decoy_free_protein_q: Option<f32>,
+
+    // =========================================================================
+    // --- PHASE 2: NEW LAYER FIELDS ---
+    // =========================================================================
+
+    // 5A. Base layer fields
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub decoy_free_p_value_base: Option<f32>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub decoy_free_pep_base: Option<f32>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub decoy_free_score_base: Option<f32>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub decoy_free_q_base: Option<f32>,
+
+    // 5B. Layer 2 fields
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub decoy_free_p_value_l2: Option<f32>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub decoy_free_pep_l2: Option<f32>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub decoy_free_score_l2: Option<f32>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub decoy_free_q_l2: Option<f32>,
+
+    // 5C. Layer 3 fields
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub decoy_free_pep_l3: Option<f32>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub decoy_free_score_l3: Option<f32>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub decoy_free_q_l3: Option<f32>,
+
+    // 5D. Layer 2 diagnostics
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub physical_mode_used: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub rt_rescue_delta: Option<f32>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub ims_rescue_delta: Option<f32>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub physical_shift_total: Option<f32>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub physical_reliability_rt: Option<f32>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub physical_reliability_ims: Option<f32>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub physical_reliability_joint: Option<f32>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub physical_cap_hit_pos: Option<bool>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub physical_cap_hit_neg: Option<bool>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub physical_anchor_eligible: Option<bool>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub dart_posterior_used: Option<bool>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub dart_rt_lik_correct: Option<f32>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub dart_rt_lik_incorrect: Option<f32>,
+
+    // 5E. Layer 3 diagnostics
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub agreement_support: Option<f32>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub recurrence_support: Option<f32>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub within_run_support: Option<f32>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub redundancy_discount_applied: Option<f32>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub repro_shift_total: Option<f32>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub repro_cap_hit: Option<bool>,
 
     // --- DECOY-FREE: Per-method outputs (p / q / pep) ---
     // Moments
@@ -280,6 +355,42 @@ impl FeatureCore {
             p_nokoi: None,
             q_nokoi: None,
             pep_nokoi: None,
+
+            // Phase 2: Init New Layer Fields
+            decoy_free_p_value_base: None,
+            decoy_free_pep_base: None,
+            decoy_free_score_base: None,
+            decoy_free_q_base: None,
+
+            decoy_free_p_value_l2: None,
+            decoy_free_pep_l2: None,
+            decoy_free_score_l2: None,
+            decoy_free_q_l2: None,
+
+            decoy_free_pep_l3: None,
+            decoy_free_score_l3: None,
+            decoy_free_q_l3: None,
+
+            physical_mode_used: None,
+            rt_rescue_delta: None,
+            ims_rescue_delta: None,
+            physical_shift_total: None,
+            physical_reliability_rt: None,
+            physical_reliability_ims: None,
+            physical_reliability_joint: None,
+            physical_cap_hit_pos: None,
+            physical_cap_hit_neg: None,
+            physical_anchor_eligible: None,
+            dart_posterior_used: None,
+            dart_rt_lik_correct: None,
+            dart_rt_lik_incorrect: None,
+
+            agreement_support: None,
+            recurrence_support: None,
+            within_run_support: None,
+            redundancy_discount_applied: None,
+            repro_shift_total: None,
+            repro_cap_hit: None,
         }
     }
 }
@@ -641,6 +752,7 @@ impl<'db> Scorer<'db> {
                 longest_y_pct: score.longest_y as f32 / (peptide.sequence.len() as f32),
                 peptide_len: peptide.sequence.len(),
                 scored_candidates: hits.scored_candidates as u32,
+                spectrum_p_value: poisson,
                 missed_cleavages: peptide.missed_cleavages,
                 predicted_rt: 0.0,
                 predicted_ims: 0.0,

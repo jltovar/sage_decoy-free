@@ -78,12 +78,16 @@ fn rt_matrix(
     (means, Matrix::new(mat, n, max_rt.len()))
 }
 
-#[derive(Copy, Clone)]
+#[derive(Copy, Clone, Debug)]
 pub struct Alignment {
     pub file_id: usize,
     pub max_rt: f32,
     pub slope: f32,
     pub intercept: f32,
+    pub support_count: usize,
+    pub residual_spread: f32,
+    pub is_normalized: bool,
+    pub coordinate_system: &'static str,
 }
 
 use std::collections::HashSet;
@@ -152,6 +156,21 @@ pub fn global_alignment(
                 intercept = 0.0;
             }
 
+            // Phase 3: compute residual spread
+            let residual_ss = rt
+                .col(file_id)
+                .zip(mean_rts.iter())
+                .filter(|(x, _)| x.is_finite())
+                .fold(0.0f64, |acc, (x, y)| {
+                    let pred = x * slope as f64 + intercept as f64;
+                    acc + (y - pred).powi(2)
+                });
+            let residual_spread = if len > 0 {
+                (residual_ss / len as f64).sqrt() as f32
+            } else {
+                0.0
+            };
+
             log::info!(
                 "aligning file #{file}: y = {m:.4}x + {b:.4}",
                 file = file_id,
@@ -164,6 +183,10 @@ pub fn global_alignment(
                 max_rt: max_rt[file_id] as f32,
                 slope: slope as f32,
                 intercept: intercept as f32,
+                support_count: len,
+                residual_spread,
+                is_normalized: true,
+                coordinate_system: "normalized_unit_interval",
             }
         })
         .collect::<Vec<Alignment>>();

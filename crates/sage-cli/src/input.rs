@@ -387,9 +387,6 @@ impl Input {
                 // Decoy-Free Lower-Order (LO) controls
                 lo_mode: None,
                 lo_lom_estimator: None,
-                lo_mean_beta_min_rank: None,
-                lo_mean_beta_count: None,
-                lo_lr_window_size: None,
 
                 // Other Controls
                 purification_factor: None,

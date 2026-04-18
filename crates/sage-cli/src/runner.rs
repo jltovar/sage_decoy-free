@@ -594,15 +594,12 @@ impl Runner {
                 .map(|f| f.to_df())
                 .collect();
 
-            // 4. RUN DECOY-FREE FDR
+            // 4. RUN DECOY-FREE FDR LAYERS (Phase 3)
             let fdr_settings = self.parameters.fdr.clone();
 
-            // Calculate Q-values (DF)
-            features = sage_core::decoy_free_fdr::calculate_q_values(
-                &features,
-                &fdr_settings,
-                &self.database,
-            );
+            // Calculate Q-values via layered execution (Base -> Physical -> Reproducibility)
+            features =
+                sage_core::decoy_free_fdr::run_df_layers(&features, &fdr_settings, &self.database);
 
             // Logging
             let q_spectrum = features

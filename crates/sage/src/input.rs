@@ -195,12 +195,116 @@ pub enum StoreyDegeneracyFallback {
     None,
 }
 
+// =========================================================================
+// Layer 2 / Layer 3 (Decoy-Free Refactor Phase 2)
+// =========================================================================
+
+#[derive(Clone, Serialize, Deserialize, Debug, Default, PartialEq, Eq)]
+#[serde(rename_all = "snake_case")]
+pub enum PhysicalRescueMode {
+    #[default]
+    Off,
+    DartBayes,
+    BoundedAux,
+}
+
+#[derive(Clone, Serialize, Deserialize, Debug, PartialEq)]
+pub struct DartBayesConfig {
+    pub dart_use_bootstrap: bool,
+    pub dart_bootstrap_iters: usize,
+    pub dart_leave_one_run_out: bool,
+    pub dart_null_rt_model: String,
+    pub dart_true_rt_model: String,
+    pub dart_recalc_q_from_posterior: bool,
+}
+
+#[derive(Clone, Serialize, Deserialize, Debug, PartialEq)]
+pub struct BoundedAuxConfig {
+    pub update_space: String,
+    pub max_rescue_shift: f64,
+    pub max_penalty_shift: f64,
+}
+
+#[derive(Clone, Serialize, Deserialize, Debug, PartialEq)]
+pub struct PhysicalRescueConfig {
+    pub mode: PhysicalRescueMode,
+    pub anchor_mode: String,
+    pub anchor_max_pep: f64,
+    pub anchor_max_q: f64,
+    pub min_anchor_count_per_run: usize,
+    pub min_anchor_count_per_charge: usize,
+    pub rt_enabled: bool,
+    pub ims_enabled: bool,
+    pub joint_mode: String,
+    pub reliability_floor: f64,
+    pub missing_penalty: f64,
+    pub rt_region_bins: usize,
+    pub use_local_rt_scale: bool,
+    pub cov_shrinkage: f64,
+    pub dart_cfg: Option<DartBayesConfig>,
+    pub bounded_cfg: Option<BoundedAuxConfig>,
+}
+
+#[derive(Clone, Serialize, Deserialize, Debug, PartialEq)]
+pub struct L3ProteinEligibilityConfig {
+    pub enabled: bool,
+    pub q_threshold_l2: f64,
+    pub min_unique_passing_peptides: usize,
+    pub min_unique_passing_fraction: Option<f64>,
+}
+
+#[derive(Clone, Serialize, Deserialize, Debug, PartialEq)]
+pub struct L3PeptideEligibilityConfig {
+    pub min_run_fraction: f64,
+    pub min_run_count: usize,
+    pub strong_reference_q_threshold_l2: f64,
+    pub strong_reference_pep_threshold_l2: Option<f64>,
+    pub min_strong_run_fraction: f64,
+    pub min_strong_run_count: usize,
+}
+
+#[derive(Clone, Serialize, Deserialize, Debug, PartialEq)]
+pub struct L3AnchorConfig {
+    pub mode: String,
+    pub trim_fraction: Option<f64>,
+}
+
+#[derive(Clone, Serialize, Deserialize, Debug, PartialEq)]
+pub struct L3RescueBandConfig {
+    pub strong_cutoff_pep_l2: f64,
+    pub weak_cutoff_pep_l2: f64,
+    pub max_rescue_fraction: f64,
+    pub rescue_mode: String,
+}
+
+#[derive(Clone, Serialize, Deserialize, Debug, PartialEq)]
+pub struct ReproducibilityConfig {
+    // Global Layer 3 controls
+    pub enabled: bool,
+    pub max_total_shift: f64,
+    pub max_agreement_shift: f64,
+    pub max_recurrence_shift: f64,
+    pub use_expert_agreement: bool,
+    pub use_cross_run_recurrence: bool,
+    pub redundancy_discount: f64,
+
+    // Eligibility controls
+    pub protein_eligibility: L3ProteinEligibilityConfig,
+    pub peptide_eligibility: L3PeptideEligibilityConfig,
+
+    // Anchor / rescue controls
+    pub anchor: L3AnchorConfig,
+    pub rescue_band: L3RescueBandConfig,
+}
+
 #[derive(Clone, Serialize, Deserialize, Debug, Default)]
 pub struct FdrOptions {
     // =========================================================================
     // A) Global knobs
     // =========================================================================
     pub mode: Option<FdrMode>,
+    pub physical_rescue: Option<PhysicalRescueConfig>,
+    pub reproducibility: Option<ReproducibilityConfig>,
     pub peptide_fdr: Option<f32>,
     pub protein_fdr: Option<f32>,
     pub precursor_fdr: Option<f32>,
@@ -293,11 +397,6 @@ pub struct FdrOptions {
 
     // Mean-β scheme controls (paper defaults: min_rank=8, count=3)
     pub lo_mean_beta_mode: Option<LoMeanBetaMode>, // default consecutive
-    pub lo_mean_beta_min_rank: Option<u32>,        // default 8
-    pub lo_mean_beta_count: Option<u32>,           // default 3
-
-    // (Optional) if you later implement PyLord sliding-window LR selection
-    pub lo_lr_window_size: Option<u32>, // default None (disabled)
 
     // =========================================================================
     // E) MSFDR specific knobs
@@ -379,6 +478,8 @@ pub struct FdrSettings {
     // A) Global knobs
     // =========================================================================
     pub mode: FdrMode,
+    pub physical_rescue: PhysicalRescueConfig,
+    pub reproducibility: ReproducibilityConfig,
     pub peptide_fdr: f32,
     pub protein_fdr: f32,
     pub precursor_fdr: f32,
@@ -418,9 +519,6 @@ pub struct FdrSettings {
     pub lo_score: LoScore,       // Raw | PerSpectrum
 
     pub lo_mean_beta_mode: LoMeanBetaMode,
-    pub lo_mean_beta_min_rank: u32,
-    pub lo_mean_beta_count: u32,
-    pub lo_lr_window_size: Option<u32>,
 
     // =========================================================================
     // E) MSFDR specific resolved null window
@@ -569,6 +667,68 @@ impl From<FdrOptions> for FdrSettings {
         // A) Global knobs
         // ---------------------------------------------------------------------
         let mode = options.mode.unwrap_or(FdrMode::DecoyFree);
+
+        let physical_rescue = options
+            .physical_rescue
+            .unwrap_or_else(|| PhysicalRescueConfig {
+                mode: PhysicalRescueMode::Off,
+                anchor_mode: "default".to_string(),
+                anchor_max_pep: 0.1,
+                anchor_max_q: 0.01,
+                min_anchor_count_per_run: 10,
+                min_anchor_count_per_charge: 5,
+                rt_enabled: false,
+                ims_enabled: false,
+                joint_mode: "independent".to_string(),
+                reliability_floor: 0.5,
+                missing_penalty: 0.0,
+                rt_region_bins: 10,
+                use_local_rt_scale: true,
+                cov_shrinkage: 0.1,
+                dart_cfg: None,
+                bounded_cfg: None,
+            });
+
+        let reproducibility = options
+            .reproducibility
+            .unwrap_or_else(|| ReproducibilityConfig {
+                enabled: false,
+                max_total_shift: 0.0,
+                max_agreement_shift: 0.0,
+                max_recurrence_shift: 0.0,
+                use_expert_agreement: false,
+                use_cross_run_recurrence: false,
+                redundancy_discount: 1.0,
+
+                protein_eligibility: L3ProteinEligibilityConfig {
+                    enabled: true,
+                    q_threshold_l2: 0.01,
+                    min_unique_passing_peptides: 2,
+                    min_unique_passing_fraction: None,
+                },
+
+                peptide_eligibility: L3PeptideEligibilityConfig {
+                    min_run_fraction: 0.6,
+                    min_run_count: 2,
+                    strong_reference_q_threshold_l2: 0.01,
+                    strong_reference_pep_threshold_l2: None,
+                    min_strong_run_fraction: 0.2,
+                    min_strong_run_count: 1,
+                },
+
+                anchor: L3AnchorConfig {
+                    mode: "second_best".to_string(),
+                    trim_fraction: Some(0.1),
+                },
+
+                rescue_band: L3RescueBandConfig {
+                    strong_cutoff_pep_l2: 0.01,
+                    weak_cutoff_pep_l2: 0.25,
+                    max_rescue_fraction: 0.5,
+                    rescue_mode: "bounded_shrinkage".to_string(),
+                },
+            });
+
         let precursor_fdr = options.precursor_fdr.unwrap_or(0.01);
         let peptide_fdr = options.peptide_fdr.unwrap_or(0.01);
         let protein_fdr = options.protein_fdr.unwrap_or(0.01);
@@ -718,10 +878,6 @@ impl From<FdrOptions> for FdrSettings {
         let lo_mean_beta_mode = options
             .lo_mean_beta_mode
             .unwrap_or(LoMeanBetaMode::Consecutive);
-
-        let lo_mean_beta_min_rank = options.lo_mean_beta_min_rank.unwrap_or(8).max(2);
-        let lo_mean_beta_count = options.lo_mean_beta_count.unwrap_or(3).clamp(1, 10);
-        let lo_lr_window_size = options.lo_lr_window_size;
 
         // ---------------------------------------------------------------------
         // E) MSFDR specific resolved null window + knobs
@@ -905,6 +1061,8 @@ impl From<FdrOptions> for FdrSettings {
             // A) Global knobs
             // =========================================================================
             mode,
+            physical_rescue,
+            reproducibility,
             peptide_fdr,
             protein_fdr,
             precursor_fdr,
@@ -942,9 +1100,6 @@ impl From<FdrOptions> for FdrSettings {
             lo_score,
 
             lo_mean_beta_mode,
-            lo_mean_beta_min_rank,
-            lo_mean_beta_count,
-            lo_lr_window_size,
 
             // =========================================================================
             // E) MSFDR specific resolved null window

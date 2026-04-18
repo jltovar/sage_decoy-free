@@ -21,6 +21,69 @@ pub fn std_dev(data: &[f64]) -> f64 {
     variance.sqrt()
 }
 
+// =========================================================================
+// Phase 3, Step 5: Shared Mode-Agnostic Math Helpers
+// =========================================================================
+
+/// Computes robust Z-scores using the Median Absolute Deviation (MAD).
+/// Scaled by 1.4826 to asymptotically match standard deviation for normal data.
+pub fn robust_z_from_mad(data: &[f64]) -> Vec<f64> {
+    if data.is_empty() {
+        return Vec::new();
+    }
+
+    let mut sorted = data.to_vec();
+    sorted.retain(|x| x.is_finite());
+    if sorted.is_empty() {
+        return vec![0.0; data.len()];
+    }
+
+    sorted.sort_by(|a, b| a.total_cmp(b));
+    let median = sorted[sorted.len() / 2];
+
+    let mut abs_devs: Vec<f64> = sorted.iter().map(|&x| (x - median).abs()).collect();
+    abs_devs.sort_by(|a, b| a.total_cmp(b));
+    let mad = abs_devs[abs_devs.len() / 2];
+
+    let scale = if mad < 1e-12 { 1e-6 } else { mad * 1.4826 };
+
+    data.iter()
+        .map(|&x| {
+            if x.is_finite() {
+                (x - median) / scale
+            } else {
+                0.0
+            }
+        })
+        .collect()
+}
+
+/// Applies linear shrinkage to a covariance matrix.
+/// Shrinks off-diagonals toward zero, and diagonals toward the mean variance.
+pub fn shrink_covariance(cov: &mut [Vec<f64>], shrinkage: f64) {
+    let s = shrinkage.clamp(0.0, 1.0);
+    if s == 0.0 || cov.is_empty() {
+        return;
+    }
+
+    let k = cov.len();
+    let mut trace = 0.0;
+    for i in 0..k {
+        trace += cov[i][i];
+    }
+    let mean_var = trace / (k as f64);
+
+    for i in 0..k {
+        for j in 0..k {
+            if i == j {
+                cov[i][j] = (1.0 - s) * cov[i][j] + s * mean_var;
+            } else {
+                cov[i][j] = (1.0 - s) * cov[i][j];
+            }
+        }
+    }
+}
+
 /// Benjamini-Hochberg FDR Control
 /// Returns q-values for the input p-values.
 pub fn bh_q_value(p_values: &[f64]) -> Vec<f64> {
@@ -357,5 +420,101 @@ pub fn combine_brown(p_values: &[f64], params: Option<BrownParams>) -> f64 {
     match ChiSquared::new(bp.dof) {
         Ok(dist) => (1.0 - dist.cdf(x)).clamp(0.0, 1.0),
         Err(_) => 1.0,
+    }
+}
+
+// =========================================================================
+// Phase 12, Step 1: Blueprint-Compliant DART Likelihood & Posterior Stability
+// =========================================================================
+
+/// Log-PDF of the Laplace distribution.
+pub fn laplace_logpdf(x: f64, mu: f64, b: f64) -> f64 {
+    if !b.is_finite() || b <= 0.0 {
+        return f64::NEG_INFINITY;
+    }
+    let b = b.max(1e-9);
+    -(2.0 * b).ln() - (x - mu).abs() / b
+}
+
+/// Log-PDF of the Normal distribution.
+pub fn normal_logpdf(x: f64, mu: f64, sigma: f64) -> f64 {
+    if !sigma.is_finite() || sigma <= 0.0 {
+        return f64::NEG_INFINITY;
+    }
+    let sigma = sigma.max(1e-9);
+    let z = (x - mu) / sigma;
+    -0.5 * std::f64::consts::TAU.ln() - sigma.ln() - 0.5 * z * z
+}
+
+/// Computes the total log-posterior odds of the null hypothesis (incorrect ID).
+/// ln( P(null|data) / P(true|data) ) = ln( P(null)/P(true) ) + ln( P(data|null)/P(data|true) )
+pub fn dart_log_posterior_odds(prior_pep: f64, log_lik_true: f64, log_lik_null: f64) -> f64 {
+    // Clamp prior to prevent log(0) and extreme weights
+    let p0 = prior_pep.clamp(1e-15, 1.0 - 1e-15);
+
+    // Log prior odds: ln(p / (1-p)) using subtraction for stability
+    let log_prior_odds = p0.ln() - (1.0 - p0).ln();
+
+    // Log likelihood ratio: ln(L_null / L_true)
+    let log_lik_ratio = log_lik_null - log_lik_true;
+
+    log_prior_odds + log_lik_ratio
+}
+
+/// Stable Bayesian posterior PEP update.
+/// Converts log-posterior odds back to probability using a numerically stable sigmoid.
+pub fn dart_posterior_pep(prior_pep: f64, log_lik_true: f64, log_lik_null: f64) -> f64 {
+    let log_post_odds = dart_log_posterior_odds(prior_pep, log_lik_true, log_lik_null);
+
+    // Stable sigmoid function to avoid overflow in exp() for extreme log-odds
+    // prob = 1 / (1 + exp(-log_odds))
+    let post_pep = if log_post_odds >= 0.0 {
+        1.0 / (1.0 + (-log_post_odds).exp())
+    } else {
+        let e = log_post_odds.exp();
+        e / (1.0 + e)
+    };
+
+    post_pep.clamp(0.0, 1.0).max(1e-300)
+}
+
+// =========================================================================
+// Phase 4B, Step 1: Bounded Transformed-Confidence Math (Layer 2)
+// =========================================================================
+
+/// Safely converts a PEP (Probability of Error) into a logit-confidence score.
+/// Confidence = 1 - PEP. Logit = ln(Confidence / PEP).
+/// Higher logit means higher confidence (better ID).
+pub fn safe_logit_confidence(pep: f64) -> f64 {
+    let p = pep.clamp(1e-15, 1.0 - 1e-15);
+    let conf = 1.0 - p;
+    (conf / p).ln()
+}
+
+/// Safely converts a logit-confidence score back into a PEP.
+pub fn safe_inv_logit_confidence(logit_conf: f64) -> f64 {
+    let conf = 1.0 / (1.0 + (-logit_conf).exp());
+    let pep = 1.0 - conf;
+    pep.clamp(0.0, 1.0).max(1e-300)
+}
+
+/// Applies a smooth hyperbolic tangent cap to a value, ensuring it never strictly exceeds max_val.
+pub fn soft_cap(val: f64, max_val: f64) -> f64 {
+    if max_val <= 0.0 {
+        return 0.0;
+    }
+    max_val * (val / max_val).tanh()
+}
+
+/// Asymmetrically bounds a confidence shift.
+/// Positive shifts (rescues) are bounded by max_rescue.
+/// Negative shifts (penalties) are bounded by max_penalty.
+pub fn capped_shift(shift: f64, max_rescue: f64, max_penalty: f64) -> f64 {
+    if shift > 0.0 {
+        soft_cap(shift, max_rescue)
+    } else if shift < 0.0 {
+        -soft_cap(-shift, max_penalty)
+    } else {
+        0.0
     }
 }

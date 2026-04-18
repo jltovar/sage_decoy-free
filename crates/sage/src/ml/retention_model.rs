@@ -11,12 +11,33 @@ use crate::scoring::FeatureCore;
 use rayon::prelude::*;
 use std::collections::HashSet;
 
+#[derive(Clone, Debug)]
+pub struct RtDiagnostics {
+    pub training_n: usize,
+    pub r2: f64,
+    pub residual_spread: f64,
+    pub is_normalized: bool,
+    pub unit_label: &'static str,
+}
+
+impl Default for RtDiagnostics {
+    fn default() -> Self {
+        Self {
+            training_n: 0,
+            r2: 0.0,
+            residual_spread: 0.0,
+            is_normalized: true,
+            unit_label: "unit_interval",
+        }
+    }
+}
+
 /// Try to fit a retention time prediction model
 pub fn predict(
     db: &IndexedDatabase,
     features: &mut [FeatureCore],
     filter: impl Fn(&FeatureCore) -> bool + Sync + Send,
-) -> Option<()> {
+) -> Option<RtDiagnostics> {
     let lr = RetentionModel::fit(db, features, filter)?;
     features.par_iter_mut().for_each(|feat| {
         let rt = lr.predict_peptide(db, feat);
@@ -24,7 +45,13 @@ pub fn predict(
         feat.predicted_rt = bounded;
         feat.delta_rt_model = (feat.aligned_rt - bounded).abs();
     });
-    Some(())
+    Some(RtDiagnostics {
+        training_n: lr.training_n,
+        r2: lr.r2,
+        residual_spread: lr.residual_spread,
+        is_normalized: true,
+        unit_label: "unit_interval",
+    })
 }
 
 /// Vanilla-compatible retention prediction:
@@ -35,7 +62,7 @@ pub fn predict_vanilla_compat(
     db: &IndexedDatabase,
     features: &mut [FeatureCore],
     selected_psm_ids: &HashSet<usize>,
-) -> Option<()> {
+) -> Option<RtDiagnostics> {
     let lr = RetentionModel::fit_vanilla_compat(db, features, selected_psm_ids)?;
     features.par_iter_mut().for_each(|feat| {
         let rt = lr.predict_peptide(db, feat);
@@ -43,13 +70,21 @@ pub fn predict_vanilla_compat(
         feat.predicted_rt = bounded;
         feat.delta_rt_model = (feat.aligned_rt - bounded).abs();
     });
-    Some(())
+    Some(RtDiagnostics {
+        training_n: lr.training_n,
+        r2: lr.r2,
+        residual_spread: lr.residual_spread,
+        is_normalized: true,
+        unit_label: "unit_interval",
+    })
 }
 
 pub struct RetentionModel {
     beta: Vec<f64>,
     map: [usize; 26],
     pub r2: f64,
+    pub training_n: usize,
+    pub residual_spread: f64,
 }
 
 const FEATURES: usize = VALID_AA.len() * 3 + 3;
@@ -149,12 +184,15 @@ impl RetentionModel {
             .sum::<f64>();
 
         let r2 = 1.0 - (sum_squared_error / rt_var);
+        let residual_spread = (sum_squared_error / rows as f64).sqrt();
         log::info!("- fit retention time model, rsq = {}", r2);
 
         Some(Self {
             beta: beta.take(),
             map,
             r2,
+            training_n: rows,
+            residual_spread,
         })
     }
 
@@ -219,12 +257,15 @@ impl RetentionModel {
             .sum::<f64>();
 
         let r2 = 1.0 - (sum_squared_error / rt_var);
+        let residual_spread = (sum_squared_error / rows as f64).sqrt();
         log::info!("- fit retention time model, rsq = {}", r2);
 
         Some(Self {
             beta: beta.take(),
             map,
             r2,
+            training_n: rows,
+            residual_spread,
         })
     }
 
