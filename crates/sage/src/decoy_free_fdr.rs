@@ -4757,6 +4757,26 @@ fn activate_final_pep_stream(
 
 #[inline]
 fn detect_final_df_stream(features: &[DfFeature], settings: &FdrSettings) -> FinalDfStream {
+    use crate::input::ModelFit;
+
+    // Phase 1 / Step 1 contract:
+    // For p-value-native selected-model runs, keep the canonical exported
+    // decoy_free_* columns on the Base stream.
+    //
+    // L2/L3 stage-local fields may still be computed and logged, but they must
+    // not become the canonical final stream for these model fits.
+    match settings.model_fit {
+        ModelFit::Moments
+        | ModelFit::Mle
+        | ModelFit::LowerOrder
+        | ModelFit::Msfdr
+        | ModelFit::Msfdr1Smix
+        | ModelFit::Msfdr2Smix => {
+            return FinalDfStream::Base;
+        }
+        _ => {}
+    }
+
     let l3_enabled = settings.reproducibility.enabled;
     let l2_enabled = settings.physical_rescue.mode != PhysicalRescueMode::Off;
 
