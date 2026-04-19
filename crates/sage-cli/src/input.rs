@@ -175,10 +175,7 @@ impl From<TmtOptions> for TmtSettings {
         let level = value.level.unwrap_or(default.level);
 
         if level != 2 && level != 3 {
-            log::error!(
-                "tmt_settings.level must be 2 or 3, got {}",
-                level
-            );
+            log::error!("tmt_settings.level must be 2 or 3, got {}", level);
             std::process::exit(1);
         }
 

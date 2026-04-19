@@ -290,8 +290,8 @@ impl Runner {
         if score_res.is_none() {
             log::warn!("linear model fitting failed, using heuristic score");
             features.par_iter_mut().for_each(|feat| {
-                feat.discriminant_score =
-                    (-feat.core.poisson as f32).ln_1p() + feat.core.longest_y_pct / 3.0
+                feat.discriminant_score = (-(feat.core.spectrum_p_value.log10() as f32)).ln_1p()
+                    + feat.core.longest_y_pct / 3.0
             });
             features
                 .par_sort_unstable_by(|a, b| b.discriminant_score.total_cmp(&a.discriminant_score));
@@ -543,7 +543,7 @@ impl Runner {
 
         log::trace!("processing outputs");
 
-                if self.decoy_free_mode {
+        if self.decoy_free_mode {
             debug_assert!(
                 !self.parameters.database.decoy_tag.is_empty(),
                 "decoy_free mode requires non-empty database.decoy_tag"
@@ -697,7 +697,7 @@ impl Runner {
                         .unwrap_or(f32::INFINITY)
                         .total_cmp(&b.decoy_free_q_value.unwrap_or(f32::INFINITY))
                         .then_with(|| b.core.hyperscore.total_cmp(&a.core.hyperscore))
-                        .then_with(|| a.core.poisson.total_cmp(&b.core.poisson))
+                        .then_with(|| a.core.spectrum_p_value.total_cmp(&b.core.spectrum_p_value))
                 });
 
                 self.parameters
@@ -730,9 +730,12 @@ impl Runner {
             // an intermediate ML-derived spectrum-q gate used only for model training.
             let alignments = if self.parameters.predict_rt {
                 // Match the ordering used by the vanilla ML q-value calculation.
-                outputs
-                    .features
-                    .par_sort_unstable_by(|a, b| a.poisson.total_cmp(&b.poisson));
+                outputs.features.par_sort_unstable_by(|a, b| {
+                    a.label
+                        .cmp(&b.label)
+                        .then_with(|| b.hyperscore.total_cmp(&a.hyperscore))
+                        .then_with(|| a.spectrum_p_value.total_cmp(&b.spectrum_p_value))
+                });
 
                 // Compute the intermediate spectrum-q gate on a temporary TDC view.
                 let mut tmp_tdc: Vec<TdcFeature> = outputs
@@ -1003,7 +1006,7 @@ impl Runner {
         );
         record.push_field(
             ryu::Buffer::new()
-                .format((-core.poisson).ln_1p())
+                .format((-(core.spectrum_p_value.log10())).ln_1p())
                 .as_bytes(),
         );
 
@@ -1164,7 +1167,7 @@ impl Runner {
         );
         record.push_field(
             ryu::Buffer::new()
-                .format((-core.poisson).ln_1p())
+                .format((-(core.spectrum_p_value.log10())).ln_1p())
                 .as_bytes(),
         );
 
@@ -1586,7 +1589,7 @@ impl Runner {
         );
         record.push_field(
             ryu::Buffer::new()
-                .format((-core.poisson).ln_1p())
+                .format((-(core.spectrum_p_value.log10())).ln_1p())
                 .as_bytes(),
         );
         // Only TdcFeature has posterior_error

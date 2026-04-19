@@ -14,7 +14,7 @@ pub fn spectrum_q_value(scores: &mut [TdcFeature]) -> usize {
     let mut decoy = 0;
     let mut target = 0;
 
-        for score in scores.iter_mut() {
+    for score in scores.iter_mut() {
         if score.core.label == -1 {
             decoy += 1;
         } else {

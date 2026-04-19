@@ -1,7 +1,7 @@
 //! Decoy-free Lower-Order (LO) model fitting utilities.
 //!
 //! The methods in this module are based on the work of Dominik Madej and Henry Lam published here:
-//! 
+//!
 //! Modeling Lower-Order Statistics to Enable Decoy-Free FDR Estimation in Proteomics
 //! Dominik Madej and Henry Lam
 //! Journal of Proteome Research 2023 22 (4), 1159-1171
@@ -1363,12 +1363,12 @@ mod tests {
         //
         // We hardcode a few representative (z,k) points.
         let cases: &[(f64, u32, f64)] = &[
-		    (-1.0, 1, 0.06598803584531254),
-    		(0.0, 1, 0.36787944117144233),
-    		(0.0, 3, 0.9196986029286058),
-    		(1.0, 1, 0.6922006275553464),
-    		(1.0, 3, 0.9936865915923109),
-		];
+            (-1.0, 1, 0.06598803584531254),
+            (0.0, 1, 0.36787944117144233),
+            (0.0, 3, 0.9196986029286058),
+            (1.0, 1, 0.6922006275553464),
+            (1.0, 3, 0.9936865915923109),
+        ];
 
         for &(z, k, expected) in cases {
             let got = tev_cdf_asymptotic(z, k);

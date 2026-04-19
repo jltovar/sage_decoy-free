@@ -1,7 +1,7 @@
 //! Decoy-free Nokoi-like model fitting utility.
 //!
 //! The methods in this module are based on the work of Giulia Gonnelli et al. published here:
-//! 
+//!
 //! A Decoy-Free Approach to the Identification of Peptides
 //! Giulia Gonnelli, Michiel Stock, Jan Verwaeren, Davy Maddelein, Bernard De Baets, Lennart Martens, and Sven Degroeve
 //! Journal of Proteome Research 2015 14 (4), 1792-1798

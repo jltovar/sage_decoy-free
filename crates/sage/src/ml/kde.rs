@@ -98,7 +98,10 @@ impl Builder {
             decoys.len(),
             "scores and decoys must have the same length"
         );
-        assert!(!scores.is_empty(), "KDE builder requires at least one score");
+        assert!(
+            !scores.is_empty(),
+            "KDE builder requires at least one score"
+        );
         assert!(self.bins >= 2, "KDE builder requires at least two bins");
 
         let d = scores

@@ -282,8 +282,8 @@ pub struct DartBayesConfig {
 #[derive(Clone, Serialize, Deserialize, Debug, PartialEq)]
 pub struct BoundedAuxConfig {
     /// Update space for bounded auxiliary rescue.
-	/// Currently only logit-confidence space is supported.
-	pub update_space: BoundedAuxUpdateSpace,
+    /// Currently only logit-confidence space is supported.
+    pub update_space: BoundedAuxUpdateSpace,
     pub max_rescue_shift: f64,
     pub max_penalty_shift: f64,
 }
@@ -732,25 +732,25 @@ impl From<FdrOptions> for FdrSettings {
         let mode = options.mode.unwrap_or(FdrMode::DecoyFree);
 
         let physical_rescue = options
-			.physical_rescue
-			.unwrap_or_else(|| PhysicalRescueConfig {
-				mode: PhysicalRescueMode::Off,
-				anchor_mode: PhysicalAnchorMode::Default,
-				anchor_max_pep: 0.1,
-				anchor_max_q: 0.01,
-				min_anchor_count_per_run: 10,
-				min_anchor_count_per_charge: 5,
-				rt_enabled: false,
-				ims_enabled: false,
-				joint_mode: JointMode::Independent,
-				reliability_floor: 0.5,
-				missing_penalty: 0.0,
-				rt_region_bins: 10,
-				use_local_rt_scale: true,
-				cov_shrinkage: 0.1,
-				dart_cfg: None,
-				bounded_cfg: None,
-			});
+            .physical_rescue
+            .unwrap_or_else(|| PhysicalRescueConfig {
+                mode: PhysicalRescueMode::Off,
+                anchor_mode: PhysicalAnchorMode::Default,
+                anchor_max_pep: 0.1,
+                anchor_max_q: 0.01,
+                min_anchor_count_per_run: 10,
+                min_anchor_count_per_charge: 5,
+                rt_enabled: false,
+                ims_enabled: false,
+                joint_mode: JointMode::Independent,
+                reliability_floor: 0.5,
+                missing_penalty: 0.0,
+                rt_region_bins: 10,
+                use_local_rt_scale: true,
+                cov_shrinkage: 0.1,
+                dart_cfg: None,
+                bounded_cfg: None,
+            });
 
         let reproducibility = options
             .reproducibility
@@ -780,16 +780,16 @@ impl From<FdrOptions> for FdrSettings {
                 },
 
                 anchor: L3AnchorConfig {
-					mode: L3AnchorMode::SecondBest,
-					trim_fraction: Some(0.1),
-				},
-				
-				rescue_band: L3RescueBandConfig {
-					strong_cutoff_pep_l2: 0.01,
-					weak_cutoff_pep_l2: 0.25,
-					max_rescue_fraction: 0.5,
-					rescue_mode: L3RescueMode::BoundedShrinkage,
-				},
+                    mode: L3AnchorMode::SecondBest,
+                    trim_fraction: Some(0.1),
+                },
+
+                rescue_band: L3RescueBandConfig {
+                    strong_cutoff_pep_l2: 0.01,
+                    weak_cutoff_pep_l2: 0.25,
+                    max_rescue_fraction: 0.5,
+                    rescue_mode: L3RescueMode::BoundedShrinkage,
+                },
             });
 
         let precursor_fdr = options.precursor_fdr.unwrap_or(0.01);

@@ -220,9 +220,7 @@ impl LinearDiscriminantAnalysis {
         let n_decoy = decoy.iter().filter(|&&label| label).count();
         let n_target = decoy.len().saturating_sub(n_decoy);
         if n_decoy == 0 || n_target == 0 {
-            log::warn!(
-                "linear discriminant training requires at least one target and one decoy"
-            );
+            log::warn!("linear discriminant training requires at least one target and one decoy");
             return None;
         }
 
@@ -262,7 +260,13 @@ impl LinearDiscriminantAnalysis {
                     .collect::<Vec<_>>(),
             );
 
-            scatter_between += diff.dot(&diff.transpose()) * count as f64;
+            let weighted_diff = Matrix::col_vector(
+                diff.data
+                    .iter()
+                    .map(|x| x * count as f64)
+                    .collect::<Vec<_>>(),
+            );
+            scatter_between += weighted_diff.dot(&diff.transpose());
             class_means.extend(class_mean);
         }
 
@@ -339,9 +343,9 @@ pub fn score_psms(
         .flat_map_iter(|s| {
             let perc = &s.core;
 
-            let poisson = match (-perc.poisson).ln_1p() {
-                x if x.is_finite() => x,
-                _ => 3.5,
+            let poisson = match (-perc.spectrum_p_value.log10()).ln_1p() {
+                score if score.is_finite() => score,
+                _ => return None,
             };
 
             let x: [f64; FEATURES] = [
@@ -366,11 +370,17 @@ pub fn score_psms(
                 (perc.delta_rt_model as f64).clamp(0.001, 0.999).sqrt(),
                 (perc.delta_ims_model as f64).clamp(0.001, 0.999).sqrt(),
             ];
-            x
+            Some(x)
         })
         .collect::<Vec<_>>();
 
-    let features = Matrix::new(features, scores.len(), FEATURES);
+    let nrows = features.len();
+    let features = features
+        .into_iter()
+        .flat_map(|row| row.into_iter())
+        .collect::<Vec<f64>>();
+
+    let features = Matrix::new(features, nrows, FEATURES);
     let lda = LinearDiscriminantAnalysis::train(&features, &decoys)?;
 
     if !lda.eigenvector.iter().all(|f| f.is_finite()) {

@@ -18,9 +18,7 @@ use rayon::prelude::*;
 type FnvDashMap<K, V> = DashMap<K, V, BuildHasherDefault<FnvHasher>>;
 
 fn max_rt_by_file(features: &[FeatureCore], n_files: usize) -> Vec<f64> {
-    let max_rt = (0..n_files)
-        .map(|_| AtomicU32::new(0))
-        .collect::<Vec<_>>();
+    let max_rt = (0..n_files).map(|_| AtomicU32::new(0)).collect::<Vec<_>>();
 
     features.par_iter().for_each(|feat| {
         max_rt[feat.file_id].fetch_max(feat.rt.ceil() as u32, std::sync::atomic::Ordering::SeqCst);
@@ -173,7 +171,7 @@ pub fn global_alignment(
                     |(len, dot, sum_x, sum_y), (x, y)| (len + 1, dot + x * y, sum_x + x, sum_y + y),
                 );
 
-                        let (slope, intercept, residual_spread) = if len == 0 {
+            let (slope, intercept, residual_spread) = if len == 0 {
                 (1.0f64, 0.0f64, 0.0f32)
             } else {
                 let x_mean = sum_x / len as f64;
@@ -198,7 +196,11 @@ pub fn global_alignment(
                 };
 
                 let slope = if slope.is_finite() { slope } else { 1.0 };
-                let intercept = if intercept.is_finite() { intercept } else { 0.0 };
+                let intercept = if intercept.is_finite() {
+                    intercept
+                } else {
+                    0.0
+                };
 
                 let residual_ss = rt
                     .col(file_id)
@@ -235,7 +237,7 @@ pub fn global_alignment(
 
     log::info!("aligned retention times across {} files", n_files);
 
-        features.par_iter_mut().for_each(|feature| {
+    features.par_iter_mut().for_each(|feature| {
         let a = alignments[feature.file_id];
         feature.aligned_rt = if a.max_rt > 0.0 && a.max_rt.is_finite() {
             (feature.rt / a.max_rt) * a.slope + a.intercept

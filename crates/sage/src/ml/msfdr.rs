@@ -1,10 +1,10 @@
 //! Decoy-free MSFDR model fitting utilities.
 //!
 //! The methods in this module are based on the work of Yisu Peng, et al. published here:
-//! 
+//!
 //! New mixture models for decoy-free false discovery rate estimation in mass spectrometry proteomics
-//! Yisu Peng, Shantanu Jain, Yong Fuga Li, Michal Greguš, Alexander R. Ivanov, Olga Vitek, Predrag Radivojac, 
-//! Bioinformatics, Volume 36, Issue Supplement_2, December 2020, Pages i745–i753, 
+//! Yisu Peng, Shantanu Jain, Yong Fuga Li, Michal Greguš, Alexander R. Ivanov, Olga Vitek, Predrag Radivojac,
+//! Bioinformatics, Volume 36, Issue Supplement_2, December 2020, Pages i745–i753,
 //! DOI: 10.1093/bioinformatics/btaa8074
 //! https://academic.oup.com/bioinformatics/article/36/Supplement_2/i745/6055912
 //!

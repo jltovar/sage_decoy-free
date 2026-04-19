@@ -273,7 +273,10 @@ impl Matrix {
     ///
     /// * Panics if the matrix has zero rows
     pub fn mean(&self) -> Vec<f64> {
-        assert!(self.rows > 0, "mean requires a matrix with at least one row");
+        assert!(
+            self.rows > 0,
+            "mean requires a matrix with at least one row"
+        );
 
         (0..self.cols)
             .into_par_iter()
@@ -365,6 +368,15 @@ impl AddAssign<Matrix> for Matrix {
         for i in 0..self.data.len() {
             self.data[i] += rhs.data[i];
         }
+    }
+}
+
+impl std::ops::Mul<f64> for Matrix {
+    type Output = Matrix;
+
+    fn mul(mut self, rhs: f64) -> Self::Output {
+        self.data.iter_mut().for_each(|x| *x *= rhs);
+        self
     }
 }
 

@@ -24,14 +24,14 @@ impl Matrix {
 }
 
 impl Gauss {
-	fn approx_zero(x: f64, tol: f64) -> bool {
-		x.abs() <= tol
-	}
-	
-	fn approx_one(x: f64, tol: f64) -> bool {
-		(x - 1.0).abs() <= tol
-	}
-	
+    fn approx_zero(x: f64, tol: f64) -> bool {
+        x.abs() <= tol
+    }
+
+    fn approx_one(x: f64, tol: f64) -> bool {
+        (x - 1.0).abs() <= tol
+    }
+
     pub fn solve_inner(left: Matrix, right: Matrix, eps: f64) -> Option<Matrix> {
         let mut g = Gauss { left, right };
         g.fill_zero(eps);
@@ -93,69 +93,69 @@ impl Gauss {
     // Check whether the left matrix is numerically consistent with an identity
     // block and any remaining rows are numerically zero.
     fn left_solved_strict(&self) -> bool {
-		let n = self.left.cols;
-		let diag_eps = 1e-8;
-		let off_diag_eps = 1e-8;
-	
-		for i in 0..n {
-			for j in 0..n {
-				let x = self.left[(i, j)];
-	
-				if i == j {
-					if !Self::approx_one(x, diag_eps) && !Self::approx_zero(x, diag_eps) {
-						log::debug!(
+        let n = self.left.cols;
+        let diag_eps = 1e-8;
+        let off_diag_eps = 1e-8;
+
+        for i in 0..n {
+            for j in 0..n {
+                let x = self.left[(i, j)];
+
+                if i == j {
+                    if !Self::approx_one(x, diag_eps) && !Self::approx_zero(x, diag_eps) {
+                        log::debug!(
 							"Finding solution to linear system failed: left side of matrix [{},{}] = {}",
 							i,
 							j,
 							x
 						);
-						return false;
-					}
-				} else if x.abs() > off_diag_eps {
-					log::debug!(
+                        return false;
+                    }
+                } else if x.abs() > off_diag_eps {
+                    log::debug!(
 						"Finding solution to linear system failed: left side of matrix [{},{}] = {}",
 						i,
 						j,
 						x
 					);
-					return false;
-				}
-			}
-		}
-		true
-	}
+                    return false;
+                }
+            }
+        }
+        true
+    }
 
     // Vanilla-compatible solved-state check preserving legacy off-diagonal semantics.
     fn left_solved_vanilla(&self) -> bool {
-		let n = self.left.cols;
-		let diag_eps = 1e-8;
-	
-		for i in 0..n {
-			for j in 0..n {
-				let x = self.left[(i, j)];
-				if i == j {
-					if !Self::approx_one(x, diag_eps) && !Self::approx_zero(x, diag_eps) {
-						log::debug!(
+        let n = self.left.cols;
+        let diag_eps = 1e-8;
+
+        for i in 0..n {
+            for j in 0..n {
+                let x = self.left[(i, j)];
+                if i == j {
+                    if !Self::approx_one(x, diag_eps) && !Self::approx_zero(x, diag_eps) {
+                        log::debug!(
 							"Finding solution to linear system failed: left side of matrix [{},{}] = {}",
 							i,
 							j,
 							x
 						);
-						return false;
-					}
-				} else if x > 1E-8 {
-					log::debug!(
+                        return false;
+                    }
+                } else if x > 1E-8 {
+                    log::debug!(
 						"Finding solution to linear system failed: left side of matrix [{},{}] = {}",
 						i,
 						j,
 						x
 					);
-					return false;
-				}
-			}
-		}
-		true
-	}
+                    return false;
+                }
+            }
+        }
+        true
+    }
 
     fn echelon(&mut self) {
         let (m, n) = self.left.shape();
@@ -163,26 +163,26 @@ impl Gauss {
         let mut k = 0;
 
         while h < m && k < n {
-			// Find the row with the largest-magnitude pivot in the current column.
-			let mut max = (h, self.left[(h, k)].abs());
-			for i in h..m {
-				let candidate = self.left[(i, k)].abs();
-				if candidate > max.1 {
-					max = (i, candidate);
-				}
-			}
-		
-			let i = max.0;
-			if Self::approx_zero(self.left[(i, k)], 1e-12) {
-				k += 1;
-				continue;
-			}
-		
-			// Swap rows (partial pivoting)
-			if h != i {
-				self.left.swap_rows(h, i);
-				self.right.swap_rows(h, i);
-			}
+            // Find the row with the largest-magnitude pivot in the current column.
+            let mut max = (h, self.left[(h, k)].abs());
+            for i in h..m {
+                let candidate = self.left[(i, k)].abs();
+                if candidate > max.1 {
+                    max = (i, candidate);
+                }
+            }
+
+            let i = max.0;
+            if Self::approx_zero(self.left[(i, k)], 1e-12) {
+                k += 1;
+                continue;
+            }
+
+            // Swap rows (partial pivoting)
+            if h != i {
+                self.left.swap_rows(h, i);
+                self.right.swap_rows(h, i);
+            }
 
             // Clear rows below pivot row
             for i in h + 1..m {
