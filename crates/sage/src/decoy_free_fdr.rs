@@ -1900,7 +1900,6 @@ struct BaseDiscoveryResult {
 
 #[derive(Clone, Debug)]
 struct PhysicalRescueResult {
-    pub mode: PhysicalRescueMode,
     pub fail_closed: bool,
 
     pub anchor_count_total: usize,
@@ -3661,7 +3660,6 @@ fn apply_physical_rescue(
                 }
             }
             PhysicalRescueResult {
-                mode: PhysicalRescueMode::Off,
                 fail_closed: false,
                 anchor_count_total: 0,
                 anchor_count_after_filters: 0,
@@ -3688,7 +3686,6 @@ fn apply_physical_rescue(
             }
 
             PhysicalRescueResult {
-                mode: settings.physical_rescue.mode.clone(),
                 fail_closed: l2_ctx.is_unreliable,
                 anchor_count_total: l2_ctx.anchor_count_total,
                 anchor_count_after_filters: l2_ctx.anchors.len(),
@@ -5005,26 +5002,26 @@ pub fn run_df_layers(
     // 2. Apply Layer 2 Physical Rescue
     let rescue_res = apply_physical_rescue(&mut new_features, settings, db);
     if settings.physical_rescue.ims_enabled {
-		log::info!(
+        log::info!(
 			"DF Layer 2: mode={:?} (anchors={}/{}) JointRel={:.4} (RT={:.4}, IMS={:.4}) FailClosed={}",
 			settings.physical_rescue.mode,
-			rescue_res.anchors.len(),
+			rescue_res.anchor_count_after_filters,
 			rescue_res.anchor_count_total,
 			rescue_res.joint_reliability,
 			rescue_res.rt_reliability,
 			rescue_res.ims_reliability,
 			rescue_res.fail_closed
 		);
-	} else {
-		log::info!(
+    } else {
+        log::info!(
 			"DF Layer 2: mode={:?} (anchors={}/{}) JointRel={:.4} (RT-only; IMS disabled) FailClosed={}",
 			settings.physical_rescue.mode,
-			rescue_res.anchors.len(),
+			rescue_res.anchor_count_after_filters,
 			rescue_res.anchor_count_total,
 			rescue_res.joint_reliability,
 			rescue_res.fail_closed
 		);
-	}
+    }
 
     // Optional: Log detailed run/charge diagnostics at DEBUG level to avoid spamming INFO
     log::debug!(
