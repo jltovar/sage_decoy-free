@@ -5008,21 +5008,21 @@ pub fn run_df_layers(
 		log::info!(
 			"DF Layer 2: mode={:?} (anchors={}/{}) JointRel={:.4} (RT={:.4}, IMS={:.4}) FailClosed={}",
 			settings.physical_rescue.mode,
-			l2_ctx.anchors.len(),
-			l2_ctx.anchor_count_total,
-			l2_ctx.joint_rel.joint_reliability,
-			l2_ctx.rt_rel.reliability,
-			l2_ctx.ims_rel.reliability,
-			l2_ctx.is_unreliable
+			rescue_res.anchors.len(),
+			rescue_res.anchor_count_total,
+			rescue_res.joint_reliability,
+			rescue_res.rt_reliability,
+			rescue_res.ims_reliability,
+			rescue_res.fail_closed
 		);
 	} else {
 		log::info!(
 			"DF Layer 2: mode={:?} (anchors={}/{}) JointRel={:.4} (RT-only; IMS disabled) FailClosed={}",
 			settings.physical_rescue.mode,
-			l2_ctx.anchors.len(),
-			l2_ctx.anchor_count_total,
-			l2_ctx.joint_rel.joint_reliability,
-			l2_ctx.is_unreliable
+			rescue_res.anchors.len(),
+			rescue_res.anchor_count_total,
+			rescue_res.joint_reliability,
+			rescue_res.fail_closed
 		);
 	}
 
