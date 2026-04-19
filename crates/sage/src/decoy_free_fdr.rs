@@ -4166,6 +4166,8 @@ struct L3ProteinSupportSummary {
 struct L3PeptideEligibilitySummary {
     pub n_runs_observed: usize,
     pub n_runs_strong_l2: usize,
+    pub observed_run_fraction: f64,
+    pub strong_run_fraction: f64,
     pub is_rescue_eligible: bool,
     pub protein_rescue_eligible: bool,
 }
@@ -4222,6 +4224,31 @@ fn compute_expert_agreement_support(f: &DfFeature, settings: &FdrSettings) -> f6
 
     let reward = (strong_experts as f64 - 1.0) * 0.5;
     crate::ml::stats::soft_cap(reward, settings.reproducibility.max_agreement_shift)
+}
+
+fn compute_cross_run_recurrence_support(
+    elig: &L3PeptideEligibilitySummary,
+    settings: &FdrSettings,
+) -> f64 {
+    if !settings.reproducibility.use_cross_run_recurrence {
+        return 0.0;
+    }
+
+    if !elig.is_rescue_eligible {
+        return 0.0;
+    }
+
+    let pep_cfg = &settings.reproducibility.peptide_eligibility;
+
+    let observed_excess = (elig.observed_run_fraction - pep_cfg.min_run_fraction).max(0.0);
+    let strong_excess = (elig.strong_run_fraction - pep_cfg.min_strong_run_fraction).max(0.0);
+
+    // Recurrence support is based on how far the peptide exceeds the minimum
+    // recurrence requirements used for L3 eligibility. Strong-run excess is
+    // weighted more heavily than observed-run excess.
+    let raw_support = observed_excess + 2.0 * strong_excess;
+
+    crate::ml::stats::soft_cap(raw_support, settings.reproducibility.max_recurrence_shift)
 }
 
 fn compute_redundancy_discount(_f: &DfFeature, settings: &FdrSettings) -> f64 {
@@ -4360,12 +4387,13 @@ fn build_l3_peptide_eligibility_map(
         let n_runs_strong_l2 = strong_runs.get(&pep_id).map(|s| s.len()).unwrap_or(0);
         let protein_rescue_eligible = protein_ok_by_peptide.get(&pep_id).copied().unwrap_or(false);
 
-        let observed_frac_ok =
-            (n_runs_observed as f64) / (total_runs as f64) >= cfg.min_run_fraction;
+        let observed_run_fraction = (n_runs_observed as f64) / (total_runs as f64);
+        let strong_run_fraction = (n_runs_strong_l2 as f64) / (total_runs as f64);
+
+        let observed_frac_ok = observed_run_fraction >= cfg.min_run_fraction;
         let observed_count_ok = n_runs_observed >= cfg.min_run_count;
 
-        let strong_frac_ok =
-            (n_runs_strong_l2 as f64) / (total_runs as f64) >= cfg.min_strong_run_fraction;
+        let strong_frac_ok = strong_run_fraction >= cfg.min_strong_run_fraction;
         let strong_count_ok = n_runs_strong_l2 >= cfg.min_strong_run_count;
 
         let is_rescue_eligible = protein_rescue_eligible
@@ -4379,6 +4407,8 @@ fn build_l3_peptide_eligibility_map(
             L3PeptideEligibilitySummary {
                 n_runs_observed,
                 n_runs_strong_l2,
+                observed_run_fraction,
+                strong_run_fraction,
                 is_rescue_eligible,
                 protein_rescue_eligible,
             },
@@ -4490,6 +4520,7 @@ fn apply_l3_anchor_rescue(
     prior_pep_l2: f64,
     anchor_pep: f64,
     expert_support_shift: f64,
+    recurrence_support_shift: f64,
     settings: &FdrSettings,
 ) -> (f64, f64) {
     let band = &settings.reproducibility.rescue_band;
@@ -4509,7 +4540,12 @@ fn apply_l3_anchor_rescue(
     let prior_logit = crate::ml::stats::safe_logit_confidence(prior);
     let rescue_logit = crate::ml::stats::safe_logit_confidence(rescued_pep);
 
-    let combined_shift = (rescue_logit - prior_logit) + expert_support_shift;
+    let recurrence_support_shift =
+        recurrence_support_shift.clamp(0.0, settings.reproducibility.max_recurrence_shift);
+
+    let combined_shift =
+        (rescue_logit - prior_logit) + expert_support_shift + recurrence_support_shift;
+
     let bounded_shift = crate::ml::stats::capped_shift(
         combined_shift,
         settings.reproducibility.max_total_shift,
@@ -4556,7 +4592,7 @@ fn apply_bounded_repro_shift(
     // It does not activate the final DF stream.
     // Final activation happens only in finalize_df_psm_stream(...).
     //
-    // Layer 3 does not grant a generic peptide-level recurrence bonus.
+    // Layer 3 does not grant a universal peptide-level recurrence bonus.
     // Rescue is allowed only for peptides that pass:
     //   1) protein-support eligibility from Layer 2,
     //   2) peptide recurrence eligibility,
@@ -4566,6 +4602,8 @@ fn apply_bounded_repro_shift(
     // Strong PSMs are left unchanged.
     // Very weak PSMs are not rescued.
     // Rescue-eligible PSMs move in a bounded way toward a Layer 2-derived anchor.
+    // Cross-run recurrence, when enabled, contributes only as an additional
+    // bounded support term within that rescue path.
     features: &mut [DfFeature],
     settings: &FdrSettings,
     db: &IndexedDatabase,
@@ -4675,13 +4713,22 @@ fn apply_bounded_repro_shift(
         agreement_sum += expert_s;
 
         let eligibility = peptide_eligibility_map.get(&pep_id);
+        let recurrence_s = eligibility
+            .map(|elig| compute_cross_run_recurrence_support(elig, settings))
+            .unwrap_or(0.0);
+
         let band = classify_l3_rescue_band(prior_pep, settings);
 
         let (post_pep, shift_abs) = match (eligibility, band) {
             (Some(elig), L3RescueBand::RescueEligible) if elig.is_rescue_eligible => {
                 if let Some(anchor) = anchor_map.get(&pep_id) {
-                    let (post, shift_abs) =
-                        apply_l3_anchor_rescue(prior_pep, anchor.anchor_value, expert_s, settings);
+                    let (post, shift_abs) = apply_l3_anchor_rescue(
+                        prior_pep,
+                        anchor.anchor_value,
+                        expert_s,
+                        recurrence_s,
+                        settings,
+                    );
                     if post + 1e-12 < prior_pep {
                         n_rescued_psms += 1;
                     }
@@ -5352,7 +5399,7 @@ pub fn calculate_protein_q_df(
 
     for (key, peptide_map) in protein_peptide_map {
         let mut vals: Vec<f64> = peptide_map.values().copied().collect();
-        if vals.is_empty() {
+        if vals.len() < 2 {
             continue;
         }
 
@@ -5360,14 +5407,10 @@ pub fn calculate_protein_q_df(
             // - unique-only peptides already enforced above
             // - require at least 2 unique peptides
             // - protein evidence = second-best (2nd smallest) peptide PEP
-            if vals.len() < 2 {
-                continue;
-            }
-
             vals.sort_by(|a, b| a.total_cmp(b));
             vals[1].clamp(0.0, 1.0).max(1e-300)
         } else {
-            // P-value native combiners
+            // P-value native combiners over at least two unique peptides
             match settings.protein_p_combine {
                 crate::input::ProteinPCombine::Fisher => {
                     stats::combine_fisher(&vals).clamp(0.0, 1.0).max(1e-300)
