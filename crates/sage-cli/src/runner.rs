@@ -737,7 +737,8 @@ impl Runner {
                         .then_with(|| a.spectrum_p_value.total_cmp(&b.spectrum_p_value))
                 });
 
-                // Compute the intermediate spectrum-q gate on a temporary TDC view.
+                // Compute the intermediate TDC spectrum-q gate on a temporary TDC view
+                // using the full vanilla TDC scoring path (LDA fit/fallback + q-value).
                 let mut tmp_tdc: Vec<TdcFeature> = outputs
                     .features
                     .iter()
@@ -745,7 +746,7 @@ impl Runner {
                     .map(FeatureCore::to_tdc)
                     .collect();
 
-                sage_core::ml::qvalue::spectrum_q_value(&mut tmp_tdc);
+                let _ = self.spectrum_fdr(&mut tmp_tdc);
 
                 // Select PSM ids admitted to RT/IMS model training.
                 let selected_psm_ids: HashSet<usize> = tmp_tdc
