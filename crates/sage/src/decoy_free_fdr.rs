@@ -3361,6 +3361,14 @@ fn compute_ims_reliability(
     anchors: &[usize],
     settings: &FdrSettings,
 ) -> ImsReliabilitySummary {
+    if !settings.physical_rescue.ims_enabled {
+        return ImsReliabilitySummary {
+            ims_sigma_global: None,
+            runwise_ims_sigma: Vec::new(),
+            reliability: 0.0,
+            fail_closed_hint: false,
+        };
+    }
     use std::collections::HashMap;
 
     let mut ims_deltas: Vec<f64> = anchors
@@ -3435,24 +3443,25 @@ fn compute_joint_physical_summary(
     settings: &FdrSettings,
 ) -> JointPhysicalSummary {
     let joint_mode = &settings.physical_rescue.joint_mode;
+    let ims_active = settings.physical_rescue.ims_enabled && ims.ims_sigma_global.is_some();
 
     let joint_reliability = match joint_mode {
         JointMode::Min => {
-            if ims.ims_sigma_global.is_some() {
+            if ims_active {
                 rt.reliability.min(ims.reliability)
             } else {
                 rt.reliability
             }
         }
         JointMode::Product => {
-            if ims.ims_sigma_global.is_some() {
+            if ims_active {
                 (rt.reliability * ims.reliability).clamp(0.0, 1.0)
             } else {
                 rt.reliability
             }
         }
         JointMode::Independent => {
-            if ims.ims_sigma_global.is_some() {
+            if ims_active {
                 0.5 * rt.reliability + 0.5 * ims.reliability
             } else {
                 rt.reliability
@@ -3460,7 +3469,7 @@ fn compute_joint_physical_summary(
         }
     };
 
-    let fail_closed_hint = rt.fail_closed_hint || ims.fail_closed_hint;
+    let fail_closed_hint = rt.fail_closed_hint || (ims_active && ims.fail_closed_hint);
 
     JointPhysicalSummary {
         joint_reliability,
@@ -3570,15 +3579,19 @@ fn prepare_l2_physical_context(
         log::debug!("L2 RT runwise sigma: {:?}", rt_rel.runwise_rt_sigma);
     }
 
-    log::debug!(
-        "L2 IMS reliability: global_sigma={:?}, reliability={:.3}, fail_closed_hint={}",
-        ims_rel.ims_sigma_global,
-        ims_rel.reliability,
-        ims_rel.fail_closed_hint
-    );
+    if settings.physical_rescue.ims_enabled {
+        log::debug!(
+            "L2 IMS reliability: global_sigma={:?}, reliability={:.3}, fail_closed_hint={}",
+            ims_rel.ims_sigma_global,
+            ims_rel.reliability,
+            ims_rel.fail_closed_hint
+        );
 
-    if !ims_rel.runwise_ims_sigma.is_empty() {
-        log::debug!("L2 IMS runwise sigma: {:?}", ims_rel.runwise_ims_sigma);
+        if !ims_rel.runwise_ims_sigma.is_empty() {
+            log::debug!("L2 IMS runwise sigma: {:?}", ims_rel.runwise_ims_sigma);
+        }
+    } else {
+        log::debug!("L2 IMS reliability: disabled");
     }
 
     log::debug!(
@@ -4991,16 +5004,27 @@ pub fn run_df_layers(
 
     // 2. Apply Layer 2 Physical Rescue
     let rescue_res = apply_physical_rescue(&mut new_features, settings, db);
-    log::info!(
-        "DF Layer 2: mode={:?} (anchors={}/{}) JointRel={:.4} (RT={:.4}, IMS={:.4}) FailClosed={}",
-        rescue_res.mode,
-        rescue_res.anchor_count_after_filters,
-        rescue_res.anchor_count_total,
-        rescue_res.joint_reliability,
-        rescue_res.rt_reliability,  // Reads diagnostic field
-        rescue_res.ims_reliability, // Reads diagnostic field
-        rescue_res.fail_closed
-    );
+    if settings.physical_rescue.ims_enabled {
+		log::info!(
+			"DF Layer 2: mode={:?} (anchors={}/{}) JointRel={:.4} (RT={:.4}, IMS={:.4}) FailClosed={}",
+			settings.physical_rescue.mode,
+			l2_ctx.anchors.len(),
+			l2_ctx.anchor_count_total,
+			l2_ctx.joint_rel.joint_reliability,
+			l2_ctx.rt_rel.reliability,
+			l2_ctx.ims_rel.reliability,
+			l2_ctx.is_unreliable
+		);
+	} else {
+		log::info!(
+			"DF Layer 2: mode={:?} (anchors={}/{}) JointRel={:.4} (RT-only; IMS disabled) FailClosed={}",
+			settings.physical_rescue.mode,
+			l2_ctx.anchors.len(),
+			l2_ctx.anchor_count_total,
+			l2_ctx.joint_rel.joint_reliability,
+			l2_ctx.is_unreliable
+		);
+	}
 
     // Optional: Log detailed run/charge diagnostics at DEBUG level to avoid spamming INFO
     log::debug!(
