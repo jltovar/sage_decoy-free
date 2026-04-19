@@ -4878,12 +4878,11 @@ fn finalize_df_psm_stream(features: &mut [DfFeature], settings: &FdrSettings) ->
     final_stream
 }
 
-fn validate_final_df_stream_contract(features: &[DfFeature]) {
+fn validate_final_df_stream_contract(features: &[DfFeature], final_stream: FinalDfStream) {
     let mut n_rank1 = 0usize;
     let mut n_p_native = 0usize;
     let mut n_pep_native = 0usize;
-    let mut n_invalid_pep_native = 0usize;
-    let mut n_invalid_mixed = 0usize;
+    let mut n_invalid = 0usize;
 
     for f in features.iter().filter(|f| f.core.rank == 1) {
         n_rank1 += 1;
@@ -4892,40 +4891,44 @@ fn validate_final_df_stream_contract(features: &[DfFeature]) {
         let has_pep = f.decoy_free_pep.is_some();
         let has_q = f.decoy_free_q_value.is_some();
 
-        if has_p {
-            n_p_native += 1;
-
-            let looks_like_l2 = f.decoy_free_pep == f.decoy_free_pep_l2
-                && f.decoy_free_q_value == f.decoy_free_q_l2
-                && f.decoy_free_pep_l2.is_some();
-
-            let looks_like_l3 = f.decoy_free_pep == f.decoy_free_pep_l3
-                && f.decoy_free_q_value == f.decoy_free_q_l3
-                && f.decoy_free_pep_l3.is_some();
-
-            if looks_like_l2 || looks_like_l3 {
-                n_invalid_mixed += 1;
+        match final_stream {
+            FinalDfStream::Base => {
+                if has_p {
+                    n_p_native += 1;
+                }
+                if !has_p || !has_pep || !has_q {
+                    n_invalid += 1;
+                }
             }
-        } else {
-            n_pep_native += 1;
-
-            if !has_pep || !has_q {
-                n_invalid_pep_native += 1;
+            FinalDfStream::Layer2 | FinalDfStream::Layer3 => {
+                if !has_p {
+                    n_pep_native += 1;
+                }
+                if has_p || !has_pep || !has_q {
+                    n_invalid += 1;
+                }
             }
         }
     }
 
-    if n_invalid_pep_native > 0 || n_invalid_mixed > 0 {
+    if n_invalid > 0 {
+        let stream_name = match final_stream {
+            FinalDfStream::Base => "base / p-value-native",
+            FinalDfStream::Layer2 => "layer2 / pep-native",
+            FinalDfStream::Layer3 => "layer3 / pep-native",
+        };
+
         let msg = format!(
-            "DF final stream contract violated: rank1={} p_native={} pep_native={} invalid_pep_native={} mixed_stream_rows={}",
-            n_rank1, n_p_native, n_pep_native, n_invalid_pep_native, n_invalid_mixed
+            "DF final stream contract violated: stream={} rank1={} p_native={} pep_native={} invalid_rows={}",
+            stream_name, n_rank1, n_p_native, n_pep_native, n_invalid
         );
         log::error!("{}", msg);
         panic!("{}", msg);
     }
 
     log::debug!(
-        "DF final stream contract OK: rank1={} p_native={} pep_native={}",
+        "DF final stream contract OK: stream={:?} rank1={} p_native={} pep_native={}",
+        final_stream,
         n_rank1,
         n_p_native,
         n_pep_native
@@ -5130,7 +5133,7 @@ pub fn run_df_layers(
 
     // 4. Finalize the active PSM stream from the completed DF layers.
     let final_stream = finalize_df_psm_stream(&mut new_features, settings);
-    validate_final_df_stream_contract(&new_features);
+    validate_final_df_stream_contract(&new_features, final_stream);
 
     let stream_kind = match final_stream {
         FinalDfStream::Base => "base / p-value-native",
