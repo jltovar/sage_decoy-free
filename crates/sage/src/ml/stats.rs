@@ -4,11 +4,17 @@ use log::warn;
 use statrs::distribution::{ChiSquared, ContinuousCDF};
 
 pub fn mean(data: &[f64]) -> f64 {
+    if data.is_empty() {
+        return 0.0;
+    }
     let sum: f64 = data.iter().sum();
     sum / data.len() as f64
 }
 
 pub fn std_dev(data: &[f64]) -> f64 {
+    if data.is_empty() {
+        return 0.0;
+    }
     let m = mean(data);
     let variance = data
         .iter()
@@ -25,8 +31,10 @@ pub fn std_dev(data: &[f64]) -> f64 {
 // Phase 3, Step 5: Shared Mode-Agnostic Math Helpers
 // =========================================================================
 
-/// Computes robust Z-scores using the Median Absolute Deviation (MAD).
-/// Scaled by 1.4826 to asymptotically match standard deviation for normal data.
+/// Computes robust z-scores using the median absolute deviation (MAD).
+/// The MAD is scaled by 1.4826 so that, for non-degenerate normal data,
+/// it is comparable to the standard deviation; a small floor is used when
+/// the MAD is numerically near zero to avoid division by zero.
 pub fn robust_z_from_mad(data: &[f64]) -> Vec<f64> {
     if data.is_empty() {
         return Vec::new();
@@ -235,45 +243,33 @@ pub fn storey_q_value(p_values: &[f64], min_n: usize) -> Vec<f64> {
     q_values
 }
 
-/// Combine P-values using Harmonic Mean P-value (HMP)
-/// Robust to dependency between tests.
+/// Computes the raw unweighted harmonic-mean aggregation score
+/// H = k / sum_i (1 / p_i) from input p-values.
+///
+/// This is used here as a dependency-tolerant consensus score.
+/// It is not presented as a fully calibrated combined p-value test,
+/// and the returned value is clamped to [0, 1].
 pub fn combine_hmp(p_values: &[f64]) -> f64 {
     if p_values.is_empty() {
         return 1.0;
     }
+
     let k = p_values.len() as f64;
-    // FIX: Relaxed clamp from 1e-15 to 1e-100 to preserve high-confidence scores
     let sum_inverse: f64 = p_values.iter().map(|&p| 1.0 / p.max(1e-100)).sum();
-
-    // Landau's correction factor usually applied for dependent tests,
-    // here simplified to the asymptotic HMP bound.
-    // HMP = (Sum(1/p) / k)^-1
-    // We adjust by * e * ln(k) for rigorous control under arbitrary dependence,
-    // but for consensus scoring, the raw harmonic mean is often used as a ranking score.
-    // We'll use the raw harmonic mean * k (Standard HMP) then typically homogenized.
-    // Here we implement the simple Harmonic Mean: k / sum(1/p)
-    // Wait, HMP for combining p-values usually roughly follows:
-    // p_combined = (w_1 + ... + w_k) / (w_1/p_1 + ... + w_k/p_k)
-
     let hmp = k / sum_inverse;
 
-    // Often we penalize slightly for ensemble agreement.
-    // HMP is asymptotically valid.
     hmp.min(1.0)
 }
 
-/// Combine P-values using Fisher's Method
-/// Assumes independence (used for Peptide -> Protein aggregation)
+/// Combines p-values using Fisher's method.
+/// Assumes independent tests.
 pub fn combine_fisher(p_values: &[f64]) -> f64 {
     if p_values.is_empty() {
         return 1.0;
     }
-    let k = p_values.len() as f64;
-    // X = -2 * sum(ln(p))
-    // FIX: Relaxed clamp here too
-    let chi_sq_stat: f64 = -2.0 * p_values.iter().map(|&p| p.max(1e-100).ln()).sum::<f64>();
 
-    // Degrees of freedom = 2k
+    let k = p_values.len() as f64;
+    let chi_sq_stat: f64 = -2.0 * p_values.iter().map(|&p| p.max(1e-100).ln()).sum::<f64>();
     let dof = 2.0 * k;
 
     match ChiSquared::new(dof) {

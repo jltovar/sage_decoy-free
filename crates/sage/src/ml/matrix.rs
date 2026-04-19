@@ -158,12 +158,12 @@ impl Matrix {
     }
 
     pub fn is_close(&self, rhs: &Self, eps: f64) -> bool {
-        if self.cols != self.rows {
+        if self.shape() != rhs.shape() {
             return false;
         }
 
         for i in 0..self.rows {
-            for j in 0..self.rows {
+            for j in 0..self.cols {
                 if (self[(i, j)] - rhs[(i, j)]).abs() > eps {
                     return false;
                 }
@@ -172,17 +172,32 @@ impl Matrix {
         true
     }
 
-    // Use power method to find the eigenvector with the largest
-    // corresponding eigenvalue
+    /// Use the power method to estimate the dominant eigenvector.
+    ///
+    /// # Panics
+    ///
+    /// * Panics if `initial` has the wrong length
+    /// * Panics if `initial` has zero norm
+    /// * Panics if an iteration produces a zero-norm vector
     pub fn power_method(&self, initial: &[f64]) -> Vec<f64> {
-        // Normalize starting vector
+        assert_eq!(
+            initial.len(),
+            self.cols,
+            "initial vector length {} does not match matrix column count {}",
+            initial.len(),
+            self.cols
+        );
+
         let n = norm(initial);
+        assert!(n > 0.0, "power_method requires a nonzero initial vector");
         let mut v = initial.iter().map(|i| i / n).collect::<Vec<_>>();
 
         let mut last_eig = 0.0;
         for _ in 0..50 {
             let mut v1 = self.dotv(&v);
             let norm = norm(&v1);
+            assert!(norm > 0.0, "power_method encountered a zero-norm iterate");
+
             if (norm - last_eig).abs() < 1E-8 {
                 break;
             }
@@ -252,8 +267,14 @@ impl Matrix {
         }
     }
 
-    /// Calculate mean of each column
+    /// Calculate the mean of each column.
+    ///
+    /// # Panics
+    ///
+    /// * Panics if the matrix has zero rows
     pub fn mean(&self) -> Vec<f64> {
+        assert!(self.rows > 0, "mean requires a matrix with at least one row");
+
         (0..self.cols)
             .into_par_iter()
             .map(|col| {
@@ -263,11 +284,19 @@ impl Matrix {
             .collect()
     }
 
+    /// Compute the empirical column-correlation matrix.
+    ///
+    /// Columns with zero variance induce undefined correlations. Those entries
+    /// are set to 0.0 here as a defensive fallback.
     pub fn correlation_matrix(mut self) -> Matrix {
+        assert!(
+            self.rows > 0,
+            "correlation_matrix requires a matrix with at least one row"
+        );
+
         let mut stds = vec![0.0f64; self.cols];
 
-        // Center the transition matrix, and calculate the standard deviation for
-        // each transition
+        // Center each column and compute its empirical standard deviation.
         for (col, mean) in self.mean().iter().enumerate() {
             let mut std = 0.0;
             for row in 0..self.rows {
@@ -276,16 +305,19 @@ impl Matrix {
             }
             stds[col] = (std / self.rows as f64).sqrt();
         }
-        // calculate the emperical covariance matrix
+
+        // Compute the empirical covariance matrix.
         let mut cov = self.transpose().dot(&self);
         cov = cov / (self.rows as f64);
 
         for i in 0..self.cols {
             for j in 0..self.cols {
-                cov[(i, j)] /= stds[i] * stds[j];
-                if cov[(i, j)].is_nan() {
-                    cov[(i, j)] = 0.0;
-                }
+                let denom = stds[i] * stds[j];
+                cov[(i, j)] = if denom > 0.0 {
+                    cov[(i, j)] / denom
+                } else {
+                    0.0
+                };
             }
         }
 

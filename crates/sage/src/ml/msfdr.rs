@@ -1,3 +1,16 @@
+//! Decoy-free MSFDR model fitting utilities.
+//!
+//! The methods in this module are based on the work of Yisu Peng, et al. published here:
+//! 
+//! New mixture models for decoy-free false discovery rate estimation in mass spectrometry proteomics
+//! Yisu Peng, Shantanu Jain, Yong Fuga Li, Michal Greguš, Alexander R. Ivanov, Olga Vitek, Predrag Radivojac, 
+//! Bioinformatics, Volume 36, Issue Supplement_2, December 2020, Pages i745–i753, 
+//! DOI: 10.1093/bioinformatics/btaa8074
+//! https://academic.oup.com/bioinformatics/article/36/Supplement_2/i745/6055912
+//!
+//! and implemented on GitHub here:
+//! https://github.com/shawn-peng/DecoyFree-MSFDR
+
 use crate::ml::skew_normal::SkewNormal;
 use serde::{Deserialize, Serialize};
 use statrs::consts::EULER_MASCHERONI;
@@ -10,11 +23,11 @@ const TINY: f64 = 1e-300;
 /// Minimum Gumbel scale used for MSFDR1 null initialization to avoid var/scale collapse.
 const MSFDR1_MIN_NULL_SCALE: f64 = 1e-6;
 
-// --- Formatting helpers for parameter debug prints ---
+// --- Formatting helpers for parameter summaries ---
 #[inline]
 fn fmt_f64(x: f64) -> String {
     if x.is_finite() {
-        // stable, compact, and unambiguous across scales
+        // Stable, compact, and unambiguous across scales.
         format!("{:.6e}", x)
     } else if x.is_nan() {
         "NaN".to_string()
@@ -25,8 +38,8 @@ fn fmt_f64(x: f64) -> String {
     }
 }
 
-/// Unified debug string contract:
-/// pi=<...>, null=(<loc>,<scale>), target=(...)
+/// Returns a compact parameter summary in the form
+/// `pi=<...>, null=(<loc>,<scale>), target=(...)`.
 pub trait MsfdrParamTuple {
     fn param_tuple(&self) -> String;
 }
@@ -113,10 +126,14 @@ fn gumbel_from_mean_var(mean: f64, var: f64) -> Option<(f64, f64)> {
     }
 }
 
-/// A thin, explicit wrapper for the seeded MSFDR model:
-/// - null is initialized from (mu_in, beta_in)
-/// - target is a skew-normal fit on rank1 (top slice init)
-/// - EM updates: pi + target moments (null fixed)
+/// Seeded two-component mixture model for rank-1 scores.
+///
+/// The null component is a Gumbel distribution with externally supplied
+/// location and scale parameters. The target component is a skew-normal
+/// distribution initialized from the upper tail of the rank-1 score
+/// distribution. During expectation-maximization, the null component remains
+/// fixed and only the mixture weight and target-component parameters are
+/// updated.
 #[derive(Clone, Debug, Serialize, Deserialize)]
 pub struct MsfdrSeededModel {
     pub null_loc: f64,
@@ -299,11 +316,13 @@ impl MsfdrParamTuple for MsfdrSeededModel {
     }
 }
 
-/// 1SMix MSFDR:
-/// rank1-only, *unanchored* 2-component mixture with EM updating:
-/// - pi
-/// - null Gumbel (moments update on null responsibilities)
-/// - target SkewNormal (moments update on target responsibilities)
+/// Unanchored two-component mixture model for rank-1 scores.
+///
+/// This variant fits a Gumbel null component and a skew-normal target
+/// component directly from the rank-1 score distribution. Both components,
+/// together with the target mixture proportion, are updated by
+/// expectation-maximization. Initialization uses lower-score observations for
+/// the null component and upper-score observations for the target component.
 #[derive(Clone, Debug, Serialize, Deserialize)]
 pub struct Msfdr1SmixModel {
     pub null_loc: f64,
@@ -680,13 +699,14 @@ impl MsfdrParamTuple for Msfdr1SmixModel {
     }
 }
 
-/// 2SMix MSFDR:
-/// - Uses rank1 scores for mixture
-/// - Uses a *pure null* pool to anchor the null Gumbel
+/// Anchored two-component mixture model for rank-1 scores.
 ///
-/// Behavior:
-/// - If mix_anchor_incorrect == true: null fixed to pool fit; learn pi + target only.
-/// - Else: allow null to drift from pool seed but clamp drift.
+/// This variant fits the target mixture on rank-1 observations while using an
+/// external null-score pool to estimate the Gumbel null component. The pooled
+/// null fit provides the initial null location and scale. When
+/// `mix_anchor_incorrect` is `true`, the null component is held fixed during
+/// expectation-maximization. Otherwise, the null component may adapt from the
+/// pooled estimate, subject to explicit drift limits on location and scale.
 #[derive(Clone, Debug, Serialize, Deserialize)]
 pub struct Msfdr2SmixModel {
     pub null_seed_loc: f64,
@@ -902,8 +922,7 @@ impl MsfdrParamTuple for Msfdr2SmixModel {
 }
 
 // -----------------------------------------------------------------------------
-// Backwards-compat shim: keep your old MsfdrModel name usable if something imports it.
-// (Optional: remove later once you rewire call sites.)
+// Backward-compatibility adapter preserving the legacy `MsfdrModel` interface.
 // -----------------------------------------------------------------------------
 #[derive(Clone, Debug, Serialize, Deserialize)]
 pub struct MsfdrModel {

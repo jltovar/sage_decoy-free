@@ -1,7 +1,7 @@
-//! Retention time prediction using linear regression
+//! Ion mobility prediction using linear regression.
 //!
-//! See Klammer et al., Anal. Chem. 2007, 79, 16, 6111–6118
-//! https://doi.org/10.1021/ac070262k
+//! The model uses a linear feature embedding and solves the associated
+//! normal equations to obtain regression coefficients.
 
 use super::{gauss::Gauss, matrix::Matrix};
 use crate::database::IndexedDatabase;
@@ -33,6 +33,7 @@ pub fn predict(
 
     feats.par_iter_mut().for_each(|feat| {
         let ims = lr.predict_peptide(db, feat);
+        // Constrain predictions to a bounded physical range used by this model path.
         let bounded = ims.clamp(0.0, 2.0) as f32;
         feat.predicted_ims = bounded;
         feat.delta_ims_model = (feat.ims - bounded).abs();
@@ -65,6 +66,7 @@ pub fn predict_vanilla_compat(
 
     feats.par_iter_mut().for_each(|feat| {
         let ims = lr.predict_peptide(db, feat);
+        // Constrain predictions to a bounded physical range used by this model path.
         let bounded = ims.clamp(0.0, 2.0) as f32;
         feat.predicted_ims = bounded;
         feat.delta_ims_model = (feat.ims - bounded).abs();
@@ -191,7 +193,7 @@ impl MobilityModel {
         embedding
     }
 
-    /// Attempt to fit a linear regression model
+    /// Fit a linear ion-mobility regression model from peptide-derived features.
     pub fn fit(
         db: &IndexedDatabase,
         training_set: &[FeatureCore],
@@ -262,8 +264,8 @@ impl MobilityModel {
         })
     }
 
-    /// Vanilla-compatible fit:
-    /// matches upstream behavior (no ims>0 filter, no min-N check, no var==0 abort)
+    /// Vanilla-compatible fit preserving the upstream training behavior:
+    /// no ims > 0 filter, no minimum-count check, and no zero-variance abort.
     pub fn fit_vanilla_compat(
         db: &IndexedDatabase,
         training_set: &[FeatureCore],
@@ -274,14 +276,15 @@ impl MobilityModel {
             map[(aa - b'A') as usize] = idx;
         }
 
-        // NOTE: vanilla does not gate on ims > 0.0 here
+        // Preserve the upstream training set definition without ims > 0 filtering.
         let ims = training_set
             .par_iter()
             .filter(|feat| filter(*feat))
             .map(|psm| psm.ims as f64)
             .collect::<Vec<f64>>();
 
-        // Vanilla does not check ims.len() or variance before proceeding.
+        // Preserve the upstream behavior by proceeding without minimum-count
+        // or variance-based early termination.
         let ims_mean = ims.iter().sum::<f64>() / ims.len() as f64;
         let ims_var = ims.iter().map(|v| (v - ims_mean).powi(2)).sum::<f64>();
 

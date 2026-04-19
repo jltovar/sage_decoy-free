@@ -1,9 +1,9 @@
-//! Gauss-Jordan elimination for solution of systems of linear equations
+//! Gauss-Jordan elimination for solving systems of linear equations.
 //!
 //! LDA requires solving the generalized eigenvalue problem for scatter matrices
-//! Sb and Sw. We can actually solve this as the standard eigenvalue problem for
-//! the matrix inv(Sw).dot(Sb) - or we solve the linear sysem Sw.dot(x) = Sb,
-//! then calculate the eigenvalue for x. This is the approach we take.
+//! Sb and Sw. This can be written as the standard eigenvalue problem for
+//! inv(Sw).dot(Sb), or equivalently as the linear system Sw.dot(x) = Sb,
+//! followed by eigenvalue evaluation on x. This module uses the latter form.
 
 use super::matrix::Matrix;
 
@@ -24,6 +24,14 @@ impl Matrix {
 }
 
 impl Gauss {
+	fn approx_zero(x: f64, tol: f64) -> bool {
+		x.abs() <= tol
+	}
+	
+	fn approx_one(x: f64, tol: f64) -> bool {
+		(x - 1.0).abs() <= tol
+	}
+	
     pub fn solve_inner(left: Matrix, right: Matrix, eps: f64) -> Option<Matrix> {
         let mut g = Gauss { left, right };
         g.fill_zero(eps);
@@ -74,84 +82,80 @@ impl Gauss {
         }
         None
     }
-    /// This SO answer details how to handle covariance matrices with zeros on
-    /// diagonals, which can ruin solving
-    /// https://stackoverflow.com/a/35958102
-    /// "thus instead of using Sigma = Cov(X) you do Sigma = Cov(X) + eps * I,
-    ///  where eps is prefedefined small constant, and I is identity matrix.
-    ///  Consequently you never have a zero values on the diagonal,
-    ///  and it is easy to prove that for reasonable epsilon, this will be inversible"
+    /// Add a small diagonal regularization term eps * I before elimination to
+    /// reduce singularity and near-singularity in covariance-like systems.
     fn fill_zero(&mut self, eps: f64) {
         for i in 0..self.left.cols {
             self.left[(i, i)] += eps;
         }
     }
 
-    // Is `left` an identity matrix, or else contains rows of all zeros?
+    // Check whether the left matrix is numerically consistent with an identity
+    // block and any remaining rows are numerically zero.
     fn left_solved_strict(&self) -> bool {
-        let n = self.left.cols;
-        // Off-diagonal tolerance: anything with magnitude > 1e-8 means "not solved"
-        let off_diag_eps = 1e-8;
-
-        for i in 0..n {
-            for j in 0..n {
-                let x = self.left[(i, j)];
-
-                if i == j {
-                    // Diagonal entries must be exactly 1.0 or 0.0 (same as before)
-                    if x != 1.0 && x != 0.0 {
-                        log::debug!(
-                            "Finding solution to linear system failed: left side of matrix [{},{}] = {}",
-                            i,
-                            j,
-                            x
-                        );
-                        return false;
-                    }
-                } else if x.abs() > off_diag_eps {
-                    // IMPORTANT CHANGE: use absolute value, so small *negative* junk is also caught
-                    log::debug!(
-                        "Finding solution to linear system failed: left side of matrix [{},{}] = {}",
-                        i,
-                        j,
-                        x
-                    );
-                    return false;
-                }
-            }
-        }
-        true
-    }
-
-    // Vanilla compatibility: off-diagonal check uses x > 1e-8 (NOT abs).
-    fn left_solved_vanilla(&self) -> bool {
-        let n = self.left.cols;
-        for i in 0..n {
-            for j in 0..n {
-                let x = self.left[(i, j)];
-                if i == j {
-                    if x != 1.0 && x != 0.0 {
-                        log::debug!(
+		let n = self.left.cols;
+		let diag_eps = 1e-8;
+		let off_diag_eps = 1e-8;
+	
+		for i in 0..n {
+			for j in 0..n {
+				let x = self.left[(i, j)];
+	
+				if i == j {
+					if !Self::approx_one(x, diag_eps) && !Self::approx_zero(x, diag_eps) {
+						log::debug!(
 							"Finding solution to linear system failed: left side of matrix [{},{}] = {}",
 							i,
 							j,
 							x
 						);
-                        return false;
-                    }
-                } else if x > 1E-8 {
-                    log::debug!(
+						return false;
+					}
+				} else if x.abs() > off_diag_eps {
+					log::debug!(
 						"Finding solution to linear system failed: left side of matrix [{},{}] = {}",
 						i,
 						j,
 						x
 					);
-                    return false;
-                }
-            }
-        }
-        true
-    }
+					return false;
+				}
+			}
+		}
+		true
+	}
+
+    // Vanilla-compatible solved-state check preserving legacy off-diagonal semantics.
+    fn left_solved_vanilla(&self) -> bool {
+		let n = self.left.cols;
+		let diag_eps = 1e-8;
+	
+		for i in 0..n {
+			for j in 0..n {
+				let x = self.left[(i, j)];
+				if i == j {
+					if !Self::approx_one(x, diag_eps) && !Self::approx_zero(x, diag_eps) {
+						log::debug!(
+							"Finding solution to linear system failed: left side of matrix [{},{}] = {}",
+							i,
+							j,
+							x
+						);
+						return false;
+					}
+				} else if x > 1E-8 {
+					log::debug!(
+						"Finding solution to linear system failed: left side of matrix [{},{}] = {}",
+						i,
+						j,
+						x
+					);
+					return false;
+				}
+			}
+		}
+		true
+	}
 
     fn echelon(&mut self) {
         let (m, n) = self.left.shape();
@@ -159,24 +163,26 @@ impl Gauss {
         let mut k = 0;
 
         while h < m && k < n {
-            // find the row with the largest value in the current pivot column (k)
-            let mut max = (0, f64::MIN);
-            for i in h..m {
-                if self.left[(i, k)] >= max.1 {
-                    max = (i, self.left[(i, k)])
-                }
-            }
-            let i = max.0;
-            if self.left[(i, k)] == 0.0 {
-                k += 1;
-                continue;
-            }
-
-            // Swap rows (partial pivoting)
-            if h != max.0 {
-                self.left.swap_rows(h, i);
-                self.right.swap_rows(h, i);
-            }
+			// Find the row with the largest-magnitude pivot in the current column.
+			let mut max = (h, self.left[(h, k)].abs());
+			for i in h..m {
+				let candidate = self.left[(i, k)].abs();
+				if candidate > max.1 {
+					max = (i, candidate);
+				}
+			}
+		
+			let i = max.0;
+			if Self::approx_zero(self.left[(i, k)], 1e-12) {
+				k += 1;
+				continue;
+			}
+		
+			// Swap rows (partial pivoting)
+			if h != i {
+				self.left.swap_rows(h, i);
+				self.right.swap_rows(h, i);
+			}
 
             // Clear rows below pivot row
             for i in h + 1..m {
@@ -194,7 +200,7 @@ impl Gauss {
         }
     }
 
-    // Reduce left matrix to reduced echelon form - diagonal is all ones
+    // Normalize each pivot row so that leading entries are one.
     fn reduce(&mut self) {
         for i in (0..self.left.rows).rev() {
             for j in 0..self.left.cols {
@@ -217,7 +223,7 @@ impl Gauss {
     fn backfill(&mut self) {
         for i in (0..self.left.rows).rev() {
             for j in 0..self.left.cols {
-                if self.left[(i, j)] == 0.0 {
+                if Self::approx_zero(self.left[(i, j)], 1e-12) {
                     continue;
                 }
                 for k in 0..i {

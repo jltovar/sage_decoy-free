@@ -133,7 +133,7 @@ pub struct FeatureCore {
     pub matched_intensity_pct: f32,
     pub scored_candidates: u32,
     pub spectrum_p_value: f64,
-    pub poisson: f64,
+	pub poisson_log10_p_value: f64,
     pub ms2_intensity: f32,
     pub fragments: Option<Fragments>,
 }
@@ -153,7 +153,7 @@ pub struct TdcFeature {
 }
 
 /// A feature augmented with Decoy-Free (DF) outputs.
-/// It strictly DOES NOT contain vanilla FDR columns.
+/// Vanilla TDC FDR fields are not included in this representation.
 #[derive(Serialize, Clone, Debug)]
 pub struct DfFeature {
     #[serde(flatten)]
@@ -174,7 +174,7 @@ pub struct DfFeature {
     pub decoy_free_protein_q: Option<f32>,
 
     // =========================================================================
-    // --- PHASE 2: NEW LAYER FIELDS ---
+    // Additional Decoy-Free layer fields
     // =========================================================================
 
     // 5A. Base layer fields
@@ -356,7 +356,7 @@ impl FeatureCore {
             q_nokoi: None,
             pep_nokoi: None,
 
-            // Phase 2: Init New Layer Fields
+            // Initialize additional Decoy-Free layer fields
             decoy_free_p_value_base: None,
             decoy_free_pep_base: None,
             decoy_free_score_base: None,
@@ -411,12 +411,42 @@ fn increment_psm_counter() -> usize {
     PSM_COUNTER.fetch_add(1, Ordering::Relaxed)
 }
 fn lnfact(n: u16) -> f64 {
-    if n == 0 {
-        1.0
+    if n <= 1 {
+        0.0
     } else {
-        let n = n as f64;
-        n * n.ln() - n + 0.5 * n.ln() + 0.5 * (std::f64::consts::PI * 2.0 * n).ln()
+        (2..=n as u32).map(|i| (i as f64).ln()).sum()
     }
+}
+
+fn poisson_sf_geq(k: u16, lambda: f64) -> f64 {
+    if !lambda.is_finite() || lambda < 0.0 {
+        return 1.0;
+    }
+    if k == 0 {
+        return 1.0;
+    }
+    if lambda == 0.0 {
+        return 0.0;
+    }
+
+    let mut term = (k as f64 * lambda.ln() - lambda - lnfact(k)).exp();
+    let mut tail = term;
+    let mut i = k as u32;
+
+    loop {
+        i += 1;
+        term *= lambda / i as f64;
+        let next = tail + term;
+        if next == tail {
+            break;
+        }
+        tail = next;
+        if i > 100_000 {
+            break;
+        }
+    }
+
+    tail.clamp(0.0, 1.0)
 }
 
 impl ScoreType {
@@ -432,10 +462,10 @@ impl ScoreType {
             }
         };
         if score.is_finite() {
-            score
-        } else {
-            255.0
-        }
+			score
+		} else {
+			f64::NEG_INFINITY
+		}
     }
 }
 
@@ -464,57 +494,57 @@ pub struct Scorer<'db> {
 }
 
 #[inline(always)]
-fn max_fragment_charge(max_fragment_charge: Option<u8>, precursor_charge: u8) -> u8 {
-    precursor_charge
-        .min(
-            max_fragment_charge
-                .map(|c| c + 1)
-                .unwrap_or(precursor_charge),
-        )
-        .max(2)
+fn first_precursor<'a>(query: &'a ProcessedSpectrum<Peak>) -> Option<&'a Precursor> {
+    let precursor = query.precursors.first();
+    if precursor.is_none() {
+        eprintln!(
+            "[sage] skipping spectrum without MS1 precursor metadata: {}",
+            query.id
+        );
+    }
+    precursor
 }
 
 impl<'db> Scorer<'db> {
     pub fn quick_score(
-        &self,
-        query: &ProcessedSpectrum<Peak>,
-        prefilter_low_memory: bool,
-    ) -> Vec<PeptideIx> {
-        assert_eq!(
-            query.level, 2,
-            "internal bug, trying to score a non-MS2 scan!"
-        );
-        let precursor = query
-            .precursors
-            .first()
-            .unwrap_or_else(|| panic!("missing MS1 precursor for {}", query.id));
-        let hits = self.initial_hits(&query, precursor);
-        if prefilter_low_memory {
-            let mut score_vector = hits
-                .preliminary
-                .iter()
-                .filter_map(|pre| {
-                    if pre.peptide == PeptideIx::default() {
-                        return None;
-                    }
-                    let (score, _) = self.score_candidate(query, pre);
-                    if (score.matched_b + score.matched_y) < self.min_matched_peaks {
-                        return None;
-                    }
-                    Some(score)
-                })
-                .collect::<Vec<_>>();
-            let k = self.report_psms.min(score_vector.len()) + 1;
-            bounded_min_heapify(&mut score_vector, k);
-            score_vector.iter().map(|x| x.peptide).collect()
-        } else {
-            hits.preliminary
-                .iter()
-                .map(|x| x.peptide)
-                .filter(|&peptide| peptide != PeptideIx::default())
-                .collect()
-        }
-    }
+		&self,
+		query: &ProcessedSpectrum<Peak>,
+		prefilter_low_memory: bool,
+	) -> Vec<PeptideIx> {
+		assert_eq!(
+			query.level, 2,
+			"internal bug, trying to score a non-MS2 scan!"
+		);
+		let Some(precursor) = first_precursor(query) else {
+			return Vec::new();
+		};
+		let hits = self.initial_hits(query, precursor);
+		if prefilter_low_memory {
+			let mut score_vector = hits
+				.preliminary
+				.iter()
+				.filter_map(|pre| {
+					if pre.peptide == PeptideIx::default() {
+						return None;
+					}
+					let (score, _) = self.score_candidate(query, pre);
+					if (score.matched_b + score.matched_y) < self.min_matched_peaks {
+						return None;
+					}
+					Some(score)
+				})
+				.collect::<Vec<_>>();
+			let k = self.report_psms.min(score_vector.len()) + 1;
+			bounded_min_heapify(&mut score_vector, k);
+			score_vector.iter().map(|x| x.peptide).collect()
+		} else {
+			hits.preliminary
+				.iter()
+				.map(|x| x.peptide)
+				.filter(|&peptide| peptide != PeptideIx::default())
+				.collect()
+		}
+	}
 
     pub fn score(&self, query: &ProcessedSpectrum<crate::spectrum::Peak>) -> Vec<FeatureCore> {
         assert_eq!(
@@ -657,15 +687,14 @@ impl<'db> Scorer<'db> {
     }
 
     pub fn score_standard(&self, query: &ProcessedSpectrum<Peak>) -> Vec<FeatureCore> {
-        let precursor = query
-            .precursors
-            .first()
-            .unwrap_or_else(|| panic!("missing MS1 precursor for {}", query.id));
-        let hits = self.initial_hits(query, precursor);
-        let mut features = Vec::with_capacity(self.report_psms);
-        self.build_features(query, precursor, &hits, self.report_psms, &mut features);
-        features
-    }
+		let Some(precursor) = first_precursor(query) else {
+			return Vec::new();
+		};
+		let hits = self.initial_hits(query, precursor);
+		let mut features = Vec::with_capacity(self.report_psms);
+		self.build_features(query, precursor, &hits, self.report_psms, &mut features);
+		features
+	}
 
     fn build_features(
         &self,
@@ -711,57 +740,62 @@ impl<'db> Scorer<'db> {
                 .map(|score| score.0.hyperscore)
                 .expect("valid index 0");
             let k = score.matched_b + score.matched_y;
-            let mut poisson = lambda.powi(k as i32) * f64::exp(-lambda) / lnfact(k).exp();
-            if poisson.is_infinite() {
-                poisson = 1E-325;
-            }
-
-            let isotope_error = score.isotope_error as f32 * NEUTRON;
-            let delta_mass = (precursor_mass - peptide.monoisotopic - isotope_error) * 2E6
-                / (precursor_mass - isotope_error + peptide.monoisotopic);
-
-            features.push(FeatureCore {
-                psm_id,
-                peptide_idx: score.peptide,
-                spec_id: query.id.clone(),
-                file_id: query.file_id,
-                rank: idx as u32 + 1,
-                label: peptide.label(),
-                expmass: precursor_mass,
-                calcmass: peptide.monoisotopic,
-                charge: score.precursor_charge,
-                rt: query.scan_start_time,
-                ims: query
-                    .precursors
-                    .first()
-                    .unwrap()
-                    .inverse_ion_mobility
-                    .unwrap_or(0.0),
-                delta_mass,
-                isotope_error,
-                average_ppm: score.ppm_difference,
-                hyperscore: score.hyperscore,
-                delta_next: score.hyperscore - next,
-                delta_best: best - score.hyperscore,
-                matched_peaks: k as u32,
-                matched_intensity_pct: 100.0 * (score.summed_b + score.summed_y)
-                    / query.total_ion_current,
-                poisson: poisson.log10(),
-                longest_b: score.longest_b as u32,
-                longest_y: score.longest_y as u32,
-                longest_y_pct: score.longest_y as f32 / (peptide.sequence.len() as f32),
-                peptide_len: peptide.sequence.len(),
-                scored_candidates: hits.scored_candidates as u32,
-                spectrum_p_value: poisson,
-                missed_cleavages: peptide.missed_cleavages,
-                predicted_rt: 0.0,
-                predicted_ims: 0.0,
-                aligned_rt: query.scan_start_time,
-                delta_rt_model: 0.999,
-                delta_ims_model: 0.999,
-                ms2_intensity: score.summed_b + score.summed_y,
-                fragments,
-            })
+			let spectrum_p_value = poisson_sf_geq(k, lambda).max(1e-325);
+			
+			let isotope_error = score.isotope_error as f32 * NEUTRON;
+			let delta_mass = (precursor_mass - peptide.monoisotopic - isotope_error) * 2E6
+				/ (precursor_mass - isotope_error + peptide.monoisotopic);
+			
+			let matched_intensity = score.summed_b + score.summed_y;
+			let matched_intensity_pct = if query.total_ion_current > 0.0 {
+				100.0 * matched_intensity / query.total_ion_current
+			} else {
+				0.0
+			};
+			
+			let fragment_positions = peptide.sequence.len().saturating_sub(1);
+			let longest_y_pct = if fragment_positions > 0 {
+				score.longest_y as f32 / fragment_positions as f32
+			} else {
+				0.0
+			};
+			
+			features.push(FeatureCore {
+				psm_id,
+				peptide_idx: score.peptide,
+				spec_id: query.id.clone(),
+				file_id: query.file_id,
+				rank: idx as u32 + 1,
+				label: peptide.label(),
+				expmass: precursor_mass,
+				calcmass: peptide.monoisotopic,
+				charge: score.precursor_charge,
+				rt: query.scan_start_time,
+				ims: precursor.inverse_ion_mobility.unwrap_or(0.0),
+				delta_mass,
+				isotope_error,
+				average_ppm: score.ppm_difference,
+				hyperscore: score.hyperscore,
+				delta_next: score.hyperscore - next,
+				delta_best: best - score.hyperscore,
+				matched_peaks: k as u32,
+				matched_intensity_pct,
+				poisson_log10_p_value: spectrum_p_value.log10(),
+				longest_b: score.longest_b as u32,
+				longest_y: score.longest_y as u32,
+				longest_y_pct,
+				peptide_len: peptide.sequence.len(),
+				scored_candidates: hits.scored_candidates as u32,
+				spectrum_p_value,
+				missed_cleavages: peptide.missed_cleavages,
+				predicted_rt: 0.0,
+				predicted_ims: 0.0,
+				aligned_rt: query.scan_start_time,
+				delta_rt_model: 0.999,
+				delta_ims_model: 0.999,
+				ms2_intensity: matched_intensity,
+				fragments,
+			})
         }
     }
 
@@ -795,28 +829,27 @@ impl<'db> Scorer<'db> {
     }
 
     pub fn score_chimera_fast(&self, query: &ProcessedSpectrum<Peak>) -> Vec<FeatureCore> {
-        let precursor = query
-            .precursors
-            .first()
-            .unwrap_or_else(|| panic!("missing MS1 precursor for {}", query.id));
-        let mut query = query.clone();
-        let hits = self.initial_hits(&query, precursor);
-        let mut candidates: Vec<FeatureCore> = Vec::with_capacity(self.report_psms);
-        let mut prev = 0;
-        while candidates.len() < self.report_psms {
-            self.build_features(&query, precursor, &hits, 1, &mut candidates);
-            if candidates.len() > prev {
-                if let Some(feat) = candidates.get_mut(prev) {
-                    self.remove_matched_peaks(&mut query, feat);
-                    feat.rank = prev as u32 + 1;
-                }
-                prev = candidates.len()
-            } else {
-                break;
-            }
-        }
-        candidates
-    }
+		let Some(precursor) = first_precursor(query) else {
+			return Vec::new();
+		};
+		let mut query = query.clone();
+		let hits = self.initial_hits(&query, precursor);
+		let mut candidates: Vec<FeatureCore> = Vec::with_capacity(self.report_psms);
+		let mut prev = 0;
+		while candidates.len() < self.report_psms {
+			self.build_features(&query, precursor, &hits, 1, &mut candidates);
+			if candidates.len() > prev {
+				if let Some(feat) = candidates.get_mut(prev) {
+					self.remove_matched_peaks(&mut query, feat);
+					feat.rank = prev as u32 + 1;
+				}
+				prev = candidates.len()
+			} else {
+				break;
+			}
+		}
+		candidates
+	}
 
     fn score_candidate(
         &self,
@@ -886,7 +919,12 @@ impl<'db> Scorer<'db> {
         score.hyperscore = score.hyperscore(self.score_type);
         score.longest_b = b_run.longest;
         score.longest_y = y_run.longest;
-        score.ppm_difference /= score.summed_b + score.summed_y;
+        let matched_intensity = score.summed_b + score.summed_y;
+		if matched_intensity > 0.0 {
+			score.ppm_difference /= matched_intensity;
+		} else {
+			score.ppm_difference = 0.0;
+		}
 
         if self.annotate_matches {
             (score, Some(fragments_details))

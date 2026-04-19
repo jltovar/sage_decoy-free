@@ -95,7 +95,7 @@ const PEPTIDE_MASS: usize = FEATURES - 2;
 const INTERCEPT: usize = FEATURES - 1;
 
 impl RetentionModel {
-    /// One-hot encoding of peptide sequences into feature vector
+    /// Encode a peptide into a linear feature vector for retention time regression.
     fn embed(peptide: &Peptide, map: &[usize; 26]) -> [f64; FEATURES] {
         let mut embedding = [0.0; FEATURES];
         let cterm = peptide.sequence.len().saturating_sub(3);
@@ -104,7 +104,7 @@ impl RetentionModel {
             let idx = map[(residue - b'A') as usize];
             embedding[idx] += 1.0;
 
-            // Embed N- and C-terminal AA's (2 on each end, excluding K/R)
+            // Embed the first two and last two residues as terminal-position features.
             match aa_idx {
                 0 | 1 => embedding[N_TERMINAL + idx] += 1.0,
                 x if x == cterm || x == cterm + 1 => {
@@ -120,7 +120,7 @@ impl RetentionModel {
         embedding
     }
 
-    /// Attempt to fit a linear regression model: peptide sequence ~ retention time
+    /// Attempt to fit a linear regression model: retention time ~ peptide features
     pub fn fit(
         db: &IndexedDatabase,
         training_set: &[FeatureCore],
@@ -183,7 +183,11 @@ impl RetentionModel {
             .map(|(pred, act)| (pred - act).powi(2))
             .sum::<f64>();
 
-        let r2 = 1.0 - (sum_squared_error / rt_var);
+        let r2 = if rt_var > 0.0 {
+            1.0 - (sum_squared_error / rt_var)
+        } else {
+            0.0
+        };
         let residual_spread = (sum_squared_error / rows as f64).sqrt();
         log::info!("- fit retention time model, rsq = {}", r2);
 
@@ -256,7 +260,11 @@ impl RetentionModel {
             .map(|(pred, act)| (pred - act).powi(2))
             .sum::<f64>();
 
-        let r2 = 1.0 - (sum_squared_error / rt_var);
+        let r2 = if rt_var > 0.0 {
+            1.0 - (sum_squared_error / rt_var)
+        } else {
+            0.0
+        };
         let residual_spread = (sum_squared_error / rows as f64).sqrt();
         log::info!("- fit retention time model, rsq = {}", r2);
 

@@ -1,3 +1,13 @@
+//! Decoy-free Nokoi-like model fitting utility.
+//!
+//! The methods in this module are based on the work of Giulia Gonnelli et al. published here:
+//! 
+//! A Decoy-Free Approach to the Identification of Peptides
+//! Giulia Gonnelli, Michiel Stock, Jan Verwaeren, Davy Maddelein, Bernard De Baets, Lennart Martens, and Sven Degroeve
+//! Journal of Proteome Research 2015 14 (4), 1792-1798
+//! DOI: 10.1021/pr501164r
+//! https://pubs.acs.org/doi/10.1021/pr501164r
+
 use crate::scoring::{DfFeature, FeatureCore};
 use rand::rngs::StdRng;
 use rand::seq::SliceRandom;
@@ -348,7 +358,7 @@ impl LogisticRegression {
     }
 }
 
-/// Robust Preprocessing: Median Imputation + Z-Score Standardization
+/// Feature preprocessing: median imputation followed by mean/std z-score standardization.
 pub fn normalize_features(data: &mut [PsmData]) -> (Vec<f64>, Vec<f64>) {
     let n_samples = data.len();
     if n_samples == 0 {
@@ -984,7 +994,8 @@ pub fn rescore_df_crossfit(
     Some((prob_target_all, null_scores_oof))
 }
 
-/// Convert Probabilities to P-values using ECDF of Negatives (Rank > 1)
+/// Convert model scores to upper-tail empirical p-values using the null-score distribution
+/// from rank > 1 PSMs, with a +1 smoothing correction.
 pub fn calc_empirical_p_values(features: &[FeatureCore], probs: &[f64]) -> Vec<f64> {
     let mut neg_probs: Vec<f64> = features
         .iter()

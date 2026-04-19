@@ -107,7 +107,9 @@ impl Runner {
         })?;
 
         if decoy_free_mode && parameters.report_psms < 10 {
-            log::warn!("decoy_free mode requires report_psms >= 10; overriding to 10");
+            log::warn!(
+                "decoy_free mode requires report_psms >= 10 to retain sufficient candidate depth for stable downstream Decoy-Free modeling and diagnostics; overriding to 10"
+            );
             parameters.report_psms = 10;
         }
 
@@ -272,11 +274,13 @@ impl Runner {
         peptide_idxs
     }
 
-    /// Unified Spectrum FDR function (TDC Mode only)
-    /// Runs LDA (score_psms) and calculates spectrum q-values.
+    /// Compute target-decoy spectrum-level q-values.
+    ///
+    /// This routine fits the linear discriminant model when possible and falls
+    /// back to the heuristic score otherwise, then computes spectrum q-values
+    /// on the resulting discriminant ordering.
     fn spectrum_fdr(&self, features: &mut [TdcFeature]) -> usize {
-        // 1. Run Linear Discriminant Analysis (LDA)
-        // score_psms must be updated to accept &mut [TdcFeature] in linear_discriminant.rs
+        // Fit the linear discriminant model used for TDC spectrum ranking.
         let score_res = score_psms(
             features,
             self.parameters.precursor_tol,
@@ -294,10 +298,9 @@ impl Runner {
             return sage_core::ml::qvalue::spectrum_q_value(features);
         }
 
-        // 2. Calculate Q-Values (TDC)
+        // Compute spectrum q-values from the discriminant-score ordering.
         features.par_sort_unstable_by(|a, b| b.discriminant_score.total_cmp(&a.discriminant_score));
 
-        // spectrum_q_value must be updated to accept &mut [TdcFeature]
         return sage_core::ml::qvalue::spectrum_q_value(features);
     }
 
@@ -540,18 +543,13 @@ impl Runner {
 
         log::trace!("processing outputs");
 
-        // The pipeline branches HERE.
-        // We perform distinct operations for Decoy-Free vs TDC to ensure type safety.
-
-        if self.decoy_free_mode {
-            // ======================== DECOY-FREE WORKFLOW ========================
+                if self.decoy_free_mode {
             debug_assert!(
                 !self.parameters.database.decoy_tag.is_empty(),
                 "decoy_free mode requires non-empty database.decoy_tag"
             );
 
-            // 1. FILTER DECOY-LABELED PSMS (on FeatureCore)
-            // Decoy-Free mode does not use explicit decoys for FDR.
+            // Decoy-Free inference excludes explicit decoy-labeled PSMs before model fitting.
             let n_before = outputs.features.len();
             outputs.features.retain(|feat| feat.label != -1);
             let n_dropped = n_before.saturating_sub(outputs.features.len());
@@ -559,8 +557,7 @@ impl Runner {
                 log::info!("decoy_free mode: dropped {} decoy-labeled PSMs", n_dropped);
             }
 
-            // 2. ML / RT PREDICTION (on FeatureCore)
-            // For DF, we train on high-confidence targets: rank 1 & label 1.
+            // Train RT and IMS models on target rank-1 PSMs only.
             let alignments = if self.parameters.predict_rt {
                 let selector = |f: &FeatureCore| f.rank == 1 && f.label == 1;
 
@@ -587,37 +584,36 @@ impl Runner {
                 None
             };
 
-            // 3. CONVERT TO DF FEATURE (Strict Type Boundary)
+            // Convert generic PSM features to the Decoy-Free feature representation.
             let mut features: Vec<DfFeature> = outputs
                 .features
                 .into_par_iter()
                 .map(|f| f.to_df())
                 .collect();
 
-            // 4. RUN DECOY-FREE FDR LAYERS (Phase 3)
             let fdr_settings = self.parameters.fdr.clone();
 
-            // Calculate Q-values via layered execution (Base -> Physical -> Reproducibility)
+            // Compute Decoy-Free PSM statistics, then enforce the rank-1 contract
+            // for downstream reporting, aggregation, quantification, and output.
             features =
                 sage_core::decoy_free_fdr::run_df_layers(&features, &fdr_settings, &self.database);
+            features.retain(|f| f.core.rank == 1);
 
-            // Logging
-            let q_spectrum = features
+            let q_psm = features
                 .iter()
                 .filter(|f| {
-                    f.core.rank == 1
-                        && f.core.label == 1
-                        && f.decoy_free_q_value.unwrap_or(1.0) <= self.parameters.fdr.peptide_fdr
+                    f.core.label == 1
+                        && f.decoy_free_q_value.unwrap_or(1.0) <= fdr_settings.peptide_fdr
                 })
                 .count();
 
             log::info!(
-                "discovered {} target peptide-spectrum matches at {}% FDR (Decoy-Free)",
-                q_spectrum,
-                self.parameters.fdr.peptide_fdr * 100.0
+                "discovered {} target peptide-spectrum matches at {}% FDR (Decoy-Free; using peptide_fdr as the primary DF reporting threshold)",
+                q_psm,
+                fdr_settings.peptide_fdr * 100.0
             );
 
-            // 5. PEPTIDE / PROTEIN AGGREGATION (DF)
+            // Aggregate rank-1 Decoy-Free PSMs to peptide- and protein-level q-values.
             let (q_peptide, _ent_peptide) = sage_core::decoy_free_fdr::calculate_peptide_q_df(
                 &mut features,
                 &self.database,
@@ -669,19 +665,17 @@ impl Runner {
                 );
             }
 
-            // 6. LFQ (DF)
             let areas = alignments.as_ref().and_then(|alignments_ref| {
                 if self.parameters.quant.lfq {
                     log::info!("Performing Decoy-Free LFQ...");
                     let mut areas_map = sage_core::lfq::build_feature_map(
                         self.parameters.quant.lfq_settings,
                         self.parameters.precursor_charge,
-                        &features, // Pass DfFeature slice
-                        true,      // decoy_free_mode = true
+                        &features,
+                        true,
                     )
                     .quantify(&self.database, &outputs.ms1, alignments_ref);
 
-                    // Use shadow-trace based precursor FDR
                     let q_precursor = sage_core::decoy_free_fdr::decoy_free_precursor(
                         &mut areas_map,
                         fdr_settings.precursor_fdr,
@@ -697,15 +691,7 @@ impl Runner {
                 }
             });
 
-            // 7. WRITE OUTPUTS (DF) — rank1-only, sorted for display
             if !parquet {
-                // Keep only rank == 1 in DF output
-                features.retain(|f| f.core.rank == 1);
-
-                // Sort:
-                //   1) decoy_free_q_value asc (None -> +inf)
-                //   2) hyperscore desc
-                //   3) poisson asc
                 features.par_sort_unstable_by(|a, b| {
                     a.decoy_free_q_value
                         .unwrap_or(f32::INFINITY)
@@ -719,7 +705,6 @@ impl Runner {
                     .push(self.write_features_df(&features, &filenames)?);
 
                 if self.parameters.annotate_matches {
-                    // Cast to FeatureCore for fragments (rank1-only, same ordering)
                     let cores: Vec<&FeatureCore> = features.iter().map(|f| &f.core).collect();
                     self.parameters
                         .output_paths
@@ -731,6 +716,7 @@ impl Runner {
                         .output_paths
                         .push(self.write_tmt(&outputs.quant, &filenames)?);
                 }
+
                 if let Some(areas) = areas {
                     self.parameters
                         .output_paths
@@ -740,44 +726,34 @@ impl Runner {
                 log::warn!("Parquet not supported for Decoy-Free mode yet.");
             }
         } else {
-            // ======================== TDC WORKFLOW (VANILLA) ========================
-
-            // 1. ML / RT PREDICTION (TDC) (on FeatureCore)
-            // Vanilla RT/IMS training gate:
-            // 1) Sort by poisson (as vanilla does for ML q-value computation).
-            // 2) Compute a *temporary ML q-value gate* (via ml::qvalue / spectrum_q_value) on a TdcFeature view.
-            // 3) Train RT/IMS on FeatureCore using ONLY those PSMs that pass: label==1 && (temporary ML q <= 0.01).
-            // NOTE: This is NOT the post-FDR spectrum_q; it is the ML-qvalue gate used only for RT/IMS training selection.
+            // In TDC mode, RT and IMS models are trained on target PSMs that pass
+            // an intermediate ML-derived spectrum-q gate used only for model training.
             let alignments = if self.parameters.predict_rt {
-                // Keep parity with vanilla ordering for ML q-value computation.
+                // Match the ordering used by the vanilla ML q-value calculation.
                 outputs
                     .features
                     .par_sort_unstable_by(|a, b| a.poisson.total_cmp(&b.poisson));
 
-                // --- TEMPORARY ML q-value gate (vanilla-style) ---
-                // qvalue::spectrum_q_value operates on TdcFeature, so compute it on a TdcFeature view.
+                // Compute the intermediate spectrum-q gate on a temporary TDC view.
                 let mut tmp_tdc: Vec<TdcFeature> = outputs
                     .features
                     .iter()
-                    .cloned() // FeatureCore: Clone
-                    .map(FeatureCore::to_tdc) // consumes the cloned FeatureCore
+                    .cloned()
+                    .map(FeatureCore::to_tdc)
                     .collect();
 
-                // Computes spectrum_q on tmp_tdc (poisson-sorted order already).
                 sage_core::ml::qvalue::spectrum_q_value(&mut tmp_tdc);
 
-                // Select PSM ids that pass the vanilla RT/IMS training gate.
+                // Select PSM ids admitted to RT/IMS model training.
                 let selected_psm_ids: HashSet<usize> = tmp_tdc
                     .iter()
                     .filter(|f| f.spectrum_q <= 0.01)
                     .map(|f| f.core.psm_id)
                     .collect();
 
-                // Selector used by your forked RT/IMS APIs (required 3rd arg).
                 let selector =
                     |f: &FeatureCore| f.label == 1 && selected_psm_ids.contains(&f.psm_id);
 
-                // --- RT alignment / models (fork requires selector arg) ---
                 let local = sage_core::ml::retention_alignment::global_alignment_vanilla_compat(
                     &mut outputs.features,
                     self.parameters.mzml_paths.len(),
@@ -801,15 +777,14 @@ impl Runner {
                 None
             };
 
-            // 2. CONVERT TO TDC FEATURE (Strict Type Boundary)
+            // Convert generic PSM features to the TDC feature representation.
             let mut features: Vec<TdcFeature> = outputs
                 .features
                 .into_par_iter()
                 .map(|f| f.to_tdc())
                 .collect();
 
-            // 3. RESTORE ORDER & RUN SPECTRUM FDR
-            // LDA + Spectrum Q-Value
+            // Compute TDC spectrum-level q-values.
             let q_spectrum = self.spectrum_fdr(&mut features);
 
             // Picked Peptide/Protein
@@ -962,7 +937,7 @@ impl Runner {
         Ok(telemetry)
     }
 
-    // --- TDC WRITERS (Vanilla) ---
+    // TDC output writers.
 
     pub fn serialize_tdc_feature(
         &self,
@@ -1032,7 +1007,7 @@ impl Runner {
                 .as_bytes(),
         );
 
-        // Vanilla specific columns
+        // TDC-specific output columns.
         record.push_field(
             ryu::Buffer::new()
                 .format(feature.discriminant_score)
@@ -1196,7 +1171,7 @@ impl Runner {
         // Write MS2 Intensity
         record.push_field(ryu::Buffer::new().format(core.ms2_intensity).as_bytes());
 
-        // Decoy-Free specific columns
+        // Decoy-Free output columns.
         let fmt_f32 = |val: Option<f32>| {
             val.map(|v| v.to_string())
                 .unwrap_or_else(|| "NaN".to_string())

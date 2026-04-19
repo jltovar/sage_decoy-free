@@ -38,10 +38,14 @@ impl SkewNormal {
         (2.0 / self.scale) * phi * capital_phi
     }
 
-    /// Estimate Skew-Normal parameters from sample Mean, Variance, and Skewness
-    /// using Method of Moments.
+    /// Estimate skew-normal parameters from sample mean, variance, and skewness
+    /// using a method-of-moments inversion.
     pub fn from_moments(mean: f64, variance: f64, skewness: f64) -> Option<Self> {
-        // Clamp skewness for numerical stability (theoretical max is ~0.995)
+        if !mean.is_finite() || !variance.is_finite() || !skewness.is_finite() || variance <= 0.0 {
+            return None;
+        }
+
+        // Clamp sample skewness below the theoretical maximum for numerical stability.
         let max_skew = 0.99;
         let clamped_skew = skewness.clamp(-max_skew, max_skew);
 
@@ -62,7 +66,7 @@ impl SkewNormal {
         // Solve for Xi (Location)
         let xi = mean - omega * delta * (2.0 / PI).sqrt();
 
-        if xi.is_nan() || omega.is_nan() || alpha.is_nan() {
+        if !xi.is_finite() || !omega.is_finite() || !alpha.is_finite() || omega <= 0.0 {
             None
         } else {
             Some(Self {
@@ -121,7 +125,8 @@ fn owen_t_integrand(h: f64, t: f64) -> f64 {
     (-0.5 * h * h * den).exp() / den
 }
 
-/// Owen’s T via fixed high-N Simpson rule (N=128) with regime shortcuts.
+/// Numerically approximate Owen’s T using a fixed Simpson rule (N = 128)
+/// together with stable shortcut approximations in extreme regimes.
 fn owen_t(h: f64, a: f64) -> f64 {
     if !h.is_finite() || !a.is_finite() {
         return 0.0;

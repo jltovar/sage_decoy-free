@@ -43,10 +43,9 @@ impl std::fmt::Debug for Features<'_> {
     }
 }
 
-// Vanilla-compatible Gauss-Jordan solver used ONLY for TDC/LDA.
-// IMPORTANT: We do NOT reuse crates/sage/src/ml/gauss.rs here because the DF fork
-// intentionally tightened the "identity" check (abs() on off-diagonals), which
-// changes LDA behavior vs vanilla. DF mode bypasses LDA anyway.
+// Vanilla-compatible Gauss-Jordan solver used for the TDC/LDA path.
+// This local implementation preserves the legacy solved-state semantics used by
+// vanilla LDA and is intentionally kept separate from the decoy-free solver.
 #[derive(Debug)]
 struct GaussVanilla {
     left: Matrix,
@@ -63,20 +62,32 @@ fn swap_rows(m: &mut Matrix, i: usize, j: usize) {
 }
 
 impl GaussVanilla {
+    #[inline]
+    fn approx_zero(x: f64, tol: f64) -> bool {
+        x.abs() <= tol
+    }
+
+    #[inline]
+    fn approx_one(x: f64, tol: f64) -> bool {
+        (x - 1.0).abs() <= tol
+    }
+
     fn fill_zero(&mut self, eps: f64) {
         for i in 0..self.left.cols {
             self.left[(i, i)] += eps;
         }
     }
 
-    // Vanilla semantics: off-diagonal failure only if x > 1e-8 (NOT abs(x))
+    // Vanilla-compatible solved-state check preserving legacy off-diagonal semantics.
     fn left_solved(&self) -> bool {
         let n = self.left.cols;
+        let diag_eps = 1e-8;
+
         for i in 0..n {
             for j in 0..n {
                 let x = self.left[(i, j)];
                 if i == j {
-                    if x != 1.0 && x != 0.0 {
+                    if !Self::approx_one(x, diag_eps) && !Self::approx_zero(x, diag_eps) {
                         log::debug!(
                             "Finding solution to linear system failed: left side of matrix [{},{}] = {}",
                             i, j, x
@@ -101,19 +112,21 @@ impl GaussVanilla {
         let mut k = 0;
 
         while h < m && k < n {
-            let mut max = (0, f64::MIN);
+            let mut max = (h, self.left[(h, k)].abs());
             for i in h..m {
-                if self.left[(i, k)] >= max.1 {
-                    max = (i, self.left[(i, k)])
+                let candidate = self.left[(i, k)].abs();
+                if candidate > max.1 {
+                    max = (i, candidate);
                 }
             }
+
             let i = max.0;
-            if self.left[(i, k)] == 0.0 {
+            if Self::approx_zero(self.left[(i, k)], 1e-12) {
                 k += 1;
                 continue;
             }
 
-            if h != max.0 {
+            if h != i {
                 swap_rows(&mut self.left, h, i);
                 swap_rows(&mut self.right, h, i);
             }
@@ -137,7 +150,7 @@ impl GaussVanilla {
         for i in (0..self.left.rows).rev() {
             for j in 0..self.left.cols {
                 let x = self.left[(i, j)];
-                if x == 0.0 {
+                if Self::approx_zero(x, 1e-12) {
                     continue;
                 }
                 for k in j..self.left.cols {
@@ -154,7 +167,7 @@ impl GaussVanilla {
     fn backfill(&mut self) {
         for i in (0..self.left.rows).rev() {
             for j in 0..self.left.cols {
-                if self.left[(i, j)] == 0.0 {
+                if Self::approx_zero(self.left[(i, j)], 1e-12) {
                     continue;
                 }
                 for k in 0..i {
@@ -204,6 +217,15 @@ impl LinearDiscriminantAnalysis {
     pub fn train(features: &Matrix, decoy: &[bool]) -> Option<LinearDiscriminantAnalysis> {
         assert_eq!(features.rows, decoy.len());
 
+        let n_decoy = decoy.iter().filter(|&&label| label).count();
+        let n_target = decoy.len().saturating_sub(n_decoy);
+        if n_decoy == 0 || n_target == 0 {
+            log::warn!(
+                "linear discriminant training requires at least one target and one decoy"
+            );
+            return None;
+        }
+
         // Calculate class means, and overall mean
         let x_bar = features.mean();
         let mut scatter_within = Matrix::zeros(features.cols, features.cols);
@@ -240,7 +262,7 @@ impl LinearDiscriminantAnalysis {
                     .collect::<Vec<_>>(),
             );
 
-            scatter_between += diff.dot(&diff.transpose());
+            scatter_between += diff.dot(&diff.transpose()) * count as f64;
             class_means.extend(class_mean);
         }
 
@@ -273,20 +295,20 @@ pub fn score_psms(
         return None;
     }
 
-    // DF mode must not touch vanilla LDA/KDE
+    // Decoy-free mode bypasses the vanilla TDC/LDA rescoring path.
     if decoy_free {
         return Some(());
     }
 
     log::trace!("fitting linear discriminant model...");
 
-    // Vanilla: decoys = label == -1
+    // Vanilla TDC labels decoys as -1.
     let decoys = scores
         .par_iter()
         .map(|sc| sc.core.label == -1)
         .collect::<Vec<_>>();
 
-    // Vanilla: mass_error depends on tolerance type
+    // Use the vanilla mass-error definition for the active precursor tolerance.
     let mass_error = match precursor_tol {
         Tolerance::Ppm(_, _) => |feat: &FeatureCore| feat.delta_mass as f64,
         Tolerance::Pct(_, _) => unreachable!("Pct tolerance should never be used on mz"),
@@ -304,14 +326,14 @@ pub fn score_psms(
         .map(|s| mass_error(&s.core))
         .collect::<Vec<_>>();
 
-    // Vanilla: KDE mass model
+    // Fit the vanilla non-parametric mass-error model.
     let mass_model = super::kde::Builder::default()
         .monotonic(false)
         .bw_adjust(move |x| x * bw_adjust)
         .bins(bin_size.ceil().abs() as usize)
         .build(&delta_mass, &decoys);
 
-    // Vanilla: feature embedding (IMPORTANT: use aligned_rt)
+    // Construct the vanilla LDA feature embedding, including aligned RT.
     let features = scores
         .par_iter()
         .flat_map_iter(|s| {

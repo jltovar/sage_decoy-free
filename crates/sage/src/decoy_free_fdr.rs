@@ -110,8 +110,11 @@ Never rely on an implicit or ambiguous “score” definition.
 
 use crate::database::IndexedDatabase;
 use crate::input::LoStratify;
-use crate::input::{EnsemblePepCombiner, LoRankKey, PhysicalRescueMode};
-use crate::input::{FdrSettings, FdrType, ModelFit};
+use crate::input::{
+    BoundedAuxUpdateSpace, DartNullRtModel, DartTrueRtModel, EnsemblePepCombiner, FdrSettings,
+    FdrType, JointMode, L3AnchorMode, L3RescueMode, LoRankKey, ModelFit, PhysicalAnchorMode,
+    PhysicalRescueMode,
+};
 use crate::lfq::{Peak, PrecursorId};
 use crate::ml::lower_order::{
     fit_decoy_free_model, fit_gumbel_mle, fit_gumbel_moments, LowerOrderModel,
@@ -463,8 +466,24 @@ fn weighted_median(peps: &[f64], weights: &[f64]) -> Option<f64> {
 }
 
 // -----------------------------------------------------------------------------
-// 5) Ensemble combiner (PEPs only)
+// 5) Ensemble combiner for expert PEPs
+//
+// IMPORTANT:
+// This function produces an empirical consensus score on the PEP scale by
+// combining expert-specific PEP estimates. The result is used operationally
+// as a PEP-like quantity for ranking and cumulative-mean q-value estimation,
+// but it should not be described as a formally calibrated posterior
+// probability unless that calibration is validated externally.
 // -----------------------------------------------------------------------------
+
+/// Combine multiple expert PEP estimates into a single empirical consensus
+/// score on the PEP scale.
+///
+/// The output is bounded to [1e-300, 1.0] and is suitable for downstream
+/// rank ordering and cumulative-mean q-value construction in the ensemble
+/// path. It is intentionally treated as a PEP-like consensus score rather
+/// than a guaranteed calibrated posterior.
+
 fn combine_peps(
     peps: &[f64],
     weights: &[f64],
@@ -672,12 +691,38 @@ fn clear_all_df_outputs(psm: &mut DfFeature, fail_closed_rank1: bool) {
 }
 
 // -----------------------------------------------------------------------------
-// 6d) DF rank-order “score” key (authoritative for "sorted by score")
+// 6d) DF rank-order score helpers
 // -----------------------------------------------------------------------------
 
 #[inline(always)]
 fn df_rank_score(f: &DfFeature) -> f64 {
     tev(f).unwrap_or_else(|| f.decoy_free_score.unwrap_or(0.0) as f64)
+}
+
+#[inline(always)]
+fn df_rank_score_base_pep(f: &DfFeature) -> f64 {
+    f.decoy_free_score
+        .map(|x| x as f64)
+        .unwrap_or_else(|| tev(f).unwrap_or(0.0))
+}
+
+#[inline(always)]
+fn df_rank_score_l2_pep(f: &DfFeature) -> f64 {
+    f.decoy_free_score_l2
+        .map(|x| x as f64)
+        .unwrap_or_else(|| f.decoy_free_score.map(|x| x as f64).unwrap_or_else(|| tev(f).unwrap_or(0.0)))
+}
+
+#[inline(always)]
+fn df_rank_score_l3_pep(f: &DfFeature) -> f64 {
+    f.decoy_free_score_l3
+        .map(|x| x as f64)
+        .unwrap_or_else(|| {
+            f.decoy_free_score_l2
+                .map(|x| x as f64)
+                .or_else(|| f.decoy_free_score.map(|x| x as f64))
+                .unwrap_or_else(|| tev(f).unwrap_or(0.0))
+        })
 }
 
 // -----------------------------------------------------------------------------
@@ -899,7 +944,7 @@ fn summarize_q(label: &str, qs_in: impl Iterator<Item = f32>) {
 }
 
 // -----------------------------------------------------------------------------
-// 9b) Model-fit diagnostics helpers (Step 4.2)
+// 9b) Model-fit diagnostics helpers
 // -----------------------------------------------------------------------------
 
 #[inline]
@@ -1835,7 +1880,7 @@ fn fit_engines(
 
 // --- MAIN FUNCTION ---
 // =============================================================================
-// LAYER 1: Base Discovery Helpers (Phase 1, Step 1)
+// LAYER 1: Base discovery helpers
 // =============================================================================
 
 #[derive(Clone)]
@@ -2268,7 +2313,7 @@ fn write_base_method_outputs(
             psm.decoy_free_p_value = None;
         }
 
-        let pep_final: f64 = if use_ensemble {
+        let pep_consensus: f64 = if use_ensemble {
             let mut pep_experts: Vec<f64> = Vec::new();
             let mut pep_weights: Vec<f64> = Vec::new();
 
@@ -2351,8 +2396,8 @@ fn write_base_method_outputs(
         .clamp(0.0, 1.0)
         .max(1e-300);
 
-        let df_score = (-10.0 * pep_final.max(1e-15).log10()) as f32;
-        psm.decoy_free_pep = Some(pep_final as f32);
+        let df_score = (-10.0 * pep_consensus.max(1e-15).log10()) as f32;
+        psm.decoy_free_pep = Some(pep_consensus as f32);
         psm.decoy_free_score = Some(df_score);
     }
 }
@@ -2678,7 +2723,7 @@ fn finalize_base_q_values(
                 if !pep.is_finite() {
                     return None;
                 }
-                let score_key = df_rank_score(f);
+                let score_key = df_rank_score_base_pep(f);
                 Some((score_key, i, pep.clamp(0.0, 1.0).max(1e-300)))
             })
             .collect();
@@ -2902,7 +2947,7 @@ fn finalize_base_q_values(
 }
 
 // =============================================================================
-// LAYER 2: Shared Scaffolding & Dispatcher (Phase 3, Steps 6 & 7)
+// LAYER 2: Shared scaffolding and dispatcher
 // =============================================================================
 
 fn build_physical_anchor_set(
@@ -3030,16 +3075,19 @@ fn exclude_non_rescue_safe_anchors(
     settings: &FdrSettings,
     db: &crate::database::IndexedDatabase,
 ) -> (Vec<usize>, Vec<usize>) {
-    let anchor_mode = settings.physical_rescue.anchor_mode.as_str();
+    let anchor_mode = &settings.physical_rescue.anchor_mode;
 
-    // Supported modes:
-    //   "strict" / "default" -> require finite aligned/predicted/delta RT and exclude contam+entrapment
-    //   "relaxed"            -> require finite aligned/predicted RT, ignore delta, still exclude contam+entrapment
-    //   "evidence_only"      -> no extra anchor safety exclusions beyond evidence floor
-    let require_aligned_rt = !matches!(anchor_mode, "evidence_only");
-    let require_predicted_rt = !matches!(anchor_mode, "evidence_only");
-    let require_delta_rt = matches!(anchor_mode, "strict" | "default");
-    let exclude_unsafe_proteins = !matches!(anchor_mode, "evidence_only");
+	// Supported modes:
+	//   Strict / Default -> require finite aligned/predicted/delta RT and exclude contam+entrapment
+	//   Relaxed          -> require finite aligned/predicted RT, ignore delta, still exclude contam+entrapment
+	//   EvidenceOnly     -> no extra anchor safety exclusions beyond evidence floor
+	let require_aligned_rt = !matches!(anchor_mode, PhysicalAnchorMode::EvidenceOnly);
+	let require_predicted_rt = !matches!(anchor_mode, PhysicalAnchorMode::EvidenceOnly);
+	let require_delta_rt = matches!(
+		anchor_mode,
+		PhysicalAnchorMode::Strict | PhysicalAnchorMode::Default
+	);
+	let exclude_unsafe_proteins = !matches!(anchor_mode, PhysicalAnchorMode::EvidenceOnly);
 
     let mut kept: Vec<usize> = Vec::new();
     let mut dropped: Vec<usize> = Vec::new();
@@ -3077,9 +3125,17 @@ fn summarize_anchor_coverage(
     use std::collections::{HashMap, HashSet};
 
     let max_pep = settings.physical_rescue.anchor_max_pep as f32;
-    let max_q = settings.physical_rescue.anchor_max_q; // <--- ADD THIS LINE
+    let max_q = settings.physical_rescue.anchor_max_q;
     let min_per_run = settings.physical_rescue.min_anchor_count_per_run;
     let min_per_charge = settings.physical_rescue.min_anchor_count_per_charge;
+    let anchor_mode = &settings.physical_rescue.anchor_mode;
+    let require_aligned_rt = !matches!(anchor_mode, PhysicalAnchorMode::EvidenceOnly);
+    let require_predicted_rt = !matches!(anchor_mode, PhysicalAnchorMode::EvidenceOnly);
+    let require_delta_rt = matches!(
+        anchor_mode,
+        PhysicalAnchorMode::Strict | PhysicalAnchorMode::Default
+    );
+    let exclude_unsafe_proteins = !matches!(anchor_mode, PhysicalAnchorMode::EvidenceOnly);
 
     // ---------------------------------------------------------------------
     // 1) Total candidates before filtering
@@ -3108,46 +3164,53 @@ fn summarize_anchor_coverage(
     let after_evidence_filtering = evidence_filtered.len();
 
     // ---------------------------------------------------------------------
-    // 3) Excluded for missing / invalid RT
+    // 3) Excluded for missing / invalid physical evidence under anchor_mode
     // ---------------------------------------------------------------------
     let excluded_for_missing_rt = evidence_filtered
         .iter()
         .filter(|&&idx| {
             let f = &features[idx];
-            let aligned_rt = f.core.aligned_rt;
-            let predicted_rt = f.core.predicted_rt;
-            let delta_rt = f.core.delta_rt_model;
-            !aligned_rt.is_finite() || !predicted_rt.is_finite() || !delta_rt.is_finite()
+            let missing_aligned = require_aligned_rt && !f.core.aligned_rt.is_finite();
+            let missing_predicted = require_predicted_rt && !f.core.predicted_rt.is_finite();
+            let missing_delta = require_delta_rt && !f.core.delta_rt_model.is_finite();
+            missing_aligned || missing_predicted || missing_delta
         })
         .count();
 
     // ---------------------------------------------------------------------
-    // 4) Excluded for contaminant / entrapment
+    // 4) Excluded for contaminant / entrapment under anchor_mode
     // ---------------------------------------------------------------------
-    let excluded_for_contam_or_entrapment = evidence_filtered
-        .iter()
-        .filter(|&&idx| {
-            let f = &features[idx];
-            let prot = db[f.core.peptide_idx].proteins(&db.decoy_tag, db.generate_decoys);
-            is_entrapment_str(&prot) || is_contam_str(&prot)
-        })
-        .count();
+    let excluded_for_contam_or_entrapment = if exclude_unsafe_proteins {
+        evidence_filtered
+            .iter()
+            .filter(|&&idx| {
+                let f = &features[idx];
+                let prot = db[f.core.peptide_idx].proteins(&db.decoy_tag, db.generate_decoys);
+                is_entrapment_str(&prot) || is_contam_str(&prot)
+            })
+            .count()
+    } else {
+        0
+    };
 
     // ---------------------------------------------------------------------
-    // 5) After unsafe-anchor exclusion
+    // 5) After mode-aware unsafe-anchor exclusion
     // ---------------------------------------------------------------------
     let safe_after_exclusion: Vec<usize> = evidence_filtered
         .into_iter()
         .filter(|&idx| {
             let f = &features[idx];
 
-            let aligned_rt = f.core.aligned_rt;
-            let predicted_rt = f.core.predicted_rt;
-            let delta_rt = f.core.delta_rt_model;
-            let rt_ok = aligned_rt.is_finite() && predicted_rt.is_finite() && delta_rt.is_finite();
+            let rt_ok = (!require_aligned_rt || f.core.aligned_rt.is_finite())
+                && (!require_predicted_rt || f.core.predicted_rt.is_finite())
+                && (!require_delta_rt || f.core.delta_rt_model.is_finite());
 
-            let prot = db[f.core.peptide_idx].proteins(&db.decoy_tag, db.generate_decoys);
-            let safe_protein = !is_entrapment_str(&prot) && !is_contam_str(&prot);
+            let safe_protein = if exclude_unsafe_proteins {
+                let prot = db[f.core.peptide_idx].proteins(&db.decoy_tag, db.generate_decoys);
+                !is_entrapment_str(&prot) && !is_contam_str(&prot)
+            } else {
+                true
+            };
 
             rt_ok && safe_protein
         })
@@ -3371,31 +3434,31 @@ fn compute_joint_physical_summary(
     ims: &ImsReliabilitySummary,
     settings: &FdrSettings,
 ) -> JointPhysicalSummary {
-    let joint_mode = settings.physical_rescue.joint_mode.as_str();
+    let joint_mode = &settings.physical_rescue.joint_mode;
 
-    let joint_reliability = match joint_mode {
-        "min" => {
-            if ims.ims_sigma_global.is_some() {
-                rt.reliability.min(ims.reliability)
-            } else {
-                rt.reliability
-            }
-        }
-        "product" => {
-            if ims.ims_sigma_global.is_some() {
-                (rt.reliability * ims.reliability).clamp(0.0, 1.0)
-            } else {
-                rt.reliability
-            }
-        }
-        _ => {
-            if ims.ims_sigma_global.is_some() {
-                0.5 * rt.reliability + 0.5 * ims.reliability
-            } else {
-                rt.reliability
-            }
-        }
-    };
+	let joint_reliability = match joint_mode {
+		JointMode::Min => {
+			if ims.ims_sigma_global.is_some() {
+				rt.reliability.min(ims.reliability)
+			} else {
+				rt.reliability
+			}
+		}
+		JointMode::Product => {
+			if ims.ims_sigma_global.is_some() {
+				(rt.reliability * ims.reliability).clamp(0.0, 1.0)
+			} else {
+				rt.reliability
+			}
+		}
+		JointMode::Independent => {
+			if ims.ims_sigma_global.is_some() {
+				0.5 * rt.reliability + 0.5 * ims.reliability
+			} else {
+				rt.reliability
+			}
+		}
+	};
 
     let fail_closed_hint = rt.fail_closed_hint || ims.fail_closed_hint;
 
@@ -3704,7 +3767,7 @@ fn verify_dart_rt_scale_consistency(
 }
 
 // =============================================================================
-// LAYER 2: DART-Bayes Mode Kernels (Phase 4A, Step 2)
+// LAYER 2: DART-Bayes mode kernels
 // =============================================================================
 
 fn compute_dart_reference_rt(
@@ -3739,12 +3802,15 @@ fn compute_dart_true_rt_likelihood(
     observed_rt: f64,
     reference_rt: f64,
     rt_sigma: f64,
-    model_type: &str,
+    model_type: &DartTrueRtModel,
 ) -> f64 {
-    if model_type == "laplace" {
-        crate::ml::stats::laplace_logpdf(observed_rt, reference_rt, rt_sigma)
-    } else {
-        crate::ml::stats::normal_logpdf(observed_rt, reference_rt, rt_sigma)
+    match model_type {
+        DartTrueRtModel::Laplace => {
+            crate::ml::stats::laplace_logpdf(observed_rt, reference_rt, rt_sigma)
+        }
+        DartTrueRtModel::Normal => {
+            crate::ml::stats::normal_logpdf(observed_rt, reference_rt, rt_sigma)
+        }
     }
 }
 
@@ -3752,19 +3818,17 @@ fn compute_dart_null_rt_likelihood(
     observed_rt: f64,
     null_center: f64,
     null_spread: f64,
-    null_model_type: &str,
+    null_model_type: &DartNullRtModel,
 ) -> f64 {
     match null_model_type {
-        "normal" => crate::ml::stats::normal_logpdf(observed_rt, null_center, null_spread),
-        "uniform" => {
+        DartNullRtModel::Normal => {
+            crate::ml::stats::normal_logpdf(observed_rt, null_center, null_spread)
+        }
+        DartNullRtModel::Uniform => {
             // A truly uniform null over the observed data spread.
             // Spread here represents the standard deviation; for a run-aware uniform
             // null, we approximate the density as 1.0 (log-lik 0.0) in the normalized [0,1] space.
             0.0
-        }
-        _ => {
-            // Default to broad normal behavior if unspecified
-            crate::ml::stats::normal_logpdf(observed_rt, null_center, null_spread)
         }
     }
 }
@@ -3840,7 +3904,7 @@ fn finalize_dart_l2_q_values(features: &mut [DfFeature]) {
         if f.core.rank == 1 {
             if let Some(pep) = f.decoy_free_pep_l2 {
                 if pep.is_finite() {
-                    let score_key = df_rank_score(f);
+					let score_key = df_rank_score_l2_pep(f);
                     rows.push((score_key, i, (pep as f64).clamp(0.0, 1.0).max(1e-300)));
                 }
             }
@@ -3923,18 +3987,18 @@ fn apply_dart_bayes_update(
         let prior_pep = f.decoy_free_pep_base.unwrap_or(1.0) as f64;
 
         let log_lik_true = compute_dart_true_rt_likelihood(
-            observed_rt,
-            reference_rt,
-            reference_sigma,
-            &dart_cfg.dart_true_rt_model,
-        );
-
-        let log_lik_null = compute_dart_null_rt_likelihood(
-            observed_rt,
-            null_center,
-            null_spread,
-            &dart_cfg.dart_null_rt_model,
-        );
+			observed_rt,
+			reference_rt,
+			reference_sigma,
+			&dart_cfg.dart_true_rt_model,
+		);
+		
+		let log_lik_null = compute_dart_null_rt_likelihood(
+			observed_rt,
+			null_center,
+			null_spread,
+			&dart_cfg.dart_null_rt_model,
+		);
 
         let posterior_pep = compute_dart_posterior_pep(prior_pep, log_lik_true, log_lik_null);
 
@@ -3952,8 +4016,13 @@ fn apply_dart_bayes_update(
 }
 
 // =============================================================================
-// LAYER 2: Bounded Auxiliary Mode Kernels (Phase 4B, Step 2)
+// LAYER 2: Bounded auxiliary mode kernels
 // =============================================================================
+
+/// Compute a bounded auxiliary rescue shift on the logit-confidence scale.
+///
+/// Positive values support rescue; negative values support demotion.
+/// The returned value is not a probability-space increment.
 
 fn compute_physical_shift(f: &DfFeature, rt_sigma: f64) -> f64 {
     let delta = f.core.delta_rt_model as f64;
@@ -3979,7 +4048,7 @@ fn finalize_bounded_l2_q_values(features: &mut [DfFeature]) {
         if f.core.rank == 1 {
             if let Some(pep) = f.decoy_free_pep_l2 {
                 if pep.is_finite() {
-                    let score_key = df_rank_score(f);
+                    let score_key = df_rank_score_l2_pep(f);
                     rows.push((score_key, i, (pep as f64).clamp(0.0, 1.0).max(1e-300)));
                 }
             }
@@ -4030,7 +4099,6 @@ fn apply_bounded_physical_shift(
         }
 
         let prior_pep = f.decoy_free_pep_base.unwrap_or(1.0) as f64;
-        let logit_prior = crate::ml::stats::safe_logit_confidence(prior_pep);
 
         let missing_rt = !f.core.aligned_rt.is_finite()
             || !f.core.predicted_rt.is_finite()
@@ -4044,13 +4112,20 @@ fn apply_bounded_physical_shift(
         } else {
             0.0
         };
-
+        
+		// The physical rescue shift is defined on the logit-confidence scale.
+		// It is capped before being added to the prior logit-confidence.
         let raw_shift = compute_physical_shift(f, rt_sigma) - missing_penalty;
         let bounded_shift =
             crate::ml::stats::capped_shift(raw_shift, cfg.max_rescue_shift, cfg.max_penalty_shift);
 
-        let logit_post = logit_prior + bounded_shift;
-        let posterior_pep = crate::ml::stats::safe_inv_logit_confidence(logit_post);
+        let posterior_pep = match cfg.update_space {
+			BoundedAuxUpdateSpace::LogitConfidence => {
+				let logit_prior = crate::ml::stats::safe_logit_confidence(prior_pep);
+				let logit_post = logit_prior + bounded_shift;
+				crate::ml::stats::safe_inv_logit_confidence(logit_post)
+			}
+		};
 
         f.decoy_free_pep_l2 = Some(posterior_pep as f32);
         let df_score = (-10.0 * posterior_pep.max(1e-15).log10()) as f32;
@@ -4092,7 +4167,7 @@ struct L3AnchorSummary {
 }
 
 // =============================================================================
-// LAYER 3: Reproducibility & Agreement (Phase 7, Steps 1 & 2)
+// LAYER 3: Reproducibility and agreement
 // =============================================================================
 
 fn compute_expert_agreement_support(f: &DfFeature, settings: &FdrSettings) -> f64 {
@@ -4355,17 +4430,16 @@ fn build_l3_anchor_map(
         }
 
         let mut tmp = vals.clone();
-        let anchor_value = match anchor_cfg.mode.as_str() {
-            "best" => tmp.iter().copied().min_by(|a, b| a.total_cmp(b)),
-            "second_best" => second_best_f64(&mut tmp),
-            "mean" => Some(tmp.iter().sum::<f64>() / (tmp.len() as f64)),
-            "median" => median_f64(tmp),
-            "trimmed_mean" => {
-                let trim = anchor_cfg.trim_fraction.unwrap_or(0.1);
-                trimmed_mean(&mut tmp, trim)
-            }
-            _ => second_best_f64(&mut tmp).or_else(|| tmp.first().copied()),
-        };
+		let anchor_value = match anchor_cfg.mode {
+			L3AnchorMode::Best => tmp.iter().copied().min_by(|a, b| a.total_cmp(b)),
+			L3AnchorMode::SecondBest => second_best_f64(&mut tmp),
+			L3AnchorMode::Mean => Some(tmp.iter().sum::<f64>() / (tmp.len() as f64)),
+			L3AnchorMode::Median => median_f64(tmp),
+			L3AnchorMode::TrimmedMean => {
+				let trim = anchor_cfg.trim_fraction.unwrap_or(0.1);
+				trimmed_mean(&mut tmp, trim)
+			}
+		};
 
         if let Some(anchor_value) = anchor_value {
             out.insert(
@@ -4415,10 +4489,9 @@ fn apply_l3_anchor_rescue(
     let anchor = anchor_pep.clamp(0.0, 1.0).max(1e-300);
 
     let improved_target = anchor.min(prior);
-    let rescued_pep = match band.rescue_mode.as_str() {
-        "replace" => prior + max_frac * (improved_target - prior),
-        "bounded_shrinkage" => prior + max_frac * (improved_target - prior),
-        _ => prior + max_frac * (improved_target - prior),
+    let rescued_pep = match band.rescue_mode {
+        L3RescueMode::Replace => improved_target,
+        L3RescueMode::BoundedShrinkage => prior + max_frac * (improved_target - prior),
     }
     .clamp(0.0, 1.0)
     .max(1e-300);
@@ -4446,7 +4519,7 @@ fn finalize_repro_l3_q_values(features: &mut [DfFeature]) {
         if f.core.rank == 1 {
             if let Some(pep) = f.decoy_free_pep_l3 {
                 if pep.is_finite() {
-                    let score_key = df_rank_score(f);
+                    let score_key = df_rank_score_l3_pep(f);
                     rows.push((score_key, i, (pep as f64).clamp(0.0, 1.0).max(1e-300)));
                 }
             }
@@ -4766,22 +4839,20 @@ fn validate_final_df_stream_contract(features: &[DfFeature]) {
     }
 
     if n_invalid_pep_native > 0 || n_invalid_mixed > 0 {
-        log::warn!(
-            "DF final stream contract warning: rank1={} p_native={} pep_native={} invalid_pep_native={} mixed_stream_rows={}",
-            n_rank1,
-            n_p_native,
-            n_pep_native,
-            n_invalid_pep_native,
-            n_invalid_mixed
+        let msg = format!(
+            "DF final stream contract violated: rank1={} p_native={} pep_native={} invalid_pep_native={} mixed_stream_rows={}",
+            n_rank1, n_p_native, n_pep_native, n_invalid_pep_native, n_invalid_mixed
         );
-    } else {
-        log::debug!(
-            "DF final stream contract OK: rank1={} p_native={} pep_native={}",
-            n_rank1,
-            n_p_native,
-            n_pep_native
-        );
+        log::error!("{}", msg);
+        panic!("{}", msg);
     }
+
+    log::debug!(
+        "DF final stream contract OK: rank1={} p_native={} pep_native={}",
+        n_rank1,
+        n_p_native,
+        n_pep_native
+    );
 }
 
 pub fn run_df_layers(
@@ -4969,7 +5040,7 @@ pub fn run_df_layers(
         repro_res.fail_closed
     );
 
-    // 4. Finalize the active PSM stream from the layers (Phase 13 Centralization)
+    // 4. Finalize the active PSM stream from the completed DF layers.
     let final_stream = finalize_df_psm_stream(&mut new_features, settings);
     validate_final_df_stream_contract(&new_features);
 
@@ -4997,7 +5068,7 @@ pub fn calculate_peptide_q_df(
     threshold: f32,
 ) -> (usize, usize) {
     // Peptide inference consumes the finalized active DF PSM stream after
-    // Layer 1 / Layer 2 / Layer 3 finalization.
+    // Finalized DF stream may come from Layer 1, Layer 2, or Layer 3.
     // If decoy_free_p_value.is_none(), the active stream is PEP-native and
     // peptide inference must use decoy_free_pep.
     // Otherwise, the active stream is p-value-native and peptide inference
@@ -5010,91 +5081,61 @@ pub fn calculate_peptide_q_df(
         .map(|f| f.decoy_free_p_value.is_none())
         .unwrap_or(false);
 
-    // Maps peptide sequence -> (best_evidence_score, is_entrapment)
-    let mut peptide_evidence_map: FnvHashMap<String, (f64, bool)> = FnvHashMap::default();
-
-    // 2. Collect the BEST PSM evidence per peptide
-    for feat in features.iter().filter(|f| {
-        f.core.rank == 1
-            && f.core.label == 1
-            && f.decoy_free_q_value
-                .map(|q| q <= threshold)
-                .unwrap_or(false)
-    }) {
-        let val = if is_pep_native {
-            feat.decoy_free_pep
-        } else {
-            feat.decoy_free_p_value
-        };
-
-        let v = match val {
-            Some(x) => (x as f64).clamp(0.0, 1.0).max(1e-300),
-            None => continue,
-        };
-
-        let peptide = db[feat.core.peptide_idx].to_string();
-        let prot = db[feat.core.peptide_idx].proteins(&db.decoy_tag, db.generate_decoys);
-        let is_ent = is_entrapment_str(&prot);
-
-        // For both PEP and P-value, lower is better. Take the min (best).
-        peptide_evidence_map
-            .entry(peptide)
-            .and_modify(|(best_v, _)| *best_v = best_v.min(v))
-            .or_insert((v, is_ent));
-    }
-
-    let mut peptide_keys = Vec::with_capacity(peptide_evidence_map.len());
-    let mut peptide_combined_vals = Vec::with_capacity(peptide_evidence_map.len());
-    let mut is_ent_flags = Vec::with_capacity(peptide_evidence_map.len());
-
-    for (peptide, (v, is_ent)) in peptide_evidence_map {
-        peptide_keys.push(peptide);
-        peptide_combined_vals.push(v);
-        is_ent_flags.push(is_ent);
-    }
-
     let mut passing_psm_count = 0usize;
-    let mut peptide_evidence_map: FnvHashMap<String, (f64, bool)> = FnvHashMap::default();
 
-    for feat in features.iter().filter(|f| {
-        f.core.rank == 1
-            && f.core.label == 1
-            && f.decoy_free_q_value
-                .map(|q| q <= threshold)
-                .unwrap_or(false)
-    }) {
-        passing_psm_count += 1;
-
-        let val = if is_pep_native {
-            feat.decoy_free_pep
-        } else {
-            feat.decoy_free_p_value
-        };
-
-        let v = match val {
-            Some(x) => (x as f64).clamp(0.0, 1.0).max(1e-300),
-            None => continue,
-        };
-
-        let peptide = db[feat.core.peptide_idx].to_string();
-        let proteins = db[feat.core.peptide_idx].proteins(&db.decoy_tag, db.generate_decoys);
-        let is_ent = is_entrapment_str(&proteins);
-
-        peptide_evidence_map
-            .entry(peptide)
-            .and_modify(|(best_v, _)| *best_v = best_v.min(v))
-            .or_insert((v, is_ent));
-    }
-
-    log::debug!(
-        "DF peptide inference pool: passing_psms={} unique_peptides={}",
-        passing_psm_count,
-        peptide_evidence_map.len()
-    );
+	// Maps peptide sequence -> (best_evidence_score, is_entrapment)
+	let mut peptide_evidence_map: FnvHashMap<String, (f64, bool)> = FnvHashMap::default();
+	
+	// Collect the best passing PSM evidence per peptide from the finalized DF stream.
+	for feat in features.iter().filter(|f| {
+		f.core.rank == 1
+			&& f.core.label == 1
+			&& f.decoy_free_q_value
+				.map(|q| q <= threshold)
+				.unwrap_or(false)
+	}) {
+		passing_psm_count += 1;
+	
+		let val = if is_pep_native {
+			feat.decoy_free_pep
+		} else {
+			feat.decoy_free_p_value
+		};
+	
+		let v = match val {
+			Some(x) => (x as f64).clamp(0.0, 1.0).max(1e-300),
+			None => continue,
+		};
+	
+		let peptide = db[feat.core.peptide_idx].to_string();
+		let proteins = db[feat.core.peptide_idx].proteins(&db.decoy_tag, db.generate_decoys);
+		let is_ent = is_entrapment_str(&proteins);
+	
+		peptide_evidence_map
+			.entry(peptide)
+			.and_modify(|(best_v, _)| *best_v = best_v.min(v))
+			.or_insert((v, is_ent));
+	}
+	
+	log::debug!(
+		"DF peptide inference pool: passing_psms={} unique_peptides={}",
+		passing_psm_count,
+		peptide_evidence_map.len()
+	);
+	
+	let mut peptide_keys = Vec::with_capacity(peptide_evidence_map.len());
+	let mut peptide_combined_vals = Vec::with_capacity(peptide_evidence_map.len());
+	let mut is_ent_flags = Vec::with_capacity(peptide_evidence_map.len());
+	
+	for (peptide, (v, is_ent)) in peptide_evidence_map {
+		peptide_keys.push(peptide);
+		peptide_combined_vals.push(v);
+		is_ent_flags.push(is_ent);
+	}
 
     // 3. Recalculate Peptide Q-values
     let q_values = if is_pep_native {
-        // PEP-native path: cumulative mean
+        // PEP-native path: cumulative mean of peptide-level PEP / PEP-like values
         let mut rows: Vec<(f64, usize)> = peptide_combined_vals
             .iter()
             .copied()
@@ -5125,7 +5166,9 @@ pub fn calculate_peptide_q_df(
         crate::ml::stats::bh_q_value(&peptide_combined_vals)
     };
 
-    // 4. Map back to features and count
+    // 4. Map back to features and count passing peptides.
+	// Returned counts are:
+	//   (total passing peptides, passing entrapment peptides)
     let mut best_q: FnvHashMap<String, (f32, bool)> = FnvHashMap::default();
     for i in 0..peptide_keys.len() {
         best_q.insert(
@@ -5154,19 +5197,19 @@ pub fn calculate_peptide_q_df(
         feat.decoy_free_peptide_q = Some(q);
     }
 
-    let mut targets = 0usize;
-    let mut ents = 0usize;
-
-    for &(q, is_ent) in best_q.values() {
-        if q <= threshold {
-            targets += 1;
-            if is_ent {
-                ents += 1;
-            }
-        }
-    }
-
-    (targets, ents)
+    let mut passing_total = 0usize;
+	let mut passing_entrapments = 0usize;
+	
+	for &(q, is_ent) in best_q.values() {
+		if q <= threshold {
+			passing_total += 1;
+			if is_ent {
+				passing_entrapments += 1;
+			}
+		}
+	}
+	
+	(passing_total, passing_entrapments)
 }
 
 fn combine_cauchy(p: &[f64]) -> f64 {
@@ -5204,7 +5247,7 @@ pub fn calculate_protein_q_df(
     // finalized active DF stream.
     // Layer 3 may change which final PSMs survive into peptide inference,
     // but it does not change the downstream protein-inference contract.
-    // Base-only remains p-value-native; Layer 2 / Layer 3 final streams are
+    // Base-only remains p-value-native; Layer 2 and Layer 3 final streams are
     // PEP-native.
     let is_pep_native = features
         .iter()
@@ -5261,7 +5304,8 @@ pub fn calculate_protein_q_df(
         protein_peptide_map.len()
     );
 
-    // Combine per protein -> evidence value
+    // Combine unique-peptide evidence per protein into a single protein-level
+	// evidence value from the finalized DF stream.
     let mut protein_keys: Vec<String> = Vec::new();
     let mut protein_combined_vals: Vec<f64> = Vec::new();
 
@@ -5322,7 +5366,7 @@ pub fn calculate_protein_q_df(
 
     // Convert protein evidence -> protein q-values (DF-only output)
     let protein_q_values = if is_pep_native {
-        // PEP-native path: cumulative mean of Protein PEPs
+        // PEP-native path: cumulative mean of protein-level PEP / PEP-like values
         let mut rows: Vec<(f64, usize)> = protein_combined_vals
             .iter()
             .copied()

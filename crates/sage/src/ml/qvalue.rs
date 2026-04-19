@@ -11,16 +11,21 @@ fn df_qvalue_trace_enabled() -> bool {
 /// # Invariants
 /// * `scores` must be sorted in descending order (e.g. best PSM is first)
 pub fn spectrum_q_value(scores: &mut [TdcFeature]) -> usize {
-    let mut decoy = 1;
+    let mut decoy = 0;
     let mut target = 0;
 
-    for score in scores.iter_mut() {
+        for score in scores.iter_mut() {
         if score.core.label == -1 {
             decoy += 1;
         } else {
             target += 1;
         }
-        score.spectrum_q = decoy as f32 / target as f32;
+
+        score.spectrum_q = if target > 0 {
+            decoy as f32 / target as f32
+        } else {
+            1.0
+        };
     }
 
     // Reverse slice, and calculate the cumulative minimum

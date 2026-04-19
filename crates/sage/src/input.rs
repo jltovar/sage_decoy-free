@@ -169,9 +169,9 @@ pub enum EnsemblePepCombiner {
 #[serde(rename_all = "snake_case")]
 pub enum NullOnlyPepMode {
     /// Approximate but simple: treat the method’s canonical p-value proxy as PEP.
-    #[default]
     PepEqualsP,
-    /// Optional: derive an approximate PEP from q-value heuristics (later step; may remain unused).
+    /// Derive an approximate PEP from q-value heuristics.
+    #[default]
     PepFromQHeuristic,
 }
 
@@ -196,7 +196,7 @@ pub enum StoreyDegeneracyFallback {
 }
 
 // =========================================================================
-// Layer 2 / Layer 3 (Decoy-Free Refactor Phase 2)
+// Layer 2 / Layer 3 configuration
 // =========================================================================
 
 #[derive(Clone, Serialize, Deserialize, Debug, Default, PartialEq, Eq)]
@@ -208,19 +208,82 @@ pub enum PhysicalRescueMode {
     BoundedAux,
 }
 
+#[derive(Clone, Serialize, Deserialize, Debug, Default, PartialEq, Eq)]
+#[serde(rename_all = "snake_case")]
+pub enum DartNullRtModel {
+    Normal,
+    #[default]
+    Uniform,
+}
+
+#[derive(Clone, Serialize, Deserialize, Debug, Default, PartialEq, Eq)]
+#[serde(rename_all = "snake_case")]
+pub enum DartTrueRtModel {
+    Normal,
+    #[default]
+    Laplace,
+}
+
+#[derive(Clone, Serialize, Deserialize, Debug, Default, PartialEq, Eq)]
+#[serde(rename_all = "snake_case")]
+pub enum BoundedAuxUpdateSpace {
+    #[default]
+    LogitConfidence,
+}
+
+#[derive(Clone, Serialize, Deserialize, Debug, Default, PartialEq, Eq)]
+#[serde(rename_all = "snake_case")]
+pub enum PhysicalAnchorMode {
+    Strict,
+    #[default]
+    Default,
+    Relaxed,
+    EvidenceOnly,
+}
+
+#[derive(Clone, Serialize, Deserialize, Debug, Default, PartialEq, Eq)]
+#[serde(rename_all = "snake_case")]
+pub enum JointMode {
+    Min,
+    Product,
+    #[default]
+    Independent,
+}
+
+#[derive(Clone, Serialize, Deserialize, Debug, Default, PartialEq, Eq)]
+#[serde(rename_all = "snake_case")]
+pub enum L3AnchorMode {
+    Best,
+    #[default]
+    SecondBest,
+    Mean,
+    Median,
+    TrimmedMean,
+}
+
+#[derive(Clone, Serialize, Deserialize, Debug, Default, PartialEq, Eq)]
+#[serde(rename_all = "snake_case")]
+pub enum L3RescueMode {
+    Replace,
+    #[default]
+    BoundedShrinkage,
+}
+
 #[derive(Clone, Serialize, Deserialize, Debug, PartialEq)]
 pub struct DartBayesConfig {
     pub dart_use_bootstrap: bool,
     pub dart_bootstrap_iters: usize,
     pub dart_leave_one_run_out: bool,
-    pub dart_null_rt_model: String,
-    pub dart_true_rt_model: String,
+    pub dart_null_rt_model: DartNullRtModel,
+    pub dart_true_rt_model: DartTrueRtModel,
     pub dart_recalc_q_from_posterior: bool,
 }
 
 #[derive(Clone, Serialize, Deserialize, Debug, PartialEq)]
 pub struct BoundedAuxConfig {
-    pub update_space: String,
+    /// Update space for bounded auxiliary rescue.
+	/// Currently only logit-confidence space is supported.
+	pub update_space: BoundedAuxUpdateSpace,
     pub max_rescue_shift: f64,
     pub max_penalty_shift: f64,
 }
@@ -228,14 +291,14 @@ pub struct BoundedAuxConfig {
 #[derive(Clone, Serialize, Deserialize, Debug, PartialEq)]
 pub struct PhysicalRescueConfig {
     pub mode: PhysicalRescueMode,
-    pub anchor_mode: String,
+    pub anchor_mode: PhysicalAnchorMode,
     pub anchor_max_pep: f64,
     pub anchor_max_q: f64,
     pub min_anchor_count_per_run: usize,
     pub min_anchor_count_per_charge: usize,
     pub rt_enabled: bool,
     pub ims_enabled: bool,
-    pub joint_mode: String,
+    pub joint_mode: JointMode,
     pub reliability_floor: f64,
     pub missing_penalty: f64,
     pub rt_region_bins: usize,
@@ -265,7 +328,7 @@ pub struct L3PeptideEligibilityConfig {
 
 #[derive(Clone, Serialize, Deserialize, Debug, PartialEq)]
 pub struct L3AnchorConfig {
-    pub mode: String,
+    pub mode: L3AnchorMode,
     pub trim_fraction: Option<f64>,
 }
 
@@ -274,7 +337,7 @@ pub struct L3RescueBandConfig {
     pub strong_cutoff_pep_l2: f64,
     pub weak_cutoff_pep_l2: f64,
     pub max_rescue_fraction: f64,
-    pub rescue_mode: String,
+    pub rescue_mode: L3RescueMode,
 }
 
 #[derive(Clone, Serialize, Deserialize, Debug, PartialEq)]
@@ -669,25 +732,25 @@ impl From<FdrOptions> for FdrSettings {
         let mode = options.mode.unwrap_or(FdrMode::DecoyFree);
 
         let physical_rescue = options
-            .physical_rescue
-            .unwrap_or_else(|| PhysicalRescueConfig {
-                mode: PhysicalRescueMode::Off,
-                anchor_mode: "default".to_string(),
-                anchor_max_pep: 0.1,
-                anchor_max_q: 0.01,
-                min_anchor_count_per_run: 10,
-                min_anchor_count_per_charge: 5,
-                rt_enabled: false,
-                ims_enabled: false,
-                joint_mode: "independent".to_string(),
-                reliability_floor: 0.5,
-                missing_penalty: 0.0,
-                rt_region_bins: 10,
-                use_local_rt_scale: true,
-                cov_shrinkage: 0.1,
-                dart_cfg: None,
-                bounded_cfg: None,
-            });
+			.physical_rescue
+			.unwrap_or_else(|| PhysicalRescueConfig {
+				mode: PhysicalRescueMode::Off,
+				anchor_mode: PhysicalAnchorMode::Default,
+				anchor_max_pep: 0.1,
+				anchor_max_q: 0.01,
+				min_anchor_count_per_run: 10,
+				min_anchor_count_per_charge: 5,
+				rt_enabled: false,
+				ims_enabled: false,
+				joint_mode: JointMode::Independent,
+				reliability_floor: 0.5,
+				missing_penalty: 0.0,
+				rt_region_bins: 10,
+				use_local_rt_scale: true,
+				cov_shrinkage: 0.1,
+				dart_cfg: None,
+				bounded_cfg: None,
+			});
 
         let reproducibility = options
             .reproducibility
@@ -717,16 +780,16 @@ impl From<FdrOptions> for FdrSettings {
                 },
 
                 anchor: L3AnchorConfig {
-                    mode: "second_best".to_string(),
-                    trim_fraction: Some(0.1),
-                },
-
-                rescue_band: L3RescueBandConfig {
-                    strong_cutoff_pep_l2: 0.01,
-                    weak_cutoff_pep_l2: 0.25,
-                    max_rescue_fraction: 0.5,
-                    rescue_mode: "bounded_shrinkage".to_string(),
-                },
+					mode: L3AnchorMode::SecondBest,
+					trim_fraction: Some(0.1),
+				},
+				
+				rescue_band: L3RescueBandConfig {
+					strong_cutoff_pep_l2: 0.01,
+					weak_cutoff_pep_l2: 0.25,
+					max_rescue_fraction: 0.5,
+					rescue_mode: L3RescueMode::BoundedShrinkage,
+				},
             });
 
         let precursor_fdr = options.precursor_fdr.unwrap_or(0.01);

@@ -91,15 +91,45 @@ pub struct LfqOptions {
 impl From<LfqOptions> for LfqSettings {
     fn from(value: LfqOptions) -> LfqSettings {
         let default = LfqSettings::default();
+
+        let spectral_angle = value.spectral_angle.unwrap_or(default.spectral_angle);
+        if !(0.0..=1.0).contains(&spectral_angle) {
+            log::error!(
+                "lfq_settings.spectral_angle must lie in [0.0, 1.0], got {}",
+                spectral_angle
+            );
+            std::process::exit(1);
+        }
+
+        let ppm_tolerance = value.ppm_tolerance.unwrap_or(default.ppm_tolerance).abs();
+
+        let peptide_q_value = value.peptide_q_value.unwrap_or(default.peptide_q_value);
+        if !(0.0..=1.0).contains(&peptide_q_value) {
+            log::error!(
+                "lfq_settings.peptide_q_value must lie in [0.0, 1.0], got {}",
+                peptide_q_value
+            );
+            std::process::exit(1);
+        }
+
+        let mobility_pct_tolerance = value
+            .mobility_pct_tolerance
+            .unwrap_or(default.mobility_pct_tolerance);
+        if mobility_pct_tolerance < 0.0 {
+            log::error!(
+                "lfq_settings.mobility_pct_tolerance must be nonnegative, got {}",
+                mobility_pct_tolerance
+            );
+            std::process::exit(1);
+        }
+
         let settings = LfqSettings {
             peak_scoring: value.peak_scoring.unwrap_or(default.peak_scoring),
             integration: value.integration.unwrap_or(default.integration),
-            spectral_angle: value.spectral_angle.unwrap_or(default.spectral_angle).abs(),
-            ppm_tolerance: value.ppm_tolerance.unwrap_or(default.ppm_tolerance).abs(),
-            peptide_q_value: value.peptide_q_value.unwrap_or(default.peptide_q_value),
-            mobility_pct_tolerance: value
-                .mobility_pct_tolerance
-                .unwrap_or(default.mobility_pct_tolerance),
+            spectral_angle,
+            ppm_tolerance,
+            peptide_q_value,
+            mobility_pct_tolerance,
             combine_charge_states: value
                 .combine_charge_states
                 .unwrap_or(default.combine_charge_states),
@@ -142,8 +172,18 @@ pub struct TmtSettings {
 impl From<TmtOptions> for TmtSettings {
     fn from(value: TmtOptions) -> Self {
         let default = Self::default();
+        let level = value.level.unwrap_or(default.level);
+
+        if level != 2 && level != 3 {
+            log::error!(
+                "tmt_settings.level must be 2 or 3, got {}",
+                level
+            );
+            std::process::exit(1);
+        }
+
         Self {
-            level: value.level.unwrap_or(default.level),
+            level,
             sn: value.sn.unwrap_or(default.sn),
         }
     }
@@ -277,10 +317,8 @@ impl Input {
     }
 
     pub fn build(mut self) -> anyhow::Result<Search> {
-        // ---------------------------------------------------------------------
-        // FDR mode: used ONLY for logging and the report_psms safety guard.
-        // All other defaults are handled in FdrSettings::from(FdrOptions).
-        // ---------------------------------------------------------------------
+        // Resolve the FDR mode for logging and report_psms validation.
+        // All other FDR defaults are defined by FdrSettings::from(FdrOptions).
         let fdr_mode = self
             .fdr
             .as_ref()
@@ -291,9 +329,7 @@ impl Input {
             log::info!("`fdr.mode` not specified; defaulting to target-decoy competition (tdc).");
         }
 
-        // ---------------------------------------------------------------------
-        // Mass tolerance sanity checks
-        // ---------------------------------------------------------------------
+        // Check mass-tolerance consistency.
         Self::check_mass_tolerances(&self.fragment_tol);
         Self::check_mass_tolerances(&self.precursor_tol);
 
@@ -318,9 +354,7 @@ impl Input {
             }
         }
 
-        // ---------------------------------------------------------------------
-        // Database + RT / LFQ compatibility
-        // ---------------------------------------------------------------------
+        // Build database parameters and enforce RT/LFQ compatibility.
         let database = self.database.make_parameters();
 
         if !self.predict_rt.unwrap_or(true)
@@ -333,9 +367,7 @@ impl Input {
             self.predict_rt = Some(true);
         }
 
-        // ---------------------------------------------------------------------
-        // mzMLs + output directory
-        // ---------------------------------------------------------------------
+        // Resolve input files and output directory.
         let mzml_paths = self.mzml_paths.expect("'mzml_paths' must be provided!");
 
         let output_directory = match self.output_directory {
@@ -349,27 +381,25 @@ impl Input {
             None => CloudPath::Local(std::env::current_dir()?),
         };
 
-        // ---------------------------------------------------------------------
-        // Scoring + report_psms (DecoyFree safety)
-        // ---------------------------------------------------------------------
+        // Resolve scoring mode and validate Decoy-Free reporting depth.
         let score_type = self.score_type.unwrap_or(ScoreType::SageHyperScore);
 
         let report_psms = self.report_psms.unwrap_or(1);
         let report_psms = if fdr_mode == FdrMode::DecoyFree && report_psms < 10 {
-            log::warn!("decoy_free mode requires report_psms >= 10; overriding to 10");
+            log::warn!(
+                "decoy_free mode requires report_psms >= 10 to retain sufficient candidate depth for stable downstream modeling and diagnostics; overriding to 10"
+            );
             10
         } else {
             report_psms
         };
 
-        // ---------------------------------------------------------------------
-        // FdrSettings: single source of truth via FdrOptions -> FdrSettings
-        // ---------------------------------------------------------------------
+        // Materialize FDR settings from the optional user configuration.
         let fdr_settings: FdrSettings = match self.fdr.clone() {
             Some(opts) => opts.into(),
             None => FdrOptions {
-                // We can pass the resolved mode here, or leave as None and let
-                // FdrSettings::from default to Tdc; both are safe.
+                // Pass through the resolved mode explicitly; all remaining defaults
+                // are supplied by FdrSettings::from(FdrOptions).
                 mode: Some(fdr_mode),
                 peptide_fdr: None,
                 protein_fdr: None,
@@ -379,28 +409,25 @@ impl Input {
                 model_fit: None,
                 type_: None,
 
-                // Configurable Safety Brakes
+                // Numerical safeguards and minimum sample constraints.
                 min_storey_n: None,
                 min_null_size: None,
                 kde_samples: None,
 
-                // Decoy-Free Lower-Order (LO) controls
+                // Lower-order model controls.
                 lo_mode: None,
                 lo_lom_estimator: None,
 
-                // Other Controls
+                // Additional inference controls.
                 purification_factor: None,
                 min_rank_count: None,
 
-                // IMPORTANT: fill all newly-added knobs (and any future ones)
                 ..Default::default()
             }
             .into(),
         };
 
-        // ---------------------------------------------------------------------
-        // Assemble Search
-        // ---------------------------------------------------------------------
+        // Assemble the resolved search configuration.
         Ok(Search {
             version: clap::crate_version!().into(),
             database,

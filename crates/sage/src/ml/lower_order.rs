@@ -1,4 +1,15 @@
 //! Decoy-free Lower-Order (LO) model fitting utilities.
+//!
+//! The methods in this module are based on the work of Dominik Madej and Henry Lam published here:
+//! 
+//! Modeling Lower-Order Statistics to Enable Decoy-Free FDR Estimation in Proteomics
+//! Dominik Madej and Henry Lam
+//! Journal of Proteome Research 2023 22 (4), 1159-1171
+//! DOI: 10.1021/acs.jproteome.2c00604
+//! https://pubs.acs.org/doi/full/10.1021/acs.jproteome.2c00604
+//!
+//! and implemented on GitHub here:
+//! https://github.com/dommad/pylord
 
 use fnv::FnvHashMap;
 use statrs::consts::EULER_MASCHERONI;
@@ -141,7 +152,7 @@ fn log_factorial_k_minus_1(k: u32) -> f64 {
 }
 
 // -----------------------------------------------------------------------------
-// Per-k LO estimators (PyLord-compatible)
+// Per-k LO estimators (PyLord-inspired / PyLord-consistent)
 // -----------------------------------------------------------------------------
 //
 // Matches PyLord stat.py:
@@ -275,8 +286,11 @@ fn nll_tev_k(mu: f64, beta: f64, scores: &[f64], k: u32) -> f64 {
 
 #[inline]
 fn tev_cdf_asymptotic(z: f64, k: u32) -> f64 {
-    // Matches PyLord stat.py:
-    // cdf_asymptotic(z, k) = exp(-exp(-z)) * Σ_{m=0..k} exp(-m z)/m!
+    // Asymptotic TEV CDF consistent with nll_tev_k():
+    // cdf_asymptotic(z, k) = exp(-exp(-z)) * Σ_{m=0..k-1} exp(-m z)/m!
+    //
+    // For k = 1 this reduces to the standard Gumbel-max CDF:
+    //   exp(-exp(-z))
     //
     // Implemented via a stable recurrence:
     // term_0 = 1
@@ -292,10 +306,10 @@ fn tev_cdf_asymptotic(z: f64, k: u32) -> f64 {
         return f64::NAN;
     }
 
-    // sum_{m=0..k} t^m / m!
+    // sum_{m=0..k-1} t^m / m!
     let mut sum = 1.0f64;
     let mut term = 1.0f64;
-    for m in 1..=k {
+    for m in 1..k {
         term *= t / (m as f64);
         sum += term;
     }
@@ -457,7 +471,9 @@ pub enum ChargeFillMode {
 // - Provides p_value(score, charge) using the existing TEV-normalization path:
 //       tev_norm = (score - mu) / beta
 //       p = 1 - TEV_CDF_asymptotic(z, k=1)
-// - Falls back to a global (mu, beta) when charge-specific params are absent.
+// - Uses fail-closed fallback parameters when charge-specific params are absent.
+//   In the current LO configuration these fallback params are NaN, causing p_value()
+//   to return 1.0 unless an explicit charge-sharing rule supplies parameters.
 //
 
 #[derive(Clone, Debug)]
@@ -527,7 +543,7 @@ impl LowerOrderModel {
 
         let z = (score - mu) / beta;
 
-        // TEV(order=1) asymptotic CDF (PyLord): cdf = exp(-exp(-z)) * (1 + exp(-z))
+        // Rank-1 asymptotic TEV CDF: for k = 1 this is the standard Gumbel-max CDF, exp(-exp(-z))
         let cdf = tev_cdf_asymptotic(z, 1);
         if !cdf.is_finite() {
             return 1.0; // fail-closed
@@ -549,7 +565,7 @@ impl LowerOrderModel {
 //
 // Output:
 // - LowerOrderModel with params_by_charge[z] = (mu, beta) for the selected TNM
-//   per charge, chosen by min-BIC across 4 candidates:
+//   per charge, chosen by minimum TEV negative log-likelihood across 4 candidates:
 //     (LR vs mean-β) × (MLE vs moments)
 //
 // Notes:
@@ -611,13 +627,14 @@ fn robust_mu_bounds(top_scores: &[f64]) -> Option<(f64, f64)> {
 }
 
 #[inline]
-fn mu_grid_best_bic_range(
+fn mu_grid_best_nll_range(
     beta: f64,
     top_scores: &[f64],
     mu_min: f64,
     mu_max: f64,
 ) -> Option<(f64, f64)> {
     // Scan mu in [mu_min..mu_max] and pick mu minimizing TEV NLL at k=1 (fixed beta).
+    // Here minimizing NLL is equivalent to minimizing BIC up to an additive constant.
     if top_scores.is_empty() || !beta.is_finite() || beta <= 0.0 {
         return None;
     }
@@ -848,14 +865,16 @@ fn eval_candidate_lr_range(
 /// This module fits a charge-stratified Target Null Model (TNM) and uses it to
 /// produce rank-1 p-values.
 ///
-/// Implementation Details (PyLord-Matched):
+/// Implementation Details (PyLord-Inspired LO):
 /// - Fits LOM parameters (μ_k, β_k) per charge for ranks k within the
 ///   configured LO null-rank window using Method of Moments (MM) and/or MLE.
 /// - Derives Rank 1 TNM candidates using Linear Regression and/or Mean-β modes.
 /// - Evaluates candidates over a configured μ scan range.
-/// - Selects the best candidate via Bayesian Information Criterion (BIC).
-/// - Strict fail-closed semantics: if a TNM cannot be reliably fit for a charge,
-///   no identifications will be produced for that charge via the LO stream.
+/// - Selects the best candidate by minimum negative log-likelihood (NLL).
+///   For the candidate TNMs compared here, this is equivalent to BIC up to an additive constant.
+/// - Fail-closed by default, with explicit charge-sharing rules for selected
+///   missing-charge cases (e.g. charge 1 inherits charge 2 when available, and
+///   charges above the fitted range inherit the highest fitted charge).
 ///
 pub fn fit_decoy_free_model(
     rank_null_stream: &[(u32, f64, u8)],
@@ -978,7 +997,7 @@ pub fn fit_decoy_free_model(
 
         // --- PYLORD KDE CUTOFF REPLICATION ---
         // PyLord uses Kernel Density Estimation (KDE) to find the "dip" between
-        // the nulls and targets, filtering out the targets before evaluating BIC.
+        // the nulls and targets, filtering out the targets before evaluating candidate TEV negative log-likelihoods.
         let mut temp_ts = ts.to_vec();
         temp_ts.sort_unstable_by(|a, b| a.total_cmp(b));
 
@@ -1035,7 +1054,7 @@ pub fn fit_decoy_free_model(
         };
 
         // ---------------------------------------------------------------------
-        // Paper/PyLord LO: per-k LOM fits (MM + MLE) and TNM selection by BIC
+        // PyLord-inspired LO: per-k LOM fits (MM + MLE) and TNM selection by minimum NLL
         // ---------------------------------------------------------------------
 
         // 1) Build LOM tables for each estimator family
@@ -1130,7 +1149,7 @@ pub fn fit_decoy_free_model(
             ) {
                 if beta_mean.is_finite() && beta_mean > 0.0 {
                     if let Some((mu, nll)) =
-                        mu_grid_best_bic_range(beta_mean, ts_slice, dyn_mu_min, dyn_mu_max)
+                        mu_grid_best_nll_range(beta_mean, ts_slice, dyn_mu_min, dyn_mu_max)
                     {
                         if mu.is_finite() && nll.is_finite() {
                             candidates.push(("MeanB/MM", (mu, beta_mean, nll)));
@@ -1148,7 +1167,7 @@ pub fn fit_decoy_free_model(
             ) {
                 if beta_mean.is_finite() && beta_mean > 0.0 {
                     if let Some((mu, nll)) =
-                        mu_grid_best_bic_range(beta_mean, ts_slice, dyn_mu_min, dyn_mu_max)
+                        mu_grid_best_nll_range(beta_mean, ts_slice, dyn_mu_min, dyn_mu_max)
                     {
                         if mu.is_finite() && nll.is_finite() {
                             candidates.push(("MeanB/MLE", (mu, beta_mean, nll)));
@@ -1158,7 +1177,9 @@ pub fn fit_decoy_free_model(
             }
         }
 
-        // 4) Pick best by smallest BIC
+        // 4) Pick the best candidate by minimum NLL.
+        //    Here this is equivalent to BIC up to an additive constant because the
+        //    candidate TNMs have the same effective complexity and are evaluated on the same data.
         let best_cand = candidates
             .into_iter()
             .min_by(|(_, (_, _, nll_a)), (_, (_, _, nll_b))| {
@@ -1197,7 +1218,7 @@ pub fn fit_decoy_free_model(
     // Charge filling rules (fit-time + query-time)
     // -------------------------
 
-    // Rule: If charge 1 missing, copy charge 2 (if present)
+    // Rule: charges above max fitted => copy max fitted
     if !params_by_charge.contains_key(&1) {
         if let Some(p2) = params_by_charge.get(&2).copied() {
             params_by_charge.insert(1, p2);
@@ -1337,17 +1358,17 @@ mod tests {
         //   cdf_asymptotic(x, mu=0, beta=1, hit_rank=k)
         // evaluated at x=z (i.e., z = (x-mu)/beta).
         //
-        // PyLord formula:
-        //   cdf = exp(-exp(-z)) * Σ_{m=0..k} exp(-m z) / m!
+        // Asymptotic TEV CDF used by this implementation:
+        //   cdf = exp(-exp(-z)) * Σ_{m=0..k-1} exp(-m z) / m!
         //
         // We hardcode a few representative (z,k) points.
         let cases: &[(f64, u32, f64)] = &[
-            (-1.0, 1, 0.24536211457932974),
-            (0.0, 1, 0.7357588823428847),
-            (0.0, 3, 0.9810118431238462),
-            (1.0, 1, 0.9468470075989289),
-            (1.0, 3, 0.9994303649203736),
-        ];
+		    (-1.0, 1, 0.06598803584531254),
+    		(0.0, 1, 0.36787944117144233),
+    		(0.0, 3, 0.9196986029286058),
+    		(1.0, 1, 0.6922006275553464),
+    		(1.0, 3, 0.9936865915923109),
+		];
 
         for &(z, k, expected) in cases {
             let got = tev_cdf_asymptotic(z, k);
