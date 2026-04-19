@@ -616,10 +616,11 @@ fn tev(f: &DfFeature) -> Option<f64> {
 
 #[inline(always)]
 fn lo_tev(f: &DfFeature) -> Option<f64> {
-    let p = f.core.spectrum_p_value as f64;
+    // Clamp p to a tiny positive float to prevent underflow to exactly 0.0
+    let p = (f.core.spectrum_p_value as f64).max(1e-300);
     let n = f.core.scored_candidates as f64;
 
-    if !p.is_finite() || p <= 0.0 || !n.is_finite() || n < 1.0 {
+    if !p.is_finite() || !n.is_finite() || n < 1.0 {
         return None;
     }
 

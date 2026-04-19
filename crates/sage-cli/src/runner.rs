@@ -988,9 +988,25 @@ impl Runner {
         record.push_field(ryu::Buffer::new().format(core.aligned_rt).as_bytes());
         record.push_field(ryu::Buffer::new().format(core.predicted_rt).as_bytes());
         record.push_field(ryu::Buffer::new().format(core.delta_rt_model).as_bytes());
-        record.push_field(ryu::Buffer::new().format(core.ims).as_bytes());
-        record.push_field(ryu::Buffer::new().format(core.predicted_ims).as_bytes());
-        record.push_field(ryu::Buffer::new().format(core.delta_ims_model).as_bytes());
+        let ims_active = self.parameters.fdr.physical_rescue.ims_enabled
+            && core.ims.is_finite()
+            && core.predicted_ims.is_finite()
+            && core.delta_ims_model.is_finite()
+            && !(core.ims == 0.0
+                && core.predicted_ims == 0.0
+                && (core.delta_ims_model - 0.999).abs() < 1e-6);
+
+        let fmt_ims_or_nan = |v: f32| {
+            if ims_active {
+                v.to_string()
+            } else {
+                "NaN".to_string()
+            }
+        };
+
+        record.push_field(fmt_ims_or_nan(core.ims).as_bytes());
+        record.push_field(fmt_ims_or_nan(core.predicted_ims).as_bytes());
+        record.push_field(fmt_ims_or_nan(core.delta_ims_model).as_bytes());
         record.push_field(itoa::Buffer::new().format(core.matched_peaks).as_bytes());
         record.push_field(itoa::Buffer::new().format(core.longest_b).as_bytes());
         record.push_field(itoa::Buffer::new().format(core.longest_y).as_bytes());
@@ -1149,9 +1165,25 @@ impl Runner {
         record.push_field(ryu::Buffer::new().format(core.aligned_rt).as_bytes());
         record.push_field(ryu::Buffer::new().format(core.predicted_rt).as_bytes());
         record.push_field(ryu::Buffer::new().format(core.delta_rt_model).as_bytes());
-        record.push_field(ryu::Buffer::new().format(core.ims).as_bytes());
-        record.push_field(ryu::Buffer::new().format(core.predicted_ims).as_bytes());
-        record.push_field(ryu::Buffer::new().format(core.delta_ims_model).as_bytes());
+        let ims_active = self.parameters.fdr.physical_rescue.ims_enabled
+            && core.ims.is_finite()
+            && core.predicted_ims.is_finite()
+            && core.delta_ims_model.is_finite()
+            && !(core.ims == 0.0
+                && core.predicted_ims == 0.0
+                && (core.delta_ims_model - 0.999).abs() < 1e-6);
+
+        let fmt_ims_or_nan = |v: f32| {
+            if ims_active {
+                v.to_string()
+            } else {
+                "NaN".to_string()
+            }
+        };
+
+        record.push_field(fmt_ims_or_nan(core.ims).as_bytes());
+        record.push_field(fmt_ims_or_nan(core.predicted_ims).as_bytes());
+        record.push_field(fmt_ims_or_nan(core.delta_ims_model).as_bytes());
         record.push_field(itoa::Buffer::new().format(core.matched_peaks).as_bytes());
         record.push_field(itoa::Buffer::new().format(core.longest_b).as_bytes());
         record.push_field(itoa::Buffer::new().format(core.longest_y).as_bytes());
@@ -1568,12 +1600,28 @@ impl Runner {
                 .format(core.delta_rt_model.clamp(0.001, 1.0).sqrt())
                 .as_bytes(),
         );
-        record.push_field(ryu::Buffer::new().format(core.predicted_ims).as_bytes());
-        record.push_field(
-            ryu::Buffer::new()
-                .format(core.delta_ims_model.clamp(0.0, 1.0).sqrt())
-                .as_bytes(),
-        );
+        let ims_active = self.parameters.fdr.physical_rescue.ims_enabled
+            && core.ims.is_finite()
+            && core.predicted_ims.is_finite()
+            && core.delta_ims_model.is_finite()
+            && !(core.ims == 0.0
+                && core.predicted_ims == 0.0
+                && (core.delta_ims_model - 0.999).abs() < 1e-6);
+
+        let predicted_ims_out = if ims_active {
+            core.predicted_ims.to_string()
+        } else {
+            "NaN".to_string()
+        };
+
+        let delta_ims_out = if ims_active {
+            core.delta_ims_model.clamp(0.0, 1.0).sqrt().to_string()
+        } else {
+            "NaN".to_string()
+        };
+
+        record.push_field(predicted_ims_out.as_bytes());
+        record.push_field(delta_ims_out.as_bytes());
         record.push_field(itoa::Buffer::new().format(core.matched_peaks).as_bytes());
         record.push_field(itoa::Buffer::new().format(core.longest_b).as_bytes());
         record.push_field(itoa::Buffer::new().format(core.longest_y).as_bytes());
