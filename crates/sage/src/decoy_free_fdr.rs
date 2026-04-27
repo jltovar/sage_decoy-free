@@ -180,7 +180,7 @@ use crate::database::IndexedDatabase;
 use crate::input::LoStratify;
 use crate::input::{
     BoundedAuxUpdateSpace, DartNullRtModel, DartTrueRtModel, EnsemblePepCombiner, FdrSettings,
-    FdrType, JointMode, L3AnchorMode, L3RescueMode, ModelFit, PhysicalAnchorMode,
+    FdrType, JointMode, L3AnchorMode, L3RescueMode, ModelFit, PeptidePCombine, PhysicalAnchorMode,
     PhysicalRescueMode,
 };
 use crate::lfq::{Peak, PrecursorId};
@@ -5167,6 +5167,7 @@ pub fn calculate_q_values(
 pub fn calculate_peptide_q_df(
     features: &mut [DfFeature],
     db: &IndexedDatabase,
+    settings: &FdrSettings,
     threshold: f32,
 ) -> (usize, usize) {
     // Peptide inference consumes the finalized active DF PSM stream.
@@ -5259,9 +5260,18 @@ pub fn calculate_peptide_q_df(
         } else {
             // P-value-native path:
             // Do not apply the PEP support bonus to p-values. Instead combine the
-            // peptide's PSM-level p-values with a p-value combiner that is more robust
-            // to dependence than Fisher's method.
-            combine_cauchy(&ev.vals)
+            // peptide's PSM-level p-values with the configured p-value combiner.
+            match settings.peptide_p_combine {
+                PeptidePCombine::Fisher => {
+                    stats::combine_fisher(&ev.vals).clamp(0.0, 1.0).max(1e-300)
+                }
+                PeptidePCombine::Cauchy => combine_cauchy(&ev.vals),
+                PeptidePCombine::SidakMinP => {
+                    let n = ev.vals.len() as f64;
+                    (1.0 - (1.0 - best).powf(n)).clamp(0.0, 1.0).max(1e-300)
+                }
+                PeptidePCombine::Best => best,
+            }
         };
 
         peptide_keys.push(peptide);
@@ -5299,7 +5309,7 @@ pub fn calculate_peptide_q_df(
 
         out
     } else {
-        // P-value-native path: BH over Cauchy-combined peptide-level p-values.
+        // P-value-native path: BH over configured-combined peptide-level p-values.
         crate::ml::stats::bh_q_value(&peptide_combined_vals)
     };
 

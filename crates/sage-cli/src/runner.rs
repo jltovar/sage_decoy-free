@@ -617,6 +617,7 @@ impl Runner {
             let (q_peptide, _ent_peptide) = sage_core::decoy_free_fdr::calculate_peptide_q_df(
                 &mut features,
                 &self.database,
+                &fdr_settings,
                 fdr_settings.peptide_fdr,
             );
 

@@ -42,6 +42,16 @@ pub enum ProteinPCombine {
     SidakMinP,
 }
 
+#[derive(Clone, Serialize, Deserialize, Debug, Default, PartialEq, Eq)]
+#[serde(rename_all = "snake_case")]
+pub enum PeptidePCombine {
+    Fisher,
+    #[default]
+    Cauchy,
+    SidakMinP,
+    Best,
+}
+
 #[derive(Debug, Clone, Copy, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
 #[serde(rename_all = "snake_case")]
 pub enum EntrapmentReportMode {
@@ -386,6 +396,7 @@ pub struct FdrOptions {
     #[serde(alias = "type")]
     pub type_: Option<FdrType>,
     pub protein_p_combine: Option<ProteinPCombine>,
+    pub peptide_p_combine: Option<PeptidePCombine>,
 
     // Configurable Safety Brakes (global)
     pub min_storey_n: Option<usize>,
@@ -409,9 +420,6 @@ pub struct FdrOptions {
 
     // Null-only PEP strategy (Moments/MLE/LO)
     pub null_only_pep_mode: Option<NullOnlyPepMode>,
-
-    // Per-method calibration / ranking controls
-    pub calibrate_per_method: Option<bool>,
 
     // Ensemble combination choices (global controls; used by ModelFit::Ensemble)
     pub ensemble_pep_combiner: Option<EnsemblePepCombiner>,
@@ -466,8 +474,6 @@ pub struct FdrOptions {
     // =========================================================================
     pub msfdr_min_null_rank: Option<u32>,
     pub msfdr_max_null_rank: Option<u32>,
-
-    pub msfdr_use_canonical_pep: Option<bool>,
     pub msfdr_multistart: Option<usize>,
 
     // =========================================================================
@@ -611,6 +617,7 @@ pub struct FdrSettings {
     pub model_fit: ModelFit,
     pub type_: FdrType,
     pub protein_p_combine: ProteinPCombine,
+    pub peptide_p_combine: PeptidePCombine,
 
     // Configurable Safety Brakes
     pub min_storey_n: usize,
@@ -631,9 +638,6 @@ pub struct FdrSettings {
     pub storey_degen_eps: f64,
     pub storey_degen_pi0_eps: f64,
     pub storey_degen_fallback: StoreyDegeneracyFallback,
-
-    // Per-method calibration / ranking controls
-    pub calibrate_per_method: bool,
 
     // Nokoi DF cross-fit calibration
     pub nokoi_k_folds: usize,
@@ -665,7 +669,6 @@ pub struct FdrSettings {
     pub ensemble_weight_nokoi: f64,
 
     // MSFDR controls
-    pub msfdr_use_canonical_pep: bool,
     pub msfdr_multistart: usize,
 
     // MSFDR init/drift knobs (needed by real models)
@@ -802,6 +805,7 @@ impl From<FdrOptions> for FdrSettings {
         let model_fit = options.model_fit.unwrap_or(ModelFit::Ensemble);
         let type_ = options.type_.unwrap_or(FdrType::Storey);
         let protein_p_combine = options.protein_p_combine.unwrap_or(ProteinPCombine::Cauchy);
+        let peptide_p_combine = options.peptide_p_combine.unwrap_or(PeptidePCombine::Cauchy);
 
         let min_storey_n = options.min_storey_n.unwrap_or(300);
         let min_null_size = options.min_null_size.unwrap_or(300);
@@ -809,8 +813,6 @@ impl From<FdrOptions> for FdrSettings {
 
         let purification_factor = options.purification_factor.unwrap_or(0.50).clamp(0.0, 0.9);
         let min_rank_count = options.min_rank_count.unwrap_or(10);
-
-        let calibrate_per_method = options.calibrate_per_method.unwrap_or(true);
 
         // ---------------------------------------------------------------------
         // A.1) Storey / pi0 tuning knobs
@@ -954,7 +956,6 @@ impl From<FdrOptions> for FdrSettings {
             50,
         );
 
-        let msfdr_use_canonical_pep = options.msfdr_use_canonical_pep.unwrap_or(true);
         let msfdr_multistart = options.msfdr_multistart.unwrap_or(3).clamp(1, 25);
 
         let msfdr_seeded_top_frac_init =
@@ -1192,6 +1193,7 @@ impl From<FdrOptions> for FdrSettings {
             model_fit,
             type_,
             protein_p_combine,
+            peptide_p_combine,
 
             // Configurable Safety Brakes
             min_storey_n,
@@ -1212,9 +1214,6 @@ impl From<FdrOptions> for FdrSettings {
             storey_degen_eps,
             storey_degen_pi0_eps,
             storey_degen_fallback,
-
-            // Per-method calibration / ranking controls
-            calibrate_per_method,
 
             // Nokoi DF cross-fit calibration
             nokoi_k_folds,
@@ -1246,7 +1245,6 @@ impl From<FdrOptions> for FdrSettings {
             ensemble_weight_nokoi,
 
             // MSFDR controls
-            msfdr_use_canonical_pep,
             msfdr_multistart,
 
             // MSFDR init/drift knobs (needed by real models)
