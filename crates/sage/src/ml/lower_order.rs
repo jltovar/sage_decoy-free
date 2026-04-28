@@ -974,7 +974,6 @@ pub fn fit_decoy_free_model(
         // Build rank buckets for k in [min_null_rank..=max_null_rank]
         // using the per-rank null scores for this charge.
         let mut buckets: Vec<RankBucket> = Vec::new();
-        let mut pooled_charge_null: Vec<f64> = Vec::new();
 
         for k in min_null_rank..=max_null_rank {
             let scores_k = match by_rank.get(&k) {
@@ -989,8 +988,6 @@ pub fn fit_decoy_free_model(
                 continue;
             }
 
-            pooled_charge_null.extend_from_slice(&scores);
-
             buckets.push(RankBucket { k, scores });
         }
 
@@ -1000,50 +997,116 @@ pub fn fit_decoy_free_model(
             continue;
         }
 
-        // --- PYLORD KDE CUTOFF REPLICATION ---
-        // PyLord uses Kernel Density Estimation (KDE) to find the "dip" between
-        // the nulls and targets, filtering out the targets before evaluating candidate TEV negative log-likelihoods.
-        let mut temp_ts = ts.to_vec();
+        // --- Rank-1 null-side subset for TNM candidate evaluation ---
+        //
+        // PyLord filters rank-1 scores before evaluating candidate TNM NLLs so
+        // that obvious target-dominated high scores do not set the null model.
+        //
+        // The original PyLord bandwidth constant is not portable after changing
+        // the LO score scale. A fixed bw=0.05 is far too narrow on hyperscore-like
+        // scales and can create arbitrary local minima. Use an adaptive bandwidth
+        // and search for the first density valley after the primary mode.
+        let mut temp_ts: Vec<f64> = ts.iter().copied().filter(|x| x.is_finite()).collect();
         temp_ts.sort_unstable_by(|a, b| a.total_cmp(b));
 
-        let cutoff = if temp_ts.len() > 10 {
-            // 1. Initialize KDE
-            // PyLord hardcodes bw=0.05. We initialize the Kde struct and override its bandwidth.
-            let mut kde = crate::ml::kde::Kde::new(&temp_ts, |bw| bw);
-            kde.bandwidth = 0.05;
+        if temp_ts.len() < lo_min_count_per_rank {
+            continue;
+        }
 
-            // 2. Evaluate over a grid of 256 points (just like PyLord's 2**8)
+        let cutoff = if temp_ts.len() > 2 * lo_min_count_per_rank {
+            let n = temp_ts.len();
             let min_val = temp_ts[0];
-            let max_val = temp_ts[temp_ts.len() - 1];
-            let grid_size = 256;
-            let step = (max_val - min_val) / (grid_size as f64 - 1.0);
+            let max_val = temp_ts[n - 1];
+            let span = max_val - min_val;
 
-            let mut pdf_vals = Vec::with_capacity(grid_size);
-            for i in 0..grid_size {
-                let x = min_val + (i as f64) * step;
-                pdf_vals.push((x, kde.pdf(x)));
-            }
+            if span.is_finite() && span > 0.0 {
+                let mean = temp_ts.iter().sum::<f64>() / n as f64;
+                let var = temp_ts
+                    .iter()
+                    .map(|x| {
+                        let d = *x - mean;
+                        d * d
+                    })
+                    .sum::<f64>()
+                    / n as f64;
 
-            // 3. Find the first local minimum (dip) in the density curve
-            let mut dip_x = None;
-            for i in 1..(grid_size - 1) {
-                if pdf_vals[i].1 < pdf_vals[i - 1].1 && pdf_vals[i].1 < pdf_vals[i + 1].1 {
-                    dip_x = Some(pdf_vals[i].0);
-                    break;
+                let sd = if var.is_finite() && var > 0.0 {
+                    var.sqrt()
+                } else {
+                    0.0
+                };
+
+                let q25 = temp_ts[((0.25 * (n as f64 - 1.0)).round() as usize).min(n - 1)];
+                let q75 = temp_ts[((0.75 * (n as f64 - 1.0)).round() as usize).min(n - 1)];
+                let iqr_sigma = ((q75 - q25) / 1.349).abs();
+
+                let scale = if sd > 0.0 && iqr_sigma > 0.0 {
+                    sd.min(iqr_sigma)
+                } else {
+                    sd.max(iqr_sigma)
+                };
+
+                let mut bandwidth = 0.9 * scale * (n as f64).powf(-0.2);
+
+                if !bandwidth.is_finite() || bandwidth <= 0.0 {
+                    bandwidth = span / 64.0;
                 }
-            }
 
-            // 4. PyLord fallback: If no dip is found, use the median of the scores
-            dip_x.unwrap_or_else(|| temp_ts[temp_ts.len() / 2])
+                bandwidth = bandwidth.clamp(span / 1000.0, span / 4.0);
+
+                let mut kde = crate::ml::kde::Kde::new(&temp_ts, |bw| bw);
+                kde.bandwidth = bandwidth;
+
+                const GRID_SIZE: usize = 256;
+                let step = span / (GRID_SIZE as f64 - 1.0);
+
+                let mut pdf_vals = Vec::with_capacity(GRID_SIZE);
+                for i in 0..GRID_SIZE {
+                    let x = min_val + (i as f64) * step;
+                    pdf_vals.push((x, kde.pdf(x)));
+                }
+
+                // Find the primary mode first, then the first valley after it.
+                // This avoids selecting a spurious left-tail wiggle as the cutoff.
+                let mode_idx = pdf_vals
+                    .iter()
+                    .enumerate()
+                    .max_by(|(_, a), (_, b)| {
+                        a.1.partial_cmp(&b.1).unwrap_or(std::cmp::Ordering::Equal)
+                    })
+                    .map(|(i, _)| i)
+                    .unwrap_or(0);
+
+                let mut dip_x = None;
+                if mode_idx + 2 < GRID_SIZE {
+                    for i in (mode_idx + 1)..(GRID_SIZE - 1) {
+                        if pdf_vals[i].1 < pdf_vals[i - 1].1
+                            && pdf_vals[i].1 <= pdf_vals[i + 1].1
+                        {
+                            dip_x = Some(pdf_vals[i].0);
+                            break;
+                        }
+                    }
+                }
+
+                dip_x.unwrap_or_else(|| temp_ts[n / 2])
+            } else {
+                temp_ts[n / 2]
+            }
         } else {
-            f64::INFINITY
+            temp_ts[temp_ts.len() / 2]
         };
 
-        let filtered_ts_data: Vec<f64> = ts.iter().copied().filter(|&x| x <= cutoff).collect();
+        let filtered_ts_data: Vec<f64> = temp_ts
+            .iter()
+            .copied()
+            .filter(|&x| x <= cutoff)
+            .collect();
+
         let ts_slice = if filtered_ts_data.len() >= lo_min_count_per_rank {
             &filtered_ts_data
         } else {
-            ts // fallback to full rank 1 if cutoff is inexplicably aggressive
+            ts
         };
 
         // --- ROBUST PYLORD-STYLE MU BOUNDS ---
