@@ -608,19 +608,19 @@ fn ols_beta_on_mu(loms: &[(u32, f64, f64)]) -> Option<(f64, f64)> {
 
     rows.sort_by_key(|(k, _, _)| *k);
 
-    // Adapt the LR window to the available ranks passed by the JSON sweep.
-    // This allows testing scripts to evaluate narrow rank windows (e.g. 2 ranks)
-    // without automatically failing closed.
-    let lr_window = rows.len().min(5).max(2);
+    // PyLord's best-linear-regression mode uses 5-rank windows.
+    // Do not allow 2-rank regressions; they are unstable and can create
+    // pathological late-window fits such as (12,13).
+    const LR_WINDOW: usize = 5;
 
-    if rows.len() < lr_window {
+    if rows.len() < LR_WINDOW {
         return None;
     }
 
     let mut best: Option<(f64, f64, f64)> = None; // slope, intercept, abs_r
 
-    for start in 0..=(rows.len() - lr_window) {
-        let window = &rows[start..start + lr_window];
+    for start in 0..=(rows.len() - LR_WINDOW) {
+        let window = &rows[start..start + LR_WINDOW];
 
         let n = window.len() as f64;
         let mean_mu = window.iter().map(|(_, mu, _)| *mu).sum::<f64>() / n;
@@ -663,27 +663,24 @@ fn ols_beta_on_mu(loms: &[(u32, f64, f64)]) -> Option<(f64, f64)> {
 }
 
 #[inline]
-fn mean_beta_from_highest_ranks(loms: &[(u32, f64, f64)], _req_count: usize) -> Option<f64> {
-    let mut xs: Vec<(u32, f64)> = loms
+fn mean_beta_from_highest_ranks(loms: &[(u32, f64, f64)], req_count: usize) -> Option<f64> {
+    let mut xs: Vec<f64> = loms
         .iter()
         .filter_map(|(k, _, beta)| {
-            if beta.is_finite() && *beta > 0.0 {
-                Some((*k, *beta))
+            if *k >= 8 && beta.is_finite() && *beta > 0.0 {
+                Some(*beta)
             } else {
                 None
             }
         })
         .collect();
 
-    if xs.is_empty() {
+    if xs.len() < req_count {
         return None;
     }
 
-    // Adapt to the available ranks if the testing script restricts them.
-    let count = xs.len().min(3);
-    xs.sort_by(|a, b| b.0.cmp(&a.0));
-
-    mean_finite(xs.into_iter().take(count).map(|(_, beta)| beta))
+    xs.sort_by(|a, b| a.total_cmp(b));
+    mean_finite(xs)
 }
 
 #[inline]
@@ -931,42 +928,29 @@ pub fn fit_decoy_free_model(
             _ => continue,
         };
 
-        let mut min_k = u32::MAX;
-        for k in by_rank.keys() {
-            if *k < min_k {
-                min_k = *k;
-            }
-        }
+        // PyLord fixed cutoff on the scaled TEV axis.
+        //
+        // With TEV = 0.02 * ln(1000 / e_value), the practical PyLord cutoff is
+        // approximately 0.18. Rank-1 scores above this value are enriched for true
+        // targets and should not be used to fit the rank-1 null model.
+        const PY_LORD_FIXED_TEV_CUTOFF: f64 = 0.18;
 
-        let ref_nulls = if min_k <= max_null_rank {
-            by_rank.get(&min_k).unwrap()
-        } else {
-            &pooled_null_scores
-        };
+        let cutoff = PY_LORD_FIXED_TEV_CUTOFF;
 
-        let cutoff = if ref_nulls.len() > 10 {
-            let n_null = ref_nulls.len() as f64;
-            let mean_null = ref_nulls.iter().sum::<f64>() / n_null;
-            let var_null = ref_nulls
-                .iter()
-                .map(|&x| (x - mean_null).powi(2))
-                .sum::<f64>()
-                / n_null;
-            mean_null + 4.5 * var_null.sqrt()
-        } else {
-            f64::INFINITY
-        };
-
-        let filtered_ts: Vec<f64> = ts_all.iter().copied().filter(|&x| x <= cutoff).collect();
+        let filtered_ts: Vec<f64> = ts_all
+            .iter()
+            .copied()
+            .filter(|&x| x.is_finite() && x <= cutoff)
+            .collect();
 
         // Strict fail-closed: Do NOT fall back to ts_all if cutoff isolates too few.
         // Falling back ingests true targets and breaks the model.
         if filtered_ts.len() < lo_min_count_per_rank {
             log::warn!(
-                "LO DEBUG charge {charge}: insufficient rank-1 noise below 4.5 sigma cutoff; rank1_total={} cutoff={:.3}",
-                ts_all.len(),
-                cutoff
-            );
+    "LO DEBUG charge {charge}: insufficient rank-1 noise below fixed PyLord TEV cutoff; rank1_total={} cutoff={:.3}",
+    ts_all.len(),
+    cutoff
+);
             continue;
         }
 

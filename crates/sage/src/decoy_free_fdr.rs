@@ -626,34 +626,24 @@ fn tev(f: &DfFeature) -> Option<f64> {
 
 #[inline(always)]
 fn lo_tev(f: &DfFeature) -> Option<f64> {
-    let h = f.core.hyperscore as f64;
+    let p = f.core.spectrum_p_value as f64;
     let n = f.core.scored_candidates as f64;
 
-    if !h.is_finite() || !n.is_finite() || n < 1.0 {
+    if !p.is_finite() || !n.is_finite() || p <= 0.0 || n < 1.0 {
         return None;
     }
 
-    // Reconstruct the LowerOrder transformed e-value in f64 without routing
-    // through spectrum_p_value, which may have already lost tail resolution.
-    //
-    // If Sage hyperscore obeys:
-    //     spectrum_p_value ≈ 10^(-hyperscore / 10)
-    //
-    // then:
-    //     -ln(p * n) = (hyperscore / 10) * ln(10) - ln(n)
-    //
-    // The Madej-Lam/PyLord implementation uses a scaled TEV axis compatible
-    // with the empirical cutoff near 0.18:
-    //     TEV = 0.02 * ln(1000 / e_value)
-    //         = 0.02 * (ln(1000) - ln(e_value))
-    let raw_tev = (h / 10.0) * std::f64::consts::LN_10 - n.ln();
-    let tev = 0.02 * (1000.0_f64.ln() + raw_tev);
+    let e_value = (p * n).clamp(1e-300, 1e300);
 
-    if tev.is_finite() {
-        Some(tev)
-    } else {
-        None
-    }
+    // Madej-Lam / PyLord scaled transformed e-value:
+    //
+    //     TEV = 0.02 * ln(1000 / e_value)
+    //
+    // Here p is Sage's local hyperscore-tail probability and n is the number
+    // of scored candidates for this spectrum/query.
+    let tev = 0.02 * (1000.0_f64.ln() - e_value.ln());
+
+    tev.is_finite().then_some(tev)
 }
 
 // -----------------------------------------------------------------------------
