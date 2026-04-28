@@ -1080,9 +1080,7 @@ pub fn fit_decoy_free_model(
                 let mut dip_x = None;
                 if mode_idx + 2 < GRID_SIZE {
                     for i in (mode_idx + 1)..(GRID_SIZE - 1) {
-                        if pdf_vals[i].1 < pdf_vals[i - 1].1
-                            && pdf_vals[i].1 <= pdf_vals[i + 1].1
-                        {
+                        if pdf_vals[i].1 < pdf_vals[i - 1].1 && pdf_vals[i].1 <= pdf_vals[i + 1].1 {
                             dip_x = Some(pdf_vals[i].0);
                             break;
                         }
@@ -1097,11 +1095,7 @@ pub fn fit_decoy_free_model(
             temp_ts[temp_ts.len() / 2]
         };
 
-        let filtered_ts_data: Vec<f64> = temp_ts
-            .iter()
-            .copied()
-            .filter(|&x| x <= cutoff)
-            .collect();
+        let filtered_ts_data: Vec<f64> = temp_ts.iter().copied().filter(|&x| x <= cutoff).collect();
 
         let ts_slice = if filtered_ts_data.len() >= lo_min_count_per_rank {
             &filtered_ts_data
