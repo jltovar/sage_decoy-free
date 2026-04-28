@@ -688,7 +688,7 @@ fn mean_beta_from_highest_ranks(loms: &[(u32, f64, f64)], _req_count: usize) -> 
 
 #[inline]
 fn lo_mu_scan_bounds(rank1_scores: &[f64]) -> Option<(f64, f64)> {
-    let xs: Vec<f64> = rank1_scores
+    let mut xs: Vec<f64> = rank1_scores
         .iter()
         .copied()
         .filter(|x| x.is_finite())
@@ -698,29 +698,27 @@ fn lo_mu_scan_bounds(rank1_scores: &[f64]) -> Option<(f64, f64)> {
         return None;
     }
 
-    let mean = xs.iter().sum::<f64>() / xs.len() as f64;
+    xs.sort_by(|a, b| a.total_cmp(b));
 
-    if mean.is_finite() && mean > 0.0 {
-        let lo = 0.1 * mean;
-        let hi = 1.5 * mean;
-
-        if lo.is_finite() && hi.is_finite() && lo < hi {
-            return Some((lo, hi));
-        }
-    }
-
-    // Defensive fallback only. On the scaled TEV path this should rarely be used.
-    let mut sorted = xs;
-    sorted.sort_by(|a, b| a.total_cmp(b));
-
-    let n = sorted.len();
-    let q05 = sorted[((0.05 * (n as f64 - 1.0)).round() as usize).min(n - 1)];
-    let q80 = sorted[((0.80 * (n as f64 - 1.0)).round() as usize).min(n - 1)];
+    let n = xs.len();
+    // mu_1 is the mode of the Gumbel distribution. For Gumbel-max, the mode is
+    // located at roughly the 37th percentile of the distribution.
+    // Bounding the search between the 5th and 80th percentiles of the NOISE slice
+    // perfectly brackets the true mu_1 without needing scale-specific hardcoding.
+    let q05 = xs[((0.05 * (n as f64 - 1.0)).round() as usize).min(n - 1)];
+    let q80 = xs[((0.80 * (n as f64 - 1.0)).round() as usize).min(n - 1)];
 
     if q05.is_finite() && q80.is_finite() && q05 < q80 {
         Some((q05, q80))
     } else {
-        None
+        // Fallback for extremely tight degenerate distributions
+        let mn = xs[0];
+        let mx = xs[n - 1];
+        if mn < mx {
+            Some((mn, mx))
+        } else {
+            None
+        }
     }
 }
 
@@ -945,14 +943,31 @@ pub fn fit_decoy_free_model(
         };
 
         let cutoff = if ref_nulls.len() > 10 {
-            let n_null = ref_nulls.len() as f64;
-            let mean_null = ref_nulls.iter().sum::<f64>() / n_null;
-            let var_null = ref_nulls
-                .iter()
-                .map(|&x| (x - mean_null).powi(2))
-                .sum::<f64>()
-                / n_null;
-            mean_null + 4.5 * var_null.sqrt()
+            // Rank 1 nulls are fundamentally shifted to the right compared to ref_nulls (Rank min_k).
+            // A simple 4.5 sigma bound on Rank min_k amputates the right tail of the Rank 1 nulls.
+            // We use the theoretical Gumbel order-statistic shift to project the true boundary.
+            let (mu_ref, beta_ref) = fit_gumbel_moments(ref_nulls);
+            if mu_ref.is_finite() && beta_ref.is_finite() && beta_ref > 0.0 {
+                // Harmonic(min_k - 1) gives the theoretical location shift from min_k to Rank 1.
+                let shift = harmonic(min_k - 1);
+                let mu_1_proj = mu_ref + beta_ref * shift;
+
+                // The 99.9th percentile of a Gumbel distribution is exactly mu + 6.9 * beta.
+                // We use 7.0 to safely encapsulate the entire right tail of Rank 1 noise
+                // without bleeding into the massive high-scoring targets.
+                mu_1_proj + 7.0 * beta_ref
+            } else {
+                // Fallback if moments fail
+                let n_null = ref_nulls.len() as f64;
+                let mean_null = ref_nulls.iter().sum::<f64>() / n_null;
+                let std_null = (ref_nulls
+                    .iter()
+                    .map(|&x| (x - mean_null).powi(2))
+                    .sum::<f64>()
+                    / n_null)
+                    .sqrt();
+                mean_null + 6.0 * std_null
+            }
         } else {
             f64::INFINITY
         };
