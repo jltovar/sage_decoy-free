@@ -608,10 +608,10 @@ fn ols_beta_on_mu(loms: &[(u32, f64, f64)]) -> Option<(f64, f64)> {
 
     rows.sort_by_key(|(k, _, _)| *k);
 
-    // Adapt the LR window to the available ranks passed by the JSON sweep.
-    // This allows testing scripts to evaluate narrow rank windows (e.g. 2 ranks)
-    // without automatically failing closed.
-    let lr_window = rows.len().min(5).max(2);
+    // Adapt the LR window to the available ranks passed by the JSON sweep,
+    // but strictly require at least 3 ranks so we don't perfectly overfit
+    // a line to 2 points (r=1.0), which produces wildly unstable TNM candidates.
+    let lr_window = rows.len().min(5).max(3);
 
     if rows.len() < lr_window {
         return None;
@@ -699,26 +699,28 @@ fn lo_mu_scan_bounds(rank1_scores: &[f64]) -> Option<(f64, f64)> {
     }
 
     xs.sort_by(|a, b| a.total_cmp(b));
-
     let n = xs.len();
-    // mu_1 is the mode of the Gumbel distribution. For Gumbel-max, the mode is
-    // located at roughly the 37th percentile of the distribution.
-    // Bounding the search between the 5th and 80th percentiles of the NOISE slice
-    // perfectly brackets the true mu_1 without needing scale-specific hardcoding.
+
+    let mean = xs.iter().sum::<f64>() / n as f64;
+
+    // PyLord uses [0.1 * mean, 1.5 * mean] as a strict empirical bounding box
+    // to prevent the optimizer from chasing target leaks. On the PyLord scaled TEV axis,
+    // this perfectly encapsulates the true mu_1.
+    if mean.is_finite() && mean > 0.0 {
+        let lo = 0.1 * mean;
+        let hi = 1.5 * mean;
+        if lo < hi {
+            return Some((lo, hi));
+        }
+    }
+
     let q05 = xs[((0.05 * (n as f64 - 1.0)).round() as usize).min(n - 1)];
     let q80 = xs[((0.80 * (n as f64 - 1.0)).round() as usize).min(n - 1)];
 
     if q05.is_finite() && q80.is_finite() && q05 < q80 {
         Some((q05, q80))
     } else {
-        // Fallback for extremely tight degenerate distributions
-        let mn = xs[0];
-        let mx = xs[n - 1];
-        if mn < mx {
-            Some((mn, mx))
-        } else {
-            None
-        }
+        None
     }
 }
 
@@ -943,21 +945,16 @@ pub fn fit_decoy_free_model(
         };
 
         let cutoff = if ref_nulls.len() > 10 {
-            // Rank 1 nulls are fundamentally shifted to the right compared to ref_nulls (Rank min_k).
-            // A simple 4.5 sigma bound on Rank min_k amputates the right tail of the Rank 1 nulls.
-            // We use the theoretical Gumbel order-statistic shift to project the true boundary.
-            let (mu_ref, beta_ref) = fit_gumbel_moments(ref_nulls);
-            if mu_ref.is_finite() && beta_ref.is_finite() && beta_ref > 0.0 {
-                // Harmonic(min_k - 1) gives the theoretical location shift from min_k to Rank 1.
-                let shift = harmonic(min_k - 1);
-                let mu_1_proj = mu_ref + beta_ref * shift;
-
-                // The 99.9th percentile of a Gumbel distribution is exactly mu + 6.9 * beta.
+            // We project the Rank 1 null distribution parameters from the Rank min_k nulls
+            // using the theoretically exact order-statistic moments.
+            // This strictly avoids Comet-specific hardcoded constants (e.g. 0.18) which
+            // arbitrarily amputate Sage's hyperscore-derived nulls.
+            if let Some((mu_1_proj, beta_proj)) = fit_tev_k_moments(ref_nulls, min_k) {
+                // The 99.9th percentile of a standard Gumbel-max is mu + 6.9 * beta.
                 // We use 7.0 to safely encapsulate the entire right tail of Rank 1 noise
                 // without bleeding into the massive high-scoring targets.
-                mu_1_proj + 7.0 * beta_ref
+                mu_1_proj + 7.0 * beta_proj
             } else {
-                // Fallback if moments fail
                 let n_null = ref_nulls.len() as f64;
                 let mean_null = ref_nulls.iter().sum::<f64>() / n_null;
                 let std_null = (ref_nulls
@@ -978,7 +975,7 @@ pub fn fit_decoy_free_model(
         // Falling back ingests true targets and breaks the model.
         if filtered_ts.len() < lo_min_count_per_rank {
             log::warn!(
-                "LO DEBUG charge {charge}: insufficient rank-1 noise below 4.5 sigma cutoff; rank1_total={} cutoff={:.3}",
+                "LO DEBUG charge {charge}: insufficient rank-1 noise below theoretical cutoff; rank1_total={} cutoff={:.3}",
                 ts_all.len(),
                 cutoff
             );
