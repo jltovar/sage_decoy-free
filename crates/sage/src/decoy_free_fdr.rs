@@ -626,30 +626,25 @@ fn tev(f: &DfFeature) -> Option<f64> {
 
 #[inline(always)]
 fn lo_tev(f: &DfFeature) -> Option<f64> {
-    // LowerOrder is an order-statistics model for transformed e-values (TEV),
-    // not for raw hyperscore.
-    //
-    // PyLord constructs TEV from an e-value-like quantity:
-    //
-    //     e_value = spectrum_p_value * scored_candidates
-    //
-    // and then applies a fixed affine transform. The affine constants do not
-    // affect rank ordering, but they do place the score on the scale expected by
-    // the paper's constrained TNM search.
-    //
-    // Use this same TEV scale for both LO fitting and LO evaluation.
-    let p = f.core.spectrum_p_value as f64;
+    let h = f.core.hyperscore as f64;
     let n = f.core.scored_candidates as f64;
 
-    if !p.is_finite() || !n.is_finite() || n < 1.0 {
+    if !h.is_finite() || !n.is_finite() || n < 1.0 {
         return None;
     }
 
-    let e_value = (p.max(1e-300) * n).max(1e-300);
-
-    // Paper/PyLord-style plotting/calibration scale:
-    //     TEV = 0.02 * ln(1000 / e_value)
-    let tev = 0.02 * (1000.0_f64.ln() - e_value.ln());
+    // Reconstruct the PyLord/LowerOrder transformed e-value in f64.
+    //
+    // This avoids f32 underflow in spectrum_p_value while keeping LO on the
+    // e-value/order-statistics scale required by the Madej-Lam model.
+    //
+    // Assumes Sage hyperscore obeys:
+    //     spectrum_p_value ≈ 10^(-hyperscore / 10)
+    //
+    // Then:
+    //     TEV = -ln(p * scored_candidates)
+    //         = (hyperscore / 10) * ln(10) - ln(scored_candidates)
+    let tev = (h / 10.0) * std::f64::consts::LN_10 - n.ln();
 
     if tev.is_finite() {
         Some(tev)

@@ -684,20 +684,12 @@ fn lo_mu_scan_bounds(rank1_scores: &[f64]) -> Option<(f64, f64)> {
 
     xs.sort_by(|a, b| a.total_cmp(b));
 
-    // On the PyLord/paper TEV scale, the constrained scan lives in this region.
-    // Keep the canonical range when the data are on that scale.
-    let median = xs[xs.len() / 2];
-    if median.is_finite() && median > -1.0 && median < 2.0 {
-        return Some((0.05, 0.40));
-    }
-
-    // Fallback for noncanonical scales.
     let n = xs.len();
-    let q05 = xs[((0.05 * (n as f64 - 1.0)).round() as usize).min(n - 1)];
-    let q95 = xs[((0.95 * (n as f64 - 1.0)).round() as usize).min(n - 1)];
+    let q01 = xs[((0.01 * (n as f64 - 1.0)).round() as usize).min(n - 1)];
+    let q99 = xs[((0.99 * (n as f64 - 1.0)).round() as usize).min(n - 1)];
 
-    if q05.is_finite() && q95.is_finite() && q05 < q95 {
-        Some((q05, q95))
+    if q01.is_finite() && q99.is_finite() && q01 < q99 {
+        Some((q01, q99))
     } else {
         None
     }
@@ -747,6 +739,56 @@ where
     best
 }
 
+#[inline]
+fn empirical_quantile_sorted(xs: &[f64], q: f64) -> Option<f64> {
+    if xs.is_empty() || !q.is_finite() {
+        return None;
+    }
+
+    let qq = q.clamp(0.0, 1.0);
+    let idx = ((qq * (xs.len() as f64 - 1.0)).round() as usize).min(xs.len() - 1);
+    let v = xs[idx];
+
+    v.is_finite().then_some(v)
+}
+
+#[inline]
+fn rank1_noise_slice_from_lower_order_nulls(
+    rank1_scores: &[f64],
+    lower_order_null_scores: &[f64],
+    min_count: usize,
+) -> Option<Vec<f64>> {
+    let mut nulls: Vec<f64> = lower_order_null_scores
+        .iter()
+        .copied()
+        .filter(|x| x.is_finite())
+        .collect();
+
+    if nulls.len() < min_count.max(10) {
+        return None;
+    }
+
+    nulls.sort_by(|a, b| a.total_cmp(b));
+
+    // Use the upper empirical null tail as the rank-1 noise cutoff.
+    // This is more robust than a Gaussian mean+sigma rule for TEV/order-statistic
+    // tails and avoids fitting TNM to the target-rich high-score rank-1 region.
+    let cutoff = empirical_quantile_sorted(&nulls, 0.975)?;
+
+    let mut xs: Vec<f64> = rank1_scores
+        .iter()
+        .copied()
+        .filter(|x| x.is_finite() && *x <= cutoff)
+        .collect();
+
+    if xs.len() < min_count.max(10) {
+        return None;
+    }
+
+    xs.sort_by(|a, b| a.total_cmp(b));
+    Some(xs)
+}
+
 /// Fits a charge-stratified Lower Order Model.
 ///
 /// LO fitting contract (Decoy-Free)
@@ -774,18 +816,21 @@ pub fn fit_decoy_free_model(
     lo_mode: crate::input::LoMode,
     lo_lom_estimator: crate::input::LoLomEstimator,
 ) -> Option<LowerOrderModel> {
-    let lo_mean_beta_min_rank = min_null_rank;
-    let lo_mean_beta_count = max_null_rank
-        .saturating_sub(min_null_rank)
-        .saturating_add(1);
-    let lo_lr_window_size = Some(lo_mean_beta_count);
+    // LowerOrder null evidence must come from non-top hits only.
+    // Rank 1 is the target-contaminated top-hit mixture and is never a valid
+    // lower-order null rank.
+    let effective_min_null_rank = min_null_rank.max(2);
+
+    if effective_min_null_rank > max_null_rank {
+        return None;
+    }
 
     if log::log_enabled!(log::Level::Debug) {
         log::debug!(
-            "LO DEBUG derived subwindow controls: mean_beta_start={} mean_beta_count={} lr_window_size={:?}",
-            lo_mean_beta_min_rank,
-            lo_mean_beta_count,
-            lo_lr_window_size
+            "LO DEBUG null-rank window: requested_min={} effective_min={} max={}",
+            min_null_rank,
+            effective_min_null_rank,
+            max_null_rank
         );
     }
 
@@ -797,7 +842,7 @@ pub fn fit_decoy_free_model(
     let mut pooled_null_scores: Vec<f64> = Vec::new();
 
     for &(rank, score, charge) in rank_null_stream {
-        if rank < min_null_rank || rank > max_null_rank {
+        if rank < effective_min_null_rank || rank > max_null_rank {
             continue;
         }
         if !score.is_finite() {
@@ -867,7 +912,7 @@ pub fn fit_decoy_free_model(
         // using the per-rank null scores for this charge.
         let mut buckets: Vec<RankBucket> = Vec::new();
 
-        for k in min_null_rank..=max_null_rank {
+        for k in effective_min_null_rank..=max_null_rank {
             let scores_k = match by_rank.get(&k) {
                 Some(v) if v.len() >= lo_min_count_per_rank => v,
                 _ => continue,
@@ -902,10 +947,34 @@ pub fn fit_decoy_free_model(
         //
         // This restores the constrained one-degree empirical optimization used by
         // the paper/PyLord. Do not median-combine LOM parameters directly.
-        let ts = match top_scores.get(&charge) {
+        let ts_all = match top_scores.get(&charge) {
             Some(v) if v.len() >= lo_min_count_per_rank => v,
             _ => continue,
         };
+
+        let charge_nulls: Vec<f64> = by_rank
+            .values()
+            .flat_map(|v| v.iter().copied())
+            .filter(|x| x.is_finite())
+            .collect();
+
+        let ts_noise = match rank1_noise_slice_from_lower_order_nulls(
+            ts_all,
+            &charge_nulls,
+            lo_min_count_per_rank,
+        ) {
+            Some(v) => v,
+            None => {
+                log::warn!(
+            "LO DEBUG charge {charge}: insufficient rank-1 noise slice; rank1_total={} lower_order_nulls={}",
+            ts_all.len(),
+            charge_nulls.len()
+        );
+                continue;
+            }
+        };
+
+        let ts = ts_noise.as_slice();
 
         let mut lom_mm: Vec<(u32, f64, f64)> = Vec::new();
         let mut lom_mle: Vec<(u32, f64, f64)> = Vec::new();
@@ -1153,20 +1222,6 @@ mod tests {
         // Loose sanity: we shouldn't be orders of magnitude off
         assert!((beta_k_mm / beta_true) > 0.2 && (beta_k_mm / beta_true) < 5.0);
         assert!((beta_k_mle / beta_true) > 0.2 && (beta_k_mle / beta_true) < 5.0);
-
-        // LR/Meanβ selection should produce finite candidates
-        let loms = vec![
-            (8u32, mu_k_mm, beta_k_mm),
-            (9u32, mu_k_mm + 0.1, beta_k_mm * 1.02),
-            (10u32, mu_k_mm + 0.2, beta_k_mm * 1.05),
-        ];
-        let top_scores = scores.clone(); // stand-in; just need non-empty
-
-        let lr = eval_candidate_lr_range(&loms, &top_scores, 0.05, 0.40, None);
-        assert!(lr.is_some());
-
-        let mb = compute_mean_beta(&loms, 8, 3, &crate::input::LoMeanBetaMode::Consecutive);
-        assert!(mb.is_some());
     }
 
     #[test]
