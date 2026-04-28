@@ -626,17 +626,33 @@ fn tev(f: &DfFeature) -> Option<f64> {
 
 #[inline(always)]
 fn lo_tev(f: &DfFeature) -> Option<f64> {
-    // LowerOrder must fit and evaluate on the same score scale.
+    // LowerOrder is an order-statistics model for transformed e-values (TEV),
+    // not for raw hyperscore.
     //
-    // Do not derive the LO score from spectrum_p_value because that field can lose
-    // high-confidence tail resolution through f32 underflow or quantization.
+    // PyLord constructs TEV from an e-value-like quantity:
     //
-    // Also do not apply an ad hoc candidate-count correction here. The LO model
-    // estimates the rank-1 target-null distribution directly from lower-order
-    // score ranks on this same preserved score scale.
-    let x = f.core.hyperscore as f64;
-    if x.is_finite() {
-        Some(x)
+    //     e_value = spectrum_p_value * scored_candidates
+    //
+    // and then applies a fixed affine transform. The affine constants do not
+    // affect rank ordering, but they do place the score on the scale expected by
+    // the paper's constrained TNM search.
+    //
+    // Use this same TEV scale for both LO fitting and LO evaluation.
+    let p = f.core.spectrum_p_value as f64;
+    let n = f.core.scored_candidates as f64;
+
+    if !p.is_finite() || !n.is_finite() || n < 1.0 {
+        return None;
+    }
+
+    let e_value = (p.max(1e-300) * n).max(1e-300);
+
+    // Paper/PyLord-style plotting/calibration scale:
+    //     TEV = 0.02 * ln(1000 / e_value)
+    let tev = 0.02 * (1000.0_f64.ln() - e_value.ln());
+
+    if tev.is_finite() {
+        Some(tev)
     } else {
         None
     }
@@ -1794,7 +1810,6 @@ fn fit_engines(
                 lo_min_count_per_rank,
                 settings.lo_mode.clone(),
                 settings.lo_lom_estimator.clone(),
-                settings.lo_mean_beta_mode.clone(),
             );
         }
     }
