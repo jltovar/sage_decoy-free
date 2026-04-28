@@ -600,51 +600,69 @@ fn mean_finite(values: impl IntoIterator<Item = f64>) -> Option<f64> {
 
 #[inline]
 fn ols_beta_on_mu(loms: &[(u32, f64, f64)]) -> Option<(f64, f64)> {
-    // Fit beta = slope * mu + intercept using lower-order model estimates.
-    if loms.len() < 2 {
-        return None;
-    }
+    // PyLord does not fit the LR candidate from an arbitrary two-point window.
+    // It searches contiguous 5-rank LOM windows and keeps the regression with
+    // the strongest absolute Pearson relationship between mu and beta.
+    //
+    // Also skip k=2 for LR: low ranks are more target-contaminated, while PyLord's
+    // best-LR search starts from deeper lower-order ranks.
+    const LR_WINDOW: usize = 5;
 
-    let pairs: Vec<(f64, f64)> = loms
+    let mut rows: Vec<(u32, f64, f64)> = loms
         .iter()
-        .filter_map(|(_, mu, beta)| {
-            if mu.is_finite() && beta.is_finite() && *beta > 0.0 {
-                Some((*mu, *beta))
-            } else {
-                None
-            }
-        })
+        .copied()
+        .filter(|(k, mu, beta)| *k >= 3 && mu.is_finite() && beta.is_finite() && *beta > 0.0)
         .collect();
 
-    if pairs.len() < 2 {
+    rows.sort_by_key(|(k, _, _)| *k);
+
+    if rows.len() < LR_WINDOW {
         return None;
     }
 
-    let n = pairs.len() as f64;
-    let mean_mu = pairs.iter().map(|(mu, _)| *mu).sum::<f64>() / n;
-    let mean_beta = pairs.iter().map(|(_, beta)| *beta).sum::<f64>() / n;
+    let mut best: Option<(f64, f64, f64)> = None; // slope, intercept, abs_r
 
-    let mut num = 0.0;
-    let mut den = 0.0;
+    for start in 0..=(rows.len() - LR_WINDOW) {
+        let window = &rows[start..start + LR_WINDOW];
 
-    for (mu, beta) in pairs {
-        let d = mu - mean_mu;
-        num += d * (beta - mean_beta);
-        den += d * d;
+        let n = window.len() as f64;
+        let mean_mu = window.iter().map(|(_, mu, _)| *mu).sum::<f64>() / n;
+        let mean_beta = window.iter().map(|(_, _, beta)| *beta).sum::<f64>() / n;
+
+        let mut sxy = 0.0;
+        let mut sxx = 0.0;
+        let mut syy = 0.0;
+
+        for &(_, mu, beta) in window {
+            let dx = mu - mean_mu;
+            let dy = beta - mean_beta;
+            sxy += dx * dy;
+            sxx += dx * dx;
+            syy += dy * dy;
+        }
+
+        if !sxx.is_finite() || !syy.is_finite() || sxx <= 0.0 || syy <= 0.0 {
+            continue;
+        }
+
+        let slope = sxy / sxx;
+        let intercept = mean_beta - slope * mean_mu;
+        let abs_r = (sxy / (sxx.sqrt() * syy.sqrt())).abs();
+
+        if !slope.is_finite() || !intercept.is_finite() || !abs_r.is_finite() {
+            continue;
+        }
+
+        match best {
+            None => best = Some((slope, intercept, abs_r)),
+            Some((_, _, best_r)) if abs_r > best_r => {
+                best = Some((slope, intercept, abs_r));
+            }
+            _ => {}
+        }
     }
 
-    if !den.is_finite() || den <= 0.0 {
-        return None;
-    }
-
-    let slope = num / den;
-    let intercept = mean_beta - slope * mean_mu;
-
-    if slope.is_finite() && intercept.is_finite() {
-        Some((slope, intercept))
-    } else {
-        None
-    }
+    best.map(|(slope, intercept, _)| (slope, intercept))
 }
 
 #[inline]
@@ -661,7 +679,7 @@ fn mean_beta_from_highest_ranks(loms: &[(u32, f64, f64)], count: usize) -> Optio
         })
         .collect();
 
-    if xs.is_empty() {
+    if xs.len() < count {
         return None;
     }
 
@@ -672,7 +690,7 @@ fn mean_beta_from_highest_ranks(loms: &[(u32, f64, f64)], count: usize) -> Optio
 
 #[inline]
 fn lo_mu_scan_bounds(rank1_scores: &[f64]) -> Option<(f64, f64)> {
-    let mut xs: Vec<f64> = rank1_scores
+    let xs: Vec<f64> = rank1_scores
         .iter()
         .copied()
         .filter(|x| x.is_finite())
@@ -682,14 +700,27 @@ fn lo_mu_scan_bounds(rank1_scores: &[f64]) -> Option<(f64, f64)> {
         return None;
     }
 
-    xs.sort_by(|a, b| a.total_cmp(b));
+    let mean = xs.iter().sum::<f64>() / xs.len() as f64;
 
-    let n = xs.len();
-    let q01 = xs[((0.01 * (n as f64 - 1.0)).round() as usize).min(n - 1)];
-    let q99 = xs[((0.99 * (n as f64 - 1.0)).round() as usize).min(n - 1)];
+    if mean.is_finite() && mean > 0.0 {
+        let lo = 0.1 * mean;
+        let hi = 1.5 * mean;
 
-    if q01.is_finite() && q99.is_finite() && q01 < q99 {
-        Some((q01, q99))
+        if lo.is_finite() && hi.is_finite() && lo < hi {
+            return Some((lo, hi));
+        }
+    }
+
+    // Defensive fallback only. On the scaled TEV path this should rarely be used.
+    let mut sorted = xs;
+    sorted.sort_by(|a, b| a.total_cmp(b));
+
+    let n = sorted.len();
+    let q05 = sorted[((0.05 * (n as f64 - 1.0)).round() as usize).min(n - 1)];
+    let q80 = sorted[((0.80 * (n as f64 - 1.0)).round() as usize).min(n - 1)];
+
+    if q05.is_finite() && q80.is_finite() && q05 < q80 {
+        Some((q05, q80))
     } else {
         None
     }
@@ -739,46 +770,17 @@ where
     best
 }
 
-#[inline]
-fn empirical_quantile_sorted(xs: &[f64], q: f64) -> Option<f64> {
-    if xs.is_empty() || !q.is_finite() {
-        return None;
-    }
-
-    let qq = q.clamp(0.0, 1.0);
-    let idx = ((qq * (xs.len() as f64 - 1.0)).round() as usize).min(xs.len() - 1);
-    let v = xs[idx];
-
-    v.is_finite().then_some(v)
-}
+const LO_TEV_FIXED_CUTOFF: f64 = 0.18;
 
 #[inline]
-fn rank1_noise_slice_from_lower_order_nulls(
-    rank1_scores: &[f64],
-    lower_order_null_scores: &[f64],
-    min_count: usize,
-) -> Option<Vec<f64>> {
-    let mut nulls: Vec<f64> = lower_order_null_scores
-        .iter()
-        .copied()
-        .filter(|x| x.is_finite())
-        .collect();
-
-    if nulls.len() < min_count.max(10) {
-        return None;
-    }
-
-    nulls.sort_by(|a, b| a.total_cmp(b));
-
-    // Use the upper empirical null tail as the rank-1 noise cutoff.
-    // This is more robust than a Gaussian mean+sigma rule for TEV/order-statistic
-    // tails and avoids fitting TNM to the target-rich high-score rank-1 region.
-    let cutoff = empirical_quantile_sorted(&nulls, 0.975)?;
-
+fn rank1_noise_slice_fixed_cutoff(rank1_scores: &[f64], min_count: usize) -> Option<Vec<f64>> {
+    // PyLord/order-stats supports a fixed cutoff of 0.18 on the scaled TEV axis.
+    // This selects the lower-scoring/noise portion of the rank-1 mixture before
+    // the TNM likelihood scan.
     let mut xs: Vec<f64> = rank1_scores
         .iter()
         .copied()
-        .filter(|x| x.is_finite() && *x <= cutoff)
+        .filter(|x| x.is_finite() && *x < LO_TEV_FIXED_CUTOFF)
         .collect();
 
     if xs.len() < min_count.max(10) {
@@ -952,24 +954,14 @@ pub fn fit_decoy_free_model(
             _ => continue,
         };
 
-        let charge_nulls: Vec<f64> = by_rank
-            .values()
-            .flat_map(|v| v.iter().copied())
-            .filter(|x| x.is_finite())
-            .collect();
-
-        let ts_noise = match rank1_noise_slice_from_lower_order_nulls(
-            ts_all,
-            &charge_nulls,
-            lo_min_count_per_rank,
-        ) {
+        let ts_noise = match rank1_noise_slice_fixed_cutoff(ts_all, lo_min_count_per_rank) {
             Some(v) => v,
             None => {
                 log::warn!(
-            "LO DEBUG charge {charge}: insufficient rank-1 noise slice; rank1_total={} lower_order_nulls={}",
-            ts_all.len(),
-            charge_nulls.len()
-        );
+                    "LO DEBUG charge {charge}: insufficient rank-1 noise below fixed TEV cutoff; rank1_total={} cutoff={:.3}",
+                    ts_all.len(),
+                    LO_TEV_FIXED_CUTOFF
+                );
                 continue;
             }
         };
@@ -1066,14 +1058,17 @@ pub fn fit_decoy_free_model(
         let (mu_final, beta_final) = match best_cand {
             Some((name, mu, beta, nll)) => {
                 log::info!(
-                    "LO DEBUG charge {charge}: best TNM candidate = {name} (mu={:.6}, beta={:.6}, rank1_nll={:.4}) | ranks: MM={}, MLE={} scan=[{:.3},{:.3}]",
+                    "LO DEBUG charge {charge}: best TNM candidate = {name} (mu={:.6}, beta={:.6}, rank1_nll={:.4}) | ranks: MM={}, MLE={} scan=[{:.3},{:.3}] rank1_fit={}/{} cutoff={:.3}",
                     mu,
                     beta,
                     nll,
                     lom_mm.len(),
                     lom_mle.len(),
                     mu_min,
-                    mu_max
+                    mu_max,
+                    ts.len(),
+                    ts_all.len(),
+                    LO_TEV_FIXED_CUTOFF
                 );
                 (mu, beta)
             }

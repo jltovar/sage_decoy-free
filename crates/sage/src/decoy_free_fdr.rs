@@ -633,18 +633,21 @@ fn lo_tev(f: &DfFeature) -> Option<f64> {
         return None;
     }
 
-    // Reconstruct the PyLord/LowerOrder transformed e-value in f64.
+    // Reconstruct the LowerOrder transformed e-value in f64 without routing
+    // through spectrum_p_value, which may have already lost tail resolution.
     //
-    // This avoids f32 underflow in spectrum_p_value while keeping LO on the
-    // e-value/order-statistics scale required by the Madej-Lam model.
-    //
-    // Assumes Sage hyperscore obeys:
+    // If Sage hyperscore obeys:
     //     spectrum_p_value ≈ 10^(-hyperscore / 10)
     //
-    // Then:
-    //     TEV = -ln(p * scored_candidates)
-    //         = (hyperscore / 10) * ln(10) - ln(scored_candidates)
-    let tev = (h / 10.0) * std::f64::consts::LN_10 - n.ln();
+    // then:
+    //     -ln(p * n) = (hyperscore / 10) * ln(10) - ln(n)
+    //
+    // The Madej-Lam/PyLord implementation uses a scaled TEV axis compatible
+    // with the empirical cutoff near 0.18:
+    //     TEV = 0.02 * ln(1000 / e_value)
+    //         = 0.02 * (ln(1000) - ln(e_value))
+    let raw_tev = (h / 10.0) * std::f64::consts::LN_10 - n.ln();
+    let tev = 0.02 * (1000.0_f64.ln() + raw_tev);
 
     if tev.is_finite() {
         Some(tev)
