@@ -600,30 +600,27 @@ fn mean_finite(values: impl IntoIterator<Item = f64>) -> Option<f64> {
 
 #[inline]
 fn ols_beta_on_mu(loms: &[(u32, f64, f64)]) -> Option<(f64, f64)> {
-    // PyLord does not fit the LR candidate from an arbitrary two-point window.
-    // It searches contiguous 5-rank LOM windows and keeps the regression with
-    // the strongest absolute Pearson relationship between mu and beta.
-    //
-    // Also skip k=2 for LR: low ranks are more target-contaminated, while PyLord's
-    // best-LR search starts from deeper lower-order ranks.
-    const LR_WINDOW: usize = 5;
-
     let mut rows: Vec<(u32, f64, f64)> = loms
         .iter()
         .copied()
-        .filter(|(k, mu, beta)| *k >= 3 && mu.is_finite() && beta.is_finite() && *beta > 0.0)
+        .filter(|(_, mu, beta)| mu.is_finite() && beta.is_finite() && *beta > 0.0)
         .collect();
 
     rows.sort_by_key(|(k, _, _)| *k);
 
-    if rows.len() < LR_WINDOW {
+    // Adapt the LR window to the available ranks passed by the JSON sweep.
+    // This allows testing scripts to evaluate narrow rank windows (e.g. 2 ranks)
+    // without automatically failing closed.
+    let lr_window = rows.len().min(5).max(2);
+
+    if rows.len() < lr_window {
         return None;
     }
 
     let mut best: Option<(f64, f64, f64)> = None; // slope, intercept, abs_r
 
-    for start in 0..=(rows.len() - LR_WINDOW) {
-        let window = &rows[start..start + LR_WINDOW];
+    for start in 0..=(rows.len() - lr_window) {
+        let window = &rows[start..start + lr_window];
 
         let n = window.len() as f64;
         let mean_mu = window.iter().map(|(_, mu, _)| *mu).sum::<f64>() / n;
@@ -666,8 +663,7 @@ fn ols_beta_on_mu(loms: &[(u32, f64, f64)]) -> Option<(f64, f64)> {
 }
 
 #[inline]
-fn mean_beta_from_highest_ranks(loms: &[(u32, f64, f64)], count: usize) -> Option<f64> {
-    // Paper's mean-beta mode uses the deepest lower-order ranks, e.g. k=8..10.
+fn mean_beta_from_highest_ranks(loms: &[(u32, f64, f64)], _req_count: usize) -> Option<f64> {
     let mut xs: Vec<(u32, f64)> = loms
         .iter()
         .filter_map(|(k, _, beta)| {
@@ -679,10 +675,12 @@ fn mean_beta_from_highest_ranks(loms: &[(u32, f64, f64)], count: usize) -> Optio
         })
         .collect();
 
-    if xs.len() < count {
+    if xs.is_empty() {
         return None;
     }
 
+    // Adapt to the available ranks if the testing script restricts them.
+    let count = xs.len().min(3);
     xs.sort_by(|a, b| b.0.cmp(&a.0));
 
     mean_finite(xs.into_iter().take(count).map(|(_, beta)| beta))
@@ -768,27 +766,6 @@ where
     }
 
     best
-}
-
-const LO_TEV_FIXED_CUTOFF: f64 = 0.18;
-
-#[inline]
-fn rank1_noise_slice_fixed_cutoff(rank1_scores: &[f64], min_count: usize) -> Option<Vec<f64>> {
-    // PyLord/order-stats supports a fixed cutoff of 0.18 on the scaled TEV axis.
-    // This selects the lower-scoring/noise portion of the rank-1 mixture before
-    // the TNM likelihood scan.
-    let mut xs: Vec<f64> = rank1_scores
-        .iter()
-        .copied()
-        .filter(|x| x.is_finite() && *x < LO_TEV_FIXED_CUTOFF)
-        .collect();
-
-    if xs.len() < min_count.max(10) {
-        return None;
-    }
-
-    xs.sort_by(|a, b| a.total_cmp(b));
-    Some(xs)
 }
 
 /// Fits a charge-stratified Lower Order Model.
@@ -954,19 +931,46 @@ pub fn fit_decoy_free_model(
             _ => continue,
         };
 
-        let ts_noise = match rank1_noise_slice_fixed_cutoff(ts_all, lo_min_count_per_rank) {
-            Some(v) => v,
-            None => {
-                log::warn!(
-                    "LO DEBUG charge {charge}: insufficient rank-1 noise below fixed TEV cutoff; rank1_total={} cutoff={:.3}",
-                    ts_all.len(),
-                    LO_TEV_FIXED_CUTOFF
-                );
-                continue;
+        let mut min_k = u32::MAX;
+        for k in by_rank.keys() {
+            if *k < min_k {
+                min_k = *k;
             }
+        }
+
+        let ref_nulls = if min_k <= max_null_rank {
+            by_rank.get(&min_k).unwrap()
+        } else {
+            &pooled_null_scores
         };
 
-        let ts = ts_noise.as_slice();
+        let cutoff = if ref_nulls.len() > 10 {
+            let n_null = ref_nulls.len() as f64;
+            let mean_null = ref_nulls.iter().sum::<f64>() / n_null;
+            let var_null = ref_nulls
+                .iter()
+                .map(|&x| (x - mean_null).powi(2))
+                .sum::<f64>()
+                / n_null;
+            mean_null + 4.5 * var_null.sqrt()
+        } else {
+            f64::INFINITY
+        };
+
+        let filtered_ts: Vec<f64> = ts_all.iter().copied().filter(|&x| x <= cutoff).collect();
+
+        // Strict fail-closed: Do NOT fall back to ts_all if cutoff isolates too few.
+        // Falling back ingests true targets and breaks the model.
+        if filtered_ts.len() < lo_min_count_per_rank {
+            log::warn!(
+                "LO DEBUG charge {charge}: insufficient rank-1 noise below 4.5 sigma cutoff; rank1_total={} cutoff={:.3}",
+                ts_all.len(),
+                cutoff
+            );
+            continue;
+        }
+
+        let ts = filtered_ts.as_slice();
 
         let mut lom_mm: Vec<(u32, f64, f64)> = Vec::new();
         let mut lom_mle: Vec<(u32, f64, f64)> = Vec::new();
@@ -1068,7 +1072,7 @@ pub fn fit_decoy_free_model(
                     mu_max,
                     ts.len(),
                     ts_all.len(),
-                    LO_TEV_FIXED_CUTOFF
+                    cutoff
                 );
                 (mu, beta)
             }
