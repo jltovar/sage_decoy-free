@@ -612,7 +612,10 @@ fn robust_mu_bounds(top_scores: &[f64]) -> Option<(f64, f64)> {
     // PyLord-like branch when the score scale is plainly positive.
     if mean.is_finite() && mean > 0.0 {
         let lo = 0.1 * mean;
-        let hi = 1.5 * mean;
+        // 1.5x is too restrictive for hyperscores with long tails.
+        // We allow mu to search up to the maximum observed null-like score,
+        // ensuring the optimizer isn't artificially blocked from fitting the true peak.
+        let hi = max_x.max(2.0 * mean);
         if lo.is_finite() && hi.is_finite() && lo < hi {
             return Some((lo, hi));
         }
@@ -1007,16 +1010,19 @@ pub fn fit_decoy_free_model(
         temp_ts.sort_unstable_by(|a, b| a.total_cmp(b));
 
         let cutoff = if temp_ts.len() > 10 {
-            // 1. Initialize KDE
-            // PyLord hardcodes bw=0.05. We initialize the Kde struct and override its bandwidth.
-            let mut kde = crate::ml::kde::Kde::new(&temp_ts, |bw| bw);
-            kde.bandwidth = 0.05;
-
-            // 2. Evaluate over a grid of 256 points (just like PyLord's 2**8)
             let min_val = temp_ts[0];
             let max_val = temp_ts[temp_ts.len() - 1];
+            let span = max_val - min_val;
+
+            // 1. Adaptive bandwidth
+            // Replace hardcoded 0.05 with a dynamically scaled bandwidth based on the
+            // data span to prevent highly jagged density curves on the hyperscore scale.
+            let mut kde = crate::ml::kde::Kde::new(&temp_ts, |bw| bw);
+            kde.bandwidth = (span / 40.0).clamp(0.5, 5.0);
+
+            // 2. Evaluate over a grid of 256 points
             let grid_size = 256;
-            let step = (max_val - min_val) / (grid_size as f64 - 1.0);
+            let step = span / (grid_size as f64 - 1.0);
 
             let mut pdf_vals = Vec::with_capacity(grid_size);
             for i in 0..grid_size {
@@ -1033,8 +1039,10 @@ pub fn fit_decoy_free_model(
                 }
             }
 
-            // 4. PyLord fallback: If no dip is found, use the median of the scores
-            dip_x.unwrap_or_else(|| temp_ts[temp_ts.len() / 2])
+            // 4. Fallback: If no dip is found, the data is likely unimodal.
+            // Do not blindly truncate 50%. Use the 95th percentile so the optimizer
+            // can still see the true distribution shape without extreme outliers.
+            dip_x.unwrap_or_else(|| temp_ts[((temp_ts.len() as f64) * 0.95) as usize])
         } else {
             f64::INFINITY
         };
