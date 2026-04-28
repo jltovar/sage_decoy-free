@@ -462,6 +462,11 @@ pub struct FdrOptions {
     pub lo_mode: Option<LoMode>,        // auto | linear_regression | mean_beta
     pub lo_lom_estimator: Option<LoLomEstimator>, // auto | mm | mle
 
+    // LowerOrder support threshold.
+    // This is not a rank-window selector. The selected LO ranks are controlled
+    // only by lower_order_min_null_rank..=lower_order_max_null_rank.
+    pub lo_min_count_per_rank: Option<usize>,
+
     // PyLord parity knobs
     pub lo_stratify: Option<LoStratify>, // default Charge
     pub lo_score: Option<LoScore>,       // default Raw
@@ -582,6 +587,13 @@ pub struct FdrSettings {
     // LO (paper/PyLord) settings
     pub lo_mode: LoMode,
     pub lo_lom_estimator: LoLomEstimator,
+
+    /// Minimum number of observations required for an individual selected
+    /// lower-order rank to contribute to the LowerOrder fit.
+    ///
+    /// This is not a rank-window selector. The selected LO ranks are controlled
+    /// only by lower_order_min_null_rank..=lower_order_max_null_rank.
+    pub lo_min_count_per_rank: usize,
 
     // PyLord parity settings
     pub lo_stratify: LoStratify, // Charge | Global
@@ -937,6 +949,7 @@ impl From<FdrOptions> for FdrSettings {
         let lo_rank_key = options.lo_rank_key.unwrap_or(LoRankKey::LoAdjusted);
         let lo_mode = options.lo_mode.unwrap_or(LoMode::Auto);
         let lo_lom_estimator = options.lo_lom_estimator.unwrap_or(LoLomEstimator::Auto);
+        let lo_min_count_per_rank = options.lo_min_count_per_rank.unwrap_or(10).max(1);
         let lo_stratify = options.lo_stratify.unwrap_or(LoStratify::Charge);
         let lo_score = options.lo_score.unwrap_or(LoScore::Raw);
 
@@ -1158,6 +1171,7 @@ impl From<FdrOptions> for FdrSettings {
             // LO (paper/PyLord) settings
             lo_mode,
             lo_lom_estimator,
+            lo_min_count_per_rank,
 
             // PyLord parity settings
             lo_stratify,

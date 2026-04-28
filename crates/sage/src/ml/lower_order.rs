@@ -570,11 +570,12 @@ impl LowerOrderModel {
 //
 // Notes:
 // - This function is intentionally self-contained (no FdrSettings dependency).
-// - All gating is per-charge using:
-//     min_null_size_per_charge  (total null size across ranks
-//                               [lower_order_min_null_rank..=lower_order_max_null_rank]
-//                               (clamped within global window))
-//     min_rank_count            (minimum per-rank count to fit a LOM at rank k)
+// - All support gating is per charge and per selected lower-order rank:
+//     lo_min_count_per_rank     minimum finite observations required for an
+//                               individual selected rank k to contribute a LOM fit.
+// - There is no separate total bucket-size threshold here. A charge is fit only
+//   if at least two selected ranks each satisfy lo_min_count_per_rank and yield
+//   finite LOM parameters.
 // - μ scan range is data-driven:
 //     * PyLord-style [0.1 * mean, 1.5 * mean] when the score scale is positive
 //     * score-range fallback when the score scale is centered / near-zero / negative
@@ -881,8 +882,7 @@ pub fn fit_decoy_free_model(
     rank1_stream: &[(f64, u8)],
     min_null_rank: u32,
     max_null_rank: u32,
-    min_null_size_per_charge: usize,
-    min_rank_count: usize,
+    lo_min_count_per_rank: usize,
     lo_mode: crate::input::LoMode,
     lo_lom_estimator: crate::input::LoLomEstimator,
     lo_mean_beta_mode: crate::input::LoMeanBetaMode,
@@ -907,7 +907,6 @@ pub fn fit_decoy_free_model(
     // -------------------------
     // null_by_rank[z][k] -> Vec<f64>
     let mut null_by_rank: FnvHashMap<u8, FnvHashMap<u32, Vec<f64>>> = FnvHashMap::default();
-    let mut null_total_by_charge: FnvHashMap<u8, usize> = FnvHashMap::default();
     let mut pooled_null_scores: Vec<f64> = Vec::new();
 
     for &(rank, score, charge) in rank_null_stream {
@@ -924,13 +923,20 @@ pub fn fit_decoy_free_model(
             .or_default()
             .push(score);
 
-        *null_total_by_charge.entry(charge).or_insert(0) += 1;
         pooled_null_scores.push(score);
     }
 
     if log::log_enabled!(log::Level::Debug) {
-        let mut v: Vec<(u8, usize)> = null_total_by_charge.iter().map(|(z, n)| (*z, *n)).collect();
+        let mut v: Vec<(u8, usize)> = null_by_rank
+            .iter()
+            .map(|(z, by_rank)| {
+                let n = by_rank.values().map(|scores| scores.len()).sum::<usize>();
+                (*z, n)
+            })
+            .collect();
+
         v.sort_by_key(|(z, _)| *z);
+
         let mut s = String::new();
         for (z, n) in v {
             if !s.is_empty() {
@@ -938,6 +944,7 @@ pub fn fit_decoy_free_model(
             }
             s.push_str(&format!("z{}={}", z, n));
         }
+
         log::debug!("LO DEBUG null totals by charge (post rank filter): {}", s);
         log::debug!(
             "LO DEBUG pooled_null_scores.len()={}",
@@ -959,10 +966,6 @@ pub fn fit_decoy_free_model(
     let mut params_by_charge: FnvHashMap<u8, (f64, f64)> = FnvHashMap::default();
 
     for (&charge, by_rank) in &null_by_rank {
-        let n_null = *null_total_by_charge.get(&charge).unwrap_or(&0);
-        if n_null < min_null_size_per_charge {
-            continue;
-        }
         let ts = match top_scores.get(&charge) {
             Some(v) if !v.is_empty() => v,
             _ => continue,
@@ -975,13 +978,14 @@ pub fn fit_decoy_free_model(
 
         for k in min_null_rank..=max_null_rank {
             let scores_k = match by_rank.get(&k) {
-                Some(v) if v.len() >= min_rank_count => v,
+                Some(v) if v.len() >= lo_min_count_per_rank => v,
                 _ => continue,
             };
 
-            // Collect finite values only (fail-closed on NaNs/Infs)
+            // Collect finite values only. A selected lower-order rank contributes
+            // only if it has enough finite observations for this charge.
             let scores: Vec<f64> = scores_k.iter().copied().filter(|x| x.is_finite()).collect();
-            if scores.len() < min_rank_count {
+            if scores.len() < lo_min_count_per_rank {
                 continue;
             }
 
@@ -990,8 +994,9 @@ pub fn fit_decoy_free_model(
             buckets.push(RankBucket { k, scores });
         }
 
-        // Need at least something to proceed; otherwise skip this charge
-        if buckets.is_empty() {
+        // LowerOrder needs at least two usable selected ranks to estimate the
+        // rank-to-rank trend used by the TNM candidates.
+        if buckets.len() < 2 {
             continue;
         }
 
@@ -1035,7 +1040,7 @@ pub fn fit_decoy_free_model(
         };
 
         let filtered_ts_data: Vec<f64> = ts.iter().copied().filter(|&x| x <= cutoff).collect();
-        let ts_slice = if filtered_ts_data.len() >= min_rank_count {
+        let ts_slice = if filtered_ts_data.len() >= lo_min_count_per_rank {
             &filtered_ts_data
         } else {
             ts // fallback to full rank 1 if cutoff is inexplicably aggressive
@@ -1067,7 +1072,7 @@ pub fn fit_decoy_free_model(
             if k < min_null_rank || k > max_null_rank {
                 continue;
             }
-            if b.scores.len() < min_rank_count {
+            if b.scores.len() < lo_min_count_per_rank {
                 continue;
             }
 

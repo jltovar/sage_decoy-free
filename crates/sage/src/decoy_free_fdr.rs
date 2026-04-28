@@ -626,25 +626,16 @@ fn tev(f: &DfFeature) -> Option<f64> {
 
 #[inline(always)]
 fn lo_tev(f: &DfFeature) -> Option<f64> {
-    // Exact-zero spectrum p-values can arise from numerical underflow in extreme
-    // tail cases. LO needs a finite TEV value, so clamp to a tiny positive floor
-    // before applying -ln(p * n).
-    let p = (f.core.spectrum_p_value as f64).max(1e-300);
-    let n = f.core.scored_candidates as f64;
-
-    if !p.is_finite() || !n.is_finite() || n < 1.0 {
-        return None;
-    }
-
-    let log10_p = p.log10();
-
-    if !log10_p.is_finite() {
-        return None;
-    }
-
-    let tev = -(p * n).ln();
-    if tev.is_finite() {
-        Some(tev)
+    // LowerOrder must preserve ordering and dynamic range in the high-confidence
+    // tail. Avoid deriving the LO score from spectrum_p_value because that field
+    // may already have lost tail resolution through f32 underflow or quantization.
+    //
+    // Use the original hyperscore scale as the LO score input; the LowerOrder
+    // fitter estimates the null-tail transformation from the selected lower-order
+    // ranks.
+    let x = f.core.hyperscore as f64;
+    if x.is_finite() {
+        Some(x)
     } else {
         None
     }
@@ -1786,23 +1777,20 @@ fn fit_engines(
                 })
                 .collect();
 
-            // LowerOrder fitting is charge-stratified when lo_stratify=charge, so the
-            // null-size threshold passed to the fitter must be a per-bucket threshold, not
-            // the global null-pool threshold used by other base models.
-            let n_lo_ranks = settings
-                .lower_order_max_null_rank
-                .saturating_sub(settings.lower_order_min_null_rank)
-                .saturating_add(1) as usize;
-
-            let lo_min_null_size_per_bucket = settings.min_rank_count.saturating_mul(n_lo_ranks);
+            // LowerOrder rank-window selection is controlled only by
+            // lower_order_min_null_rank..=lower_order_max_null_rank.
+            //
+            // lo_min_count_per_rank is a fixed support threshold for each selected
+            // lower-order rank within the active LO bucket. It is not multiplied by
+            // the number of selected ranks.
+            let lo_min_count_per_rank = settings.lo_min_count_per_rank;
 
             lo_model = fit_decoy_free_model(
                 &lo_fit_data,
                 &rank1_scores_by_charge,
                 settings.lower_order_min_null_rank,
                 settings.lower_order_max_null_rank,
-                lo_min_null_size_per_bucket,
-                settings.min_rank_count,
+                lo_min_count_per_rank,
                 settings.lo_mode.clone(),
                 settings.lo_lom_estimator.clone(),
                 settings.lo_mean_beta_mode.clone(),
