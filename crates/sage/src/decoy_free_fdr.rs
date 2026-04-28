@@ -626,28 +626,17 @@ fn tev(f: &DfFeature) -> Option<f64> {
 
 #[inline(always)]
 fn lo_tev(f: &DfFeature) -> Option<f64> {
-    // LowerOrder must preserve high-confidence tail resolution while also
-    // accounting for spectrum-level candidate-count effects.
+    // LowerOrder must fit and evaluate on the same score scale.
     //
-    // Do not derive this score from spectrum_p_value: that field may already have
-    // lost tail resolution through f32 underflow or quantization. Instead, use the
-    // original hyperscore and apply a first-order candidate-count correction on
-    // the same logarithmic scale.
+    // Do not derive the LO score from spectrum_p_value because that field can lose
+    // high-confidence tail resolution through f32 underflow or quantization.
     //
-    // This preserves continuous tail ordering and prevents spectra with very
-    // different candidate counts from being treated as directly comparable solely
-    // by raw hyperscore.
+    // Also do not apply an ad hoc candidate-count correction here. The LO model
+    // estimates the rank-1 target-null distribution directly from lower-order
+    // score ranks on this same preserved score scale.
     let x = f.core.hyperscore as f64;
-    let n = f.core.scored_candidates as f64;
-
-    if !x.is_finite() || !n.is_finite() || n < 1.0 {
-        return None;
-    }
-
-    let corrected = x - n.ln();
-
-    if corrected.is_finite() {
-        Some(corrected)
+    if x.is_finite() {
+        Some(x)
     } else {
         None
     }

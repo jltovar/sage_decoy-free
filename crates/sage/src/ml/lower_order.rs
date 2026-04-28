@@ -582,281 +582,60 @@ impl LowerOrderModel {
 //
 
 #[inline]
-fn robust_mu_bounds(top_scores: &[f64]) -> Option<(f64, f64)> {
-    if top_scores.is_empty() {
+fn median_of_finite(values: impl IntoIterator<Item = f64>) -> Option<f64> {
+    let mut xs: Vec<f64> = values.into_iter().filter(|x| x.is_finite()).collect();
+    if xs.is_empty() {
         return None;
     }
 
-    let finite: Vec<f64> = top_scores
-        .iter()
-        .copied()
-        .filter(|x| x.is_finite())
-        .collect();
-    if finite.is_empty() {
-        return None;
-    }
+    xs.sort_by(|a, b| a.total_cmp(b));
 
-    let n = finite.len() as f64;
-    let mean = finite.iter().sum::<f64>() / n;
-    let min_x = finite
-        .iter()
-        .copied()
-        .min_by(|a, b| a.total_cmp(b))
-        .unwrap();
-    let max_x = finite
-        .iter()
-        .copied()
-        .max_by(|a, b| a.total_cmp(b))
-        .unwrap();
-
-    // PyLord-like branch when the score scale is plainly positive.
-    if mean.is_finite() && mean > 0.0 {
-        let lo = 0.1 * mean;
-        let hi = 1.5 * mean;
-        if lo.is_finite() && hi.is_finite() && lo < hi {
-            return Some((lo, hi));
-        }
-    }
-
-    // Fallback branch for centered / near-zero / negative score scales.
-    let span = (max_x - min_x).abs().max(1e-3);
-    let pad = (0.1 * span).max(1e-3);
-    let lo = min_x - pad;
-    let hi = max_x + pad;
-
-    (lo.is_finite() && hi.is_finite() && lo < hi).then_some((lo, hi))
-}
-
-#[inline]
-fn mu_grid_best_nll_range(
-    beta: f64,
-    top_scores: &[f64],
-    mu_min: f64,
-    mu_max: f64,
-) -> Option<(f64, f64)> {
-    // Scan mu in [mu_min..mu_max] and pick mu minimizing TEV NLL at k=1 (fixed beta).
-    // Here minimizing NLL is equivalent to minimizing BIC up to an additive constant.
-    if top_scores.is_empty() || !beta.is_finite() || beta <= 0.0 {
-        return None;
-    }
-    if !mu_min.is_finite() || !mu_max.is_finite() || mu_min >= mu_max {
-        return None;
-    }
-
-    const MU_N: usize = 256;
-
-    let step = (mu_max - mu_min) / ((MU_N - 1) as f64);
-    if !step.is_finite() || step <= 0.0 {
-        return None;
-    }
-
-    let mut best_mu = mu_min;
-    let mut best_nll = f64::INFINITY;
-
-    for i in 0..MU_N {
-        let mu = mu_min + (i as f64) * step;
-        let nll = nll_tev_k(mu, beta, top_scores, 1);
-        if nll < best_nll {
-            best_nll = nll;
-            best_mu = mu;
-        }
-    }
-
-    best_nll.is_finite().then_some((best_mu, best_nll))
-}
-
-#[inline]
-fn ols_with_r(pairs: &[(f64, f64)]) -> Option<(f64, f64, f64)> {
-    // Fit beta = a*mu + b by OLS, and also return Pearson's r.
-    if pairs.len() < 2 {
-        return None;
-    }
-    let n = pairs.len() as f64;
-
-    let sum_x = pairs.iter().map(|(mu, _)| *mu).sum::<f64>();
-    let sum_y = pairs.iter().map(|(_, b)| *b).sum::<f64>();
-    let sum_xx = pairs.iter().map(|(mu, _)| mu * mu).sum::<f64>();
-    let sum_yy = pairs.iter().map(|(_, b)| b * b).sum::<f64>();
-    let sum_xy = pairs.iter().map(|(mu, b)| mu * b).sum::<f64>();
-
-    let denom_x = n * sum_xx - sum_x * sum_x;
-    let denom_y = n * sum_yy - sum_y * sum_y;
-
-    if !denom_x.is_finite() || denom_x.abs() < 1e-12 {
-        return None;
-    }
-
-    let a = (n * sum_xy - sum_x * sum_y) / denom_x;
-    let b = (sum_y - a * sum_x) / n;
-
-    let mut r = 0.0;
-    if denom_y > 0.0 {
-        r = (n * sum_xy - sum_x * sum_y) / (denom_x * denom_y).sqrt();
-    }
-
-    (a.is_finite() && b.is_finite()).then_some((a, b, r))
-}
-
-#[inline]
-fn compute_mean_beta(
-    loms: &[(u32, f64, f64)],
-    start_rank: u32,
-    count: u32,
-    mode: &crate::input::LoMeanBetaMode,
-) -> Option<f64> {
-    if count < 1 {
-        return None;
-    }
-
-    let mut by_rank: Vec<(u32, f64)> = loms
-        .iter()
-        .map(|(k, _mu, beta)| (*k, *beta))
-        .filter(|(_k, b)| b.is_finite() && *b > 0.0)
-        .collect();
-
-    if by_rank.is_empty() {
-        return None;
-    }
-    by_rank.sort_by_key(|(k, _)| *k);
-
-    match mode {
-        crate::input::LoMeanBetaMode::All => {
-            // PyLord Mode: mean of ALL ranks >= start_rank
-            let valid: Vec<f64> = by_rank
-                .iter()
-                .filter(|(k, _)| *k >= start_rank)
-                .map(|(_, b)| *b)
-                .collect();
-            if valid.is_empty() {
-                return None;
-            }
-            let m = valid.iter().sum::<f64>() / (valid.len() as f64);
-            return (m.is_finite() && m > 0.0).then_some(m);
-        }
-        crate::input::LoMeanBetaMode::Consecutive => {
-            // Paper Mode: exact block of length `count`
-            let mut fast: Vec<f64> = Vec::new();
-            for k in start_rank..(start_rank + count) {
-                if let Some((_, b)) = by_rank.iter().find(|(rk, _)| *rk == k) {
-                    fast.push(*b);
-                } else {
-                    fast.clear();
-                    break;
-                }
-            }
-            if fast.len() == count as usize {
-                let m = fast.iter().sum::<f64>() / (count as f64);
-                return (m.is_finite() && m > 0.0).then_some(m);
-            }
-
-            // Fallback consecutive block scanner
-            let ranks: Vec<u32> = by_rank.iter().map(|(k, _)| *k).collect();
-            if ranks.len() < count as usize {
-                return None;
-            }
-
-            let mut best_block: Option<Vec<f64>> = None;
-            let mut best_gap: u32 = u32::MAX;
-
-            for i in 0..=(ranks.len() - count as usize) {
-                let window = &ranks[i..i + count as usize];
-                let min_k = window[0];
-                let max_k = window[window.len() - 1];
-                let expected_span = count - 1;
-                let gap = (max_k - min_k).saturating_sub(expected_span);
-
-                if gap < best_gap {
-                    let mut betas: Vec<f64> = Vec::with_capacity(count as usize);
-                    for k in min_k..=max_k {
-                        if let Some((_, b)) = by_rank.iter().find(|(rk, _)| *rk == k) {
-                            betas.push(*b);
-                        }
-                    }
-                    if betas.len() == count as usize {
-                        best_gap = gap;
-                        best_block = Some(betas);
-                        if best_gap == 0 {
-                            break;
-                        }
-                    }
-                }
-            }
-
-            let block = best_block?;
-            let m = block.iter().sum::<f64>() / (block.len() as f64);
-            (m.is_finite() && m > 0.0).then_some(m)
-        }
-    }
-}
-
-#[inline]
-fn eval_candidate_lr_range(
-    loms: &[(u32, f64, f64)], // (k, mu_k, beta_k)
-    top_scores: &[f64],
-    mu_scan_min: f64,
-    mu_scan_max: f64,
-    window_size: Option<u32>,
-) -> Option<(f64, f64, f64)> {
-    let pairs: Vec<(f64, f64)> = loms
-        .iter()
-        .map(|(_k, mu, beta)| (*mu, *beta))
-        .filter(|(mu, beta)| mu.is_finite() && beta.is_finite() && *beta > 0.0)
-        .collect();
-
-    if pairs.len() < 2 {
-        return None;
-    }
-
-    // PyLord Sliding Window + Pearson R logic
-    let (a, b) = if let Some(w) = window_size {
-        let w = w as usize;
-        if pairs.len() >= w {
-            let mut best_r_abs = -1.0;
-            let mut best_ab = None;
-            for i in 0..=(pairs.len() - w) {
-                let slice = &pairs[i..i + w];
-                if let Some((a_cand, b_cand, r)) = ols_with_r(slice) {
-                    let r_abs = r.abs();
-                    if r_abs > best_r_abs {
-                        best_r_abs = r_abs;
-                        best_ab = Some((a_cand, b_cand));
-                    }
-                }
-            }
-            best_ab.or_else(|| ols_with_r(&pairs).map(|(a, b, _)| (a, b)))?
-        } else {
-            ols_with_r(&pairs).map(|(a, b, _)| (a, b))?
-        }
+    let n = xs.len();
+    if n % 2 == 1 {
+        Some(xs[n / 2])
     } else {
-        ols_with_r(&pairs).map(|(a, b, _)| (a, b))?
-    };
+        Some(0.5 * (xs[n / 2 - 1] + xs[n / 2]))
+    }
+}
 
-    const MU_N: usize = 256;
-    if !mu_scan_min.is_finite() || !mu_scan_max.is_finite() || mu_scan_min >= mu_scan_max {
+#[inline]
+fn median_lom_params(loms: &[(u32, f64, f64)]) -> Option<(f64, f64)> {
+    if loms.len() < 2 {
         return None;
     }
-    let step = (mu_scan_max - mu_scan_min) / ((MU_N - 1) as f64);
 
-    let mut best: Option<(f64, f64, f64)> = None;
+    let mu = median_of_finite(loms.iter().map(|(_, mu, _)| *mu))?;
+    let beta = median_of_finite(loms.iter().map(|(_, _, beta)| *beta))?;
 
-    for i in 0..MU_N {
-        let mu = mu_scan_min + (i as f64) * step;
-        let beta = a * mu + b;
-        if !beta.is_finite() || beta <= 0.0 {
-            continue;
-        }
-        let nll = nll_tev_k(mu, beta, top_scores, 1);
-        if !nll.is_finite() {
-            continue;
-        }
-        match best {
-            None => best = Some((mu, beta, nll)),
-            Some((_, _, best_nll)) if nll < best_nll => best = Some((mu, beta, nll)),
-            _ => {}
-        }
+    if mu.is_finite() && beta.is_finite() && beta > 0.0 {
+        Some((mu, beta))
+    } else {
+        None
+    }
+}
+
+#[inline]
+fn lower_order_total_nll(buckets: &[RankBucket], mu: f64, beta: f64) -> Option<f64> {
+    if !mu.is_finite() || !beta.is_finite() || beta <= 0.0 {
+        return None;
     }
 
-    best
+    let mut total = 0.0f64;
+
+    for b in buckets {
+        if b.k < 2 || b.scores.len() < 2 {
+            continue;
+        }
+
+        let nll = nll_tev_k(mu, beta, &b.scores, b.k);
+        if !nll.is_finite() {
+            return None;
+        }
+
+        total += nll;
+    }
+
+    total.is_finite().then_some(total)
 }
 
 /// Fits a charge-stratified Lower Order Model.
@@ -966,10 +745,15 @@ pub fn fit_decoy_free_model(
     let mut params_by_charge: FnvHashMap<u8, (f64, f64)> = FnvHashMap::default();
 
     for (&charge, by_rank) in &null_by_rank {
-        let ts = match top_scores.get(&charge) {
-            Some(v) if !v.is_empty() => v,
-            _ => continue,
-        };
+        // Require rank-1 scores for this charge so the fitted model is only built
+        // for charge states observed in the rank-1 evaluation stream.
+        if !top_scores
+            .get(&charge)
+            .map(|v| !v.is_empty())
+            .unwrap_or(false)
+        {
+            continue;
+        }
 
         // Build rank buckets for k in [min_null_rank..=max_null_rank]
         // using the per-rank null scores for this charge.
@@ -997,130 +781,27 @@ pub fn fit_decoy_free_model(
             continue;
         }
 
-        // --- Rank-1 null-side subset for TNM candidate evaluation ---
-        //
-        // PyLord filters rank-1 scores before evaluating candidate TNM NLLs so
-        // that obvious target-dominated high scores do not set the null model.
-        //
-        // The original PyLord bandwidth constant is not portable after changing
-        // the LO score scale. A fixed bw=0.05 is far too narrow on hyperscore-like
-        // scales and can create arbitrary local minima. Use an adaptive bandwidth
-        // and search for the first density valley after the primary mode.
-        let mut temp_ts: Vec<f64> = ts.iter().copied().filter(|x| x.is_finite()).collect();
-        temp_ts.sort_unstable_by(|a, b| a.total_cmp(b));
-
-        if temp_ts.len() < lo_min_count_per_rank {
-            continue;
-        }
-
-        let cutoff = if temp_ts.len() > 2 * lo_min_count_per_rank {
-            let n = temp_ts.len();
-            let min_val = temp_ts[0];
-            let max_val = temp_ts[n - 1];
-            let span = max_val - min_val;
-
-            if span.is_finite() && span > 0.0 {
-                let mean = temp_ts.iter().sum::<f64>() / n as f64;
-                let var = temp_ts
-                    .iter()
-                    .map(|x| {
-                        let d = *x - mean;
-                        d * d
-                    })
-                    .sum::<f64>()
-                    / n as f64;
-
-                let sd = if var.is_finite() && var > 0.0 {
-                    var.sqrt()
-                } else {
-                    0.0
-                };
-
-                let q25 = temp_ts[((0.25 * (n as f64 - 1.0)).round() as usize).min(n - 1)];
-                let q75 = temp_ts[((0.75 * (n as f64 - 1.0)).round() as usize).min(n - 1)];
-                let iqr_sigma = ((q75 - q25) / 1.349).abs();
-
-                let scale = if sd > 0.0 && iqr_sigma > 0.0 {
-                    sd.min(iqr_sigma)
-                } else {
-                    sd.max(iqr_sigma)
-                };
-
-                let mut bandwidth = 0.9 * scale * (n as f64).powf(-0.2);
-
-                if !bandwidth.is_finite() || bandwidth <= 0.0 {
-                    bandwidth = span / 64.0;
-                }
-
-                bandwidth = bandwidth.clamp(span / 1000.0, span / 4.0);
-
-                let mut kde = crate::ml::kde::Kde::new(&temp_ts, |bw| bw);
-                kde.bandwidth = bandwidth;
-
-                const GRID_SIZE: usize = 256;
-                let step = span / (GRID_SIZE as f64 - 1.0);
-
-                let mut pdf_vals = Vec::with_capacity(GRID_SIZE);
-                for i in 0..GRID_SIZE {
-                    let x = min_val + (i as f64) * step;
-                    pdf_vals.push((x, kde.pdf(x)));
-                }
-
-                // Find the primary mode first, then the first valley after it.
-                // This avoids selecting a spurious left-tail wiggle as the cutoff.
-                let mode_idx = pdf_vals
-                    .iter()
-                    .enumerate()
-                    .max_by(|(_, a), (_, b)| {
-                        a.1.partial_cmp(&b.1).unwrap_or(std::cmp::Ordering::Equal)
-                    })
-                    .map(|(i, _)| i)
-                    .unwrap_or(0);
-
-                let mut dip_x = None;
-                if mode_idx + 2 < GRID_SIZE {
-                    for i in (mode_idx + 1)..(GRID_SIZE - 1) {
-                        if pdf_vals[i].1 < pdf_vals[i - 1].1 && pdf_vals[i].1 <= pdf_vals[i + 1].1 {
-                            dip_x = Some(pdf_vals[i].0);
-                            break;
-                        }
-                    }
-                }
-
-                dip_x.unwrap_or_else(|| temp_ts[n / 2])
-            } else {
-                temp_ts[n / 2]
-            }
-        } else {
-            temp_ts[temp_ts.len() / 2]
-        };
-
-        let filtered_ts_data: Vec<f64> = temp_ts.iter().copied().filter(|&x| x <= cutoff).collect();
-
-        let ts_slice = if filtered_ts_data.len() >= lo_min_count_per_rank {
-            &filtered_ts_data
-        } else {
-            ts
-        };
-
-        // --- ROBUST PYLORD-STYLE MU BOUNDS ---
-        // Use PyLord-style mean-based bounds when the score scale is positive.
-        // Fall back to score-range bounds when the score scale is centered,
-        // near zero, or negative.
-        let (dyn_mu_min, dyn_mu_max) = match robust_mu_bounds(ts_slice) {
-            Some(bounds) => bounds,
-            None => {
-                log::warn!("LO DEBUG charge {charge}: could not derive finite mu bounds.");
-                continue;
-            }
-        };
-
         // ---------------------------------------------------------------------
-        // PyLord-inspired LO: per-k LOM fits (MM + MLE) and TNM selection by minimum NLL
+        // LowerOrder TNM construction
         // ---------------------------------------------------------------------
+        //
+        // The per-rank LowerOrder estimators already convert rank-k score samples
+        // into estimates of the rank-1 target-null model parameters (mu, beta).
+        //
+        // Therefore the TNM should be derived from the lower-order LOM estimates
+        // themselves. Do not re-fit mu against rank-1 scores here: rank-1 scores
+        // are target-contaminated, and KDE-based rank-1 filtering makes the model
+        // discontinuous across nearby null-rank windows.
+        //
+        // We build MM and/or MLE LOM tables, robustly aggregate their implied TNM
+        // parameters, and select the candidate that best explains the lower-order
+        // buckets by their own rank-k likelihood.
+        let _ = lo_mode;
+        let _ = &lo_mean_beta_mode;
 
-        // 1) Build LOM tables for each estimator family
-        // Each entry: (k, mu_k, beta_k)
+        // 1) Build LOM tables for each estimator family.
+        // Each entry is the rank-1 TNM estimate implied by lower-order rank k:
+        //     (k, mu, beta)
         let mut lom_mm: Vec<(u32, f64, f64)> = Vec::new();
         let mut lom_mle: Vec<(u32, f64, f64)> = Vec::new();
 
@@ -1146,14 +827,10 @@ pub fn fit_decoy_free_model(
             }
         }
 
-        // Need enough points to do anything
         if lom_mm.len() < 2 && lom_mle.len() < 2 {
-            continue; // fail-closed per charge
+            continue;
         }
 
-        // ---------------------------------------------------------------------
-        // PyLord Candidate Tournament (Respecting Config Knobs)
-        // ---------------------------------------------------------------------
         let use_mm = matches!(
             lo_lom_estimator,
             crate::input::LoLomEstimator::Auto | crate::input::LoLomEstimator::Mm
@@ -1162,86 +839,25 @@ pub fn fit_decoy_free_model(
             lo_lom_estimator,
             crate::input::LoLomEstimator::Auto | crate::input::LoLomEstimator::Mle
         );
-        let use_lr = matches!(
-            lo_mode,
-            crate::input::LoMode::Auto | crate::input::LoMode::LinearRegression
-        );
-        let use_mean = matches!(
-            lo_mode,
-            crate::input::LoMode::Auto | crate::input::LoMode::MeanBeta
-        );
 
-        let mut candidates = Vec::new();
+        let mut candidates: Vec<(&'static str, (f64, f64, f64))> = Vec::new();
 
-        // 2) Linear regression TNM candidates
-        if use_lr && use_mm {
-            if let Some(cand) = eval_candidate_lr_range(
-                &lom_mm,
-                ts_slice,
-                dyn_mu_min,
-                dyn_mu_max,
-                lo_lr_window_size,
-            ) {
-                if cand.0.is_finite() && cand.1.is_finite() && cand.1 > 0.0 && cand.2.is_finite() {
-                    candidates.push(("LR/MM", cand));
-                }
-            }
-        }
-        if use_lr && use_mle {
-            if let Some(cand) = eval_candidate_lr_range(
-                &lom_mle,
-                ts_slice,
-                dyn_mu_min,
-                dyn_mu_max,
-                lo_lr_window_size,
-            ) {
-                if cand.0.is_finite() && cand.1.is_finite() && cand.1 > 0.0 && cand.2.is_finite() {
-                    candidates.push(("LR/MLE", cand));
+        if use_mm {
+            if let Some((mu, beta)) = median_lom_params(&lom_mm) {
+                if let Some(nll) = lower_order_total_nll(&buckets, mu, beta) {
+                    candidates.push(("LO/MM", (mu, beta, nll)));
                 }
             }
         }
 
-        // 3) Mean-β TNM candidates
-        if use_mean && use_mm {
-            if let Some(beta_mean) = compute_mean_beta(
-                &lom_mm,
-                lo_mean_beta_min_rank,
-                lo_mean_beta_count,
-                &lo_mean_beta_mode,
-            ) {
-                if beta_mean.is_finite() && beta_mean > 0.0 {
-                    if let Some((mu, nll)) =
-                        mu_grid_best_nll_range(beta_mean, ts_slice, dyn_mu_min, dyn_mu_max)
-                    {
-                        if mu.is_finite() && nll.is_finite() {
-                            candidates.push(("MeanB/MM", (mu, beta_mean, nll)));
-                        }
-                    }
-                }
-            }
-        }
-        if use_mean && use_mle {
-            if let Some(beta_mean) = compute_mean_beta(
-                &lom_mle,
-                lo_mean_beta_min_rank,
-                lo_mean_beta_count,
-                &lo_mean_beta_mode,
-            ) {
-                if beta_mean.is_finite() && beta_mean > 0.0 {
-                    if let Some((mu, nll)) =
-                        mu_grid_best_nll_range(beta_mean, ts_slice, dyn_mu_min, dyn_mu_max)
-                    {
-                        if mu.is_finite() && nll.is_finite() {
-                            candidates.push(("MeanB/MLE", (mu, beta_mean, nll)));
-                        }
-                    }
+        if use_mle {
+            if let Some((mu, beta)) = median_lom_params(&lom_mle) {
+                if let Some(nll) = lower_order_total_nll(&buckets, mu, beta) {
+                    candidates.push(("LO/MLE", (mu, beta, nll)));
                 }
             }
         }
 
-        // 4) Pick the best candidate by minimum NLL.
-        //    Here this is equivalent to BIC up to an additive constant because the
-        //    candidate TNMs have the same effective complexity and are evaluated on the same data.
         let best_cand = candidates
             .into_iter()
             .min_by(|(_, (_, _, nll_a)), (_, (_, _, nll_b))| {
@@ -1250,17 +866,20 @@ pub fn fit_decoy_free_model(
                     .unwrap_or(std::cmp::Ordering::Equal)
             });
 
-        // 5) Fail-closed: no finite candidate => skip charge
         let (mu_final, beta_final) = match best_cand {
-            Some((name, t)) => {
+            Some((name, (mu, beta, nll))) => {
                 log::info!(
-					"LO DEBUG charge {charge}: best TNM candidate = {name} (mu={:.4}, beta={:.4}, nll={:.4}) | ranks: MM={}, MLE={}",
-					t.0, t.1, t.2, lom_mm.len(), lom_mle.len()
-				);
-                (t.0, t.1)
+                    "LO DEBUG charge {charge}: best TNM candidate = {name} (mu={:.4}, beta={:.4}, lower_order_nll={:.4}) | ranks: MM={}, MLE={}",
+                    mu,
+                    beta,
+                    nll,
+                    lom_mm.len(),
+                    lom_mle.len()
+                );
+                (mu, beta)
             }
             None => {
-                log::warn!("LO DEBUG charge {charge}: all TNM candidates failed.");
+                log::warn!("LO DEBUG charge {charge}: all lower-order TNM candidates failed.");
                 continue;
             }
         };
