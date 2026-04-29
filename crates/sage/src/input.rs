@@ -470,6 +470,7 @@ pub struct FdrOptions {
     // PyLord parity knobs
     pub lo_stratify: Option<LoStratify>, // default Charge
     pub lo_score: Option<LoScore>,       // default Raw
+    pub lo_tev_cutoff: Option<f64>,      // default 0.18
 
     // Mean-β scheme controls (paper defaults: min_rank=8, count=3)
     pub lo_mean_beta_mode: Option<LoMeanBetaMode>, // default consecutive
@@ -598,6 +599,7 @@ pub struct FdrSettings {
     // PyLord parity settings
     pub lo_stratify: LoStratify, // Charge | Global
     pub lo_score: LoScore,       // Raw | PerSpectrum
+    pub lo_tev_cutoff: f64,
 
     pub lo_mean_beta_mode: LoMeanBetaMode,
 
@@ -952,6 +954,7 @@ impl From<FdrOptions> for FdrSettings {
         let lo_min_count_per_rank = options.lo_min_count_per_rank.unwrap_or(10).max(1);
         let lo_stratify = options.lo_stratify.unwrap_or(LoStratify::Charge);
         let lo_score = options.lo_score.unwrap_or(LoScore::Raw);
+        let lo_tev_cutoff = options.lo_tev_cutoff.unwrap_or(0.18).clamp(0.01, 1.0);
 
         let lo_mean_beta_mode = options
             .lo_mean_beta_mode
@@ -1176,6 +1179,7 @@ impl From<FdrOptions> for FdrSettings {
             // PyLord parity settings
             lo_stratify,
             lo_score,
+            lo_tev_cutoff,
 
             lo_mean_beta_mode,
 

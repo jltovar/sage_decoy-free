@@ -685,37 +685,26 @@ fn mean_beta_from_highest_ranks(loms: &[(u32, f64, f64)], req_count: usize) -> O
 
 #[inline]
 fn lo_mu_scan_bounds(rank1_scores: &[f64]) -> Option<(f64, f64)> {
-    let xs: Vec<f64> = rank1_scores
+    let mut sorted: Vec<f64> = rank1_scores
         .iter()
         .copied()
         .filter(|x| x.is_finite())
         .collect();
 
-    if xs.len() < 10 {
+    if sorted.len() < 10 {
         return None;
     }
 
-    let mean = xs.iter().sum::<f64>() / xs.len() as f64;
-
-    if mean.is_finite() && mean > 0.0 {
-        let lo = 0.1 * mean;
-        let hi = 1.5 * mean;
-
-        if lo.is_finite() && hi.is_finite() && lo < hi {
-            return Some((lo, hi));
-        }
-    }
-
-    // Defensive fallback only. On the scaled TEV path this should rarely be used.
-    let mut sorted = xs;
+    // Use empirical quantiles to guarantee a stable grid search domain
+    // and avoid zero-width windows caused by multiplier-based bounds.
     sorted.sort_by(|a, b| a.total_cmp(b));
 
     let n = sorted.len();
     let q05 = sorted[((0.05 * (n as f64 - 1.0)).round() as usize).min(n - 1)];
-    let q80 = sorted[((0.80 * (n as f64 - 1.0)).round() as usize).min(n - 1)];
+    let q95 = sorted[((0.95 * (n as f64 - 1.0)).round() as usize).min(n - 1)];
 
-    if q05.is_finite() && q80.is_finite() && q05 < q80 {
-        Some((q05, q80))
+    if q05.is_finite() && q95.is_finite() && q05 < q95 {
+        Some((q05, q95))
     } else {
         None
     }
@@ -791,6 +780,7 @@ pub fn fit_decoy_free_model(
     lo_min_count_per_rank: usize,
     lo_mode: crate::input::LoMode,
     lo_lom_estimator: crate::input::LoLomEstimator,
+    lo_tev_cutoff: f64,
 ) -> Option<LowerOrderModel> {
     // LowerOrder null evidence must come from non-top hits only.
     // Rank 1 is the target-contaminated top-hit mixture and is never a valid
@@ -928,14 +918,7 @@ pub fn fit_decoy_free_model(
             _ => continue,
         };
 
-        // PyLord fixed cutoff on the scaled TEV axis.
-        //
-        // With TEV = 0.02 * ln(1000 / e_value), the practical PyLord cutoff is
-        // approximately 0.18. Rank-1 scores above this value are enriched for true
-        // targets and should not be used to fit the rank-1 null model.
-        const PY_LORD_FIXED_TEV_CUTOFF: f64 = 0.18;
-
-        let cutoff = PY_LORD_FIXED_TEV_CUTOFF;
+        let cutoff = lo_tev_cutoff;
 
         let filtered_ts: Vec<f64> = ts_all
             .iter()

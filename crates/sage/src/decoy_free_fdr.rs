@@ -1798,6 +1798,7 @@ fn fit_engines(
                 lo_min_count_per_rank,
                 settings.lo_mode.clone(),
                 settings.lo_lom_estimator.clone(),
+                settings.lo_tev_cutoff,
             );
         }
     }
