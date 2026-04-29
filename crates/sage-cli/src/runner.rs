@@ -280,27 +280,56 @@ impl Runner {
     /// on the resulting discriminant ordering.
     fn spectrum_fdr(&self, features: &mut [TdcFeature]) -> usize {
         // Fit the linear discriminant model used for TDC spectrum ranking.
-        let score_res = score_psms(
-            features,
-            self.parameters.precursor_tol,
-            self.decoy_free_mode,
-        );
+        //
+        // TDC scoring should fail closed to the deterministic heuristic score if
+        // LDA cannot be fit. This preserves search completion while making the
+        // fallback visible in the logs.
+        let score_res = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+            score_psms(
+                features,
+                self.parameters.precursor_tol,
+                self.decoy_free_mode,
+            )
+        }));
 
-        if score_res.is_none() {
-            log::warn!("linear model fitting failed, using heuristic score");
+        let lda_ok = match score_res {
+            Ok(Some(())) => true,
+            Ok(None) => {
+                log::warn!("linear model fitting failed, using heuristic score");
+                false
+            }
+            Err(_) => {
+                log::warn!(
+                    "linear model fitting panicked, using heuristic score; \
+                 this indicates an internal LDA edge case that should be audited"
+                );
+                false
+            }
+        };
+
+        if !lda_ok {
             features.par_iter_mut().for_each(|feat| {
-                feat.discriminant_score = (-(feat.core.spectrum_p_value.log10() as f32)).ln_1p()
-                    + feat.core.longest_y_pct / 3.0
+                let p = feat.core.spectrum_p_value as f64;
+                let p = if p.is_finite() && p > 0.0 {
+                    p.min(1.0)
+                } else {
+                    f64::MIN_POSITIVE
+                };
+
+                feat.discriminant_score =
+                    (-p.log10()).ln_1p() as f32 + feat.core.longest_y_pct / 3.0;
             });
-            features
-                .par_sort_unstable_by(|a, b| b.discriminant_score.total_cmp(&a.discriminant_score));
-            return sage_core::ml::qvalue::spectrum_q_value(features);
         }
 
-        // Compute spectrum q-values from the discriminant-score ordering.
-        features.par_sort_unstable_by(|a, b| b.discriminant_score.total_cmp(&a.discriminant_score));
+        features.par_sort_unstable_by(|a, b| {
+            b.discriminant_score
+                .total_cmp(&a.discriminant_score)
+                .then_with(|| b.core.hyperscore.total_cmp(&a.core.hyperscore))
+                .then_with(|| a.core.spectrum_p_value.total_cmp(&b.core.spectrum_p_value))
+                .then_with(|| a.core.psm_id.cmp(&b.core.psm_id))
+        });
 
-        return sage_core::ml::qvalue::spectrum_q_value(features);
+        sage_core::ml::qvalue::spectrum_q_value(features)
     }
 
     fn make_path<S: AsRef<str>>(&self, file_name: S) -> CloudPath {

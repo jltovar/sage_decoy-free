@@ -215,7 +215,14 @@ struct LinearDiscriminantAnalysis {
 
 impl LinearDiscriminantAnalysis {
     pub fn train(features: &Matrix, decoy: &[bool]) -> Option<LinearDiscriminantAnalysis> {
-        assert_eq!(features.rows, decoy.len());
+        if features.rows != decoy.len() {
+            log::warn!(
+        "linear discriminant training received mismatched feature/label lengths: features.rows={}, labels={}; using heuristic fallback",
+        features.rows,
+        decoy.len()
+    );
+            return None;
+        }
 
         let n_decoy = decoy.iter().filter(|&&label| label).count();
         let n_target = decoy.len().saturating_sub(n_decoy);
@@ -343,10 +350,14 @@ pub fn score_psms(
         .flat_map_iter(|s| {
             let perc = &s.core;
 
-            let poisson = match (-perc.spectrum_p_value.log10()).ln_1p() {
-                score if score.is_finite() => score,
-                _ => return None,
+            let p = perc.spectrum_p_value as f64;
+            let p = if p.is_finite() && p > 0.0 {
+                p.min(1.0)
+            } else {
+                f64::MIN_POSITIVE
             };
+
+            let poisson = (-p.log10()).ln_1p();
 
             let x: [f64; FEATURES] = [
                 (perc.rank as f64),
@@ -375,12 +386,32 @@ pub fn score_psms(
         .collect::<Vec<_>>();
 
     let nrows = features.len();
+
+    if nrows != decoys.len() {
+        log::warn!(
+        "linear discriminant feature/label length mismatch: features={}, labels={}; using heuristic fallback",
+        nrows,
+        decoys.len()
+    );
+        return None;
+    }
+
     let features = features
         .into_iter()
         .flat_map(|row| row.into_iter())
         .collect::<Vec<f64>>();
 
     let features = Matrix::new(features, nrows, FEATURES);
+
+    if features.rows != decoys.len() {
+        log::warn!(
+        "linear discriminant matrix/label length mismatch: matrix_rows={}, labels={}; using heuristic fallback",
+        features.rows,
+        decoys.len()
+    );
+        return None;
+    }
+
     let lda = LinearDiscriminantAnalysis::train(&features, &decoys)?;
 
     if !lda.eigenvector.iter().all(|f| f.is_finite()) {
