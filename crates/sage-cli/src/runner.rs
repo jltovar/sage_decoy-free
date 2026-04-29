@@ -1221,6 +1221,21 @@ impl Runner {
         record.push_field(fmt_f32(feature.decoy_free_peptide_q).as_bytes());
         record.push_field(fmt_f32(feature.decoy_free_protein_q).as_bytes());
 
+        // Layer-by-Layer Audit Trail
+        record.push_field(fmt_f32(feature.decoy_free_p_value_base).as_bytes());
+        record.push_field(fmt_f32(feature.decoy_free_pep_base).as_bytes());
+        record.push_field(fmt_f32(feature.decoy_free_score_base).as_bytes());
+        record.push_field(fmt_f32(feature.decoy_free_q_base).as_bytes());
+
+        record.push_field(fmt_f32(feature.decoy_free_p_value_l2).as_bytes());
+        record.push_field(fmt_f32(feature.decoy_free_pep_l2).as_bytes());
+        record.push_field(fmt_f32(feature.decoy_free_score_l2).as_bytes());
+        record.push_field(fmt_f32(feature.decoy_free_q_l2).as_bytes());
+
+        record.push_field(fmt_f32(feature.decoy_free_pep_l3).as_bytes());
+        record.push_field(fmt_f32(feature.decoy_free_score_l3).as_bytes());
+        record.push_field(fmt_f32(feature.decoy_free_q_l3).as_bytes());
+
         // Per-method diagnostics (ordered to match headers)
 
         // p_*
@@ -1306,6 +1321,18 @@ impl Runner {
             "decoy_free_q_value",
             "decoy_free_peptide_q",
             "decoy_free_protein_q",
+            // Layer-by-Layer Audit Trail
+            "decoy_free_p_value_base",
+            "decoy_free_pep_base",
+            "decoy_free_score_base",
+            "decoy_free_q_base",
+            "decoy_free_p_value_l2",
+            "decoy_free_pep_l2",
+            "decoy_free_score_l2",
+            "decoy_free_q_l2",
+            "decoy_free_pep_l3",
+            "decoy_free_score_l3",
+            "decoy_free_q_l3",
             // p_*
             "p_mom",
             "p_mle",

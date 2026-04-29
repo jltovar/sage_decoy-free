@@ -181,7 +181,6 @@ use crate::input::LoStratify;
 use crate::input::{
     BoundedAuxUpdateSpace, DartNullRtModel, DartTrueRtModel, EnsemblePepCombiner, FdrSettings,
     FdrType, JointMode, L3AnchorMode, L3RescueMode, ModelFit, PeptidePCombine, PhysicalAnchorMode,
-    PhysicalRescueMode,
 };
 use crate::lfq::{Peak, PrecursorId};
 use crate::ml::lower_order::{
@@ -4811,28 +4810,11 @@ fn activate_final_pep_stream(
 
 #[inline]
 fn detect_final_df_stream(features: &[DfFeature], settings: &FdrSettings) -> FinalDfStream {
-    use crate::input::ModelFit;
-
-    // Phase 1 / Step 1 contract:
-    // For p-value-native selected-model runs, keep the canonical exported
-    // decoy_free_* columns on the Base stream.
-    //
-    // L2/L3 stage-local fields may still be computed and logged, but they must
-    // not become the canonical final stream for these model fits.
-    match settings.model_fit {
-        ModelFit::Moments
-        | ModelFit::Mle
-        | ModelFit::LowerOrder
-        | ModelFit::Msfdr
-        | ModelFit::Msfdr1Smix
-        | ModelFit::Msfdr2Smix => {
-            return FinalDfStream::Base;
-        }
-        _ => {}
-    }
+    // We allow all models to flow into the L2/L3 PEP-native rescue paths.
+    // The original base estimates are safely preserved in the decoy_free_*_base columns.
 
     let l3_enabled = settings.reproducibility.enabled;
-    let l2_enabled = settings.physical_rescue.mode != PhysicalRescueMode::Off;
+    let l2_enabled = settings.physical_rescue.mode != crate::input::PhysicalRescueMode::Off;
 
     if l3_enabled
         && features
