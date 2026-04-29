@@ -409,7 +409,6 @@ impl Input {
                 // Numerical safeguards and minimum sample constraints.
                 min_storey_n: None,
                 min_null_size: None,
-                kde_samples: None,
 
                 // Lower-order model controls.
                 lo_mode: None,

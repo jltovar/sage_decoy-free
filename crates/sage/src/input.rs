@@ -390,7 +390,6 @@ pub struct FdrOptions {
     // Configurable Safety Brakes (global)
     pub min_storey_n: Option<usize>,
     pub min_null_size: Option<usize>,
-    pub kde_samples: Option<usize>,
 
     // Storey/π0 tuning knobs (decoy-free and general)
     pub storey_pi0_clamp_min: Option<f64>,
@@ -623,7 +622,6 @@ pub struct FdrSettings {
     // Configurable Safety Brakes
     pub min_storey_n: usize,
     pub min_null_size: usize,
-    pub kde_samples: usize,
 
     // Storey/π0 tuning knobs
     pub storey_pi0_clamp_min: f64,
@@ -808,7 +806,6 @@ impl From<FdrOptions> for FdrSettings {
 
         let min_storey_n = options.min_storey_n.unwrap_or(300);
         let min_null_size = options.min_null_size.unwrap_or(300);
-        let kde_samples = options.kde_samples.unwrap_or(50_000);
 
         let purification_factor = options.purification_factor.unwrap_or(0.50).clamp(0.0, 0.9);
         let min_rank_count = options.min_rank_count.unwrap_or(10);
@@ -1196,7 +1193,6 @@ impl From<FdrOptions> for FdrSettings {
             // Configurable Safety Brakes
             min_storey_n,
             min_null_size,
-            kde_samples,
 
             // Storey/π0 tuning knobs
             storey_pi0_clamp_min,
