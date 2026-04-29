@@ -174,17 +174,6 @@ pub enum EnsemblePepCombiner {
     LogitMean,
 }
 
-/// Mandatory PEP derivation for null-only methods (Moments/MLE/LO).
-#[derive(Clone, Serialize, Deserialize, Debug, Default, PartialEq, Eq)]
-#[serde(rename_all = "snake_case")]
-pub enum NullOnlyPepMode {
-    /// Approximate but simple: treat the method’s canonical p-value proxy as PEP.
-    PepEqualsP,
-    /// Derive an approximate PEP from q-value heuristics.
-    #[default]
-    PepFromQHeuristic,
-}
-
 /// How to aggregate pi0(lambda) values over a lambda grid.
 #[derive(Clone, Serialize, Deserialize, Debug, Default, PartialEq, Eq)]
 #[serde(rename_all = "snake_case")]
@@ -417,9 +406,6 @@ pub struct FdrOptions {
     pub storey_degen_eps: Option<f64>,
     pub storey_degen_pi0_eps: Option<f64>,
     pub storey_degen_fallback: Option<StoreyDegeneracyFallback>,
-
-    // Null-only PEP strategy (Moments/MLE/LO)
-    pub null_only_pep_mode: Option<NullOnlyPepMode>,
 
     // Ensemble combination choices (global controls; used by ModelFit::Ensemble)
     pub ensemble_pep_combiner: Option<EnsemblePepCombiner>,
@@ -662,9 +648,6 @@ pub struct FdrSettings {
     pub nokoi_l1_lambda_max: f64,
     pub nokoi_l1_lambda_steps: usize,
 
-    // Null-only PEP strategy (Moments/MLE/LO)
-    pub null_only_pep_mode: NullOnlyPepMode,
-
     // Ensemble combination choices
     pub ensemble_pep_combiner: EnsemblePepCombiner,
 
@@ -875,14 +858,7 @@ impl From<FdrOptions> for FdrSettings {
             .unwrap_or(StoreyDegeneracyFallback::Bh);
 
         // ---------------------------------------------------------------------
-        // A.3) Null-only PEP strategy
-        // ---------------------------------------------------------------------
-        let null_only_pep_mode = options
-            .null_only_pep_mode
-            .unwrap_or(NullOnlyPepMode::PepFromQHeuristic);
-
-        // ---------------------------------------------------------------------
-        // A.4) Global null window (superset pool builder)
+        // A.3) Global null window (superset pool builder)
         // ---------------------------------------------------------------------
         let (min_null_rank, max_null_rank) = {
             let a = options.min_null_rank.unwrap_or(2);
@@ -1244,9 +1220,6 @@ impl From<FdrOptions> for FdrSettings {
             nokoi_l1_lambda_min,
             nokoi_l1_lambda_max,
             nokoi_l1_lambda_steps,
-
-            // Null-only PEP strategy (Moments/MLE/LO)
-            null_only_pep_mode,
 
             // Ensemble combination choices
             ensemble_pep_combiner,
