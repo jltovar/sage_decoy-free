@@ -3791,18 +3791,87 @@ fn compute_dart_reference_rt(
     features: &[DfFeature],
     settings: &FdrSettings,
     l2_ctx: &L2PhysicalContext,
+    peptide_rts: &[f64],
 ) -> (f64, f64, bool) {
+    use crate::input::DartBootstrapMethod;
+    let dart_cfg = settings
+        .physical_rescue
+        .dart_cfg
+        .as_ref()
+        .expect("DART-Bayes config missing");
+
     let predicted_rt = f.core.predicted_rt as f64;
     let observed_rt = f.core.aligned_rt as f64;
     let delta_rt = f.core.delta_rt_model as f64;
 
-    let reference_rt = if observed_rt.is_finite() && delta_rt.is_finite() {
+    let mut reference_rt = if observed_rt.is_finite() && delta_rt.is_finite() {
         (observed_rt - delta_rt).clamp(0.0, 1.0)
     } else {
         predicted_rt
     };
 
-    let reference_rt_sigma = compute_dart_bootstrap_uncertainty(f, features, settings, l2_ctx);
+    let mut reference_rt_sigma = compute_dart_bootstrap_uncertainty(f, features, settings, l2_ctx);
+
+    if dart_cfg.dart_use_bootstrap && peptide_rts.len() > 1 && dart_cfg.dart_bootstrap_iters > 0 {
+        let iters = dart_cfg.dart_bootstrap_iters;
+        let mut prng = FastRng((f.core.spec_id.len() + f.core.file_id * 1337) as u64 + 101);
+        let mut boot_mus = Vec::with_capacity(iters);
+
+        for _ in 0..iters {
+            let mut sample = Vec::with_capacity(peptide_rts.len());
+            for _ in 0..peptide_rts.len() {
+                sample.push(peptide_rts[prng.next_usize(peptide_rts.len())]);
+            }
+
+            let mu_b = match dart_cfg.dart_bootstrap_method {
+                DartBootstrapMethod::None | DartBootstrapMethod::NonParametric => {
+                    aggregate_mu(&mut sample, &dart_cfg.dart_mu_estimation)
+                }
+                DartBootstrapMethod::Parametric | DartBootstrapMethod::ParametricMixture => {
+                    let mut weights = Vec::with_capacity(sample.len());
+                    for &rt_cand in &sample {
+                        let log_lik_true = compute_dart_true_rt_likelihood(
+                            rt_cand,
+                            predicted_rt,
+                            reference_rt_sigma,
+                            &dart_cfg.dart_true_rt_model,
+                        );
+                        let log_lik_null = compute_dart_null_rt_likelihood(
+                            rt_cand,
+                            l2_ctx.null_rt_center,
+                            l2_ctx.null_rt_spread,
+                            &dart_cfg.dart_null_rt_model,
+                        );
+
+                        let weight = if dart_cfg.dart_bootstrap_method
+                            == DartBootstrapMethod::ParametricMixture
+                        {
+                            let p_true = log_lik_true.exp();
+                            let p_null = log_lik_null.exp();
+                            p_true / (p_true + p_null + 1e-300)
+                        } else {
+                            1.0
+                        };
+                        weights.push(weight);
+                    }
+                    aggregate_weighted_mu(&mut sample, &weights, &dart_cfg.dart_mu_estimation)
+                }
+            };
+            boot_mus.push(mu_b);
+        }
+
+        reference_rt = aggregate_mu(&mut boot_mus, &dart_cfg.dart_mu_estimation).clamp(0.0, 1.0);
+
+        if boot_mus.len() > 1 {
+            let mean = boot_mus.iter().sum::<f64>() / boot_mus.len() as f64;
+            let var = boot_mus.iter().map(|v| (v - mean).powi(2)).sum::<f64>()
+                / (boot_mus.len() - 1) as f64;
+            let boot_sigma = var.sqrt().clamp(0.02, 0.30);
+            let shrink = settings.physical_rescue.cov_shrinkage;
+            reference_rt_sigma =
+                ((1.0 - shrink) * boot_sigma + shrink * reference_rt_sigma).clamp(0.02, 0.30);
+        }
+    }
 
     let reference_rt_valid = reference_rt.is_finite()
         && (0.0..=1.0).contains(&reference_rt)
@@ -3851,6 +3920,72 @@ fn compute_dart_null_rt_likelihood(
 
 fn compute_dart_posterior_pep(prior_pep: f64, log_lik_true: f64, log_lik_null: f64) -> f64 {
     crate::ml::stats::dart_posterior_pep(prior_pep, log_lik_true, log_lik_null)
+}
+
+struct FastRng(u64);
+impl FastRng {
+    fn next_f64(&mut self) -> f64 {
+        self.0 ^= self.0 << 21;
+        self.0 ^= self.0 >> 35;
+        self.0 ^= self.0 << 4;
+        (self.0 as f64) / (u64::MAX as f64)
+    }
+    fn next_usize(&mut self, max: usize) -> usize {
+        (self.next_f64() * (max as f64)) as usize
+    }
+}
+
+fn aggregate_mu(vals: &mut [f64], method: &crate::input::DartMuEstimation) -> f64 {
+    if vals.is_empty() {
+        return 0.0;
+    }
+    match method {
+        crate::input::DartMuEstimation::Mean | crate::input::DartMuEstimation::WeightedMean => {
+            vals.iter().sum::<f64>() / vals.len() as f64
+        }
+        crate::input::DartMuEstimation::Median => {
+            vals.sort_by(|a, b| a.total_cmp(b));
+            let mid = vals.len() / 2;
+            if vals.len() % 2 == 0 {
+                (vals[mid - 1] + vals[mid]) / 2.0
+            } else {
+                vals[mid]
+            }
+        }
+    }
+}
+
+fn aggregate_weighted_mu(
+    vals: &mut [f64],
+    weights: &[f64],
+    method: &crate::input::DartMuEstimation,
+) -> f64 {
+    if vals.is_empty() {
+        return 0.0;
+    }
+    let sum_w: f64 = weights.iter().sum();
+    if sum_w <= 1e-12 {
+        return aggregate_mu(vals, &crate::input::DartMuEstimation::Median);
+    }
+    match method {
+        crate::input::DartMuEstimation::Mean | crate::input::DartMuEstimation::WeightedMean => {
+            vals.iter().zip(weights).map(|(v, w)| v * w).sum::<f64>() / sum_w
+        }
+        crate::input::DartMuEstimation::Median => {
+            let mut pairs: Vec<(f64, f64)> =
+                vals.iter().copied().zip(weights.iter().copied()).collect();
+            pairs.sort_by(|a, b| a.0.total_cmp(&b.0));
+            let mut cum = 0.0;
+            let target = sum_w / 2.0;
+            for (v, w) in pairs {
+                cum += w;
+                if cum >= target {
+                    return v;
+                }
+            }
+            vals.last().copied().unwrap_or(0.0)
+        }
+    }
 }
 
 fn compute_dart_bootstrap_uncertainty(
@@ -3953,6 +4088,18 @@ fn apply_dart_bayes_update(
 
     let snapshot = features.to_vec();
 
+    let mut pep_rt_map: FnvHashMap<u32, Vec<f64>> = FnvHashMap::default();
+    if !is_unreliable && dart_cfg.dart_use_bootstrap {
+        for a in snapshot.iter() {
+            if a.core.aligned_rt.is_finite() && a.core.delta_rt_model.is_finite() {
+                pep_rt_map.entry(a.core.peptide_idx.0).or_default().push(
+                    (a.core.aligned_rt as f64 - a.core.delta_rt_model as f64).clamp(0.0, 1.0),
+                );
+            }
+        }
+    }
+    let empty_rts = Vec::new();
+
     for f in features.iter_mut() {
         if f.core.rank != 1 {
             continue;
@@ -3989,8 +4136,10 @@ fn apply_dart_bayes_update(
             null_spread,
         );
 
+        let peptide_rts = pep_rt_map.get(&f.core.peptide_idx.0).unwrap_or(&empty_rts);
+
         let (reference_rt, reference_sigma, reference_valid) =
-            compute_dart_reference_rt(f, &snapshot, settings, l2_ctx);
+            compute_dart_reference_rt(f, &snapshot, settings, l2_ctx, peptide_rts);
 
         if !rt_ok || !reference_valid {
             f.dart_posterior_used = Some(false);

@@ -268,9 +268,30 @@ pub enum L3RescueMode {
     BoundedShrinkage,
 }
 
+#[derive(Clone, Serialize, Deserialize, Debug, Default, PartialEq, Eq)]
+#[serde(rename_all = "snake_case")]
+pub enum DartBootstrapMethod {
+    None,
+    Parametric,
+    #[default]
+    ParametricMixture,
+    NonParametric,
+}
+
+#[derive(Clone, Serialize, Deserialize, Debug, Default, PartialEq, Eq)]
+#[serde(rename_all = "snake_case")]
+pub enum DartMuEstimation {
+    Mean,
+    #[default]
+    Median,
+    WeightedMean,
+}
+
 #[derive(Clone, Serialize, Deserialize, Debug, PartialEq)]
 pub struct DartBayesConfig {
     pub dart_use_bootstrap: bool,
+    pub dart_bootstrap_method: DartBootstrapMethod,
+    pub dart_mu_estimation: DartMuEstimation,
     pub dart_bootstrap_iters: usize,
     pub dart_leave_one_run_out: bool,
     pub dart_null_rt_model: DartNullRtModel,
