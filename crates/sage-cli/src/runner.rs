@@ -18,8 +18,7 @@ use sage_core::scoring::Fragments;
 use sage_core::scoring::{DfFeature, FeatureCore, Scorer, TdcFeature};
 use sage_core::spectrum::{MS1Spectra, ProcessedSpectrum, RawSpectrum, SpectrumProcessor};
 use sage_core::tmt::TmtQuant;
-use std::collections::HashMap;
-use std::collections::HashSet;
+use std::collections::{HashMap, HashSet};
 use std::time::Instant;
 
 pub struct Runner {
@@ -727,19 +726,21 @@ impl Runner {
                 log::warn!("Parquet not supported for Decoy-Free mode yet.");
             }
         } else {
-            // In TDC mode, RT and IMS models are trained on target PSMs that pass
-            // an intermediate ML-derived spectrum-q gate used only for model training.
+            // In TDC mode, keep vanilla Sage RT/IMS training behavior.
+            // Do not run the full LDA/TDC spectrum_fdr() path here. That path belongs to
+            // final TDC FDR scoring, not the preliminary RT-training q-value prepass.
             let alignments = if self.parameters.predict_rt {
-                // Match the ordering used by the vanilla ML q-value calculation.
+                // Vanilla-style preliminary q-value gate:
+                // sort by raw spectrum p-value / Poisson-like score, convert to a temporary
+                // TDC view only because qvalue::spectrum_q_value currently operates on
+                // TdcFeature, then select the admitted PSM ids for RT/IMS training.
                 outputs.features.par_sort_unstable_by(|a, b| {
-                    a.label
-                        .cmp(&b.label)
+                    a.spectrum_p_value
+                        .total_cmp(&b.spectrum_p_value)
                         .then_with(|| b.hyperscore.total_cmp(&a.hyperscore))
-                        .then_with(|| a.spectrum_p_value.total_cmp(&b.spectrum_p_value))
+                        .then_with(|| a.psm_id.cmp(&b.psm_id))
                 });
 
-                // Compute the intermediate TDC spectrum-q gate on a temporary TDC view
-                // using the full vanilla TDC scoring path (LDA fit/fallback + q-value).
                 let mut tmp_tdc: Vec<TdcFeature> = outputs
                     .features
                     .iter()
@@ -747,12 +748,11 @@ impl Runner {
                     .map(FeatureCore::to_tdc)
                     .collect();
 
-                let _ = self.spectrum_fdr(&mut tmp_tdc);
+                sage_core::ml::qvalue::spectrum_q_value(&mut tmp_tdc);
 
-                // Select PSM ids admitted to RT/IMS model training.
                 let selected_psm_ids: HashSet<usize> = tmp_tdc
                     .iter()
-                    .filter(|f| f.spectrum_q <= 0.01)
+                    .filter(|f| f.core.label == 1 && f.spectrum_q <= 0.01)
                     .map(|f| f.core.psm_id)
                     .collect();
 
@@ -782,14 +782,15 @@ impl Runner {
                 None
             };
 
-            // Convert generic PSM features to the TDC feature representation.
+            // Convert generic PSM features to the TDC feature representation after
+            // RT/IMS prediction has been applied to FeatureCore.
             let mut features: Vec<TdcFeature> = outputs
                 .features
                 .into_par_iter()
-                .map(|f| f.to_tdc())
+                .map(FeatureCore::to_tdc)
                 .collect();
 
-            // Compute TDC spectrum-level q-values.
+            // Compute final TDC spectrum-level q-values using the vanilla LDA/fallback path.
             let q_spectrum = self.spectrum_fdr(&mut features);
 
             // Picked Peptide/Protein

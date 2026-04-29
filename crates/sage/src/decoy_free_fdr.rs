@@ -4963,7 +4963,11 @@ pub fn run_df_layers(
     } else {
         matches!(settings.model_fit, ModelFit::Msfdr2Smix)
     };
-    let run_nokoi = use_ensemble || matches!(settings.model_fit, ModelFit::Nokoi);
+    let run_nokoi = if use_ensemble {
+        settings.enable_nokoi
+    } else {
+        matches!(settings.model_fit, ModelFit::Nokoi)
+    };
 
     let gates = RunGates {
         run_mom,

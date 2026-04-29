@@ -531,6 +531,7 @@ pub struct FdrOptions {
     pub enable_msfdr_seeded: Option<bool>, // default true
     pub enable_msfdr_1smix: Option<bool>,  // default true
     pub enable_msfdr_2smix: Option<bool>,  // default true
+    pub enable_nokoi: Option<bool>,        // default true
 
     // =========================================================================
     // H) Nokoi specific knobs
@@ -702,6 +703,7 @@ pub struct FdrSettings {
     pub enable_msfdr_seeded: bool, // default true
     pub enable_msfdr_1smix: bool,  // default true
     pub enable_msfdr_2smix: bool,  // default true
+    pub enable_nokoi: bool,        // default true
 
     // Mixture knobs (MSFDR 1smix / 2smix)
     pub mix_em_max_iter: usize,
@@ -1084,6 +1086,8 @@ impl From<FdrOptions> for FdrSettings {
         // ---------------------------------------------------------------------
         // H) Nokoi specific resolved null window + knobs
         // ---------------------------------------------------------------------
+        let enable_nokoi = options.enable_nokoi.unwrap_or(true);
+
         let (nokoi_min_null_rank, nokoi_max_null_rank) = resolve_window(
             options.nokoi_min_null_rank,
             options.nokoi_max_null_rank,
@@ -1282,6 +1286,7 @@ impl From<FdrOptions> for FdrSettings {
             enable_msfdr_seeded,
             enable_msfdr_1smix,
             enable_msfdr_2smix,
+            enable_nokoi,
 
             // Mixture knobs (MSFDR 1smix / 2smix)
             mix_em_max_iter,
