@@ -4546,7 +4546,9 @@ fn apply_peptide_reproducibility_update_to_active_stream(
 ) -> ReproducibilityResult {
     let res = apply_bounded_repro_shift(features, settings, db);
 
-    if !res.fail_closed {
+    // A reproducibility stage with zero rescued PSMs is a no-op.
+    // Do not promote a stage-local L3 stream just because the stage was enabled.
+    if !res.fail_closed && res.n_rescued_psms > 0 {
         promote_l3_to_active_stream(features);
     }
 
@@ -4563,7 +4565,9 @@ fn apply_protein_reproducibility_update_to_active_stream(
     // made mathematically independent after this build is clean.
     let res = apply_bounded_repro_shift(features, settings, db);
 
-    if !res.fail_closed {
+    // A reproducibility stage with zero rescued PSMs is a no-op.
+    // Do not promote a stage-local L3 stream just because the stage was enabled.
+    if !res.fail_closed && res.n_rescued_psms > 0 {
         promote_l3_to_active_stream(features);
     }
 
@@ -4584,7 +4588,7 @@ fn apply_peptide_reproducibility_rescue(
 
     let res = apply_peptide_reproducibility_update_to_active_stream(features, settings, db);
 
-    if !res.fail_closed {
+    if !res.fail_closed && res.n_rescued_psms > 0 {
         finalize_stage_snapshot(features, settings, DfAdjustmentStage::PeptideRescue);
     }
 
@@ -4605,7 +4609,7 @@ fn apply_protein_reproducibility_rescue(
 
     let res = apply_protein_reproducibility_update_to_active_stream(features, settings, db);
 
-    if !res.fail_closed {
+    if !res.fail_closed && res.n_rescued_psms > 0 {
         finalize_stage_snapshot(features, settings, DfAdjustmentStage::ProteinRescue);
     }
 
@@ -5878,19 +5882,27 @@ where
 #[inline]
 fn detect_final_df_stream(features: &[DfFeature], settings: &FdrSettings) -> FinalDfStream {
     if settings.enable_protein_reproducibility_rescue
-        && any_rank1_has(features, |f| f.decoy_free_pep_protein_rescue.is_some())
+        && any_rank1_has(features, |f| {
+            f.decoy_free_pep_protein_rescue.is_some() && f.decoy_free_q_protein_rescue.is_some()
+        })
     {
         FinalDfStream::ProteinRescue
     } else if settings.enable_peptide_reproducibility_rescue
-        && any_rank1_has(features, |f| f.decoy_free_pep_peptide_rescue.is_some())
+        && any_rank1_has(features, |f| {
+            f.decoy_free_pep_peptide_rescue.is_some() && f.decoy_free_q_peptide_rescue.is_some()
+        })
     {
         FinalDfStream::PeptideRescue
     } else if settings.enable_ims_confidence_adjustment
-        && any_rank1_has(features, |f| f.decoy_free_pep_ims.is_some())
+        && any_rank1_has(features, |f| {
+            f.decoy_free_pep_ims.is_some() && f.decoy_free_q_ims.is_some()
+        })
     {
         FinalDfStream::Ims
     } else if settings.enable_rt_confidence_adjustment
-        && any_rank1_has(features, |f| f.decoy_free_pep_rt.is_some())
+        && any_rank1_has(features, |f| {
+            f.decoy_free_pep_rt.is_some() && f.decoy_free_q_rt.is_some()
+        })
     {
         FinalDfStream::Rt
     } else {
@@ -6053,7 +6065,8 @@ fn recalculate_active_pep_q_values(features: &mut [DfFeature]) {
         };
 
         let score_key = f.decoy_free_score.unwrap_or_else(|| df_score_from_pep(pep)) as f64;
-        rows.push((-score_key, i, pep));
+
+        rows.push((score_key, i, pep));
     }
 
     for (feat_idx, q) in q_from_pep_cummean(rows) {
