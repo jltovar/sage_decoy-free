@@ -310,14 +310,13 @@ pub struct BoundedAuxConfig {
 
 #[derive(Clone, Serialize, Deserialize, Debug, PartialEq)]
 pub struct PhysicalRescueConfig {
-    pub mode: PhysicalRescueMode,
+    pub rt_mode: PhysicalRescueMode,
+    pub ims_mode: PhysicalRescueMode,
     pub anchor_mode: PhysicalAnchorMode,
     pub anchor_max_pep: f64,
     pub anchor_max_q: f64,
     pub min_anchor_count_per_run: usize,
     pub min_anchor_count_per_charge: usize,
-    pub rt_enabled: bool,
-    pub ims_enabled: bool,
     pub joint_mode: JointMode,
     pub reliability_floor: f64,
     pub missing_penalty: f64,
@@ -388,6 +387,14 @@ pub struct FdrOptions {
     pub mode: Option<FdrMode>,
     pub physical_rescue: Option<PhysicalRescueConfig>,
     pub reproducibility: Option<ReproducibilityConfig>,
+
+    // Explicit post-base Decoy-Free stage gates.
+    // These control whether stage-specific TSV snapshots are produced and whether
+    // the stage is allowed to replace the active decoy_free_* stream.
+    pub enable_rt_confidence_adjustment: Option<bool>,
+    pub enable_ims_confidence_adjustment: Option<bool>,
+    pub enable_peptide_reproducibility_rescue: Option<bool>,
+    pub enable_protein_reproducibility_rescue: Option<bool>,
     pub peptide_fdr: Option<f32>,
     pub protein_fdr: Option<f32>,
     pub precursor_fdr: Option<f32>,
@@ -562,6 +569,13 @@ pub struct FdrSettings {
     pub mode: FdrMode,
     pub physical_rescue: PhysicalRescueConfig,
     pub reproducibility: ReproducibilityConfig,
+
+    // Explicit post-base Decoy-Free stage gates.
+    pub enable_rt_confidence_adjustment: bool,
+    pub enable_ims_confidence_adjustment: bool,
+    pub enable_peptide_reproducibility_rescue: bool,
+    pub enable_protein_reproducibility_rescue: bool,
+
     pub peptide_fdr: f32,
     pub protein_fdr: f32,
     pub precursor_fdr: f32,
@@ -755,14 +769,13 @@ impl From<FdrOptions> for FdrSettings {
         let physical_rescue = options
             .physical_rescue
             .unwrap_or_else(|| PhysicalRescueConfig {
-                mode: PhysicalRescueMode::Off,
+                rt_mode: PhysicalRescueMode::Off,
+                ims_mode: PhysicalRescueMode::Off,
                 anchor_mode: PhysicalAnchorMode::Default,
                 anchor_max_pep: 0.1,
                 anchor_max_q: 0.01,
                 min_anchor_count_per_run: 10,
                 min_anchor_count_per_charge: 5,
-                rt_enabled: false,
-                ims_enabled: false,
                 joint_mode: JointMode::Independent,
                 reliability_floor: 0.5,
                 missing_penalty: 0.0,
@@ -812,6 +825,29 @@ impl From<FdrOptions> for FdrSettings {
                     rescue_mode: L3RescueMode::BoundedShrinkage,
                 },
             });
+
+        // New explicit post-base stage gates.
+        //
+        // Backward-compatible behavior:
+        // - RT defaults to disabled unless enable_rt_confidence_adjustment is true.
+        // - IMS defaults to disabled unless enable_ims_confidence_adjustment is true.
+        // - Peptide/protein reproducibility default to reproducibility.enabled.
+        //
+        // This lets old JSONs continue to work, while allowing the new independent
+        // switches to be used directly.
+        let enable_rt_confidence_adjustment =
+            options.enable_rt_confidence_adjustment.unwrap_or(false);
+
+        let enable_ims_confidence_adjustment =
+            options.enable_ims_confidence_adjustment.unwrap_or(false);
+
+        let enable_peptide_reproducibility_rescue = options
+            .enable_peptide_reproducibility_rescue
+            .unwrap_or(reproducibility.enabled);
+
+        let enable_protein_reproducibility_rescue = options
+            .enable_protein_reproducibility_rescue
+            .unwrap_or(reproducibility.enabled);
 
         let precursor_fdr = options.precursor_fdr.unwrap_or(0.01);
         let peptide_fdr = options.peptide_fdr.unwrap_or(0.01);
@@ -1141,6 +1177,12 @@ impl From<FdrOptions> for FdrSettings {
             mode,
             physical_rescue,
             reproducibility,
+
+            enable_rt_confidence_adjustment,
+            enable_ims_confidence_adjustment,
+            enable_peptide_reproducibility_rescue,
+            enable_protein_reproducibility_rescue,
+
             peptide_fdr,
             protein_fdr,
             precursor_fdr,

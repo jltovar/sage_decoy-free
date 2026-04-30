@@ -8,7 +8,7 @@ use rayon::prelude::*;
 use sage_cloudpath::{CloudPath, FileFormat};
 use sage_core::database::{IndexedDatabase, Parameters, PeptideIx};
 use sage_core::fasta::Fasta;
-use sage_core::input::FdrMode;
+use sage_core::input::{FdrMode, ModelFit};
 use sage_core::ion_series::Kind;
 use sage_core::lfq::{Peak, PrecursorId};
 use sage_core::mass::Tolerance;
@@ -79,6 +79,16 @@ impl FromIterator<RawSpectrum> for RawSpectrumAccumulator {
             RawSpectrumAccumulator::fold_op,
         )
     }
+}
+
+#[derive(Clone, Debug)]
+enum DfDynamicColumn {
+    Final(&'static str),
+    BaseModel(&'static str),
+    RtModel(&'static str),
+    ImsModel(&'static str),
+    PeptideRescueModel(&'static str),
+    ProteinRescueModel(&'static str),
 }
 
 impl Runner {
@@ -1019,7 +1029,7 @@ impl Runner {
         record.push_field(ryu::Buffer::new().format(core.aligned_rt).as_bytes());
         record.push_field(ryu::Buffer::new().format(core.predicted_rt).as_bytes());
         record.push_field(ryu::Buffer::new().format(core.delta_rt_model).as_bytes());
-        let ims_active = self.parameters.fdr.physical_rescue.ims_enabled
+        let ims_active = self.parameters.fdr.enable_ims_confidence_adjustment
             && core.ims.is_finite()
             && core.predicted_ims.is_finite()
             && core.delta_ims_model.is_finite()
@@ -1148,12 +1158,363 @@ impl Runner {
         Ok(cp.to_string())
     }
 
-    // --- DF WRITERS (Decoy-Free) ---
+    fn active_df_model_suffixes(&self) -> Vec<&'static str> {
+        let fdr = &self.parameters.fdr;
 
-    pub fn serialize_df_feature(
+        match fdr.model_fit {
+            ModelFit::Moments => vec!["mom"],
+            ModelFit::Mle => vec!["mle"],
+            ModelFit::LowerOrder => vec!["lo"],
+            ModelFit::Msfdr => vec!["msfdr"],
+            ModelFit::Msfdr1Smix => vec!["1smix"],
+            ModelFit::Msfdr2Smix => vec!["2smix"],
+            ModelFit::Nokoi => vec!["nokoi"],
+
+            ModelFit::Ensemble => {
+                let mut v = Vec::new();
+
+                if fdr.enable_moments {
+                    v.push("mom");
+                }
+                if fdr.enable_mle {
+                    v.push("mle");
+                }
+                if fdr.enable_lower_order {
+                    v.push("lo");
+                }
+                if fdr.enable_msfdr_seeded {
+                    v.push("msfdr");
+                }
+                if fdr.enable_msfdr_1smix {
+                    v.push("1smix");
+                }
+                if fdr.enable_msfdr_2smix {
+                    v.push("2smix");
+                }
+                if fdr.enable_nokoi {
+                    v.push("nokoi");
+                }
+
+                // Ensemble is itself the active model fit.
+                v.push("ensemble");
+
+                v
+            }
+        }
+    }
+
+    fn df_dynamic_columns(&self) -> Vec<DfDynamicColumn> {
+        let fdr = &self.parameters.fdr;
+        let mut cols = Vec::new();
+
+        cols.extend([
+            DfDynamicColumn::Final("decoy_free_p_value"),
+            DfDynamicColumn::Final("decoy_free_pep"),
+            DfDynamicColumn::Final("decoy_free_score"),
+            DfDynamicColumn::Final("decoy_free_q_value"),
+            DfDynamicColumn::Final("decoy_free_peptide_q"),
+            DfDynamicColumn::Final("decoy_free_protein_q"),
+        ]);
+
+        for suffix in self.active_df_model_suffixes() {
+            cols.push(DfDynamicColumn::BaseModel(suffix));
+
+            if fdr.enable_rt_confidence_adjustment {
+                cols.push(DfDynamicColumn::RtModel(suffix));
+            }
+
+            if fdr.enable_ims_confidence_adjustment {
+                cols.push(DfDynamicColumn::ImsModel(suffix));
+            }
+
+            if fdr.enable_peptide_reproducibility_rescue {
+                cols.push(DfDynamicColumn::PeptideRescueModel(suffix));
+            }
+
+            if fdr.enable_protein_reproducibility_rescue {
+                cols.push(DfDynamicColumn::ProteinRescueModel(suffix));
+            }
+        }
+
+        cols
+    }
+
+    fn push_df_dynamic_headers(headers: &mut Vec<String>, cols: &[DfDynamicColumn]) {
+        for col in cols {
+            match col {
+                DfDynamicColumn::Final(name) => {
+                    headers.push((*name).to_string());
+                }
+
+                DfDynamicColumn::BaseModel(suffix) => {
+                    headers.push(format!("p_{suffix}"));
+                    headers.push(format!("q_{suffix}"));
+                    headers.push(format!("pep_{suffix}"));
+                }
+
+                DfDynamicColumn::RtModel(suffix) => {
+                    headers.push(format!("rt_adjust_p_{suffix}"));
+                    headers.push(format!("rt_adjust_q_{suffix}"));
+                    headers.push(format!("rt_adjust_pep_{suffix}"));
+                }
+
+                DfDynamicColumn::ImsModel(suffix) => {
+                    headers.push(format!("ims_adjust_p_{suffix}"));
+                    headers.push(format!("ims_adjust_q_{suffix}"));
+                    headers.push(format!("ims_adjust_pep_{suffix}"));
+                }
+
+                DfDynamicColumn::PeptideRescueModel(suffix) => {
+                    headers.push(format!("peptide_rescue_p_{suffix}"));
+                    headers.push(format!("peptide_rescue_q_{suffix}"));
+                    headers.push(format!("peptide_rescue_pep_{suffix}"));
+                }
+
+                DfDynamicColumn::ProteinRescueModel(suffix) => {
+                    headers.push(format!("protein_rescue_p_{suffix}"));
+                    headers.push(format!("protein_rescue_q_{suffix}"));
+                    headers.push(format!("protein_rescue_pep_{suffix}"));
+                }
+            }
+        }
+    }
+
+    fn df_base_model_values(
+        feature: &DfFeature,
+        suffix: &str,
+    ) -> (Option<f32>, Option<f32>, Option<f32>) {
+        match suffix {
+            "mom" => (feature.p_mom, feature.q_mom, feature.pep_mom),
+            "mle" => (feature.p_mle, feature.q_mle, feature.pep_mle),
+            "lo" => (feature.p_lo, feature.q_lo, feature.pep_lo),
+            "msfdr" => (feature.p_msfdr, feature.q_msfdr, feature.pep_msfdr),
+            "1smix" => (feature.p_1smix, feature.q_1smix, feature.pep_1smix),
+            "2smix" => (feature.p_2smix, feature.q_2smix, feature.pep_2smix),
+            "nokoi" => (feature.p_nokoi, feature.q_nokoi, feature.pep_nokoi),
+            "ensemble" => (feature.p_ensemble, feature.q_ensemble, feature.pep_ensemble),
+            _ => (None, None, None),
+        }
+    }
+
+    fn df_rt_model_values(
+        feature: &DfFeature,
+        suffix: &str,
+    ) -> (Option<f32>, Option<f32>, Option<f32>) {
+        match suffix {
+            "mom" => (
+                feature.rt_adjust_p_mom,
+                feature.rt_adjust_q_mom,
+                feature.rt_adjust_pep_mom,
+            ),
+            "mle" => (
+                feature.rt_adjust_p_mle,
+                feature.rt_adjust_q_mle,
+                feature.rt_adjust_pep_mle,
+            ),
+            "lo" => (
+                feature.rt_adjust_p_lo,
+                feature.rt_adjust_q_lo,
+                feature.rt_adjust_pep_lo,
+            ),
+            "msfdr" => (
+                feature.rt_adjust_p_msfdr,
+                feature.rt_adjust_q_msfdr,
+                feature.rt_adjust_pep_msfdr,
+            ),
+            "1smix" => (
+                feature.rt_adjust_p_1smix,
+                feature.rt_adjust_q_1smix,
+                feature.rt_adjust_pep_1smix,
+            ),
+            "2smix" => (
+                feature.rt_adjust_p_2smix,
+                feature.rt_adjust_q_2smix,
+                feature.rt_adjust_pep_2smix,
+            ),
+            "nokoi" => (
+                feature.rt_adjust_p_nokoi,
+                feature.rt_adjust_q_nokoi,
+                feature.rt_adjust_pep_nokoi,
+            ),
+            "ensemble" => (
+                feature.rt_adjust_p_ensemble,
+                feature.rt_adjust_q_ensemble,
+                feature.rt_adjust_pep_ensemble,
+            ),
+            _ => (None, None, None),
+        }
+    }
+
+    fn df_ims_model_values(
+        feature: &DfFeature,
+        suffix: &str,
+    ) -> (Option<f32>, Option<f32>, Option<f32>) {
+        match suffix {
+            "mom" => (
+                feature.ims_adjust_p_mom,
+                feature.ims_adjust_q_mom,
+                feature.ims_adjust_pep_mom,
+            ),
+            "mle" => (
+                feature.ims_adjust_p_mle,
+                feature.ims_adjust_q_mle,
+                feature.ims_adjust_pep_mle,
+            ),
+            "lo" => (
+                feature.ims_adjust_p_lo,
+                feature.ims_adjust_q_lo,
+                feature.ims_adjust_pep_lo,
+            ),
+            "msfdr" => (
+                feature.ims_adjust_p_msfdr,
+                feature.ims_adjust_q_msfdr,
+                feature.ims_adjust_pep_msfdr,
+            ),
+            "1smix" => (
+                feature.ims_adjust_p_1smix,
+                feature.ims_adjust_q_1smix,
+                feature.ims_adjust_pep_1smix,
+            ),
+            "2smix" => (
+                feature.ims_adjust_p_2smix,
+                feature.ims_adjust_q_2smix,
+                feature.ims_adjust_pep_2smix,
+            ),
+            "nokoi" => (
+                feature.ims_adjust_p_nokoi,
+                feature.ims_adjust_q_nokoi,
+                feature.ims_adjust_pep_nokoi,
+            ),
+            "ensemble" => (
+                feature.ims_adjust_p_ensemble,
+                feature.ims_adjust_q_ensemble,
+                feature.ims_adjust_pep_ensemble,
+            ),
+            _ => (None, None, None),
+        }
+    }
+
+    fn df_peptide_rescue_model_values(
+        feature: &DfFeature,
+        suffix: &str,
+    ) -> (Option<f32>, Option<f32>, Option<f32>) {
+        match suffix {
+            "mom" => (
+                feature.peptide_rescue_p_mom,
+                feature.peptide_rescue_q_mom,
+                feature.peptide_rescue_pep_mom,
+            ),
+            "mle" => (
+                feature.peptide_rescue_p_mle,
+                feature.peptide_rescue_q_mle,
+                feature.peptide_rescue_pep_mle,
+            ),
+            "lo" => (
+                feature.peptide_rescue_p_lo,
+                feature.peptide_rescue_q_lo,
+                feature.peptide_rescue_pep_lo,
+            ),
+            "msfdr" => (
+                feature.peptide_rescue_p_msfdr,
+                feature.peptide_rescue_q_msfdr,
+                feature.peptide_rescue_pep_msfdr,
+            ),
+            "1smix" => (
+                feature.peptide_rescue_p_1smix,
+                feature.peptide_rescue_q_1smix,
+                feature.peptide_rescue_pep_1smix,
+            ),
+            "2smix" => (
+                feature.peptide_rescue_p_2smix,
+                feature.peptide_rescue_q_2smix,
+                feature.peptide_rescue_pep_2smix,
+            ),
+            "nokoi" => (
+                feature.peptide_rescue_p_nokoi,
+                feature.peptide_rescue_q_nokoi,
+                feature.peptide_rescue_pep_nokoi,
+            ),
+            "ensemble" => (
+                feature.peptide_rescue_p_ensemble,
+                feature.peptide_rescue_q_ensemble,
+                feature.peptide_rescue_pep_ensemble,
+            ),
+            _ => (None, None, None),
+        }
+    }
+
+    fn df_protein_rescue_model_values(
+        feature: &DfFeature,
+        suffix: &str,
+    ) -> (Option<f32>, Option<f32>, Option<f32>) {
+        match suffix {
+            "mom" => (
+                feature.protein_rescue_p_mom,
+                feature.protein_rescue_q_mom,
+                feature.protein_rescue_pep_mom,
+            ),
+            "mle" => (
+                feature.protein_rescue_p_mle,
+                feature.protein_rescue_q_mle,
+                feature.protein_rescue_pep_mle,
+            ),
+            "lo" => (
+                feature.protein_rescue_p_lo,
+                feature.protein_rescue_q_lo,
+                feature.protein_rescue_pep_lo,
+            ),
+            "msfdr" => (
+                feature.protein_rescue_p_msfdr,
+                feature.protein_rescue_q_msfdr,
+                feature.protein_rescue_pep_msfdr,
+            ),
+            "1smix" => (
+                feature.protein_rescue_p_1smix,
+                feature.protein_rescue_q_1smix,
+                feature.protein_rescue_pep_1smix,
+            ),
+            "2smix" => (
+                feature.protein_rescue_p_2smix,
+                feature.protein_rescue_q_2smix,
+                feature.protein_rescue_pep_2smix,
+            ),
+            "nokoi" => (
+                feature.protein_rescue_p_nokoi,
+                feature.protein_rescue_q_nokoi,
+                feature.protein_rescue_pep_nokoi,
+            ),
+            "ensemble" => (
+                feature.protein_rescue_p_ensemble,
+                feature.protein_rescue_q_ensemble,
+                feature.protein_rescue_pep_ensemble,
+            ),
+            _ => (None, None, None),
+        }
+    }
+
+    fn push_opt_f32(record: &mut csv::ByteRecord, val: Option<f32>) {
+        record.push_field(
+            val.map(|v| v.to_string())
+                .unwrap_or_else(|| "NaN".to_string())
+                .as_bytes(),
+        );
+    }
+
+    fn push_df_triplet(
+        record: &mut csv::ByteRecord,
+        vals: (Option<f32>, Option<f32>, Option<f32>),
+    ) {
+        Self::push_opt_f32(record, vals.0);
+        Self::push_opt_f32(record, vals.1);
+        Self::push_opt_f32(record, vals.2);
+    }
+
+    // --- DF WRITERS (Decoy-Free) ---
+    fn serialize_df_feature(
         &self,
         feature: &DfFeature,
         filenames: &[String],
+        df_cols: &[DfDynamicColumn],
     ) -> csv::ByteRecord {
         let mut record = csv::ByteRecord::new();
         let core = &feature.core;
@@ -1196,7 +1557,7 @@ impl Runner {
         record.push_field(ryu::Buffer::new().format(core.aligned_rt).as_bytes());
         record.push_field(ryu::Buffer::new().format(core.predicted_rt).as_bytes());
         record.push_field(ryu::Buffer::new().format(core.delta_rt_model).as_bytes());
-        let ims_active = self.parameters.fdr.physical_rescue.ims_enabled
+        let ims_active = self.parameters.fdr.enable_ims_confidence_adjustment
             && core.ims.is_finite()
             && core.predicted_ims.is_finite()
             && core.delta_ims_model.is_finite()
@@ -1239,61 +1600,53 @@ impl Runner {
         record.push_field(ryu::Buffer::new().format(core.ms2_intensity).as_bytes());
 
         // Decoy-Free output columns.
-        let fmt_f32 = |val: Option<f32>| {
-            val.map(|v| v.to_string())
-                .unwrap_or_else(|| "NaN".to_string())
-        };
+        for col in df_cols {
+            match col {
+                DfDynamicColumn::Final(name) => match *name {
+                    "decoy_free_p_value" => {
+                        Self::push_opt_f32(&mut record, feature.decoy_free_p_value)
+                    }
+                    "decoy_free_pep" => Self::push_opt_f32(&mut record, feature.decoy_free_pep),
+                    "decoy_free_score" => Self::push_opt_f32(&mut record, feature.decoy_free_score),
+                    "decoy_free_q_value" => {
+                        Self::push_opt_f32(&mut record, feature.decoy_free_q_value)
+                    }
+                    "decoy_free_peptide_q" => {
+                        Self::push_opt_f32(&mut record, feature.decoy_free_peptide_q)
+                    }
+                    "decoy_free_protein_q" => {
+                        Self::push_opt_f32(&mut record, feature.decoy_free_protein_q)
+                    }
+                    _ => Self::push_opt_f32(&mut record, None),
+                },
 
-        record.push_field(fmt_f32(feature.decoy_free_p_value).as_bytes());
-        record.push_field(fmt_f32(feature.decoy_free_pep).as_bytes());
-        record.push_field(fmt_f32(feature.decoy_free_score).as_bytes());
-        record.push_field(fmt_f32(feature.decoy_free_q_value).as_bytes());
-        record.push_field(fmt_f32(feature.decoy_free_peptide_q).as_bytes());
-        record.push_field(fmt_f32(feature.decoy_free_protein_q).as_bytes());
+                DfDynamicColumn::BaseModel(suffix) => {
+                    Self::push_df_triplet(&mut record, Self::df_base_model_values(feature, suffix));
+                }
 
-        // Layer-by-Layer Audit Trail
-        record.push_field(fmt_f32(feature.decoy_free_p_value_base).as_bytes());
-        record.push_field(fmt_f32(feature.decoy_free_pep_base).as_bytes());
-        record.push_field(fmt_f32(feature.decoy_free_score_base).as_bytes());
-        record.push_field(fmt_f32(feature.decoy_free_q_base).as_bytes());
+                DfDynamicColumn::RtModel(suffix) => {
+                    Self::push_df_triplet(&mut record, Self::df_rt_model_values(feature, suffix));
+                }
 
-        record.push_field(fmt_f32(feature.decoy_free_p_value_l2).as_bytes());
-        record.push_field(fmt_f32(feature.decoy_free_pep_l2).as_bytes());
-        record.push_field(fmt_f32(feature.decoy_free_score_l2).as_bytes());
-        record.push_field(fmt_f32(feature.decoy_free_q_l2).as_bytes());
+                DfDynamicColumn::ImsModel(suffix) => {
+                    Self::push_df_triplet(&mut record, Self::df_ims_model_values(feature, suffix));
+                }
 
-        record.push_field(fmt_f32(feature.decoy_free_pep_l3).as_bytes());
-        record.push_field(fmt_f32(feature.decoy_free_score_l3).as_bytes());
-        record.push_field(fmt_f32(feature.decoy_free_q_l3).as_bytes());
+                DfDynamicColumn::PeptideRescueModel(suffix) => {
+                    Self::push_df_triplet(
+                        &mut record,
+                        Self::df_peptide_rescue_model_values(feature, suffix),
+                    );
+                }
 
-        // Per-method diagnostics (ordered to match headers)
-
-        // p_*
-        record.push_field(fmt_f32(feature.p_mom).as_bytes());
-        record.push_field(fmt_f32(feature.p_mle).as_bytes());
-        record.push_field(fmt_f32(feature.p_lo).as_bytes());
-        record.push_field(fmt_f32(feature.p_msfdr).as_bytes());
-        record.push_field(fmt_f32(feature.p_1smix).as_bytes());
-        record.push_field(fmt_f32(feature.p_2smix).as_bytes());
-        record.push_field(fmt_f32(feature.p_nokoi).as_bytes());
-
-        // q_*
-        record.push_field(fmt_f32(feature.q_mom).as_bytes());
-        record.push_field(fmt_f32(feature.q_mle).as_bytes());
-        record.push_field(fmt_f32(feature.q_lo).as_bytes());
-        record.push_field(fmt_f32(feature.q_msfdr).as_bytes());
-        record.push_field(fmt_f32(feature.q_1smix).as_bytes());
-        record.push_field(fmt_f32(feature.q_2smix).as_bytes());
-        record.push_field(fmt_f32(feature.q_nokoi).as_bytes());
-
-        // pep_*
-        record.push_field(fmt_f32(feature.pep_mom).as_bytes());
-        record.push_field(fmt_f32(feature.pep_mle).as_bytes());
-        record.push_field(fmt_f32(feature.pep_lo).as_bytes());
-        record.push_field(fmt_f32(feature.pep_msfdr).as_bytes());
-        record.push_field(fmt_f32(feature.pep_1smix).as_bytes());
-        record.push_field(fmt_f32(feature.pep_2smix).as_bytes());
-        record.push_field(fmt_f32(feature.pep_nokoi).as_bytes());
+                DfDynamicColumn::ProteinRescueModel(suffix) => {
+                    Self::push_df_triplet(
+                        &mut record,
+                        Self::df_protein_rescue_model_values(feature, suffix),
+                    );
+                }
+            }
+        }
 
         record
     }
@@ -1308,7 +1661,7 @@ impl Runner {
             .delimiter(b'\t')
             .from_writer(vec![]);
 
-        let headers = vec![
+        let mut headers: Vec<String> = vec![
             "psm_id",
             "peptide",
             "proteins",
@@ -1344,56 +1697,21 @@ impl Runner {
             "scored_candidates",
             "poisson",
             "ms2_intensity",
-            // DF Columns
-            "decoy_free_p_value",
-            "decoy_free_pep",
-            "decoy_free_score",
-            "decoy_free_q_value",
-            "decoy_free_peptide_q",
-            "decoy_free_protein_q",
-            // Layer-by-Layer Audit Trail
-            "decoy_free_p_value_base",
-            "decoy_free_pep_base",
-            "decoy_free_score_base",
-            "decoy_free_q_base",
-            "decoy_free_p_value_l2",
-            "decoy_free_pep_l2",
-            "decoy_free_score_l2",
-            "decoy_free_q_l2",
-            "decoy_free_pep_l3",
-            "decoy_free_score_l3",
-            "decoy_free_q_l3",
-            // p_*
-            "p_mom",
-            "p_mle",
-            "p_lo",
-            "p_msfdr",
-            "p_1smix",
-            "p_2smix",
-            "p_nokoi",
-            // q_*
-            "q_mom",
-            "q_mle",
-            "q_lo",
-            "q_msfdr",
-            "q_1smix",
-            "q_2smix",
-            "q_nokoi",
-            // pep_*
-            "pep_mom",
-            "pep_mle",
-            "pep_lo",
-            "pep_msfdr",
-            "pep_1smix",
-            "pep_2smix",
-            "pep_nokoi",
-        ];
+        ]
+        .into_iter()
+        .map(String::from)
+        .collect();
 
-        wtr.write_byte_record(&csv::ByteRecord::from(headers))?;
+        let df_cols = self.df_dynamic_columns();
+        Self::push_df_dynamic_headers(&mut headers, &df_cols);
+
+        wtr.write_byte_record(&csv::ByteRecord::from(
+            headers.iter().map(|s| s.as_str()).collect::<Vec<_>>(),
+        ))?;
 
         let records: Vec<csv::ByteRecord> = features
             .par_iter()
-            .map(|feat| self.serialize_df_feature(feat, filenames))
+            .map(|feat| self.serialize_df_feature(feat, filenames, &df_cols))
             .collect();
 
         for record in records {
@@ -1658,7 +1976,7 @@ impl Runner {
                 .format(core.delta_rt_model.clamp(0.001, 1.0).sqrt())
                 .as_bytes(),
         );
-        let ims_active = self.parameters.fdr.physical_rescue.ims_enabled
+        let ims_active = self.parameters.fdr.enable_ims_confidence_adjustment
             && core.ims.is_finite()
             && core.predicted_ims.is_finite()
             && core.delta_ims_model.is_finite()

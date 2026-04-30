@@ -2012,8 +2012,9 @@ struct BaseDiscoveryResult {
     pub pep_nokoi_vec: Vec<f64>,
 }
 
-#[derive(Clone, Debug)]
+#[derive(Clone, Debug, Default)]
 struct PhysicalRescueResult {
+    pub enabled: bool,
     pub fail_closed: bool,
 
     pub anchor_count_total: usize,
@@ -2611,6 +2612,47 @@ fn scrub_non_rank1_df_outputs(features: &mut [DfFeature]) {
             psm.q_1smix = None;
             psm.q_2smix = None;
             psm.q_nokoi = None;
+
+            psm.decoy_free_p_value_rt = None;
+            psm.decoy_free_pep_rt = None;
+            psm.decoy_free_score_rt = None;
+            psm.decoy_free_q_rt = None;
+
+            psm.decoy_free_p_value_ims = None;
+            psm.decoy_free_pep_ims = None;
+            psm.decoy_free_score_ims = None;
+            psm.decoy_free_q_ims = None;
+
+            psm.decoy_free_p_value_peptide_rescue = None;
+            psm.decoy_free_pep_peptide_rescue = None;
+            psm.decoy_free_score_peptide_rescue = None;
+            psm.decoy_free_q_peptide_rescue = None;
+
+            psm.decoy_free_p_value_protein_rescue = None;
+            psm.decoy_free_pep_protein_rescue = None;
+            psm.decoy_free_score_protein_rescue = None;
+            psm.decoy_free_q_protein_rescue = None;
+
+            psm.p_ensemble = None;
+            psm.q_ensemble = None;
+            psm.pep_ensemble = None;
+            psm.score_ensemble = None;
+
+            psm.rt_adjust_p_ensemble = None;
+            psm.rt_adjust_q_ensemble = None;
+            psm.rt_adjust_pep_ensemble = None;
+
+            psm.ims_adjust_p_ensemble = None;
+            psm.ims_adjust_q_ensemble = None;
+            psm.ims_adjust_pep_ensemble = None;
+
+            psm.peptide_rescue_p_ensemble = None;
+            psm.peptide_rescue_q_ensemble = None;
+            psm.peptide_rescue_pep_ensemble = None;
+
+            psm.protein_rescue_p_ensemble = None;
+            psm.protein_rescue_q_ensemble = None;
+            psm.protein_rescue_pep_ensemble = None;
         }
     });
 }
@@ -2765,6 +2807,30 @@ fn finalize_base_q_values(
                     "DF ASSERT decoy_free_q_value invalid"
                 );
             }
+        }
+    }
+
+    // If the active model fit is Ensemble, preserve the finalized base ensemble
+    // stream in explicit ensemble audit columns before any later RT/IMS/rescue
+    // stage is allowed to replace the live decoy_free_* controlling stream.
+    //
+    // At this point:
+    //   decoy_free_p_value = ensemble base p-like stream, if populated
+    //   decoy_free_pep     = ensemble base PEP stream
+    //   decoy_free_score   = ensemble base score
+    //   decoy_free_q_value = finalized ensemble base q-value
+    if use_ensemble {
+        for &i in &work.rank1_indices {
+            let f = &mut features[i];
+
+            if f.core.rank != 1 {
+                continue;
+            }
+
+            f.p_ensemble = f.decoy_free_p_value;
+            f.q_ensemble = f.decoy_free_q_value;
+            f.pep_ensemble = f.decoy_free_pep;
+            f.score_ensemble = f.decoy_free_score;
         }
     }
 
@@ -3366,7 +3432,7 @@ fn compute_ims_reliability(
     anchors: &[usize],
     settings: &FdrSettings,
 ) -> ImsReliabilitySummary {
-    if !settings.physical_rescue.ims_enabled {
+    if !settings.enable_ims_confidence_adjustment {
         return ImsReliabilitySummary {
             ims_sigma_global: None,
             runwise_ims_sigma: Vec::new(),
@@ -3431,7 +3497,7 @@ fn compute_ims_reliability(
         None => 0.0,
     };
 
-    let fail_closed_hint = settings.physical_rescue.ims_enabled
+    let fail_closed_hint = settings.enable_ims_confidence_adjustment
         && (ims_sigma_global.is_none() || reliability < settings.physical_rescue.reliability_floor);
 
     ImsReliabilitySummary {
@@ -3448,7 +3514,7 @@ fn compute_joint_physical_summary(
     settings: &FdrSettings,
 ) -> JointPhysicalSummary {
     let joint_mode = &settings.physical_rescue.joint_mode;
-    let ims_active = settings.physical_rescue.ims_enabled && ims.ims_sigma_global.is_some();
+    let ims_active = settings.enable_ims_confidence_adjustment && ims.ims_sigma_global.is_some();
 
     let joint_reliability = match joint_mode {
         JointMode::Min => {
@@ -3584,7 +3650,7 @@ fn prepare_l2_physical_context(
         log::debug!("L2 RT runwise sigma: {:?}", rt_rel.runwise_rt_sigma);
     }
 
-    if settings.physical_rescue.ims_enabled {
+    if settings.enable_ims_confidence_adjustment {
         log::debug!(
             "L2 IMS reliability: global_sigma={:?}, reliability={:.3}, fail_closed_hint={}",
             ims_rel.ims_sigma_global,
@@ -3643,9 +3709,10 @@ fn apply_physical_rescue(
 ) -> PhysicalRescueResult {
     use crate::input::PhysicalRescueMode;
 
-    // 1. Capture Base Layer active outputs into explicit base fields
+    // Capture the original base stream only once.
+    // Later stages must not overwrite the base audit snapshot.
     for f in features.iter_mut() {
-        if f.core.rank == 1 {
+        if f.core.rank == 1 && f.decoy_free_pep_base.is_none() {
             f.decoy_free_p_value_base = f.decoy_free_p_value;
             f.decoy_free_pep_base = f.decoy_free_pep;
             f.decoy_free_score_base = f.decoy_free_score;
@@ -3654,7 +3721,7 @@ fn apply_physical_rescue(
     }
 
     // 2. Dispatcher
-    match settings.physical_rescue.mode {
+    match settings.physical_rescue.rt_mode {
         PhysicalRescueMode::Off => {
             for f in features.iter_mut() {
                 if f.core.rank == 1 {
@@ -3666,6 +3733,7 @@ fn apply_physical_rescue(
                 }
             }
             PhysicalRescueResult {
+                enabled: false,
                 fail_closed: false,
                 anchor_count_total: 0,
                 anchor_count_after_filters: 0,
@@ -3681,7 +3749,7 @@ fn apply_physical_rescue(
         _ => {
             let l2_ctx = prepare_l2_physical_context(features, settings, db, false, false);
 
-            match settings.physical_rescue.mode {
+            match settings.physical_rescue.rt_mode {
                 PhysicalRescueMode::DartBayes => {
                     apply_dart_bayes_update(features, settings, &l2_ctx);
                 }
@@ -3692,6 +3760,7 @@ fn apply_physical_rescue(
             }
 
             PhysicalRescueResult {
+                enabled: true,
                 fail_closed: l2_ctx.is_unreliable,
                 anchor_count_total: l2_ctx.anchor_count_total,
                 anchor_count_after_filters: l2_ctx.anchors.len(),
@@ -3705,6 +3774,842 @@ fn apply_physical_rescue(
             }
         }
     }
+}
+
+// =============================================================================
+// INDEPENDENT KERNELS: RT-Only and IMS-Only
+// =============================================================================
+
+fn promote_l2_to_active_stream(features: &mut [DfFeature]) {
+    for f in features.iter_mut().filter(|f| f.core.rank == 1) {
+        f.decoy_free_p_value = f.decoy_free_p_value_l2;
+        f.decoy_free_pep = f.decoy_free_pep_l2;
+        f.decoy_free_score = f.decoy_free_score_l2;
+        f.decoy_free_q_value = f.decoy_free_q_l2;
+    }
+}
+
+fn apply_rt_dart_bayes_update_to_active_stream(
+    features: &mut [DfFeature],
+    settings: &FdrSettings,
+    db: &IndexedDatabase,
+) -> PhysicalRescueResult {
+    let mut rt_settings = settings.clone();
+
+    // Force the old DART implementation to behave as an RT-only stage.
+    rt_settings.enable_ims_confidence_adjustment = false;
+    rt_settings.physical_rescue.rt_mode = crate::input::PhysicalRescueMode::DartBayes;
+    rt_settings.physical_rescue.ims_mode = crate::input::PhysicalRescueMode::Off;
+
+    let res = apply_physical_rescue(features, &rt_settings, db);
+
+    if !res.fail_closed {
+        promote_l2_to_active_stream(features);
+    }
+
+    res
+}
+
+fn apply_physical_update_to_active_stream(
+    features: &mut [DfFeature],
+    settings: &FdrSettings,
+    db: &IndexedDatabase,
+    stage: PhysicalEvidenceStage,
+) -> PhysicalRescueResult {
+    use crate::input::PhysicalRescueMode;
+
+    match stage {
+        PhysicalEvidenceStage::RtOnly => match settings.physical_rescue.rt_mode {
+            PhysicalRescueMode::Off => PhysicalRescueResult {
+                enabled: false,
+                fail_closed: false,
+                ..Default::default()
+            },
+            PhysicalRescueMode::BoundedAux => {
+                apply_rt_bounded_update_to_active_stream(features, settings, db)
+            }
+            PhysicalRescueMode::DartBayes => {
+                apply_rt_dart_bayes_update_to_active_stream(features, settings, db)
+            }
+        },
+
+        PhysicalEvidenceStage::ImsOnly => match settings.physical_rescue.ims_mode {
+            PhysicalRescueMode::Off => PhysicalRescueResult {
+                enabled: false,
+                fail_closed: false,
+                ..Default::default()
+            },
+            PhysicalRescueMode::BoundedAux => {
+                apply_ims_bounded_update_to_active_stream(features, settings, db)
+            }
+            PhysicalRescueMode::DartBayes => {
+                apply_ims_dart_bayes_update_to_active_stream(features, settings, db)
+            }
+        },
+    }
+}
+
+fn apply_rt_only_physical_update_to_active_stream(
+    features: &mut [DfFeature],
+    settings: &FdrSettings,
+    db: &IndexedDatabase,
+) -> PhysicalRescueResult {
+    apply_physical_update_to_active_stream(features, settings, db, PhysicalEvidenceStage::RtOnly)
+}
+
+fn apply_ims_only_physical_update_to_active_stream(
+    features: &mut [DfFeature],
+    settings: &FdrSettings,
+    db: &IndexedDatabase,
+) -> PhysicalRescueResult {
+    apply_physical_update_to_active_stream(features, settings, db, PhysicalEvidenceStage::ImsOnly)
+}
+
+fn apply_rt_bounded_update_to_active_stream(
+    features: &mut [DfFeature],
+    settings: &FdrSettings,
+    db: &IndexedDatabase,
+) -> PhysicalRescueResult {
+    use crate::input::PhysicalRescueMode;
+
+    if matches!(settings.physical_rescue.rt_mode, PhysicalRescueMode::Off) {
+        return PhysicalRescueResult {
+            enabled: false,
+            fail_closed: false,
+            ..Default::default()
+        };
+    }
+
+    let candidates = build_physical_anchor_set(features, settings, db);
+    let anchor_count_total = candidates.len();
+
+    let (safe_anchors, _) = exclude_non_rescue_safe_anchors(features, candidates, settings, db);
+    let (run_vetted, dropped_runs) =
+        filter_anchor_candidates_by_run(features, safe_anchors, settings);
+    let (final_anchors, dropped_charge_bins) =
+        filter_anchor_candidates_by_charge(features, run_vetted, settings);
+
+    let rt_rel = compute_rt_reliability(features, &final_anchors, settings);
+
+    let is_unreliable = final_anchors.len() < settings.physical_rescue.min_anchor_count_per_run
+        || rt_rel.rt_sigma_global.is_none()
+        || rt_rel.reliability < settings.physical_rescue.reliability_floor
+        || rt_rel.fail_closed_hint;
+
+    let rt_sigma = if is_unreliable {
+        1.0
+    } else {
+        rt_rel.rt_sigma_global.unwrap_or(1.0)
+    };
+
+    let cfg = settings.physical_rescue.bounded_cfg.as_ref().expect(
+        "Invalid DF config: IMS bounded auxiliary adjustment requires physical_rescue.bounded_cfg.",
+    );
+
+    let mut rows_for_q: Vec<(f64, usize, f64)> = Vec::new();
+
+    for (i, f) in features.iter_mut().enumerate() {
+        if f.core.rank != 1 {
+            continue;
+        }
+
+        f.physical_mode_used = Some(if is_unreliable {
+            "rt_bounded_aux_fail_closed".to_string()
+        } else {
+            "rt_bounded_aux".to_string()
+        });
+
+        if is_unreliable {
+            continue;
+        }
+
+        let prior_pep = f.decoy_free_pep.unwrap_or(1.0) as f64;
+
+        let missing_rt = !f.core.aligned_rt.is_finite()
+            || !f.core.predicted_rt.is_finite()
+            || !f.core.delta_rt_model.is_finite();
+
+        let missing_penalty = if missing_rt {
+            settings.physical_rescue.missing_penalty.max(0.0)
+        } else {
+            0.0
+        };
+
+        let raw_shift = if missing_rt {
+            0.0
+        } else {
+            compute_physical_shift(f, rt_sigma)
+        } - missing_penalty;
+
+        let bounded_shift =
+            crate::ml::stats::capped_shift(raw_shift, cfg.max_rescue_shift, cfg.max_penalty_shift);
+
+        let posterior_pep = match cfg.update_space {
+            BoundedAuxUpdateSpace::LogitConfidence => {
+                let logit_prior = crate::ml::stats::safe_logit_confidence(prior_pep);
+                let logit_post = logit_prior + bounded_shift;
+                crate::ml::stats::safe_inv_logit_confidence(logit_post)
+            }
+        };
+
+        f.decoy_free_pep = Some(posterior_pep as f32);
+
+        let df_score = (-10.0 * posterior_pep.max(1e-15).log10()) as f32;
+        f.decoy_free_score = Some(df_score);
+
+        rows_for_q.push((
+            df_score as f64,
+            i,
+            posterior_pep.clamp(0.0, 1.0).max(1e-300),
+        ));
+    }
+
+    if !is_unreliable {
+        for (feat_idx, q) in q_from_pep_cummean(rows_for_q) {
+            features[feat_idx].decoy_free_q_value = Some(q as f32);
+        }
+    }
+
+    PhysicalRescueResult {
+        enabled: true,
+        fail_closed: is_unreliable,
+        anchor_count_total,
+        anchor_count_after_filters: final_anchors.len(),
+        rt_reliability: rt_rel.reliability,
+        ims_reliability: 0.0,
+        joint_reliability: rt_rel.reliability,
+        rt_sigma_global: rt_rel.rt_sigma_global,
+        ims_sigma_global: None,
+        dropped_runs,
+        dropped_charge_bins,
+    }
+}
+
+fn apply_ims_bounded_update_to_active_stream(
+    features: &mut [DfFeature],
+    settings: &FdrSettings,
+    db: &IndexedDatabase,
+) -> PhysicalRescueResult {
+    use crate::input::PhysicalRescueMode;
+
+    if matches!(settings.physical_rescue.ims_mode, PhysicalRescueMode::Off) {
+        return PhysicalRescueResult {
+            enabled: false,
+            fail_closed: false,
+            ..Default::default()
+        };
+    }
+
+    let candidates = build_physical_anchor_set(features, settings, db);
+    let anchor_count_total = candidates.len();
+
+    let anchor_mode = &settings.physical_rescue.anchor_mode;
+    let exclude_unsafe_proteins = !matches!(anchor_mode, PhysicalAnchorMode::EvidenceOnly);
+
+    let mut safe_anchors = Vec::new();
+
+    for idx in candidates.iter().copied() {
+        let f = &features[idx];
+
+        let ims_ok = f.core.ims.is_finite() && f.core.predicted_ims.is_finite();
+
+        let protein_ok = if exclude_unsafe_proteins {
+            let prot = db[f.core.peptide_idx].proteins(&db.decoy_tag, db.generate_decoys);
+            !is_entrapment_str(&prot) && !is_contam_str(&prot)
+        } else {
+            true
+        };
+
+        if ims_ok && protein_ok {
+            safe_anchors.push(idx);
+        }
+    }
+
+    let (run_vetted, dropped_runs) =
+        filter_anchor_candidates_by_run(features, safe_anchors, settings);
+    let (final_anchors, dropped_charge_bins) =
+        filter_anchor_candidates_by_charge(features, run_vetted, settings);
+
+    let ims_rel = compute_ims_reliability(features, &final_anchors, settings);
+
+    let is_unreliable = final_anchors.len() < settings.physical_rescue.min_anchor_count_per_run
+        || ims_rel.ims_sigma_global.is_none()
+        || ims_rel.reliability < settings.physical_rescue.reliability_floor
+        || ims_rel.fail_closed_hint;
+
+    let ims_sigma = if is_unreliable {
+        1.0
+    } else {
+        ims_rel.ims_sigma_global.unwrap_or(1.0)
+    };
+
+    let cfg = settings
+        .physical_rescue
+        .bounded_cfg
+        .as_ref()
+        .expect("BoundedAux config required for IMS");
+
+    let mut rows_for_q: Vec<(f64, usize, f64)> = Vec::new();
+
+    for (i, f) in features.iter_mut().enumerate() {
+        if f.core.rank != 1 {
+            continue;
+        }
+
+        f.physical_mode_used = Some(if is_unreliable {
+            "ims_bounded_aux_fail_closed".to_string()
+        } else {
+            "ims_bounded_aux".to_string()
+        });
+
+        if is_unreliable {
+            continue;
+        }
+
+        let prior_pep = f.decoy_free_pep.unwrap_or(1.0) as f64;
+
+        let missing_ims = !f.core.ims.is_finite() || !f.core.predicted_ims.is_finite();
+
+        let missing_penalty = if missing_ims {
+            settings.physical_rescue.missing_penalty.max(0.0)
+        } else {
+            0.0
+        };
+
+        let raw_shift = if missing_ims {
+            0.0
+        } else {
+            let delta = (f.core.ims - f.core.predicted_ims).abs() as f64;
+            let z = delta / ims_sigma.max(1e-9);
+            2.0 - z.powi(2)
+        } - missing_penalty;
+
+        let bounded_shift =
+            crate::ml::stats::capped_shift(raw_shift, cfg.max_rescue_shift, cfg.max_penalty_shift);
+
+        let posterior_pep = match cfg.update_space {
+            BoundedAuxUpdateSpace::LogitConfidence => {
+                let logit_prior = crate::ml::stats::safe_logit_confidence(prior_pep);
+                let logit_post = logit_prior + bounded_shift;
+                crate::ml::stats::safe_inv_logit_confidence(logit_post)
+            }
+        };
+
+        f.decoy_free_pep = Some(posterior_pep as f32);
+
+        let df_score = (-10.0 * posterior_pep.max(1e-15).log10()) as f32;
+        f.decoy_free_score = Some(df_score);
+
+        rows_for_q.push((
+            df_score as f64,
+            i,
+            posterior_pep.clamp(0.0, 1.0).max(1e-300),
+        ));
+    }
+
+    if !is_unreliable {
+        for (feat_idx, q) in q_from_pep_cummean(rows_for_q) {
+            features[feat_idx].decoy_free_q_value = Some(q as f32);
+        }
+    }
+
+    PhysicalRescueResult {
+        enabled: true,
+        fail_closed: is_unreliable,
+        anchor_count_total,
+        anchor_count_after_filters: final_anchors.len(),
+        rt_reliability: 0.0,
+        ims_reliability: ims_rel.reliability,
+        joint_reliability: ims_rel.reliability,
+        rt_sigma_global: None,
+        ims_sigma_global: ims_rel.ims_sigma_global,
+        dropped_runs,
+        dropped_charge_bins,
+    }
+}
+
+fn compute_dart_null_ims_params(features: &[DfFeature], anchors: &[usize]) -> (f64, f64) {
+    let mut values: Vec<f64> = anchors
+        .iter()
+        .filter_map(|&i| {
+            let x = features[i].core.ims as f64;
+            x.is_finite().then_some(x)
+        })
+        .collect();
+
+    if values.len() < 8 {
+        values = features
+            .iter()
+            .filter(|f| f.core.rank == 1)
+            .filter_map(|f| {
+                let x = f.core.ims as f64;
+                x.is_finite().then_some(x)
+            })
+            .collect();
+    }
+
+    if values.len() < 2 {
+        return (0.0, 1.0);
+    }
+
+    let center = stats::mean(&values);
+    let spread = stats::std_dev(&values).clamp(0.01, 0.25);
+
+    (center, spread)
+}
+
+#[derive(Clone, Debug)]
+struct ImsDartContext {
+    pub anchors: Vec<usize>,
+    pub ims_rel: ImsReliabilitySummary,
+    pub is_unreliable: bool,
+    pub ims_sigma: f64,
+    pub null_ims_center: f64,
+    pub null_ims_spread: f64,
+    pub anchor_count_total: usize,
+    pub dropped_runs: Vec<usize>,
+    pub dropped_charge_bins: Vec<(i32, usize)>,
+}
+
+fn prepare_ims_dart_context(
+    features: &[DfFeature],
+    settings: &FdrSettings,
+    db: &IndexedDatabase,
+) -> ImsDartContext {
+    let candidates = build_physical_anchor_set(features, settings, db);
+    let anchor_count_total = candidates.len();
+
+    let anchor_mode = &settings.physical_rescue.anchor_mode;
+    let exclude_unsafe_proteins = !matches!(anchor_mode, PhysicalAnchorMode::EvidenceOnly);
+
+    let mut safe_anchors = Vec::new();
+
+    for idx in candidates.iter().copied() {
+        let f = &features[idx];
+
+        let ims_ok = f.core.ims.is_finite() && f.core.predicted_ims.is_finite();
+
+        let protein_ok = if exclude_unsafe_proteins {
+            let prot = db[f.core.peptide_idx].proteins(&db.decoy_tag, db.generate_decoys);
+            !is_entrapment_str(&prot) && !is_contam_str(&prot)
+        } else {
+            true
+        };
+
+        if ims_ok && protein_ok {
+            safe_anchors.push(idx);
+        }
+    }
+
+    let (run_vetted, dropped_runs) =
+        filter_anchor_candidates_by_run(features, safe_anchors, settings);
+
+    let (final_anchors, dropped_charge_bins) =
+        filter_anchor_candidates_by_charge(features, run_vetted, settings);
+
+    let ims_rel = compute_ims_reliability(features, &final_anchors, settings);
+
+    let is_unreliable = final_anchors.len() < settings.physical_rescue.min_anchor_count_per_run
+        || ims_rel.ims_sigma_global.is_none()
+        || ims_rel.reliability < settings.physical_rescue.reliability_floor
+        || ims_rel.fail_closed_hint;
+
+    let ims_sigma = if is_unreliable {
+        1.0
+    } else {
+        ims_rel.ims_sigma_global.unwrap_or(1.0)
+    };
+
+    let (null_ims_center, null_ims_spread) = compute_dart_null_ims_params(features, &final_anchors);
+
+    ImsDartContext {
+        anchors: final_anchors,
+        ims_rel,
+        is_unreliable,
+        ims_sigma,
+        null_ims_center,
+        null_ims_spread,
+        anchor_count_total,
+        dropped_runs,
+        dropped_charge_bins,
+    }
+}
+
+fn compute_dart_true_ims_likelihood(
+    observed_ims: f64,
+    reference_ims: f64,
+    ims_sigma: f64,
+    model_type: &DartTrueRtModel,
+) -> f64 {
+    match model_type {
+        DartTrueRtModel::Laplace => {
+            crate::ml::stats::laplace_logpdf(observed_ims, reference_ims, ims_sigma)
+        }
+        DartTrueRtModel::Normal => {
+            crate::ml::stats::normal_logpdf(observed_ims, reference_ims, ims_sigma)
+        }
+    }
+}
+
+fn compute_dart_null_ims_likelihood(
+    observed_ims: f64,
+    null_center: f64,
+    null_spread: f64,
+    null_model_type: &DartNullRtModel,
+) -> f64 {
+    match null_model_type {
+        DartNullRtModel::Normal => {
+            crate::ml::stats::normal_logpdf(observed_ims, null_center, null_spread)
+        }
+        DartNullRtModel::Uniform => 0.0,
+    }
+}
+
+fn finalize_active_dart_q_values(features: &mut [DfFeature]) {
+    let mut rows: Vec<(f64, usize, f64)> = Vec::new();
+
+    for (i, f) in features.iter().enumerate() {
+        if f.core.rank != 1 {
+            continue;
+        }
+
+        let pep = match f.decoy_free_pep {
+            Some(x) if x.is_finite() => (x as f64).clamp(0.0, 1.0).max(1e-300),
+            _ => continue,
+        };
+
+        let score_key = f
+            .decoy_free_score
+            .map(|s| s as f64)
+            .unwrap_or_else(|| -10.0 * pep.max(1e-15).log10());
+
+        rows.push((score_key, i, pep));
+    }
+
+    for (feat_idx, q) in q_from_pep_cummean(rows) {
+        features[feat_idx].decoy_free_q_value = Some(q as f32);
+    }
+}
+
+fn apply_ims_dart_bayes_update_to_active_stream(
+    features: &mut [DfFeature],
+    settings: &FdrSettings,
+    db: &IndexedDatabase,
+) -> PhysicalRescueResult {
+    let dart_cfg = settings
+        .physical_rescue
+        .dart_cfg
+        .as_ref()
+        .expect("DART-Bayes config required when physical_rescue.ims_mode='dart_bayes'");
+
+    let ims_ctx = prepare_ims_dart_context(features, settings, db);
+    let is_unreliable = ims_ctx.is_unreliable;
+
+    let snapshot = features.to_vec();
+
+    let mut peptide_ims_map: FnvHashMap<u32, Vec<f64>> = FnvHashMap::default();
+
+    if !is_unreliable && dart_cfg.dart_use_bootstrap {
+        for a in snapshot.iter() {
+            if a.core.ims.is_finite() && a.core.predicted_ims.is_finite() {
+                peptide_ims_map
+                    .entry(a.core.peptide_idx.0)
+                    .or_default()
+                    .push(a.core.ims as f64);
+            }
+        }
+    }
+
+    let empty_ims = Vec::new();
+
+    for f in features.iter_mut() {
+        if f.core.rank != 1 {
+            continue;
+        }
+
+        f.physical_mode_used = Some(
+            if is_unreliable {
+                "ims_dart_bayes_fail_closed"
+            } else {
+                "ims_dart_bayes"
+            }
+            .to_string(),
+        );
+
+        if is_unreliable {
+            f.dart_posterior_used = Some(false);
+            continue;
+        }
+
+        let observed_ims = f.core.ims as f64;
+        let predicted_ims = f.core.predicted_ims as f64;
+
+        if !observed_ims.is_finite() || !predicted_ims.is_finite() {
+            f.dart_posterior_used = Some(false);
+            f.physical_mode_used = Some("ims_dart_bayes_fail_closed:missing-ims".to_string());
+            continue;
+        }
+
+        let peptide_ims = peptide_ims_map
+            .get(&f.core.peptide_idx.0)
+            .unwrap_or(&empty_ims);
+
+        let mut reference_ims = predicted_ims;
+        let mut reference_sigma = ims_ctx.ims_sigma.clamp(0.01, 0.25);
+
+        if dart_cfg.dart_use_bootstrap && peptide_ims.len() > 1 && dart_cfg.dart_bootstrap_iters > 0
+        {
+            let iters = dart_cfg.dart_bootstrap_iters;
+            let mut prng = FastRng((f.core.spec_id.len() + f.core.file_id * 7331) as u64 + 211);
+            let mut boot_mus = Vec::with_capacity(iters);
+
+            for _ in 0..iters {
+                let mut sample = Vec::with_capacity(peptide_ims.len());
+
+                for _ in 0..peptide_ims.len() {
+                    sample.push(peptide_ims[prng.next_usize(peptide_ims.len())]);
+                }
+
+                let mu_b = match dart_cfg.dart_bootstrap_method {
+                    crate::input::DartBootstrapMethod::None
+                    | crate::input::DartBootstrapMethod::NonParametric => {
+                        aggregate_mu(&mut sample, &dart_cfg.dart_mu_estimation)
+                    }
+
+                    crate::input::DartBootstrapMethod::Parametric
+                    | crate::input::DartBootstrapMethod::ParametricMixture => {
+                        let mut weights = Vec::with_capacity(sample.len());
+
+                        for &ims_cand in &sample {
+                            let log_lik_true = compute_dart_true_ims_likelihood(
+                                ims_cand,
+                                predicted_ims,
+                                reference_sigma,
+                                &dart_cfg.dart_true_rt_model,
+                            );
+
+                            let log_lik_null = compute_dart_null_ims_likelihood(
+                                ims_cand,
+                                ims_ctx.null_ims_center,
+                                ims_ctx.null_ims_spread,
+                                &dart_cfg.dart_null_rt_model,
+                            );
+
+                            let weight = if dart_cfg.dart_bootstrap_method
+                                == crate::input::DartBootstrapMethod::ParametricMixture
+                            {
+                                let p_true = log_lik_true.exp();
+                                let p_null = log_lik_null.exp();
+                                p_true / (p_true + p_null + 1e-300)
+                            } else {
+                                1.0
+                            };
+
+                            weights.push(weight);
+                        }
+
+                        aggregate_weighted_mu(&mut sample, &weights, &dart_cfg.dart_mu_estimation)
+                    }
+                };
+
+                boot_mus.push(mu_b);
+            }
+
+            reference_ims = aggregate_mu(&mut boot_mus, &dart_cfg.dart_mu_estimation);
+
+            if boot_mus.len() > 1 {
+                let mean = boot_mus.iter().sum::<f64>() / boot_mus.len() as f64;
+                let var = boot_mus.iter().map(|v| (v - mean).powi(2)).sum::<f64>()
+                    / (boot_mus.len() - 1) as f64;
+
+                let boot_sigma = var.sqrt().clamp(0.01, 0.25);
+                let shrink = settings.physical_rescue.cov_shrinkage.clamp(0.0, 1.0);
+
+                reference_sigma =
+                    ((1.0 - shrink) * boot_sigma + shrink * reference_sigma).clamp(0.01, 0.25);
+            }
+        }
+
+        if !reference_ims.is_finite() || !reference_sigma.is_finite() || reference_sigma <= 0.0 {
+            f.dart_posterior_used = Some(false);
+            f.physical_mode_used = Some("ims_dart_bayes_fail_closed:invalid-reference".to_string());
+            continue;
+        }
+
+        let prior_pep = f.decoy_free_pep.unwrap_or(1.0) as f64;
+
+        let log_lik_true = compute_dart_true_ims_likelihood(
+            observed_ims,
+            reference_ims,
+            reference_sigma,
+            &dart_cfg.dart_true_rt_model,
+        );
+
+        let log_lik_null = compute_dart_null_ims_likelihood(
+            observed_ims,
+            ims_ctx.null_ims_center,
+            ims_ctx.null_ims_spread,
+            &dart_cfg.dart_null_rt_model,
+        );
+
+        let posterior_pep = compute_dart_posterior_pep(prior_pep, log_lik_true, log_lik_null)
+            .clamp(0.0, 1.0)
+            .max(1e-300);
+
+        f.decoy_free_pep = Some(posterior_pep as f32);
+        f.decoy_free_score = Some((-10.0 * posterior_pep.max(1e-15).log10()) as f32);
+
+        f.dart_posterior_used = Some(true);
+
+        // Existing TSV fields are RT-named, but they are generic DART likelihood
+        // diagnostics in this implementation.
+        f.dart_rt_lik_correct = Some(log_lik_true as f32);
+        f.dart_rt_lik_incorrect = Some(log_lik_null as f32);
+    }
+
+    if !is_unreliable && dart_cfg.dart_recalc_q_from_posterior {
+        finalize_active_dart_q_values(features);
+    }
+
+    PhysicalRescueResult {
+        enabled: true,
+        fail_closed: is_unreliable,
+        anchor_count_total: ims_ctx.anchor_count_total,
+        anchor_count_after_filters: ims_ctx.anchors.len(),
+        rt_reliability: 0.0,
+        ims_reliability: ims_ctx.ims_rel.reliability,
+        joint_reliability: ims_ctx.ims_rel.reliability,
+        rt_sigma_global: None,
+        ims_sigma_global: ims_ctx.ims_rel.ims_sigma_global,
+        dropped_runs: ims_ctx.dropped_runs,
+        dropped_charge_bins: ims_ctx.dropped_charge_bins,
+    }
+}
+
+fn apply_rt_confidence_adjustment(
+    features: &mut [DfFeature],
+    settings: &FdrSettings,
+    db: &IndexedDatabase,
+) -> PhysicalRescueResult {
+    if !settings.enable_rt_confidence_adjustment {
+        return PhysicalRescueResult {
+            enabled: false,
+            ..Default::default()
+        };
+    }
+
+    let res = apply_rt_only_physical_update_to_active_stream(features, settings, db);
+
+    if !res.fail_closed {
+        finalize_stage_snapshot(features, settings, DfAdjustmentStage::Rt);
+    }
+
+    res
+}
+
+fn apply_ims_confidence_adjustment(
+    features: &mut [DfFeature],
+    settings: &FdrSettings,
+    db: &IndexedDatabase,
+) -> PhysicalRescueResult {
+    if !settings.enable_ims_confidence_adjustment {
+        return PhysicalRescueResult {
+            enabled: false,
+            ..Default::default()
+        };
+    }
+
+    let res = apply_ims_only_physical_update_to_active_stream(features, settings, db);
+
+    if !res.fail_closed {
+        finalize_stage_snapshot(features, settings, DfAdjustmentStage::Ims);
+    }
+
+    res
+}
+
+fn promote_l3_to_active_stream(features: &mut [DfFeature]) {
+    for f in features.iter_mut().filter(|f| f.core.rank == 1) {
+        f.decoy_free_pep = f.decoy_free_pep_l3;
+        f.decoy_free_score = f.decoy_free_score_l3;
+        f.decoy_free_q_value = f.decoy_free_q_l3;
+
+        // L3 is currently PEP-native. Keep the active p-value stream from
+        // the prior stage instead of erasing it.
+    }
+}
+
+fn apply_peptide_reproducibility_update_to_active_stream(
+    features: &mut [DfFeature],
+    settings: &FdrSettings,
+    db: &IndexedDatabase,
+) -> ReproducibilityResult {
+    let res = apply_bounded_repro_shift(features, settings, db);
+
+    if !res.fail_closed {
+        promote_l3_to_active_stream(features);
+    }
+
+    res
+}
+
+fn apply_protein_reproducibility_update_to_active_stream(
+    features: &mut [DfFeature],
+    settings: &FdrSettings,
+    db: &IndexedDatabase,
+) -> ReproducibilityResult {
+    // Transitional compile-safe implementation.
+    // This still uses the existing L3 kernel. The protein/peptide split can be
+    // made mathematically independent after this build is clean.
+    let res = apply_bounded_repro_shift(features, settings, db);
+
+    if !res.fail_closed {
+        promote_l3_to_active_stream(features);
+    }
+
+    res
+}
+
+fn apply_peptide_reproducibility_rescue(
+    features: &mut [DfFeature],
+    settings: &FdrSettings,
+    db: &IndexedDatabase,
+) -> ReproducibilityResult {
+    if !settings.enable_peptide_reproducibility_rescue {
+        return ReproducibilityResult {
+            enabled: false,
+            ..Default::default()
+        };
+    }
+
+    let res = apply_peptide_reproducibility_update_to_active_stream(features, settings, db);
+
+    if !res.fail_closed {
+        finalize_stage_snapshot(features, settings, DfAdjustmentStage::PeptideRescue);
+    }
+
+    res
+}
+
+fn apply_protein_reproducibility_rescue(
+    features: &mut [DfFeature],
+    settings: &FdrSettings,
+    db: &IndexedDatabase,
+) -> ReproducibilityResult {
+    if !settings.enable_protein_reproducibility_rescue {
+        return ReproducibilityResult {
+            enabled: false,
+            ..Default::default()
+        };
+    }
+
+    let res = apply_protein_reproducibility_update_to_active_stream(features, settings, db);
+
+    if !res.fail_closed {
+        finalize_stage_snapshot(features, settings, DfAdjustmentStage::ProteinRescue);
+    }
+
+    res
 }
 
 fn verify_dart_rt_scale_consistency(
@@ -4269,7 +5174,7 @@ fn apply_bounded_physical_shift(
             || !f.core.predicted_rt.is_finite()
             || !f.core.delta_rt_model.is_finite();
 
-        let missing_ims = settings.physical_rescue.ims_enabled
+        let missing_ims = settings.enable_ims_confidence_adjustment
             && (!f.core.ims.is_finite() || !f.core.predicted_ims.is_finite());
 
         let missing_penalty = if missing_rt || missing_ims {
@@ -4732,16 +5637,6 @@ fn finalize_repro_l3_q_values(features: &mut [DfFeature]) {
     }
 }
 
-fn clear_l3_stage_outputs(features: &mut [DfFeature]) {
-    for f in features.iter_mut() {
-        if f.core.rank == 1 {
-            f.decoy_free_pep_l3 = None;
-            f.decoy_free_score_l3 = None;
-            f.decoy_free_q_l3 = None;
-        }
-    }
-}
-
 fn apply_bounded_repro_shift(
     // This function writes stage-local Layer 3 PEP-native outputs only.
     // It does not activate the final DF stream.
@@ -4932,8 +5827,10 @@ fn apply_bounded_repro_shift(
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 enum FinalDfStream {
     Base,
-    Layer2,
-    Layer3,
+    Rt,
+    Ims,
+    PeptideRescue,
+    ProteinRescue,
 }
 
 #[inline]
@@ -4945,38 +5842,45 @@ fn activate_final_base_stream(f: &mut DfFeature) {
 }
 
 #[inline]
-fn activate_final_pep_stream(
+fn activate_final_stage_stream(
     f: &mut DfFeature,
+    p: Option<f32>,
     pep: Option<f32>,
     score: Option<f32>,
     q: Option<f32>,
 ) {
-    f.decoy_free_p_value = None;
+    f.decoy_free_p_value = p;
     f.decoy_free_pep = pep;
     f.decoy_free_score = score;
     f.decoy_free_q_value = q;
 }
 
 #[inline]
+fn any_rank1_has<F>(features: &[DfFeature], pred: F) -> bool
+where
+    F: Fn(&DfFeature) -> bool,
+{
+    features.iter().any(|f| f.core.rank == 1 && pred(f))
+}
+
+#[inline]
 fn detect_final_df_stream(features: &[DfFeature], settings: &FdrSettings) -> FinalDfStream {
-    // We allow all models to flow into the L2/L3 PEP-native rescue paths.
-    // The original base estimates are safely preserved in the decoy_free_*_base columns.
-
-    let l3_enabled = settings.reproducibility.enabled;
-    let l2_enabled = settings.physical_rescue.mode != crate::input::PhysicalRescueMode::Off;
-
-    if l3_enabled
-        && features
-            .iter()
-            .any(|f| f.core.rank == 1 && f.decoy_free_pep_l3.is_some())
+    if settings.enable_protein_reproducibility_rescue
+        && any_rank1_has(features, |f| f.decoy_free_pep_protein_rescue.is_some())
     {
-        FinalDfStream::Layer3
-    } else if l2_enabled
-        && features
-            .iter()
-            .any(|f| f.core.rank == 1 && f.decoy_free_pep_l2.is_some())
+        FinalDfStream::ProteinRescue
+    } else if settings.enable_peptide_reproducibility_rescue
+        && any_rank1_has(features, |f| f.decoy_free_pep_peptide_rescue.is_some())
     {
-        FinalDfStream::Layer2
+        FinalDfStream::PeptideRescue
+    } else if settings.enable_ims_confidence_adjustment
+        && any_rank1_has(features, |f| f.decoy_free_pep_ims.is_some())
+    {
+        FinalDfStream::Ims
+    } else if settings.enable_rt_confidence_adjustment
+        && any_rank1_has(features, |f| f.decoy_free_pep_rt.is_some())
+    {
+        FinalDfStream::Rt
     } else {
         FinalDfStream::Base
     }
@@ -4991,24 +5895,44 @@ fn finalize_df_psm_stream(features: &mut [DfFeature], settings: &FdrSettings) ->
         }
 
         match final_stream {
-            FinalDfStream::Layer3 => {
-                activate_final_pep_stream(
-                    f,
-                    f.decoy_free_pep_l3,
-                    f.decoy_free_score_l3,
-                    f.decoy_free_q_l3,
-                );
-            }
-            FinalDfStream::Layer2 => {
-                activate_final_pep_stream(
-                    f,
-                    f.decoy_free_pep_l2,
-                    f.decoy_free_score_l2,
-                    f.decoy_free_q_l2,
-                );
-            }
             FinalDfStream::Base => {
                 activate_final_base_stream(f);
+            }
+            FinalDfStream::Rt => {
+                activate_final_stage_stream(
+                    f,
+                    f.decoy_free_p_value_rt,
+                    f.decoy_free_pep_rt,
+                    f.decoy_free_score_rt,
+                    f.decoy_free_q_rt,
+                );
+            }
+            FinalDfStream::Ims => {
+                activate_final_stage_stream(
+                    f,
+                    f.decoy_free_p_value_ims,
+                    f.decoy_free_pep_ims,
+                    f.decoy_free_score_ims,
+                    f.decoy_free_q_ims,
+                );
+            }
+            FinalDfStream::PeptideRescue => {
+                activate_final_stage_stream(
+                    f,
+                    f.decoy_free_p_value_peptide_rescue,
+                    f.decoy_free_pep_peptide_rescue,
+                    f.decoy_free_score_peptide_rescue,
+                    f.decoy_free_q_peptide_rescue,
+                );
+            }
+            FinalDfStream::ProteinRescue => {
+                activate_final_stage_stream(
+                    f,
+                    f.decoy_free_p_value_protein_rescue,
+                    f.decoy_free_pep_protein_rescue,
+                    f.decoy_free_score_protein_rescue,
+                    f.decoy_free_q_protein_rescue,
+                );
             }
         }
     }
@@ -5018,8 +5942,6 @@ fn finalize_df_psm_stream(features: &mut [DfFeature], settings: &FdrSettings) ->
 
 fn validate_final_df_stream_contract(features: &[DfFeature], final_stream: FinalDfStream) {
     let mut n_rank1 = 0usize;
-    let mut n_p_native = 0usize;
-    let mut n_pep_native = 0usize;
     let mut n_invalid = 0usize;
 
     for f in features.iter().filter(|f| f.core.rank == 1) {
@@ -5027,50 +5949,309 @@ fn validate_final_df_stream_contract(features: &[DfFeature], final_stream: Final
 
         let has_p = f.decoy_free_p_value.is_some();
         let has_pep = f.decoy_free_pep.is_some();
+        let has_score = f.decoy_free_score.is_some();
         let has_q = f.decoy_free_q_value.is_some();
 
-        match final_stream {
-            FinalDfStream::Base => {
-                if has_p {
-                    n_p_native += 1;
-                }
-                if !has_p || !has_pep || !has_q {
-                    n_invalid += 1;
-                }
-            }
-            FinalDfStream::Layer2 | FinalDfStream::Layer3 => {
-                if !has_p {
-                    n_pep_native += 1;
-                }
-                if has_p || !has_pep || !has_q {
-                    n_invalid += 1;
-                }
-            }
+        if !has_p || !has_pep || !has_score || !has_q {
+            n_invalid += 1;
         }
     }
 
     if n_invalid > 0 {
-        let stream_name = match final_stream {
-            FinalDfStream::Base => "base / p-value-native",
-            FinalDfStream::Layer2 => "layer2 / pep-native",
-            FinalDfStream::Layer3 => "layer3 / pep-native",
-        };
-
         let msg = format!(
-            "DF final stream contract violated: stream={} rank1={} p_native={} pep_native={} invalid_rows={}",
-            stream_name, n_rank1, n_p_native, n_pep_native, n_invalid
+            "DF final stream contract violated: stream={:?} rank1={} invalid_rows={}",
+            final_stream, n_rank1, n_invalid
         );
         log::error!("{}", msg);
         panic!("{}", msg);
     }
 
     log::debug!(
-        "DF final stream contract OK: stream={:?} rank1={} p_native={} pep_native={}",
+        "DF final stream contract OK: stream={:?} rank1={}",
         final_stream,
-        n_rank1,
-        n_p_native,
-        n_pep_native
+        n_rank1
     );
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum DfAdjustmentStage {
+    Rt,
+    Ims,
+    PeptideRescue,
+    ProteinRescue,
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum PhysicalEvidenceStage {
+    RtOnly,
+    ImsOnly,
+}
+
+#[inline]
+fn df_score_from_pep(pep: f64) -> f32 {
+    (-10.0 * pep.clamp(1e-15, 1.0).log10()) as f32
+}
+
+#[inline]
+fn snapshot_current_stream_to_stage(f: &mut DfFeature, stage: DfAdjustmentStage) {
+    let p = f.decoy_free_p_value;
+    let pep = f.decoy_free_pep;
+    let score = f.decoy_free_score;
+    let q = f.decoy_free_q_value;
+
+    match stage {
+        DfAdjustmentStage::Rt => {
+            f.decoy_free_p_value_rt = p;
+            f.decoy_free_pep_rt = pep;
+            f.decoy_free_score_rt = score;
+            f.decoy_free_q_rt = q;
+        }
+        DfAdjustmentStage::Ims => {
+            f.decoy_free_p_value_ims = p;
+            f.decoy_free_pep_ims = pep;
+            f.decoy_free_score_ims = score;
+            f.decoy_free_q_ims = q;
+        }
+        DfAdjustmentStage::PeptideRescue => {
+            f.decoy_free_p_value_peptide_rescue = p;
+            f.decoy_free_pep_peptide_rescue = pep;
+            f.decoy_free_score_peptide_rescue = score;
+            f.decoy_free_q_peptide_rescue = q;
+        }
+        DfAdjustmentStage::ProteinRescue => {
+            f.decoy_free_p_value_protein_rescue = p;
+            f.decoy_free_pep_protein_rescue = pep;
+            f.decoy_free_score_protein_rescue = score;
+            f.decoy_free_q_protein_rescue = q;
+        }
+    }
+}
+
+fn recalculate_active_pep_q_values(features: &mut [DfFeature]) {
+    let mut rows: Vec<(f64, usize, f64)> = Vec::new();
+
+    for (i, f) in features.iter().enumerate() {
+        if f.core.rank != 1 {
+            continue;
+        }
+
+        let pep = match f.decoy_free_pep {
+            Some(x) if x.is_finite() => (x as f64).clamp(0.0, 1.0).max(1e-300),
+            _ => continue,
+        };
+
+        let score_key = f.decoy_free_score.unwrap_or_else(|| df_score_from_pep(pep)) as f64;
+        rows.push((-score_key, i, pep));
+    }
+
+    for (feat_idx, q) in q_from_pep_cummean(rows) {
+        features[feat_idx].decoy_free_q_value = Some(q as f32);
+    }
+}
+
+fn write_model_stage_snapshot(f: &mut DfFeature, settings: &FdrSettings, stage: DfAdjustmentStage) {
+    let p = f.decoy_free_p_value;
+    let q = f.decoy_free_q_value;
+    let pep = f.decoy_free_pep;
+
+    match settings.model_fit {
+        ModelFit::Moments => match stage {
+            DfAdjustmentStage::Rt => {
+                f.rt_adjust_p_mom = p;
+                f.rt_adjust_q_mom = q;
+                f.rt_adjust_pep_mom = pep;
+            }
+            DfAdjustmentStage::Ims => {
+                f.ims_adjust_p_mom = p;
+                f.ims_adjust_q_mom = q;
+                f.ims_adjust_pep_mom = pep;
+            }
+            DfAdjustmentStage::PeptideRescue => {
+                f.peptide_rescue_p_mom = p;
+                f.peptide_rescue_q_mom = q;
+                f.peptide_rescue_pep_mom = pep;
+            }
+            DfAdjustmentStage::ProteinRescue => {
+                f.protein_rescue_p_mom = p;
+                f.protein_rescue_q_mom = q;
+                f.protein_rescue_pep_mom = pep;
+            }
+        },
+
+        ModelFit::Mle => match stage {
+            DfAdjustmentStage::Rt => {
+                f.rt_adjust_p_mle = p;
+                f.rt_adjust_q_mle = q;
+                f.rt_adjust_pep_mle = pep;
+            }
+            DfAdjustmentStage::Ims => {
+                f.ims_adjust_p_mle = p;
+                f.ims_adjust_q_mle = q;
+                f.ims_adjust_pep_mle = pep;
+            }
+            DfAdjustmentStage::PeptideRescue => {
+                f.peptide_rescue_p_mle = p;
+                f.peptide_rescue_q_mle = q;
+                f.peptide_rescue_pep_mle = pep;
+            }
+            DfAdjustmentStage::ProteinRescue => {
+                f.protein_rescue_p_mle = p;
+                f.protein_rescue_q_mle = q;
+                f.protein_rescue_pep_mle = pep;
+            }
+        },
+
+        ModelFit::LowerOrder => match stage {
+            DfAdjustmentStage::Rt => {
+                f.rt_adjust_p_lo = p;
+                f.rt_adjust_q_lo = q;
+                f.rt_adjust_pep_lo = pep;
+            }
+            DfAdjustmentStage::Ims => {
+                f.ims_adjust_p_lo = p;
+                f.ims_adjust_q_lo = q;
+                f.ims_adjust_pep_lo = pep;
+            }
+            DfAdjustmentStage::PeptideRescue => {
+                f.peptide_rescue_p_lo = p;
+                f.peptide_rescue_q_lo = q;
+                f.peptide_rescue_pep_lo = pep;
+            }
+            DfAdjustmentStage::ProteinRescue => {
+                f.protein_rescue_p_lo = p;
+                f.protein_rescue_q_lo = q;
+                f.protein_rescue_pep_lo = pep;
+            }
+        },
+
+        ModelFit::Msfdr => match stage {
+            DfAdjustmentStage::Rt => {
+                f.rt_adjust_p_msfdr = p;
+                f.rt_adjust_q_msfdr = q;
+                f.rt_adjust_pep_msfdr = pep;
+            }
+            DfAdjustmentStage::Ims => {
+                f.ims_adjust_p_msfdr = p;
+                f.ims_adjust_q_msfdr = q;
+                f.ims_adjust_pep_msfdr = pep;
+            }
+            DfAdjustmentStage::PeptideRescue => {
+                f.peptide_rescue_p_msfdr = p;
+                f.peptide_rescue_q_msfdr = q;
+                f.peptide_rescue_pep_msfdr = pep;
+            }
+            DfAdjustmentStage::ProteinRescue => {
+                f.protein_rescue_p_msfdr = p;
+                f.protein_rescue_q_msfdr = q;
+                f.protein_rescue_pep_msfdr = pep;
+            }
+        },
+
+        ModelFit::Msfdr1Smix => match stage {
+            DfAdjustmentStage::Rt => {
+                f.rt_adjust_p_1smix = p;
+                f.rt_adjust_q_1smix = q;
+                f.rt_adjust_pep_1smix = pep;
+            }
+            DfAdjustmentStage::Ims => {
+                f.ims_adjust_p_1smix = p;
+                f.ims_adjust_q_1smix = q;
+                f.ims_adjust_pep_1smix = pep;
+            }
+            DfAdjustmentStage::PeptideRescue => {
+                f.peptide_rescue_p_1smix = p;
+                f.peptide_rescue_q_1smix = q;
+                f.peptide_rescue_pep_1smix = pep;
+            }
+            DfAdjustmentStage::ProteinRescue => {
+                f.protein_rescue_p_1smix = p;
+                f.protein_rescue_q_1smix = q;
+                f.protein_rescue_pep_1smix = pep;
+            }
+        },
+
+        ModelFit::Msfdr2Smix => match stage {
+            DfAdjustmentStage::Rt => {
+                f.rt_adjust_p_2smix = p;
+                f.rt_adjust_q_2smix = q;
+                f.rt_adjust_pep_2smix = pep;
+            }
+            DfAdjustmentStage::Ims => {
+                f.ims_adjust_p_2smix = p;
+                f.ims_adjust_q_2smix = q;
+                f.ims_adjust_pep_2smix = pep;
+            }
+            DfAdjustmentStage::PeptideRescue => {
+                f.peptide_rescue_p_2smix = p;
+                f.peptide_rescue_q_2smix = q;
+                f.peptide_rescue_pep_2smix = pep;
+            }
+            DfAdjustmentStage::ProteinRescue => {
+                f.protein_rescue_p_2smix = p;
+                f.protein_rescue_q_2smix = q;
+                f.protein_rescue_pep_2smix = pep;
+            }
+        },
+
+        ModelFit::Nokoi => match stage {
+            DfAdjustmentStage::Rt => {
+                f.rt_adjust_p_nokoi = p;
+                f.rt_adjust_q_nokoi = q;
+                f.rt_adjust_pep_nokoi = pep;
+            }
+            DfAdjustmentStage::Ims => {
+                f.ims_adjust_p_nokoi = p;
+                f.ims_adjust_q_nokoi = q;
+                f.ims_adjust_pep_nokoi = pep;
+            }
+            DfAdjustmentStage::PeptideRescue => {
+                f.peptide_rescue_p_nokoi = p;
+                f.peptide_rescue_q_nokoi = q;
+                f.peptide_rescue_pep_nokoi = pep;
+            }
+            DfAdjustmentStage::ProteinRescue => {
+                f.protein_rescue_p_nokoi = p;
+                f.protein_rescue_q_nokoi = q;
+                f.protein_rescue_pep_nokoi = pep;
+            }
+        },
+
+        ModelFit::Ensemble => match stage {
+            DfAdjustmentStage::Rt => {
+                f.rt_adjust_p_ensemble = p;
+                f.rt_adjust_q_ensemble = q;
+                f.rt_adjust_pep_ensemble = pep;
+            }
+            DfAdjustmentStage::Ims => {
+                f.ims_adjust_p_ensemble = p;
+                f.ims_adjust_q_ensemble = q;
+                f.ims_adjust_pep_ensemble = pep;
+            }
+            DfAdjustmentStage::PeptideRescue => {
+                f.peptide_rescue_p_ensemble = p;
+                f.peptide_rescue_q_ensemble = q;
+                f.peptide_rescue_pep_ensemble = pep;
+            }
+            DfAdjustmentStage::ProteinRescue => {
+                f.protein_rescue_p_ensemble = p;
+                f.protein_rescue_q_ensemble = q;
+                f.protein_rescue_pep_ensemble = pep;
+            }
+        },
+    }
+}
+
+fn finalize_stage_snapshot(
+    features: &mut [DfFeature],
+    settings: &FdrSettings,
+    stage: DfAdjustmentStage,
+) {
+    recalculate_active_pep_q_values(features);
+
+    for f in features.iter_mut().filter(|f| f.core.rank == 1) {
+        snapshot_current_stream_to_stage(f, stage);
+        write_model_stage_snapshot(f, settings, stage);
+    }
 }
 
 pub fn run_df_layers(
@@ -5208,76 +6389,94 @@ pub fn run_df_layers(
     // 1G. Finalize Base Q-Values
     finalize_base_q_values(&mut new_features, &base_res.workset, settings, db);
 
-    // 2. Apply Layer 2 Physical Rescue
-    let rescue_res = apply_physical_rescue(&mut new_features, settings, db);
-    if settings.physical_rescue.ims_enabled {
+    // 2A. Optional RT confidence adjustment.
+    if settings.enable_rt_confidence_adjustment {
+        let rt_res = apply_rt_confidence_adjustment(&mut new_features, settings, db);
+
         log::info!(
-			"DF Layer 2: mode={:?} (anchors={}/{}) JointRel={:.4} (RT={:.4}, IMS={:.4}) FailClosed={}",
-			settings.physical_rescue.mode,
-			rescue_res.anchor_count_after_filters,
-			rescue_res.anchor_count_total,
-			rescue_res.joint_reliability,
-			rescue_res.rt_reliability,
-			rescue_res.ims_reliability,
-			rescue_res.fail_closed
-		);
+    "DF RT adjustment: enabled={} anchors={}/{} rt_reliability={:.4} joint_reliability={:.4} rt_sigma={:?} ims_sigma={:?} dropped_runs={} dropped_charge_bins={} fail_closed={}",
+    rt_res.enabled,
+    rt_res.anchor_count_after_filters,
+    rt_res.anchor_count_total,
+    rt_res.rt_reliability,
+    rt_res.joint_reliability,
+    rt_res.rt_sigma_global,
+    rt_res.ims_sigma_global,
+    rt_res.dropped_runs.len(),
+    rt_res.dropped_charge_bins.len(),
+    rt_res.fail_closed
+);
     } else {
-        log::info!(
-			"DF Layer 2: mode={:?} (anchors={}/{}) JointRel={:.4} (RT-only; IMS disabled) FailClosed={}",
-			settings.physical_rescue.mode,
-			rescue_res.anchor_count_after_filters,
-			rescue_res.anchor_count_total,
-			rescue_res.joint_reliability,
-			rescue_res.fail_closed
-		);
+        log::info!("DF RT adjustment: enabled=false");
     }
 
-    // Optional: Log detailed run/charge diagnostics at DEBUG level to avoid spamming INFO
-    log::debug!(
-        "DF Layer 2 Details: rt_sigma={:?}, ims_sigma={:?}, dropped_runs={:?}, dropped_charges={:?}",
-        rescue_res.rt_sigma_global,
-        rescue_res.ims_sigma_global,
-        rescue_res.dropped_runs,
-        rescue_res.dropped_charge_bins
-    );
+    // 2B. Optional IMS confidence adjustment.
+    if settings.enable_ims_confidence_adjustment {
+        let ims_res = apply_ims_confidence_adjustment(&mut new_features, settings, db);
 
-    // 3. Apply Layer 3 Reproducibility & Agreement
-    let repro_res = if rescue_res.fail_closed {
-        clear_l3_stage_outputs(&mut new_features);
-        log::warn!(
-            "DF Layer 3 skipped: Layer 2 fail-closed; Layer 3 will not activate as the final stream."
-        );
-        ReproducibilityResult {
-            enabled: false,
-            fail_closed: true,
-            ..Default::default()
-        }
+        log::info!(
+    "DF IMS adjustment: enabled={} anchors={}/{} ims_reliability={:.4} joint_reliability={:.4} rt_sigma={:?} ims_sigma={:?} dropped_runs={} dropped_charge_bins={} fail_closed={}",
+    ims_res.enabled,
+    ims_res.anchor_count_after_filters,
+    ims_res.anchor_count_total,
+    ims_res.ims_reliability,
+    ims_res.joint_reliability,
+    ims_res.rt_sigma_global,
+    ims_res.ims_sigma_global,
+    ims_res.dropped_runs.len(),
+    ims_res.dropped_charge_bins.len(),
+    ims_res.fail_closed
+);
     } else {
-        apply_bounded_repro_shift(&mut new_features, settings, db)
-    };
+        log::info!("DF IMS adjustment: enabled=false");
+    }
 
-    log::info!(
-        "DF Layer 3: enabled={} eligible_proteins={} eligible_peptides={} anchor_peptides={} rescued_psms={} strong_unchanged={} too_weak_unrescued={} agree_mean={:.4} max_shift={:.4} fail_closed={}",
-        repro_res.enabled,
-        repro_res.n_rescue_eligible_proteins,
-        repro_res.n_rescue_eligible_peptides,
-        repro_res.n_anchor_peptides,
-        repro_res.n_rescued_psms,
-        repro_res.n_strong_unchanged_psms,
-        repro_res.n_too_weak_unrescued_psms,
-        repro_res.agreement_support_mean,
-        repro_res.max_shift_applied,
-        repro_res.fail_closed
+    // 3A. Optional peptide reproducibility rescue.
+    if settings.enable_peptide_reproducibility_rescue {
+        let pep_repro_res = apply_peptide_reproducibility_rescue(&mut new_features, settings, db);
+
+        log::info!(
+        "DF peptide reproducibility rescue: enabled={} eligible_peptides={} anchor_peptides={} rescued_psms={} strong_unchanged={} too_weak_unrescued={} agree_mean={:.4} max_shift={:.4} fail_closed={}",
+        pep_repro_res.enabled,
+        pep_repro_res.n_rescue_eligible_peptides,
+        pep_repro_res.n_anchor_peptides,
+        pep_repro_res.n_rescued_psms,
+        pep_repro_res.n_strong_unchanged_psms,
+        pep_repro_res.n_too_weak_unrescued_psms,
+        pep_repro_res.agreement_support_mean,
+        pep_repro_res.max_shift_applied,
+        pep_repro_res.fail_closed
     );
+    } else {
+        log::info!("DF peptide reproducibility rescue: enabled=false");
+    }
+
+    // 3B. Optional protein reproducibility rescue.
+    if settings.enable_protein_reproducibility_rescue {
+        let prot_repro_res = apply_protein_reproducibility_rescue(&mut new_features, settings, db);
+
+        log::info!(
+        "DF protein reproducibility rescue: enabled={} eligible_proteins={} rescued_psms={} max_shift={:.4} fail_closed={}",
+        prot_repro_res.enabled,
+        prot_repro_res.n_rescue_eligible_proteins,
+        prot_repro_res.n_rescued_psms,
+        prot_repro_res.max_shift_applied,
+        prot_repro_res.fail_closed
+    );
+    } else {
+        log::info!("DF protein reproducibility rescue: enabled=false");
+    }
 
     // 4. Finalize the active PSM stream from the completed DF layers.
     let final_stream = finalize_df_psm_stream(&mut new_features, settings);
     validate_final_df_stream_contract(&new_features, final_stream);
 
     let stream_kind = match final_stream {
-        FinalDfStream::Base => "base / p-value-native",
-        FinalDfStream::Layer2 => "layer2 / pep-native",
-        FinalDfStream::Layer3 => "layer3 / pep-native",
+        FinalDfStream::Base => "base",
+        FinalDfStream::Rt => "rt_adjusted",
+        FinalDfStream::Ims => "ims_adjusted",
+        FinalDfStream::PeptideRescue => "peptide_reproducibility_rescue",
+        FinalDfStream::ProteinRescue => "protein_reproducibility_rescue",
     };
     log::info!("DF final active stream: {}", stream_kind);
 

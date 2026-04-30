@@ -174,10 +174,21 @@ pub struct DfFeature {
     pub decoy_free_protein_q: Option<f32>,
 
     // =========================================================================
-    // Additional Decoy-Free layer fields
+    // Decoy-Free explicit stage snapshots
     // =========================================================================
+    //
+    // The live controlling stream is always:
+    //   decoy_free_p_value
+    //   decoy_free_pep
+    //   decoy_free_score
+    //   decoy_free_q_value
+    //   decoy_free_peptide_q
+    //   decoy_free_protein_q
+    //
+    // These fields preserve stage-local snapshots. They should only be populated
+    // when the corresponding model/stage actually ran.
 
-    // 5A. Base layer fields
+    // Base Sage Decoy-Free post-model-fit snapshot.
     #[serde(skip_serializing_if = "Option::is_none")]
     pub decoy_free_p_value_base: Option<f32>,
     #[serde(skip_serializing_if = "Option::is_none")]
@@ -187,7 +198,49 @@ pub struct DfFeature {
     #[serde(skip_serializing_if = "Option::is_none")]
     pub decoy_free_q_base: Option<f32>,
 
-    // 5B. Layer 2 fields
+    // RT confidence adjustment snapshot.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub decoy_free_p_value_rt: Option<f32>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub decoy_free_pep_rt: Option<f32>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub decoy_free_score_rt: Option<f32>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub decoy_free_q_rt: Option<f32>,
+
+    // IMS confidence adjustment snapshot.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub decoy_free_p_value_ims: Option<f32>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub decoy_free_pep_ims: Option<f32>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub decoy_free_score_ims: Option<f32>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub decoy_free_q_ims: Option<f32>,
+
+    // Peptide reproducibility rescue snapshot.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub decoy_free_p_value_peptide_rescue: Option<f32>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub decoy_free_pep_peptide_rescue: Option<f32>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub decoy_free_score_peptide_rescue: Option<f32>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub decoy_free_q_peptide_rescue: Option<f32>,
+
+    // Protein reproducibility rescue snapshot.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub decoy_free_p_value_protein_rescue: Option<f32>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub decoy_free_pep_protein_rescue: Option<f32>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub decoy_free_score_protein_rescue: Option<f32>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub decoy_free_q_protein_rescue: Option<f32>,
+
+    // Transitional internal fields.
+    // TODO: remove after apply_physical_rescue/apply_bounded_repro_shift are rewritten
+    // to operate directly on the active decoy_free_* stream.
     #[serde(skip_serializing_if = "Option::is_none")]
     pub decoy_free_p_value_l2: Option<f32>,
     #[serde(skip_serializing_if = "Option::is_none")]
@@ -197,7 +250,6 @@ pub struct DfFeature {
     #[serde(skip_serializing_if = "Option::is_none")]
     pub decoy_free_q_l2: Option<f32>,
 
-    // 5C. Layer 3 fields
     #[serde(skip_serializing_if = "Option::is_none")]
     pub decoy_free_pep_l3: Option<f32>,
     #[serde(skip_serializing_if = "Option::is_none")]
@@ -256,6 +308,34 @@ pub struct DfFeature {
     #[serde(skip_serializing_if = "Option::is_none")]
     pub pep_mom: Option<f32>,
 
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub rt_adjust_p_mom: Option<f32>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub rt_adjust_q_mom: Option<f32>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub rt_adjust_pep_mom: Option<f32>,
+
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub ims_adjust_p_mom: Option<f32>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub ims_adjust_q_mom: Option<f32>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub ims_adjust_pep_mom: Option<f32>,
+
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub peptide_rescue_p_mom: Option<f32>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub peptide_rescue_q_mom: Option<f32>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub peptide_rescue_pep_mom: Option<f32>,
+
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub protein_rescue_p_mom: Option<f32>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub protein_rescue_q_mom: Option<f32>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub protein_rescue_pep_mom: Option<f32>,
+
     // MLE
     #[serde(skip_serializing_if = "Option::is_none")]
     pub p_mle: Option<f32>,
@@ -263,6 +343,34 @@ pub struct DfFeature {
     pub q_mle: Option<f32>,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub pep_mle: Option<f32>,
+
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub rt_adjust_p_mle: Option<f32>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub rt_adjust_q_mle: Option<f32>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub rt_adjust_pep_mle: Option<f32>,
+
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub ims_adjust_p_mle: Option<f32>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub ims_adjust_q_mle: Option<f32>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub ims_adjust_pep_mle: Option<f32>,
+
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub peptide_rescue_p_mle: Option<f32>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub peptide_rescue_q_mle: Option<f32>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub peptide_rescue_pep_mle: Option<f32>,
+
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub protein_rescue_p_mle: Option<f32>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub protein_rescue_q_mle: Option<f32>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub protein_rescue_pep_mle: Option<f32>,
 
     // Lower Order
     #[serde(skip_serializing_if = "Option::is_none")]
@@ -272,6 +380,34 @@ pub struct DfFeature {
     #[serde(skip_serializing_if = "Option::is_none")]
     pub pep_lo: Option<f32>,
 
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub rt_adjust_p_lo: Option<f32>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub rt_adjust_q_lo: Option<f32>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub rt_adjust_pep_lo: Option<f32>,
+
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub ims_adjust_p_lo: Option<f32>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub ims_adjust_q_lo: Option<f32>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub ims_adjust_pep_lo: Option<f32>,
+
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub peptide_rescue_p_lo: Option<f32>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub peptide_rescue_q_lo: Option<f32>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub peptide_rescue_pep_lo: Option<f32>,
+
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub protein_rescue_p_lo: Option<f32>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub protein_rescue_q_lo: Option<f32>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub protein_rescue_pep_lo: Option<f32>,
+
     // MSFDR (seeded / legacy)
     #[serde(skip_serializing_if = "Option::is_none")]
     pub p_msfdr: Option<f32>,
@@ -279,6 +415,34 @@ pub struct DfFeature {
     pub q_msfdr: Option<f32>,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub pep_msfdr: Option<f32>,
+
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub rt_adjust_p_msfdr: Option<f32>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub rt_adjust_q_msfdr: Option<f32>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub rt_adjust_pep_msfdr: Option<f32>,
+
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub ims_adjust_p_msfdr: Option<f32>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub ims_adjust_q_msfdr: Option<f32>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub ims_adjust_pep_msfdr: Option<f32>,
+
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub peptide_rescue_p_msfdr: Option<f32>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub peptide_rescue_q_msfdr: Option<f32>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub peptide_rescue_pep_msfdr: Option<f32>,
+
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub protein_rescue_p_msfdr: Option<f32>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub protein_rescue_q_msfdr: Option<f32>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub protein_rescue_pep_msfdr: Option<f32>,
 
     // MSFDR (1-state mixture)
     #[serde(skip_serializing_if = "Option::is_none")]
@@ -288,6 +452,34 @@ pub struct DfFeature {
     #[serde(skip_serializing_if = "Option::is_none")]
     pub pep_1smix: Option<f32>,
 
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub rt_adjust_p_1smix: Option<f32>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub rt_adjust_q_1smix: Option<f32>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub rt_adjust_pep_1smix: Option<f32>,
+
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub ims_adjust_p_1smix: Option<f32>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub ims_adjust_q_1smix: Option<f32>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub ims_adjust_pep_1smix: Option<f32>,
+
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub peptide_rescue_p_1smix: Option<f32>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub peptide_rescue_q_1smix: Option<f32>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub peptide_rescue_pep_1smix: Option<f32>,
+
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub protein_rescue_p_1smix: Option<f32>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub protein_rescue_q_1smix: Option<f32>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub protein_rescue_pep_1smix: Option<f32>,
+
     // MSFDR (2-state mixture)
     #[serde(skip_serializing_if = "Option::is_none")]
     pub p_2smix: Option<f32>,
@@ -296,6 +488,34 @@ pub struct DfFeature {
     #[serde(skip_serializing_if = "Option::is_none")]
     pub pep_2smix: Option<f32>,
 
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub rt_adjust_p_2smix: Option<f32>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub rt_adjust_q_2smix: Option<f32>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub rt_adjust_pep_2smix: Option<f32>,
+
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub ims_adjust_p_2smix: Option<f32>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub ims_adjust_q_2smix: Option<f32>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub ims_adjust_pep_2smix: Option<f32>,
+
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub peptide_rescue_p_2smix: Option<f32>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub peptide_rescue_q_2smix: Option<f32>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub peptide_rescue_pep_2smix: Option<f32>,
+
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub protein_rescue_p_2smix: Option<f32>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub protein_rescue_q_2smix: Option<f32>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub protein_rescue_pep_2smix: Option<f32>,
+
     // Nokoi
     #[serde(skip_serializing_if = "Option::is_none")]
     pub p_nokoi: Option<f32>,
@@ -303,6 +523,72 @@ pub struct DfFeature {
     pub q_nokoi: Option<f32>,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub pep_nokoi: Option<f32>,
+
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub rt_adjust_p_nokoi: Option<f32>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub rt_adjust_q_nokoi: Option<f32>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub rt_adjust_pep_nokoi: Option<f32>,
+
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub ims_adjust_p_nokoi: Option<f32>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub ims_adjust_q_nokoi: Option<f32>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub ims_adjust_pep_nokoi: Option<f32>,
+
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub peptide_rescue_p_nokoi: Option<f32>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub peptide_rescue_q_nokoi: Option<f32>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub peptide_rescue_pep_nokoi: Option<f32>,
+
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub protein_rescue_p_nokoi: Option<f32>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub protein_rescue_q_nokoi: Option<f32>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub protein_rescue_pep_nokoi: Option<f32>,
+
+    // Ensemble consensus stream
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub p_ensemble: Option<f32>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub q_ensemble: Option<f32>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub pep_ensemble: Option<f32>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub score_ensemble: Option<f32>,
+
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub rt_adjust_p_ensemble: Option<f32>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub rt_adjust_q_ensemble: Option<f32>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub rt_adjust_pep_ensemble: Option<f32>,
+
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub ims_adjust_p_ensemble: Option<f32>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub ims_adjust_q_ensemble: Option<f32>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub ims_adjust_pep_ensemble: Option<f32>,
+
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub peptide_rescue_p_ensemble: Option<f32>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub peptide_rescue_q_ensemble: Option<f32>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub peptide_rescue_pep_ensemble: Option<f32>,
+
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub protein_rescue_p_ensemble: Option<f32>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub protein_rescue_q_ensemble: Option<f32>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub protein_rescue_pep_ensemble: Option<f32>,
 }
 
 // Conversion helpers
@@ -356,11 +642,164 @@ impl FeatureCore {
             q_nokoi: None,
             pep_nokoi: None,
 
+            rt_adjust_p_mom: None,
+            rt_adjust_q_mom: None,
+            rt_adjust_pep_mom: None,
+
+            ims_adjust_p_mom: None,
+            ims_adjust_q_mom: None,
+            ims_adjust_pep_mom: None,
+
+            peptide_rescue_p_mom: None,
+            peptide_rescue_q_mom: None,
+            peptide_rescue_pep_mom: None,
+
+            protein_rescue_p_mom: None,
+            protein_rescue_q_mom: None,
+            protein_rescue_pep_mom: None,
+
+            rt_adjust_p_mle: None,
+            rt_adjust_q_mle: None,
+            rt_adjust_pep_mle: None,
+
+            ims_adjust_p_mle: None,
+            ims_adjust_q_mle: None,
+            ims_adjust_pep_mle: None,
+
+            peptide_rescue_p_mle: None,
+            peptide_rescue_q_mle: None,
+            peptide_rescue_pep_mle: None,
+
+            protein_rescue_p_mle: None,
+            protein_rescue_q_mle: None,
+            protein_rescue_pep_mle: None,
+
+            rt_adjust_p_lo: None,
+            rt_adjust_q_lo: None,
+            rt_adjust_pep_lo: None,
+
+            ims_adjust_p_lo: None,
+            ims_adjust_q_lo: None,
+            ims_adjust_pep_lo: None,
+
+            peptide_rescue_p_lo: None,
+            peptide_rescue_q_lo: None,
+            peptide_rescue_pep_lo: None,
+
+            protein_rescue_p_lo: None,
+            protein_rescue_q_lo: None,
+            protein_rescue_pep_lo: None,
+
+            rt_adjust_p_msfdr: None,
+            rt_adjust_q_msfdr: None,
+            rt_adjust_pep_msfdr: None,
+
+            ims_adjust_p_msfdr: None,
+            ims_adjust_q_msfdr: None,
+            ims_adjust_pep_msfdr: None,
+
+            peptide_rescue_p_msfdr: None,
+            peptide_rescue_q_msfdr: None,
+            peptide_rescue_pep_msfdr: None,
+
+            protein_rescue_p_msfdr: None,
+            protein_rescue_q_msfdr: None,
+            protein_rescue_pep_msfdr: None,
+
+            rt_adjust_p_1smix: None,
+            rt_adjust_q_1smix: None,
+            rt_adjust_pep_1smix: None,
+
+            ims_adjust_p_1smix: None,
+            ims_adjust_q_1smix: None,
+            ims_adjust_pep_1smix: None,
+
+            peptide_rescue_p_1smix: None,
+            peptide_rescue_q_1smix: None,
+            peptide_rescue_pep_1smix: None,
+
+            protein_rescue_p_1smix: None,
+            protein_rescue_q_1smix: None,
+            protein_rescue_pep_1smix: None,
+
+            rt_adjust_p_2smix: None,
+            rt_adjust_q_2smix: None,
+            rt_adjust_pep_2smix: None,
+
+            ims_adjust_p_2smix: None,
+            ims_adjust_q_2smix: None,
+            ims_adjust_pep_2smix: None,
+
+            peptide_rescue_p_2smix: None,
+            peptide_rescue_q_2smix: None,
+            peptide_rescue_pep_2smix: None,
+
+            protein_rescue_p_2smix: None,
+            protein_rescue_q_2smix: None,
+            protein_rescue_pep_2smix: None,
+
+            rt_adjust_p_nokoi: None,
+            rt_adjust_q_nokoi: None,
+            rt_adjust_pep_nokoi: None,
+
+            ims_adjust_p_nokoi: None,
+            ims_adjust_q_nokoi: None,
+            ims_adjust_pep_nokoi: None,
+
+            peptide_rescue_p_nokoi: None,
+            peptide_rescue_q_nokoi: None,
+            peptide_rescue_pep_nokoi: None,
+
+            protein_rescue_p_nokoi: None,
+            protein_rescue_q_nokoi: None,
+            protein_rescue_pep_nokoi: None,
+
+            p_ensemble: None,
+            q_ensemble: None,
+            pep_ensemble: None,
+            score_ensemble: None,
+
+            rt_adjust_p_ensemble: None,
+            rt_adjust_q_ensemble: None,
+            rt_adjust_pep_ensemble: None,
+
+            ims_adjust_p_ensemble: None,
+            ims_adjust_q_ensemble: None,
+            ims_adjust_pep_ensemble: None,
+
+            peptide_rescue_p_ensemble: None,
+            peptide_rescue_q_ensemble: None,
+            peptide_rescue_pep_ensemble: None,
+
+            protein_rescue_p_ensemble: None,
+            protein_rescue_q_ensemble: None,
+            protein_rescue_pep_ensemble: None,
+
             // Initialize additional Decoy-Free layer fields
             decoy_free_p_value_base: None,
             decoy_free_pep_base: None,
             decoy_free_score_base: None,
             decoy_free_q_base: None,
+
+            decoy_free_p_value_rt: None,
+            decoy_free_pep_rt: None,
+            decoy_free_score_rt: None,
+            decoy_free_q_rt: None,
+
+            decoy_free_p_value_ims: None,
+            decoy_free_pep_ims: None,
+            decoy_free_score_ims: None,
+            decoy_free_q_ims: None,
+
+            decoy_free_p_value_peptide_rescue: None,
+            decoy_free_pep_peptide_rescue: None,
+            decoy_free_score_peptide_rescue: None,
+            decoy_free_q_peptide_rescue: None,
+
+            decoy_free_p_value_protein_rescue: None,
+            decoy_free_pep_protein_rescue: None,
+            decoy_free_score_protein_rescue: None,
+            decoy_free_q_protein_rescue: None,
 
             decoy_free_p_value_l2: None,
             decoy_free_pep_l2: None,
