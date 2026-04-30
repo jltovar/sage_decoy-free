@@ -3709,16 +3709,11 @@ fn apply_physical_rescue(
 ) -> PhysicalRescueResult {
     use crate::input::PhysicalRescueMode;
 
-    // Capture the original base stream only once.
-    // Later stages must not overwrite the base audit snapshot.
-    for f in features.iter_mut() {
-        if f.core.rank == 1 && f.decoy_free_pep_base.is_none() {
-            f.decoy_free_p_value_base = f.decoy_free_p_value;
-            f.decoy_free_pep_base = f.decoy_free_pep;
-            f.decoy_free_score_base = f.decoy_free_score;
-            f.decoy_free_q_base = f.decoy_free_q_value;
-        }
-    }
+    // Base stream must already have been frozen immediately after base q-value
+    // finalization in run_df_layers(). Do not snapshot here: this function may be
+    // called after another physical/rescue stage has already modified the active
+    // decoy_free_* stream.
+    snapshot_base_stream_once(features);
 
     // 2. Dispatcher
     match settings.physical_rescue.rt_mode {
@@ -3903,7 +3898,7 @@ fn apply_rt_bounded_update_to_active_stream(
     };
 
     let cfg = settings.physical_rescue.bounded_cfg.as_ref().expect(
-        "Invalid DF config: IMS bounded auxiliary adjustment requires physical_rescue.bounded_cfg.",
+        "Invalid DF config: RT bounded auxiliary adjustment requires physical_rescue.bounded_cfg.",
     );
 
     let mut rows_for_q: Vec<(f64, usize, f64)> = Vec::new();
@@ -4490,42 +4485,54 @@ fn apply_rt_confidence_adjustment(
     features: &mut [DfFeature],
     settings: &FdrSettings,
     db: &IndexedDatabase,
-) -> PhysicalRescueResult {
+) -> (PhysicalRescueResult, DfStageOutcome) {
     if !settings.enable_rt_confidence_adjustment {
-        return PhysicalRescueResult {
-            enabled: false,
-            ..Default::default()
-        };
+        return (
+            PhysicalRescueResult {
+                enabled: false,
+                ..Default::default()
+            },
+            DfStageOutcome::Skipped,
+        );
     }
 
     let res = apply_rt_only_physical_update_to_active_stream(features, settings, db);
 
-    if !res.fail_closed {
+    let outcome = if res.fail_closed || res.anchor_count_total == 0 {
+        DfStageOutcome::FailedClosed
+    } else {
         finalize_stage_snapshot(features, settings, DfAdjustmentStage::Rt);
-    }
+        DfStageOutcome::Applied
+    };
 
-    res
+    (res, outcome)
 }
 
 fn apply_ims_confidence_adjustment(
     features: &mut [DfFeature],
     settings: &FdrSettings,
     db: &IndexedDatabase,
-) -> PhysicalRescueResult {
+) -> (PhysicalRescueResult, DfStageOutcome) {
     if !settings.enable_ims_confidence_adjustment {
-        return PhysicalRescueResult {
-            enabled: false,
-            ..Default::default()
-        };
+        return (
+            PhysicalRescueResult {
+                enabled: false,
+                ..Default::default()
+            },
+            DfStageOutcome::Skipped,
+        );
     }
 
     let res = apply_ims_only_physical_update_to_active_stream(features, settings, db);
 
-    if !res.fail_closed {
+    let outcome = if res.fail_closed || res.anchor_count_total == 0 {
+        DfStageOutcome::FailedClosed
+    } else {
         finalize_stage_snapshot(features, settings, DfAdjustmentStage::Ims);
-    }
+        DfStageOutcome::Applied
+    };
 
-    res
+    (res, outcome)
 }
 
 fn promote_l3_to_active_stream(features: &mut [DfFeature]) {
@@ -4578,42 +4585,58 @@ fn apply_peptide_reproducibility_rescue(
     features: &mut [DfFeature],
     settings: &FdrSettings,
     db: &IndexedDatabase,
-) -> ReproducibilityResult {
+) -> (ReproducibilityResult, DfStageOutcome) {
     if !settings.enable_peptide_reproducibility_rescue {
-        return ReproducibilityResult {
-            enabled: false,
-            ..Default::default()
-        };
+        return (
+            ReproducibilityResult {
+                enabled: false,
+                ..Default::default()
+            },
+            DfStageOutcome::Skipped,
+        );
     }
 
     let res = apply_peptide_reproducibility_update_to_active_stream(features, settings, db);
 
-    if !res.fail_closed && res.n_rescued_psms > 0 {
+    let outcome = if res.fail_closed {
+        DfStageOutcome::FailedClosed
+    } else if res.n_rescued_psms == 0 {
+        DfStageOutcome::Skipped
+    } else {
         finalize_stage_snapshot(features, settings, DfAdjustmentStage::PeptideRescue);
-    }
+        DfStageOutcome::Applied
+    };
 
-    res
+    (res, outcome)
 }
 
 fn apply_protein_reproducibility_rescue(
     features: &mut [DfFeature],
     settings: &FdrSettings,
     db: &IndexedDatabase,
-) -> ReproducibilityResult {
+) -> (ReproducibilityResult, DfStageOutcome) {
     if !settings.enable_protein_reproducibility_rescue {
-        return ReproducibilityResult {
-            enabled: false,
-            ..Default::default()
-        };
+        return (
+            ReproducibilityResult {
+                enabled: false,
+                ..Default::default()
+            },
+            DfStageOutcome::Skipped,
+        );
     }
 
     let res = apply_protein_reproducibility_update_to_active_stream(features, settings, db);
 
-    if !res.fail_closed && res.n_rescued_psms > 0 {
+    let outcome = if res.fail_closed {
+        DfStageOutcome::FailedClosed
+    } else if res.n_rescued_psms == 0 {
+        DfStageOutcome::Skipped
+    } else {
         finalize_stage_snapshot(features, settings, DfAdjustmentStage::ProteinRescue);
-    }
+        DfStageOutcome::Applied
+    };
 
-    res
+    (res, outcome)
 }
 
 fn verify_dart_rt_scale_consistency(
@@ -5840,8 +5863,22 @@ fn apply_bounded_repro_shift(
     }
 }
 
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
-enum FinalDfStream {
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum DfStageOutcome {
+    Applied,
+    Skipped,
+    FailedClosed,
+}
+
+impl DfStageOutcome {
+    #[inline]
+    pub fn applied(self) -> bool {
+        matches!(self, DfStageOutcome::Applied)
+    }
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum ActiveDfStream {
     Base,
     Rt,
     Ims,
@@ -5849,122 +5886,7 @@ enum FinalDfStream {
     ProteinRescue,
 }
 
-#[inline]
-fn activate_final_base_stream(f: &mut DfFeature) {
-    f.decoy_free_p_value = f.decoy_free_p_value_base;
-    f.decoy_free_pep = f.decoy_free_pep_base;
-    f.decoy_free_score = f.decoy_free_score_base;
-    f.decoy_free_q_value = f.decoy_free_q_base;
-}
-
-#[inline]
-fn activate_final_stage_stream(
-    f: &mut DfFeature,
-    p: Option<f32>,
-    pep: Option<f32>,
-    score: Option<f32>,
-    q: Option<f32>,
-) {
-    f.decoy_free_p_value = p;
-    f.decoy_free_pep = pep;
-    f.decoy_free_score = score;
-    f.decoy_free_q_value = q;
-}
-
-#[inline]
-fn any_rank1_has<F>(features: &[DfFeature], pred: F) -> bool
-where
-    F: Fn(&DfFeature) -> bool,
-{
-    features.iter().any(|f| f.core.rank == 1 && pred(f))
-}
-
-#[inline]
-fn detect_final_df_stream(features: &[DfFeature], settings: &FdrSettings) -> FinalDfStream {
-    if settings.enable_protein_reproducibility_rescue
-        && any_rank1_has(features, |f| {
-            f.decoy_free_pep_protein_rescue.is_some() && f.decoy_free_q_protein_rescue.is_some()
-        })
-    {
-        FinalDfStream::ProteinRescue
-    } else if settings.enable_peptide_reproducibility_rescue
-        && any_rank1_has(features, |f| {
-            f.decoy_free_pep_peptide_rescue.is_some() && f.decoy_free_q_peptide_rescue.is_some()
-        })
-    {
-        FinalDfStream::PeptideRescue
-    } else if settings.enable_ims_confidence_adjustment
-        && any_rank1_has(features, |f| {
-            f.decoy_free_pep_ims.is_some() && f.decoy_free_q_ims.is_some()
-        })
-    {
-        FinalDfStream::Ims
-    } else if settings.enable_rt_confidence_adjustment
-        && any_rank1_has(features, |f| {
-            f.decoy_free_pep_rt.is_some() && f.decoy_free_q_rt.is_some()
-        })
-    {
-        FinalDfStream::Rt
-    } else {
-        FinalDfStream::Base
-    }
-}
-
-fn finalize_df_psm_stream(features: &mut [DfFeature], settings: &FdrSettings) -> FinalDfStream {
-    let final_stream = detect_final_df_stream(features, settings);
-
-    for f in features.iter_mut() {
-        if f.core.rank != 1 {
-            continue;
-        }
-
-        match final_stream {
-            FinalDfStream::Base => {
-                activate_final_base_stream(f);
-            }
-            FinalDfStream::Rt => {
-                activate_final_stage_stream(
-                    f,
-                    f.decoy_free_p_value_rt,
-                    f.decoy_free_pep_rt,
-                    f.decoy_free_score_rt,
-                    f.decoy_free_q_rt,
-                );
-            }
-            FinalDfStream::Ims => {
-                activate_final_stage_stream(
-                    f,
-                    f.decoy_free_p_value_ims,
-                    f.decoy_free_pep_ims,
-                    f.decoy_free_score_ims,
-                    f.decoy_free_q_ims,
-                );
-            }
-            FinalDfStream::PeptideRescue => {
-                activate_final_stage_stream(
-                    f,
-                    f.decoy_free_p_value_peptide_rescue,
-                    f.decoy_free_pep_peptide_rescue,
-                    f.decoy_free_score_peptide_rescue,
-                    f.decoy_free_q_peptide_rescue,
-                );
-            }
-            FinalDfStream::ProteinRescue => {
-                activate_final_stage_stream(
-                    f,
-                    f.decoy_free_p_value_protein_rescue,
-                    f.decoy_free_pep_protein_rescue,
-                    f.decoy_free_score_protein_rescue,
-                    f.decoy_free_q_protein_rescue,
-                );
-            }
-        }
-    }
-
-    final_stream
-}
-
-fn validate_final_df_stream_contract(features: &[DfFeature], final_stream: FinalDfStream) {
+fn validate_final_df_stream_contract(features: &[DfFeature], final_stream: ActiveDfStream) {
     let mut n_rank1 = 0usize;
     let mut n_invalid = 0usize;
 
@@ -6071,6 +5993,21 @@ fn recalculate_active_pep_q_values(features: &mut [DfFeature]) {
 
     for (feat_idx, q) in q_from_pep_cummean(rows) {
         features[feat_idx].decoy_free_q_value = Some(q as f32);
+    }
+}
+
+fn snapshot_base_stream_once(features: &mut [DfFeature]) {
+    for f in features.iter_mut().filter(|f| f.core.rank == 1) {
+        if f.decoy_free_pep_base.is_none()
+            && f.decoy_free_q_base.is_none()
+            && f.decoy_free_score_base.is_none()
+            && f.decoy_free_p_value_base.is_none()
+        {
+            f.decoy_free_p_value_base = f.decoy_free_p_value;
+            f.decoy_free_pep_base = f.decoy_free_pep;
+            f.decoy_free_score_base = f.decoy_free_score;
+            f.decoy_free_q_base = f.decoy_free_q_value;
+        }
     }
 }
 
@@ -6414,94 +6351,107 @@ pub fn run_df_layers(
     // 1G. Finalize Base Q-Values
     finalize_base_q_values(&mut new_features, &base_res.workset, settings, db);
 
+    // 1H. Freeze the finalized base DF stream before any RT/IMS/rescue stage.
+    // RT/IMS anchor selection reads decoy_free_*_base, so these fields must be
+    // populated immediately after base q-values are computed.
+    snapshot_base_stream_once(&mut new_features);
+
+    let base_snapshot_missing = new_features
+        .iter()
+        .filter(|f| f.core.rank == 1)
+        .filter(|f| {
+            f.decoy_free_pep_base.is_none()
+                || f.decoy_free_q_base.is_none()
+                || f.decoy_free_score_base.is_none()
+        })
+        .count();
+
+    if base_snapshot_missing > 0 {
+        panic!(
+        "DF base snapshot failed: {} rank-1 rows are missing base pep/q/score after finalize_base_q_values",
+        base_snapshot_missing
+    );
+    }
+
+    // --- Explicit Active Stream Tracking ---
+    let mut active_stream = ActiveDfStream::Base;
+
     // 2A. Optional RT confidence adjustment.
     if settings.enable_rt_confidence_adjustment {
-        let rt_res = apply_rt_confidence_adjustment(&mut new_features, settings, db);
-
+        let (rt_res, outcome) = apply_rt_confidence_adjustment(&mut new_features, settings, db);
+        if outcome.applied() {
+            active_stream = ActiveDfStream::Rt;
+        }
         log::info!(
-    "DF RT adjustment: enabled={} anchors={}/{} rt_reliability={:.4} joint_reliability={:.4} rt_sigma={:?} ims_sigma={:?} dropped_runs={} dropped_charge_bins={} fail_closed={}",
-    rt_res.enabled,
-    rt_res.anchor_count_after_filters,
-    rt_res.anchor_count_total,
-    rt_res.rt_reliability,
-    rt_res.joint_reliability,
-    rt_res.rt_sigma_global,
-    rt_res.ims_sigma_global,
-    rt_res.dropped_runs.len(),
-    rt_res.dropped_charge_bins.len(),
-    rt_res.fail_closed
-);
+            "DF RT adjustment: enabled={} anchors={}/{} rt_reliability={:.4} joint_reliability={:.4} rt_sigma={:?} ims_sigma={:?} dropped_runs={} dropped_charge_bins={} fail_closed={}",
+            rt_res.enabled, rt_res.anchor_count_after_filters, rt_res.anchor_count_total,
+            rt_res.rt_reliability, rt_res.joint_reliability, rt_res.rt_sigma_global,
+            rt_res.ims_sigma_global, rt_res.dropped_runs.len(), rt_res.dropped_charge_bins.len(),
+            rt_res.fail_closed
+        );
     } else {
         log::info!("DF RT adjustment: enabled=false");
     }
 
     // 2B. Optional IMS confidence adjustment.
     if settings.enable_ims_confidence_adjustment {
-        let ims_res = apply_ims_confidence_adjustment(&mut new_features, settings, db);
-
+        let (ims_res, outcome) = apply_ims_confidence_adjustment(&mut new_features, settings, db);
+        if outcome.applied() {
+            active_stream = ActiveDfStream::Ims;
+        }
         log::info!(
-    "DF IMS adjustment: enabled={} anchors={}/{} ims_reliability={:.4} joint_reliability={:.4} rt_sigma={:?} ims_sigma={:?} dropped_runs={} dropped_charge_bins={} fail_closed={}",
-    ims_res.enabled,
-    ims_res.anchor_count_after_filters,
-    ims_res.anchor_count_total,
-    ims_res.ims_reliability,
-    ims_res.joint_reliability,
-    ims_res.rt_sigma_global,
-    ims_res.ims_sigma_global,
-    ims_res.dropped_runs.len(),
-    ims_res.dropped_charge_bins.len(),
-    ims_res.fail_closed
-);
+            "DF IMS adjustment: enabled={} anchors={}/{} ims_reliability={:.4} joint_reliability={:.4} rt_sigma={:?} ims_sigma={:?} dropped_runs={} dropped_charge_bins={} fail_closed={}",
+            ims_res.enabled, ims_res.anchor_count_after_filters, ims_res.anchor_count_total,
+            ims_res.ims_reliability, ims_res.joint_reliability, ims_res.rt_sigma_global,
+            ims_res.ims_sigma_global, ims_res.dropped_runs.len(), ims_res.dropped_charge_bins.len(),
+            ims_res.fail_closed
+        );
     } else {
         log::info!("DF IMS adjustment: enabled=false");
     }
 
     // 3A. Optional peptide reproducibility rescue.
     if settings.enable_peptide_reproducibility_rescue {
-        let pep_repro_res = apply_peptide_reproducibility_rescue(&mut new_features, settings, db);
-
+        let (pep_repro_res, outcome) =
+            apply_peptide_reproducibility_rescue(&mut new_features, settings, db);
+        if outcome.applied() {
+            active_stream = ActiveDfStream::PeptideRescue;
+        }
         log::info!(
-        "DF peptide reproducibility rescue: enabled={} eligible_peptides={} anchor_peptides={} rescued_psms={} strong_unchanged={} too_weak_unrescued={} agree_mean={:.4} max_shift={:.4} fail_closed={}",
-        pep_repro_res.enabled,
-        pep_repro_res.n_rescue_eligible_peptides,
-        pep_repro_res.n_anchor_peptides,
-        pep_repro_res.n_rescued_psms,
-        pep_repro_res.n_strong_unchanged_psms,
-        pep_repro_res.n_too_weak_unrescued_psms,
-        pep_repro_res.agreement_support_mean,
-        pep_repro_res.max_shift_applied,
-        pep_repro_res.fail_closed
-    );
+            "DF peptide reproducibility rescue: enabled={} eligible_peptides={} anchor_peptides={} rescued_psms={} strong_unchanged={} too_weak_unrescued={} agree_mean={:.4} max_shift={:.4} fail_closed={}",
+            pep_repro_res.enabled, pep_repro_res.n_rescue_eligible_peptides, pep_repro_res.n_anchor_peptides,
+            pep_repro_res.n_rescued_psms, pep_repro_res.n_strong_unchanged_psms, pep_repro_res.n_too_weak_unrescued_psms,
+            pep_repro_res.agreement_support_mean, pep_repro_res.max_shift_applied, pep_repro_res.fail_closed
+        );
     } else {
         log::info!("DF peptide reproducibility rescue: enabled=false");
     }
 
     // 3B. Optional protein reproducibility rescue.
     if settings.enable_protein_reproducibility_rescue {
-        let prot_repro_res = apply_protein_reproducibility_rescue(&mut new_features, settings, db);
-
+        let (prot_repro_res, outcome) =
+            apply_protein_reproducibility_rescue(&mut new_features, settings, db);
+        if outcome.applied() {
+            active_stream = ActiveDfStream::ProteinRescue;
+        }
         log::info!(
-        "DF protein reproducibility rescue: enabled={} eligible_proteins={} rescued_psms={} max_shift={:.4} fail_closed={}",
-        prot_repro_res.enabled,
-        prot_repro_res.n_rescue_eligible_proteins,
-        prot_repro_res.n_rescued_psms,
-        prot_repro_res.max_shift_applied,
-        prot_repro_res.fail_closed
-    );
+            "DF protein reproducibility rescue: enabled={} eligible_proteins={} rescued_psms={} max_shift={:.4} fail_closed={}",
+            prot_repro_res.enabled, prot_repro_res.n_rescue_eligible_proteins, prot_repro_res.n_rescued_psms,
+            prot_repro_res.max_shift_applied, prot_repro_res.fail_closed
+        );
     } else {
         log::info!("DF protein reproducibility rescue: enabled=false");
     }
 
-    // 4. Finalize the active PSM stream from the completed DF layers.
-    let final_stream = finalize_df_psm_stream(&mut new_features, settings);
-    validate_final_df_stream_contract(&new_features, final_stream);
+    // 4. Validate the active PSM stream from the completed DF layers.
+    validate_final_df_stream_contract(&new_features, active_stream);
 
-    let stream_kind = match final_stream {
-        FinalDfStream::Base => "base",
-        FinalDfStream::Rt => "rt_adjusted",
-        FinalDfStream::Ims => "ims_adjusted",
-        FinalDfStream::PeptideRescue => "peptide_reproducibility_rescue",
-        FinalDfStream::ProteinRescue => "protein_reproducibility_rescue",
+    let stream_kind = match active_stream {
+        ActiveDfStream::Base => "base",
+        ActiveDfStream::Rt => "rt_adjusted",
+        ActiveDfStream::Ims => "ims_adjusted",
+        ActiveDfStream::PeptideRescue => "peptide_reproducibility_rescue",
+        ActiveDfStream::ProteinRescue => "protein_reproducibility_rescue",
     };
     log::info!("DF final active stream: {}", stream_kind);
 
