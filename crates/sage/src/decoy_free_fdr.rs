@@ -5341,7 +5341,7 @@ fn build_l3_protein_support_map(
             .insert(peptide_seq.clone());
 
         if f.decoy_free_q_l2
-            .map(|q| q <= cfg.q_threshold_l2 as f32)
+            .map(|q| q <= cfg.q_threshold_physical as f32)
             .unwrap_or(false)
         {
             passing.entry(protein_key).or_default().insert(peptide_seq);
@@ -5422,10 +5422,10 @@ fn build_l3_peptide_eligibility_map(
 
         let q_ok = f
             .decoy_free_q_l2
-            .map(|q| q <= cfg.strong_reference_q_threshold_l2 as f32)
+            .map(|q| q <= cfg.strong_reference_q_threshold_physical as f32)
             .unwrap_or(false);
 
-        let pep_ok = match cfg.strong_reference_pep_threshold_l2 {
+        let pep_ok = match cfg.strong_reference_pep_threshold_physical {
             Some(thr) => f
                 .decoy_free_pep_l2
                 .map(|p| p <= thr as f32)
@@ -5502,10 +5502,10 @@ fn build_l3_anchor_map(
 
         let q_ok = f
             .decoy_free_q_l2
-            .map(|q| q <= pep_cfg.strong_reference_q_threshold_l2 as f32)
+            .map(|q| q <= pep_cfg.strong_reference_q_threshold_physical as f32)
             .unwrap_or(false);
 
-        let pep_ok = match pep_cfg.strong_reference_pep_threshold_l2 {
+        let pep_ok = match pep_cfg.strong_reference_pep_threshold_physical {
             Some(thr) => f
                 .decoy_free_pep_l2
                 .map(|p| p <= thr as f32)

@@ -330,7 +330,7 @@ pub struct PhysicalRescueConfig {
 #[derive(Clone, Serialize, Deserialize, Debug, PartialEq)]
 pub struct L3ProteinEligibilityConfig {
     pub enabled: bool,
-    pub q_threshold_l2: f64,
+    pub q_threshold_physical: f64,
     pub min_unique_passing_peptides: usize,
     pub min_unique_passing_fraction: Option<f64>,
 }
@@ -339,8 +339,8 @@ pub struct L3ProteinEligibilityConfig {
 pub struct L3PeptideEligibilityConfig {
     pub min_run_fraction: f64,
     pub min_run_count: usize,
-    pub strong_reference_q_threshold_l2: f64,
-    pub strong_reference_pep_threshold_l2: Option<f64>,
+    pub strong_reference_q_threshold_physical: f64,
+    pub strong_reference_pep_threshold_physical: Option<f64>,
     pub min_strong_run_fraction: f64,
     pub min_strong_run_count: usize,
 }
@@ -799,7 +799,7 @@ impl From<FdrOptions> for FdrSettings {
 
                 protein_eligibility: L3ProteinEligibilityConfig {
                     enabled: true,
-                    q_threshold_l2: 0.01,
+                    q_threshold_physical: 0.01,
                     min_unique_passing_peptides: 2,
                     min_unique_passing_fraction: None,
                 },
@@ -807,8 +807,8 @@ impl From<FdrOptions> for FdrSettings {
                 peptide_eligibility: L3PeptideEligibilityConfig {
                     min_run_fraction: 0.6,
                     min_run_count: 2,
-                    strong_reference_q_threshold_l2: 0.01,
-                    strong_reference_pep_threshold_l2: None,
+                    strong_reference_q_threshold_physical: 0.01,
+                    strong_reference_pep_threshold_physical: None,
                     min_strong_run_fraction: 0.2,
                     min_strong_run_count: 1,
                 },
