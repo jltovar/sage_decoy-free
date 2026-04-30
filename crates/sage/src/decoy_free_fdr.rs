@@ -731,25 +731,6 @@ fn df_rank_score_base_pep(f: &DfFeature) -> f64 {
         .unwrap_or_else(|| tev(f).unwrap_or(0.0))
 }
 
-#[inline(always)]
-fn df_rank_score_l2_pep(f: &DfFeature) -> f64 {
-    f.decoy_free_score_l2.map(|x| x as f64).unwrap_or_else(|| {
-        f.decoy_free_score
-            .map(|x| x as f64)
-            .unwrap_or_else(|| tev(f).unwrap_or(0.0))
-    })
-}
-
-#[inline(always)]
-fn df_rank_score_l3_pep(f: &DfFeature) -> f64 {
-    f.decoy_free_score_l3.map(|x| x as f64).unwrap_or_else(|| {
-        f.decoy_free_score_l2
-            .map(|x| x as f64)
-            .or_else(|| f.decoy_free_score.map(|x| x as f64))
-            .unwrap_or_else(|| tev(f).unwrap_or(0.0))
-    })
-}
-
 // -----------------------------------------------------------------------------
 // 8) Protein-string classification (contam / entrapment)
 // -----------------------------------------------------------------------------
@@ -3775,15 +3756,6 @@ fn apply_physical_rescue(
 // INDEPENDENT KERNELS: RT-Only and IMS-Only
 // =============================================================================
 
-fn promote_l2_to_active_stream(features: &mut [DfFeature]) {
-    for f in features.iter_mut().filter(|f| f.core.rank == 1) {
-        f.decoy_free_p_value = f.decoy_free_p_value_l2;
-        f.decoy_free_pep = f.decoy_free_pep_l2;
-        f.decoy_free_score = f.decoy_free_score_l2;
-        f.decoy_free_q_value = f.decoy_free_q_l2;
-    }
-}
-
 fn apply_rt_dart_bayes_update_to_active_stream(
     features: &mut [DfFeature],
     settings: &FdrSettings,
@@ -3796,13 +3768,7 @@ fn apply_rt_dart_bayes_update_to_active_stream(
     rt_settings.physical_rescue.rt_mode = crate::input::PhysicalRescueMode::DartBayes;
     rt_settings.physical_rescue.ims_mode = crate::input::PhysicalRescueMode::Off;
 
-    let res = apply_physical_rescue(features, &rt_settings, db);
-
-    if !res.fail_closed {
-        promote_l2_to_active_stream(features);
-    }
-
-    res
+    apply_physical_rescue(features, &rt_settings, db)
 }
 
 fn apply_physical_update_to_active_stream(
@@ -4260,32 +4226,6 @@ fn compute_dart_null_ims_likelihood(
     }
 }
 
-fn finalize_active_dart_q_values(features: &mut [DfFeature]) {
-    let mut rows: Vec<(f64, usize, f64)> = Vec::new();
-
-    for (i, f) in features.iter().enumerate() {
-        if f.core.rank != 1 {
-            continue;
-        }
-
-        let pep = match f.decoy_free_pep {
-            Some(x) if x.is_finite() => (x as f64).clamp(0.0, 1.0).max(1e-300),
-            _ => continue,
-        };
-
-        let score_key = f
-            .decoy_free_score
-            .map(|s| s as f64)
-            .unwrap_or_else(|| -10.0 * pep.max(1e-15).log10());
-
-        rows.push((score_key, i, pep));
-    }
-
-    for (feat_idx, q) in q_from_pep_cummean(rows) {
-        features[feat_idx].decoy_free_q_value = Some(q as f32);
-    }
-}
-
 fn apply_ims_dart_bayes_update_to_active_stream(
     features: &mut [DfFeature],
     settings: &FdrSettings,
@@ -4463,7 +4403,7 @@ fn apply_ims_dart_bayes_update_to_active_stream(
     }
 
     if !is_unreliable && dart_cfg.dart_recalc_q_from_posterior {
-        finalize_active_dart_q_values(features);
+        recalculate_active_pep_q_values(features);
     }
 
     PhysicalRescueResult {
@@ -4535,31 +4475,12 @@ fn apply_ims_confidence_adjustment(
     (res, outcome)
 }
 
-fn promote_l3_to_active_stream(features: &mut [DfFeature]) {
-    for f in features.iter_mut().filter(|f| f.core.rank == 1) {
-        f.decoy_free_pep = f.decoy_free_pep_l3;
-        f.decoy_free_score = f.decoy_free_score_l3;
-        f.decoy_free_q_value = f.decoy_free_q_l3;
-
-        // L3 is currently PEP-native. Keep the active p-value stream from
-        // the prior stage instead of erasing it.
-    }
-}
-
 fn apply_peptide_reproducibility_update_to_active_stream(
     features: &mut [DfFeature],
     settings: &FdrSettings,
     db: &IndexedDatabase,
 ) -> ReproducibilityResult {
-    let res = apply_bounded_repro_shift(features, settings, db);
-
-    // A reproducibility stage with zero rescued PSMs is a no-op.
-    // Do not promote a stage-local L3 stream just because the stage was enabled.
-    if !res.fail_closed && res.n_rescued_psms > 0 {
-        promote_l3_to_active_stream(features);
-    }
-
-    res
+    apply_bounded_repro_shift(features, settings, db)
 }
 
 fn apply_protein_reproducibility_update_to_active_stream(
@@ -4567,18 +4488,7 @@ fn apply_protein_reproducibility_update_to_active_stream(
     settings: &FdrSettings,
     db: &IndexedDatabase,
 ) -> ReproducibilityResult {
-    // Transitional compile-safe implementation.
-    // This still uses the existing L3 kernel. The protein/peptide split can be
-    // made mathematically independent after this build is clean.
-    let res = apply_bounded_repro_shift(features, settings, db);
-
-    // A reproducibility stage with zero rescued PSMs is a no-op.
-    // Do not promote a stage-local L3 stream just because the stage was enabled.
-    if !res.fail_closed && res.n_rescued_psms > 0 {
-        promote_l3_to_active_stream(features);
-    }
-
-    res
+    apply_bounded_repro_shift(features, settings, db)
 }
 
 fn apply_peptide_reproducibility_rescue(
@@ -4980,29 +4890,7 @@ fn compute_dart_bootstrap_uncertainty(
     sigma
 }
 
-fn finalize_dart_l2_q_values(features: &mut [DfFeature]) {
-    let mut rows: Vec<(f64, usize, f64)> = Vec::new();
-
-    for (i, f) in features.iter().enumerate() {
-        if f.core.rank == 1 {
-            if let Some(pep) = f.decoy_free_pep_l2 {
-                if pep.is_finite() {
-                    let score_key = df_rank_score_l2_pep(f);
-                    rows.push((score_key, i, (pep as f64).clamp(0.0, 1.0).max(1e-300)));
-                }
-            }
-        }
-    }
-
-    for (feat_idx, q) in q_from_pep_cummean(rows) {
-        features[feat_idx].decoy_free_q_l2 = Some(q as f32);
-    }
-}
-
 fn apply_dart_bayes_update(
-    // This function writes stage-local Layer 2 PEP-native outputs only.
-    // It does not activate the final DF stream.
-    // Final activation happens only in finalize_df_psm_stream(...).
     features: &mut [DfFeature],
     settings: &FdrSettings,
     l2_ctx: &L2PhysicalContext,
@@ -5015,13 +4903,21 @@ fn apply_dart_bayes_update(
         .as_ref()
         .expect("DART-Bayes config must be provided");
 
+    if is_unreliable {
+        for f in features.iter_mut().filter(|f| f.core.rank == 1) {
+            f.physical_mode_used = Some("dart_bayes_fail_closed".to_string());
+            f.dart_posterior_used = Some(false);
+        }
+        return;
+    }
+
     let null_center = l2_ctx.null_rt_center;
     let null_spread = l2_ctx.null_rt_spread;
 
     let snapshot = features.to_vec();
 
     let mut pep_rt_map: FnvHashMap<u32, Vec<f64>> = FnvHashMap::default();
-    if !is_unreliable && dart_cfg.dart_use_bootstrap {
+    if dart_cfg.dart_use_bootstrap {
         for a in snapshot.iter() {
             if a.core.aligned_rt.is_finite() && a.core.delta_rt_model.is_finite() {
                 pep_rt_map.entry(a.core.peptide_idx.0).or_default().push(
@@ -5037,24 +4933,7 @@ fn apply_dart_bayes_update(
             continue;
         }
 
-        f.decoy_free_p_value_l2 = f.decoy_free_p_value_base;
-        f.decoy_free_pep_l2 = f.decoy_free_pep_base;
-        f.decoy_free_score_l2 = f.decoy_free_score_base;
-        f.decoy_free_q_l2 = f.decoy_free_q_base;
-
-        f.physical_mode_used = Some(
-            if is_unreliable {
-                "dart_bayes_fail_closed"
-            } else {
-                "dart_bayes"
-            }
-            .to_string(),
-        );
-
-        if is_unreliable {
-            f.dart_posterior_used = Some(false);
-            continue;
-        }
+        f.physical_mode_used = Some("dart_bayes".to_string());
 
         let observed_rt = f.core.aligned_rt as f64;
         let predicted_rt = f.core.predicted_rt as f64;
@@ -5081,7 +4960,7 @@ fn apply_dart_bayes_update(
             continue;
         }
 
-        let prior_pep = f.decoy_free_pep_base.unwrap_or(1.0) as f64;
+        let prior_pep = f.decoy_free_pep.unwrap_or(1.0) as f64;
 
         let log_lik_true = compute_dart_true_rt_likelihood(
             observed_rt,
@@ -5099,16 +4978,16 @@ fn apply_dart_bayes_update(
 
         let posterior_pep = compute_dart_posterior_pep(prior_pep, log_lik_true, log_lik_null);
 
-        f.decoy_free_pep_l2 = Some(posterior_pep as f32);
-        f.decoy_free_score_l2 = Some((-10.0 * posterior_pep.max(1e-15).log10()) as f32);
+        f.decoy_free_pep = Some(posterior_pep as f32);
+        f.decoy_free_score = Some((-10.0 * posterior_pep.max(1e-15).log10()) as f32);
 
         f.dart_posterior_used = Some(true);
         f.dart_rt_lik_correct = Some(log_lik_true as f32);
         f.dart_rt_lik_incorrect = Some(log_lik_null as f32);
     }
 
-    if !is_unreliable && dart_cfg.dart_recalc_q_from_posterior {
-        finalize_dart_l2_q_values(features);
+    if dart_cfg.dart_recalc_q_from_posterior {
+        recalculate_active_pep_q_values(features);
     }
 }
 
@@ -5138,29 +5017,7 @@ fn compute_physical_shift(f: &DfFeature, rt_sigma: f64) -> f64 {
     2.0 - z.powi(2)
 }
 
-fn finalize_bounded_l2_q_values(features: &mut [DfFeature]) {
-    let mut rows: Vec<(f64, usize, f64)> = Vec::new();
-
-    for (i, f) in features.iter().enumerate() {
-        if f.core.rank == 1 {
-            if let Some(pep) = f.decoy_free_pep_l2 {
-                if pep.is_finite() {
-                    let score_key = df_rank_score_l2_pep(f);
-                    rows.push((score_key, i, (pep as f64).clamp(0.0, 1.0).max(1e-300)));
-                }
-            }
-        }
-    }
-
-    for (feat_idx, q) in q_from_pep_cummean(rows) {
-        features[feat_idx].decoy_free_q_l2 = Some(q as f32);
-    }
-}
-
 fn apply_bounded_physical_shift(
-    // This function writes stage-local Layer 2 PEP-native outputs only.
-    // It does not activate the final DF stream.
-    // Final activation happens only in finalize_df_psm_stream(...).
     features: &mut [DfFeature],
     settings: &FdrSettings,
     l2_ctx: &L2PhysicalContext,
@@ -5174,28 +5031,21 @@ fn apply_bounded_physical_shift(
         .as_ref()
         .expect("BoundedAux config must be provided");
 
+    if is_unreliable {
+        for f in features.iter_mut().filter(|f| f.core.rank == 1) {
+            f.physical_mode_used = Some("bounded_aux_fail_closed".to_string());
+        }
+        return;
+    }
+
     for f in features.iter_mut() {
         if f.core.rank != 1 {
             continue;
         }
 
-        f.decoy_free_p_value_l2 = f.decoy_free_p_value_base;
-        f.decoy_free_pep_l2 = f.decoy_free_pep_base;
-        f.decoy_free_score_l2 = f.decoy_free_score_base;
-        f.decoy_free_q_l2 = f.decoy_free_q_base;
+        f.physical_mode_used = Some("bounded_aux".to_string());
 
-        let mode_str = if is_unreliable {
-            "bounded_aux_fail_closed"
-        } else {
-            "bounded_aux"
-        };
-        f.physical_mode_used = Some(mode_str.to_string());
-
-        if is_unreliable {
-            continue;
-        }
-
-        let prior_pep = f.decoy_free_pep_base.unwrap_or(1.0) as f64;
+        let prior_pep = f.decoy_free_pep.unwrap_or(1.0) as f64;
 
         let missing_rt = !f.core.aligned_rt.is_finite()
             || !f.core.predicted_rt.is_finite()
@@ -5210,8 +5060,6 @@ fn apply_bounded_physical_shift(
             0.0
         };
 
-        // The physical rescue shift is defined on the logit-confidence scale.
-        // It is capped before being added to the prior logit-confidence.
         let raw_shift = compute_physical_shift(f, rt_sigma) - missing_penalty;
         let bounded_shift =
             crate::ml::stats::capped_shift(raw_shift, cfg.max_rescue_shift, cfg.max_penalty_shift);
@@ -5224,9 +5072,9 @@ fn apply_bounded_physical_shift(
             }
         };
 
-        f.decoy_free_pep_l2 = Some(posterior_pep as f32);
+        f.decoy_free_pep = Some(posterior_pep as f32);
         let df_score = (-10.0 * posterior_pep.max(1e-15).log10()) as f32;
-        f.decoy_free_score_l2 = Some(df_score);
+        f.decoy_free_score = Some(df_score);
 
         f.physical_shift_total = Some(bounded_shift as f32);
 
@@ -5237,9 +5085,7 @@ fn apply_bounded_physical_shift(
         }
     }
 
-    if !is_unreliable {
-        finalize_bounded_l2_q_values(features);
-    }
+    recalculate_active_pep_q_values(features);
 }
 
 #[derive(Clone, Debug, Default)]
@@ -5653,55 +5499,12 @@ fn apply_l3_anchor_rescue(
     (post_pep, bounded_shift.abs())
 }
 
-fn finalize_repro_l3_q_values(features: &mut [DfFeature]) {
-    let mut rows: Vec<(f64, usize, f64)> = Vec::new();
-
-    for (i, f) in features.iter().enumerate() {
-        if f.core.rank == 1 {
-            if let Some(pep) = f.decoy_free_pep_l3 {
-                if pep.is_finite() {
-                    let score_key = df_rank_score_l3_pep(f);
-                    rows.push((score_key, i, (pep as f64).clamp(0.0, 1.0).max(1e-300)));
-                }
-            }
-        }
-    }
-
-    for (feat_idx, q) in q_from_pep_cummean(rows) {
-        features[feat_idx].decoy_free_q_l3 = Some(q as f32);
-    }
-}
-
 fn apply_bounded_repro_shift(
-    // This function writes stage-local Layer 3 PEP-native outputs only.
-    // It does not activate the final DF stream.
-    // Final activation happens only in finalize_df_psm_stream(...).
-    //
-    // Layer 3 does not grant a universal peptide-level recurrence bonus.
-    // Rescue is allowed only for peptides that pass:
-    //   1) protein-support eligibility from the active prior stream,
-    //   2) peptide recurrence eligibility,
-    //   3) strong-reference eligibility.
-    //
-    // Only weaker-but-plausible PSMs are rescue candidates.
-    // Strong PSMs are left unchanged.
-    // Very weak PSMs are not rescued.
-    // Rescue-eligible PSMs move in a bounded way toward an active-stream-derived anchor.
-    // Cross-run recurrence, when enabled, contributes only as an additional
-    // bounded support term within that rescue path.
     features: &mut [DfFeature],
     settings: &FdrSettings,
     db: &IndexedDatabase,
 ) -> ReproducibilityResult {
     if !settings.reproducibility.enabled {
-        for f in features.iter_mut() {
-            if f.core.rank == 1 {
-                f.decoy_free_pep_l3 = f.decoy_free_pep;
-                f.decoy_free_score_l3 = f.decoy_free_score;
-                f.decoy_free_q_l3 = f.decoy_free_q_value;
-            }
-        }
-
         return ReproducibilityResult {
             enabled: false,
             ..Default::default()
@@ -5791,9 +5594,6 @@ fn apply_bounded_repro_shift(
 
         cnt += 1;
 
-        // Reproducibility rescue consumes the active prior stream.
-        // This preserves independence of base-only, RT-only, IMS-only,
-        // peptide-rescue, and protein-rescue execution.
         let prior_pep = f.decoy_free_pep.unwrap_or(1.0) as f64;
         let pep_id = f.core.peptide_idx.0;
 
@@ -5834,20 +5634,16 @@ fn apply_bounded_repro_shift(
                 n_too_weak_unrescued_psms += 1;
                 (prior_pep, 0.0)
             }
-            _ => {
-                // Not eligible for peptide-context rescue.
-                // Leave unchanged rather than applying a generic recurrence bonus.
-                (prior_pep, 0.0)
-            }
+            _ => (prior_pep, 0.0),
         };
 
         max_shift_applied = max_shift_applied.max(shift_abs);
 
-        f.decoy_free_pep_l3 = Some(post_pep as f32);
-        f.decoy_free_score_l3 = Some((-10.0 * post_pep.max(1e-15).log10()) as f32);
+        f.decoy_free_pep = Some(post_pep as f32);
+        f.decoy_free_score = Some((-10.0 * post_pep.max(1e-15).log10()) as f32);
     }
 
-    finalize_repro_l3_q_values(features);
+    recalculate_active_pep_q_values(features);
 
     ReproducibilityResult {
         enabled: true,
