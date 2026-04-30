@@ -1,18 +1,20 @@
 /* =============================================================================
 Decoy-Free (DF) FDR Logic Contract
 
-This comment defines the invariants for Decoy-Free mode.
+This module implements Decoy-Free FDR scoring, optional post-model evidence
+updates, and peptide/protein-level DF aggregation. The central invariant is that
+`decoy_free_*` always represents the current last-good active PSM stream.
 
-1) Scope: DF is rank==1 only
------------------------------------
-- All Decoy-Free outputs are defined only for rank==1 PSMs.
-- For rank!=1, every DF output and every DF auxiliary/per-method output must be
-  scrubbed to None.
-- No stale DF values may survive on non-rank-1 rows.
+1) Rank scope
+-------------
+DF PSM-level outputs are defined only for rank==1 PSMs. For rank!=1 rows, all
+DF final, stage-specific, and method-specific fields must be scrubbed to None.
+This prevents stale values from lower-ranked candidates from leaking into TSV
+output, peptide inference, protein inference, or diagnostics.
 
 2) Final-output boundary
--------------------------------
-The only DF outputs that represent the selected final answer are:
+------------------------
+The selected active DF answer is represented only by:
 
   decoy_free_p_value
   decoy_free_pep
@@ -21,156 +23,103 @@ The only DF outputs that represent the selected final answer are:
   decoy_free_peptide_q
   decoy_free_protein_q
 
-All other DF-family fields are auxiliary stage streams or per-method streams and
-must never be treated as the final answer. This includes, for example:
+All other DF-family fields are audit snapshots, candidate buffers, or
+method-specific diagnostic streams. They must not be used to infer the final
+active stream.
 
-  p_msfdr / pep_msfdr / q_msfdr
-  p_1smix / pep_1smix / q_1smix
-  p_2smix / pep_2smix / q_2smix
-  p_mom / pep_mom / q_mom
-  p_nokoi / pep_nokoi / q_nokoi
-  and any other expert-specific DF fields
+3) Active-stream pipeline
+-------------------------
+The active-stream order is:
 
-3) Evidence-stream contract
------------------------------------
-Decoy-Free engines may produce either p-like evidence streams or PEP-like
-streams, but the base writeback normalizes the selected evidence into the
-active decoy_free_* output fields before peptide/protein inference.
+  base model fit
+  -> optional RT confidence adjustment
+  -> optional IMS confidence adjustment
+  -> optional peptide reproducibility rescue
+  -> optional protein reproducibility rescue
 
-Current intended stream semantics:
+The mandatory base model creates the first valid active stream. Optional stages
+may replace the active stream only after producing a finite, validated,
+stage-specific update. If an optional stage fails locally or produces no
+productive update, the previous active stream must remain unchanged.
 
-- Moments / MLE:
-    p_mom / p_mle are Gumbel-tail p-value streams.
-    pep_mom / pep_mle are calibrated local-FDR/PEP-like streams derived from
-    those p-values.
+4) Failure semantics
+--------------------
+The full DF run fails closed only if the mandatory base DF model cannot produce
+a valid rank-1 active stream.
 
-- LowerOrder:
-    p_lo is a lower-order p-like stream evaluated on the LO TEV scale.
-    pep_lo is the calibrated local-FDR/PEP-like stream derived from p_lo.
+RT, IMS, peptide rescue, and protein rescue are optional nonfatal stages. Their
+local failure must never erase, invalidate, or reinitialize the existing
+`decoy_free_*` active stream. A local optional-stage failure means: keep the
+last-good active stream and continue.
 
-- MSFDR variants:
-    p_msfdr / p_1smix / p_2smix are fitted-null tail p-like streams.
-    pep_msfdr / pep_1smix / pep_2smix are calibrated PEP-like streams derived
-    from those p-like streams.
-    Raw mixture posterior probabilities must not be treated as final calibrated
-    PEPs unless explicitly validated.
+5) Evidence-stream semantics
+----------------------------
+Base DF experts may be p-value-native or PEP-native.
 
-- Nokoi:
-    p_nokoi is an empirical null-survival p-like stream from Nokoi classifier
-    scores.
-    pep_nokoi is a calibrated PEP-like stream derived from p_nokoi.
-    Raw 1 - P(target) from the logistic classifier must not be treated as PEP.
+- Moments / MLE / LowerOrder:
+    p_* fields are fitted-null tail p-value streams.
+    pep_* fields are calibrated local-FDR/PEP-like streams derived from those
+    p-value streams.
+
+- MSFDR variants and Nokoi:
+    p_* fields are fitted or empirical null-survival p-like streams.
+    pep_* fields are calibrated PEP-like streams derived from those p-like
+    streams. Raw classifier or mixture posteriors are not final calibrated PEPs
+    unless explicitly validated.
 
 - Ensemble:
-    Ensemble combines expert PEP-like streams according to the configured
-    ensemble_pep_combiner and expert weights.
-    The result is an empirical consensus PEP-like stream, not a raw p-value
-    stream.
+    combines expert PEP-like streams into an empirical consensus PEP-like
+    stream. It should be treated as operational PEP-like evidence, not as a
+    formally calibrated posterior unless externally validated.
 
-4) Final-stream contract before peptide/protein inference
-----------------------------------------------------------------
-Before peptide or protein inference runs, the active final DF PSM stream must be
-fully activated into the decoy_free_* fields.
+Physical RT/IMS adjustments and reproducibility rescue operate on PEP-like
+confidence evidence and update the active stream only through validated stage
+wrappers.
 
-Layer definitions:
-- Layer 1 = base DF consensus/model stream
-- Layer 2 = physical/DART-updated DF stream
-- Layer 3 = reproducibility-updated DF stream
+6) Q-value semantics
+--------------------
+For PEP-native active streams, q-values are cumulative means of PEP after
+best-first sorting by the stream’s quality key, followed by monotonic
+correction.
 
-Required final-stream behavior:
-- If the active final stream is p-value-native:
-    decoy_free_p_value is populated.
-    decoy_free_pep and decoy_free_score may also be populated as calibrated
-    auxiliary posterior-like evidence, but decoy_free_q_value is computed from
-    the active p-value stream using the configured p-value FDR procedure.
+For p-value-native active streams, q-values are computed from the active p-value
+stream using the configured p-value FDR procedure.
 
-- If the active final stream is PEP-native:
-    decoy_free_p_value must be None unless a valid aligned p-value stream is
-    explicitly available and explicitly selected.
-    decoy_free_pep / decoy_free_score / decoy_free_q_value must come from the
-    active PEP-native stream.
+PEP-native streams must not use BH or Storey directly unless they have first
+been converted into a valid p-value stream.
 
-- Ensemble, Layer 2, and Layer 3 are PEP-native by design.
-- Standalone MSFDR, MSFDR-1smix, MSFDR-2smix, and Nokoi are treated as
-  PEP-native final streams in the current implementation.
-- Standalone Moments, MLE, and LowerOrder remain p-value-native final streams
-  in the current implementation.
-
-Peptide and protein inference consume only this finalized active stream.
-They must not infer the active layer from stale auxiliary fields.
-
-5) Q-value semantics
+7) Peptide/protein inference
 ----------------------------
-For PEP-native final DF streams, q-values must be computed from cumulative means
-of PEP after sorting best-first by the stream’s defined quality key, followed by
-a monotone pass.
-
-Formally:
-  q[k] = mean(pep[0..k])   after best-first sorting
-
-This applies to:
-- Ensemble final q-values
-- standalone MSFDR / MSFDR-1smix / MSFDR-2smix / Nokoi final q-values
-- any final physical-rescue or reproducibility-updated PEP-native stream
-- auxiliary q_1smix and q_2smix streams in the current implementation
-
-PEP-native final streams must not use BH or Storey directly.
-
-For p-value-native DF streams:
-- q-values may use the configured p-value FDR procedure, such as BH or Storey.
-- In the current implementation, auxiliary q_mom, q_mle, q_lo, q_msfdr, and
-  q_nokoi are computed from their p_* streams using the configured p-value FDR
-  procedure.
-- Any calibrated pep_* field written alongside a p-value-native stream is
-  auxiliary unless that stream is explicitly activated as PEP-native.
-
-6) Peptide/protein inference
------------------------------------
-Peptide and protein inference consume only the finalized active decoy_free_*
+Peptide and protein inference consume only the finalized active `decoy_free_*`
 stream.
 
-For PEP-native peptide inference:
-- The peptide evidence is derived from the best supporting PSM-level PEP, with
-  at most bounded support from additional strong PSMs.
-- Repeated spectra for the same peptide are corroborating evidence and must not
-  be penalized with a count-based Šidák selected-min correction.
+For PEP-native peptide inference, peptide evidence is derived from the best
+supporting PSM-level PEP with bounded support from additional strong PSMs.
+Repeated spectra for the same peptide are corroborating evidence and must not
+be penalized with a count-based selected-min correction.
 
-For p-value-native peptide/protein inference:
-- Method-specific p-value combination rules may be used only when the active
-  stream is genuinely p-value-native.
+For p-value-native peptide/protein inference, method-appropriate p-value
+combination rules may be used only when the active stream is genuinely
+p-value-native.
 
-Protein inference must respect the selected p-native vs PEP-native semantics of
-the finalized active stream.
+8) Stage snapshots
+------------------
+`decoy_free_*_base`, `decoy_free_*_rt`, `decoy_free_*_ims`,
+`decoy_free_*_peptide_rescue`, and `decoy_free_*_protein_rescue` are audit
+snapshots of the active stream after a stage is successfully applied. They must
+not be used to infer control flow. Legacy internal L2/L3 candidate fields have
+been entirely removed in favor of direct active-stream tracking.
 
-7) Failure behavior is fail-closed
------------------------------------------
-If DF engines do not exist, fail to fit, or do not run:
-- DF outputs must not remain permissively populated from stale values.
-- The implementation may either clear DF outputs to None or write conservative
-  fail-closed rank==1 defaults.
-
-Current allowed fail-closed rank==1 defaults are:
-  p=1, pep=1, score=0, q=1, peptide_q=1, protein_q=1
-
-Rank!=1 must always remain None.
-
-8) Best-first sorting key must be explicit
--------------------------------------------------
-Whenever this module says “sorted by score” or “sorted by quality (best-first)”,
-the sorting key must be the method-appropriate key for that block.
+9) Sorting keys
+---------------
+Whenever this module says “best-first,” the sorting key must be explicit and
+stage-appropriate.
 
 Examples:
-- For PEP-native q-values:
-    sort by the stream’s defined quality key or by increasing PEP if no
-    independent quality key is available.
-
-- For LowerOrder:
-    use the configured LO quality key, such as LO-adjusted p-like evidence or
-    hyperscore, according to lo_rank_key.
-
-- For Grenander calibration of a p-like stream:
-    sort by the p-like value itself. The p-like stream must already encode the
-    method-specific evidence ordering.
+- PEP-native q-values sort by a defined quality score, or by increasing PEP if
+  no independent quality score is available.
+- LowerOrder uses the configured LO quality key.
+- Grenander calibration sorts by the p-like stream being calibrated.
 
 Never rely on an implicit or ambiguous “score” definition.
 
@@ -180,7 +129,7 @@ use crate::database::IndexedDatabase;
 use crate::input::LoStratify;
 use crate::input::{
     BoundedAuxUpdateSpace, DartNullRtModel, DartTrueRtModel, EnsemblePepCombiner, FdrSettings,
-    FdrType, JointMode, L3AnchorMode, L3RescueMode, ModelFit, PeptidePCombine, PhysicalAnchorMode,
+    FdrType, JointMode, ModelFit, PeptidePCombine, PhysicalAnchorMode,
 };
 use crate::lfq::{Peak, PrecursorId};
 use crate::ml::lower_order::{
@@ -651,7 +600,7 @@ fn lo_tev(f: &DfFeature) -> Option<f64> {
 
 #[inline(always)]
 fn clear_all_df_outputs(psm: &mut DfFeature, fail_closed_rank1: bool) {
-    // clear final DF streams
+    // Clear the active final DF stream.
     psm.decoy_free_p_value = None;
     psm.decoy_free_pep = None;
     psm.decoy_free_score = None;
@@ -659,22 +608,11 @@ fn clear_all_df_outputs(psm: &mut DfFeature, fail_closed_rank1: bool) {
     psm.decoy_free_peptide_q = None;
     psm.decoy_free_protein_q = None;
 
-    // clear Layer 1/base snapshots
+    // Clear the frozen base-stage audit snapshot.
     psm.decoy_free_p_value_base = None;
     psm.decoy_free_pep_base = None;
     psm.decoy_free_score_base = None;
     psm.decoy_free_q_base = None;
-
-    // clear Layer 2 physical/DART streams
-    psm.decoy_free_p_value_l2 = None;
-    psm.decoy_free_pep_l2 = None;
-    psm.decoy_free_score_l2 = None;
-    psm.decoy_free_q_l2 = None;
-
-    // clear Layer 3 reproducibility streams
-    psm.decoy_free_pep_l3 = None;
-    psm.decoy_free_score_l3 = None;
-    psm.decoy_free_q_l3 = None;
 
     // clear per-method p streams
     psm.p_mom = None;
@@ -703,8 +641,9 @@ fn clear_all_df_outputs(psm: &mut DfFeature, fail_closed_rank1: bool) {
     psm.q_2smix = None;
     psm.q_nokoi = None;
 
-    // If you want rank1 to be explicitly fail-closed (rather than None),
-    // populate rank1 with conservative defaults.
+    // If the mandatory base DF model fails, rank-1 rows may be populated with
+    // conservative fail-closed defaults. Optional-stage local failures must not call
+    // this path; they preserve the previous active stream instead.
     if fail_closed_rank1 && psm.core.rank == 1 {
         psm.decoy_free_p_value = Some(1.0);
         psm.decoy_free_pep = Some(1.0);
@@ -2565,13 +2504,6 @@ fn scrub_non_rank1_df_outputs(features: &mut [DfFeature]) {
             psm.decoy_free_pep_base = None;
             psm.decoy_free_score_base = None;
             psm.decoy_free_q_base = None;
-            psm.decoy_free_p_value_l2 = None;
-            psm.decoy_free_pep_l2 = None;
-            psm.decoy_free_score_l2 = None;
-            psm.decoy_free_q_l2 = None;
-            psm.decoy_free_pep_l3 = None;
-            psm.decoy_free_score_l3 = None;
-            psm.decoy_free_q_l3 = None;
             psm.p_mom = None;
             psm.p_mle = None;
             psm.p_lo = None;
@@ -2999,7 +2931,7 @@ fn finalize_base_q_values(
 }
 
 // =============================================================================
-// LAYER 2: Shared scaffolding and dispatcher
+// Optional physical evidence stages: shared anchor and reliability scaffolding
 // =============================================================================
 
 fn build_physical_anchor_set(
@@ -3018,13 +2950,16 @@ fn build_physical_anchor_set(
                 return false;
             }
 
-            // Evidence Floor (PEP)
+            // Physical-stage anchors are selected from the frozen base stream, not from the
+            // mutable active stream. This prevents an RT/IMS stage from using evidence that
+            // was already modified by an earlier optional stage.
             let pep = f.decoy_free_pep_base.unwrap_or(1.0);
             if !pep.is_finite() || pep > max_pep {
                 return false;
             }
 
-            // Evidence Floor (Q-value)
+            // The q-value threshold enforces global base-stream confidence before a PSM can
+            // contribute to RT/IMS reliability estimation.
             let q = f.decoy_free_q_base.unwrap_or(1.0);
             if q > max_q as f32 {
                 return false;
@@ -3329,7 +3264,7 @@ fn summarize_anchor_coverage(
     }
 
     log::debug!(
-        "L2 Anchor Diagnostics: total_before={} after_evidence={} after_run={} after_charge={} excluded_missing_rt={} excluded_contam_or_entrapment={} final_accepted={} runs={} charges={}",
+        "DF physical anchor diagnostics: total_before={} after_evidence={} after_run={} after_charge={} excluded_missing_rt={} excluded_contam_or_entrapment={} final_accepted={} runs={} charges={}",
         total_candidates_before_filtering,
         after_evidence_filtering,
         after_run_filtering,
@@ -3529,31 +3464,6 @@ fn compute_joint_physical_summary(
     }
 }
 
-fn should_fail_closed_l2(
-    anchor_count_after_filters: usize,
-    joint: &JointPhysicalSummary,
-    settings: &FdrSettings,
-    rt_scale_invalid: bool,
-    missing_critical_diagnostics: bool,
-) -> bool {
-    if rt_scale_invalid {
-        return true;
-    }
-    if missing_critical_diagnostics {
-        return true;
-    }
-    if anchor_count_after_filters < settings.physical_rescue.min_anchor_count_per_run {
-        return true;
-    }
-    if joint.fail_closed_hint {
-        return true;
-    }
-    if joint.joint_reliability < settings.physical_rescue.reliability_floor {
-        return true;
-    }
-    false
-}
-
 fn compute_dart_null_rt_params(features: &[DfFeature], anchors: &[usize]) -> (f64, f64) {
     let mut rts: Vec<f64> = anchors
         .iter()
@@ -3583,8 +3493,37 @@ fn compute_dart_null_rt_params(features: &[DfFeature], anchors: &[usize]) -> (f6
     (center, spread)
 }
 
+// Local optional-stage failure predicate for physical evidence updates.
+// A true result means the RT/IMS stage must not modify the active stream.
+fn should_fail_closed_physical(
+    anchor_count_after_filters: usize,
+    joint: &JointPhysicalSummary,
+    settings: &FdrSettings,
+    rt_scale_invalid: bool,
+    missing_critical_diagnostics: bool,
+) -> bool {
+    if rt_scale_invalid {
+        return true;
+    }
+    if missing_critical_diagnostics {
+        return true;
+    }
+    if anchor_count_after_filters < settings.physical_rescue.min_anchor_count_per_run {
+        return true;
+    }
+    if joint.fail_closed_hint {
+        return true;
+    }
+    if joint.joint_reliability < settings.physical_rescue.reliability_floor {
+        return true;
+    }
+    false
+}
+
+// Physical-stage context shared by legacy DART and bounded auxiliary kernels.
+// Semantically, this is the reliability and anchor context for optional RT/IMS updates.
 #[derive(Clone, Debug)]
-struct L2PhysicalContext {
+struct PhysicalContext {
     pub anchors: Vec<usize>,
     pub rt_rel: RtReliabilitySummary,
     pub ims_rel: ImsReliabilitySummary,
@@ -3598,13 +3537,13 @@ struct L2PhysicalContext {
     pub dropped_charge_bins: Vec<(i32, usize)>,
 }
 
-fn prepare_l2_physical_context(
+fn prepare_physical_context(
     features: &[DfFeature],
     settings: &FdrSettings,
     db: &IndexedDatabase,
     rt_scale_invalid: bool,
     missing_critical_diagnostics: bool,
-) -> L2PhysicalContext {
+) -> PhysicalContext {
     let candidates = build_physical_anchor_set(features, settings, db);
     let anchor_count_total = candidates.len();
 
@@ -3621,38 +3560,44 @@ fn prepare_l2_physical_context(
     let joint_rel = compute_joint_physical_summary(&rt_rel, &ims_rel, settings);
 
     log::debug!(
-        "L2 RT reliability: global_sigma={:?}, reliability={:.3}, fail_closed_hint={}",
+        "DF physical RT reliability: global_sigma={:?}, reliability={:.3}, fail_closed_hint={}",
         rt_rel.rt_sigma_global,
         rt_rel.reliability,
         rt_rel.fail_closed_hint
     );
 
     if !rt_rel.runwise_rt_sigma.is_empty() {
-        log::debug!("L2 RT runwise sigma: {:?}", rt_rel.runwise_rt_sigma);
+        log::debug!(
+            "DF physical RT runwise sigma: {:?}",
+            rt_rel.runwise_rt_sigma
+        );
     }
 
     if settings.enable_ims_confidence_adjustment {
         log::debug!(
-            "L2 IMS reliability: global_sigma={:?}, reliability={:.3}, fail_closed_hint={}",
+            "DF physical IMS reliability: global_sigma={:?}, reliability={:.3}, fail_closed_hint={}",
             ims_rel.ims_sigma_global,
             ims_rel.reliability,
             ims_rel.fail_closed_hint
         );
 
         if !ims_rel.runwise_ims_sigma.is_empty() {
-            log::debug!("L2 IMS runwise sigma: {:?}", ims_rel.runwise_ims_sigma);
+            log::debug!(
+                "DF physical IMS runwise sigma: {:?}",
+                ims_rel.runwise_ims_sigma
+            );
         }
     } else {
-        log::debug!("L2 IMS reliability: disabled");
+        log::debug!("DF physical IMS reliability: disabled");
     }
 
     log::debug!(
-        "L2 joint physical reliability: joint_reliability={:.3}, fail_closed_hint={}",
+        "DF physical joint reliability: joint_reliability={:.3}, fail_closed_hint={}",
         joint_rel.joint_reliability,
         joint_rel.fail_closed_hint
     );
 
-    let is_unreliable = should_fail_closed_l2(
+    let is_unreliable = should_fail_closed_physical(
         final_anchors.len(),
         &joint_rel,
         settings,
@@ -3668,7 +3613,7 @@ fn prepare_l2_physical_context(
 
     let (null_rt_center, null_rt_spread) = compute_dart_null_rt_params(features, &final_anchors);
 
-    L2PhysicalContext {
+    PhysicalContext {
         anchors: final_anchors,
         rt_rel,
         ims_rel,
@@ -3690,21 +3635,12 @@ fn apply_physical_rescue(
 ) -> PhysicalRescueResult {
     use crate::input::PhysicalRescueMode;
 
-    // Base stream must already have been frozen immediately after base q-value
-    // finalization in run_df_layers(). Do not snapshot here: this function may be
-    // called after another physical/rescue stage has already modified the active
-    // decoy_free_* stream.
     snapshot_base_stream_once(features);
 
-    // 2. Dispatcher
     match settings.physical_rescue.rt_mode {
         PhysicalRescueMode::Off => {
             for f in features.iter_mut() {
                 if f.core.rank == 1 {
-                    f.decoy_free_p_value_l2 = f.decoy_free_p_value_base;
-                    f.decoy_free_pep_l2 = f.decoy_free_pep_base;
-                    f.decoy_free_score_l2 = f.decoy_free_score_base;
-                    f.decoy_free_q_l2 = f.decoy_free_q_base;
                     f.physical_mode_used = Some("off".to_string());
                 }
             }
@@ -3723,37 +3659,37 @@ fn apply_physical_rescue(
             }
         }
         _ => {
-            let l2_ctx = prepare_l2_physical_context(features, settings, db, false, false);
+            let phys_ctx = prepare_physical_context(features, settings, db, false, false);
 
             match settings.physical_rescue.rt_mode {
                 PhysicalRescueMode::DartBayes => {
-                    apply_dart_bayes_update(features, settings, &l2_ctx);
+                    apply_dart_bayes_update(features, settings, &phys_ctx);
                 }
                 PhysicalRescueMode::BoundedAux => {
-                    apply_bounded_physical_shift(features, settings, &l2_ctx);
+                    apply_bounded_physical_shift(features, settings, &phys_ctx);
                 }
                 PhysicalRescueMode::Off => unreachable!(),
             }
 
             PhysicalRescueResult {
                 enabled: true,
-                fail_closed: l2_ctx.is_unreliable,
-                anchor_count_total: l2_ctx.anchor_count_total,
-                anchor_count_after_filters: l2_ctx.anchors.len(),
-                rt_reliability: l2_ctx.rt_rel.reliability,
-                ims_reliability: l2_ctx.ims_rel.reliability,
-                joint_reliability: l2_ctx.joint_rel.joint_reliability,
-                rt_sigma_global: l2_ctx.rt_rel.rt_sigma_global,
-                ims_sigma_global: l2_ctx.ims_rel.ims_sigma_global,
-                dropped_runs: l2_ctx.dropped_runs.clone(),
-                dropped_charge_bins: l2_ctx.dropped_charge_bins.clone(),
+                fail_closed: phys_ctx.is_unreliable,
+                anchor_count_total: phys_ctx.anchor_count_total,
+                anchor_count_after_filters: phys_ctx.anchors.len(),
+                rt_reliability: phys_ctx.rt_rel.reliability,
+                ims_reliability: phys_ctx.ims_rel.reliability,
+                joint_reliability: phys_ctx.joint_rel.joint_reliability,
+                rt_sigma_global: phys_ctx.rt_rel.rt_sigma_global,
+                ims_sigma_global: phys_ctx.ims_rel.ims_sigma_global,
+                dropped_runs: phys_ctx.dropped_runs.clone(),
+                dropped_charge_bins: phys_ctx.dropped_charge_bins.clone(),
             }
         }
     }
 }
 
 // =============================================================================
-// INDEPENDENT KERNELS: RT-Only and IMS-Only
+// Independent optional physical stages: RT-only and IMS-only wrappers
 // =============================================================================
 
 fn apply_rt_dart_bayes_update_to_active_stream(
@@ -3763,7 +3699,10 @@ fn apply_rt_dart_bayes_update_to_active_stream(
 ) -> PhysicalRescueResult {
     let mut rt_settings = settings.clone();
 
-    // Force the old DART implementation to behave as an RT-only stage.
+    // Force the legacy DART implementation to behave as an RT-only optional stage.
+    // The DART kernel proposes posterior PEP/score/q updates; the wrapper-level
+    // stage outcome determines whether those values are accepted as the new active
+    // stream.
     rt_settings.enable_ims_confidence_adjustment = false;
     rt_settings.physical_rescue.rt_mode = crate::input::PhysicalRescueMode::DartBayes;
     rt_settings.physical_rescue.ims_mode = crate::input::PhysicalRescueMode::Off;
@@ -4625,14 +4564,14 @@ fn verify_dart_rt_scale_consistency(
 }
 
 // =============================================================================
-// LAYER 2: DART-Bayes mode kernels
+// Legacy DART-Bayes physical evidence kernels
 // =============================================================================
 
 fn compute_dart_reference_rt(
     f: &DfFeature,
     features: &[DfFeature],
     settings: &FdrSettings,
-    l2_ctx: &L2PhysicalContext,
+    phys_ctx: &PhysicalContext,
     peptide_rts: &[f64],
 ) -> (f64, f64, bool) {
     use crate::input::DartBootstrapMethod;
@@ -4652,7 +4591,8 @@ fn compute_dart_reference_rt(
         predicted_rt
     };
 
-    let mut reference_rt_sigma = compute_dart_bootstrap_uncertainty(f, features, settings, l2_ctx);
+    let mut reference_rt_sigma =
+        compute_dart_bootstrap_uncertainty(f, features, settings, phys_ctx);
 
     if dart_cfg.dart_use_bootstrap && peptide_rts.len() > 1 && dart_cfg.dart_bootstrap_iters > 0 {
         let iters = dart_cfg.dart_bootstrap_iters;
@@ -4680,8 +4620,8 @@ fn compute_dart_reference_rt(
                         );
                         let log_lik_null = compute_dart_null_rt_likelihood(
                             rt_cand,
-                            l2_ctx.null_rt_center,
-                            l2_ctx.null_rt_spread,
+                            phys_ctx.null_rt_center,
+                            phys_ctx.null_rt_spread,
                             &dart_cfg.dart_null_rt_model,
                         );
 
@@ -4834,7 +4774,7 @@ fn compute_dart_bootstrap_uncertainty(
     f: &DfFeature,
     features: &[DfFeature],
     settings: &FdrSettings,
-    l2_ctx: &L2PhysicalContext,
+    phys_ctx: &PhysicalContext,
 ) -> f64 {
     let dart_cfg = settings
         .physical_rescue
@@ -4842,7 +4782,7 @@ fn compute_dart_bootstrap_uncertainty(
         .as_ref()
         .expect("DART-Bayes config missing");
 
-    let global_sigma = l2_ctx.rt_sigma.clamp(0.02, 0.30);
+    let global_sigma = phys_ctx.rt_sigma.clamp(0.02, 0.30);
 
     if !settings.physical_rescue.use_local_rt_scale && !dart_cfg.dart_use_bootstrap {
         return global_sigma;
@@ -4856,7 +4796,7 @@ fn compute_dart_bootstrap_uncertainty(
     let bins = settings.physical_rescue.rt_region_bins.max(2) as f64;
     let half_width = (1.0 / bins).clamp(0.02, 0.25);
 
-    let mut local_abs_deltas: Vec<f64> = l2_ctx
+    let mut local_abs_deltas: Vec<f64> = phys_ctx
         .anchors
         .iter()
         .filter_map(|&idx| {
@@ -4893,9 +4833,9 @@ fn compute_dart_bootstrap_uncertainty(
 fn apply_dart_bayes_update(
     features: &mut [DfFeature],
     settings: &FdrSettings,
-    l2_ctx: &L2PhysicalContext,
+    phys_ctx: &PhysicalContext,
 ) {
-    let is_unreliable = l2_ctx.is_unreliable;
+    let is_unreliable = phys_ctx.is_unreliable;
 
     let dart_cfg = settings
         .physical_rescue
@@ -4911,8 +4851,8 @@ fn apply_dart_bayes_update(
         return;
     }
 
-    let null_center = l2_ctx.null_rt_center;
-    let null_spread = l2_ctx.null_rt_spread;
+    let null_center = phys_ctx.null_rt_center;
+    let null_spread = phys_ctx.null_rt_spread;
 
     let snapshot = features.to_vec();
 
@@ -4950,7 +4890,7 @@ fn apply_dart_bayes_update(
         let peptide_rts = pep_rt_map.get(&f.core.peptide_idx.0).unwrap_or(&empty_rts);
 
         let (reference_rt, reference_sigma, reference_valid) =
-            compute_dart_reference_rt(f, &snapshot, settings, l2_ctx, peptide_rts);
+            compute_dart_reference_rt(f, &snapshot, settings, phys_ctx, peptide_rts);
 
         if !rt_ok || !reference_valid {
             f.dart_posterior_used = Some(false);
@@ -4992,38 +4932,40 @@ fn apply_dart_bayes_update(
 }
 
 // =============================================================================
-// LAYER 2: Bounded auxiliary mode kernels
+// Bounded auxiliary physical evidence kernels
 // =============================================================================
 
-/// Compute a bounded auxiliary rescue shift on the logit-confidence scale.
+/// Compute a bounded RT/IMS auxiliary shift on the logit-confidence scale.
 ///
-/// Positive values support rescue; negative values support demotion.
-/// The returned value is not a probability-space increment.
+/// Positive values increase confidence, negative values decrease confidence.
+/// The returned value is a bounded logit-space shift, not a probability-space
+/// increment. Conversion back to PEP/confidence space happens downstream.
 
 fn compute_physical_shift(f: &DfFeature, rt_sigma: f64) -> f64 {
     let delta = f.core.delta_rt_model as f64;
     let predicted = f.core.predicted_rt as f64;
 
-    // Missing or invalid evidence -> zero shift/penalty
+    // Missing or invalid physical evidence is neutral. It must not create either a
+    // rescue bonus or a demotion penalty.
     if !delta.is_finite() || !predicted.is_finite() || predicted <= 0.0 || predicted >= 1.0 {
         return 0.0;
     }
 
     let z = delta / rt_sigma.max(1e-9);
 
-    // Base log-odds shift: Reward tight RT (Z ~ 0), mildly penalize wide RT.
-    // Yields +2.0 at z=0, 0.0 at z=1.414, and goes negative for z > 1.414.
-    // The exact min/max bounds are strictly enforced downstream by the soft_cap.
+    // Quadratic logit-confidence shift: tight agreement with the physical model
+    // supports rescue, while large deviations support demotion. The exact positive
+    // and negative bounds are enforced downstream by the configured caps.
     2.0 - z.powi(2)
 }
 
 fn apply_bounded_physical_shift(
     features: &mut [DfFeature],
     settings: &FdrSettings,
-    l2_ctx: &L2PhysicalContext,
+    phys_ctx: &PhysicalContext,
 ) {
-    let is_unreliable = l2_ctx.is_unreliable;
-    let rt_sigma = l2_ctx.rt_sigma;
+    let is_unreliable = phys_ctx.is_unreliable;
+    let rt_sigma = phys_ctx.rt_sigma;
 
     let cfg = settings
         .physical_rescue
@@ -5089,14 +5031,14 @@ fn apply_bounded_physical_shift(
 }
 
 #[derive(Clone, Debug, Default)]
-struct L3ProteinSupportSummary {
+struct ProteinSupportSummary {
     pub n_unique_observed: usize,
     pub n_unique_passing_prior: usize,
     pub is_rescue_eligible: bool,
 }
 
 #[derive(Clone, Debug, Default)]
-struct L3PeptideEligibilitySummary {
+struct PeptideEligibilitySummary {
     pub n_runs_observed: usize,
     pub n_runs_strong_prior: usize,
     pub observed_run_fraction: f64,
@@ -5106,13 +5048,13 @@ struct L3PeptideEligibilitySummary {
 }
 
 #[derive(Clone, Debug, Default)]
-struct L3AnchorSummary {
+struct ReproducibilityAnchorSummary {
     pub anchor_value: f64,
     pub n_anchor_observations: usize,
 }
 
 // =============================================================================
-// LAYER 3: Reproducibility and agreement
+// Optional reproducibility rescue: peptide/protein recurrence and expert agreement
 // =============================================================================
 
 fn compute_expert_agreement_support(f: &DfFeature, settings: &FdrSettings) -> f64 {
@@ -5160,7 +5102,7 @@ fn compute_expert_agreement_support(f: &DfFeature, settings: &FdrSettings) -> f6
 }
 
 fn compute_cross_run_recurrence_support(
-    elig: &L3PeptideEligibilitySummary,
+    elig: &PeptideEligibilitySummary,
     settings: &FdrSettings,
 ) -> f64 {
     if !settings.reproducibility.use_cross_run_recurrence {
@@ -5176,9 +5118,6 @@ fn compute_cross_run_recurrence_support(
     let observed_excess = (elig.observed_run_fraction - pep_cfg.min_run_fraction).max(0.0);
     let strong_excess = (elig.strong_run_fraction - pep_cfg.min_strong_run_fraction).max(0.0);
 
-    // Recurrence support is based on how far the peptide exceeds the minimum
-    // recurrence requirements used for L3 eligibility. Strong-run excess is
-    // weighted more heavily than observed-run excess.
     let raw_support = observed_excess + 2.0 * strong_excess;
 
     crate::ml::stats::soft_cap(raw_support, settings.reproducibility.max_recurrence_shift)
@@ -5188,11 +5127,11 @@ fn compute_redundancy_discount(_f: &DfFeature, settings: &FdrSettings) -> f64 {
     settings.reproducibility.redundancy_discount.clamp(0.0, 1.0)
 }
 
-fn build_l3_protein_support_map(
+fn build_protein_support_map(
     features: &[DfFeature],
     db: &IndexedDatabase,
     settings: &FdrSettings,
-) -> FnvHashMap<String, L3ProteinSupportSummary> {
+) -> FnvHashMap<String, ProteinSupportSummary> {
     let cfg = &settings.reproducibility.protein_eligibility;
 
     let mut observed: FnvHashMap<String, FnvHashSet<String>> = FnvHashMap::default();
@@ -5214,9 +5153,6 @@ fn build_l3_protein_support_map(
             .or_default()
             .insert(peptide_seq.clone());
 
-        // Reproducibility must consume the currently active DF stream.
-        // This may be base, RT-adjusted, IMS-adjusted, peptide-rescued,
-        // or protein-rescued depending on which stages have already run.
         if f.decoy_free_q_value
             .map(|q| q <= cfg.q_threshold_physical as f32)
             .unwrap_or(false)
@@ -5225,7 +5161,7 @@ fn build_l3_protein_support_map(
         }
     }
 
-    let mut out: FnvHashMap<String, L3ProteinSupportSummary> = FnvHashMap::default();
+    let mut out: FnvHashMap<String, ProteinSupportSummary> = FnvHashMap::default();
 
     for (protein_key, obs_set) in observed {
         let n_unique_observed = obs_set.len();
@@ -5247,7 +5183,7 @@ fn build_l3_protein_support_map(
 
         out.insert(
             protein_key,
-            L3ProteinSupportSummary {
+            ProteinSupportSummary {
                 n_unique_observed,
                 n_unique_passing_prior,
                 is_rescue_eligible,
@@ -5258,12 +5194,12 @@ fn build_l3_protein_support_map(
     out
 }
 
-fn build_l3_peptide_eligibility_map(
+fn build_peptide_eligibility_map(
     features: &[DfFeature],
     db: &IndexedDatabase,
     settings: &FdrSettings,
-    protein_support_map: &FnvHashMap<String, L3ProteinSupportSummary>,
-) -> FnvHashMap<u32, L3PeptideEligibilitySummary> {
+    protein_support_map: &FnvHashMap<String, ProteinSupportSummary>,
+) -> FnvHashMap<u32, PeptideEligibilitySummary> {
     let cfg = &settings.reproducibility.peptide_eligibility;
 
     let total_runs = features
@@ -5298,8 +5234,6 @@ fn build_l3_peptide_eligibility_map(
             .and_modify(|v| *v |= protein_rescue_eligible)
             .or_insert(protein_rescue_eligible);
 
-        // Reproducibility strong-reference eligibility must use the active
-        // stream, not the obsolete decoy_free_*_l2 physical stream.
         let q_ok = f
             .decoy_free_q_value
             .map(|q| q <= cfg.strong_reference_q_threshold_physical as f32)
@@ -5318,7 +5252,7 @@ fn build_l3_peptide_eligibility_map(
         }
     }
 
-    let mut out: FnvHashMap<u32, L3PeptideEligibilitySummary> = FnvHashMap::default();
+    let mut out: FnvHashMap<u32, PeptideEligibilitySummary> = FnvHashMap::default();
 
     for (pep_id, obs_set) in observed_runs {
         let n_runs_observed = obs_set.len();
@@ -5342,7 +5276,7 @@ fn build_l3_peptide_eligibility_map(
 
         out.insert(
             pep_id,
-            L3PeptideEligibilitySummary {
+            PeptideEligibilitySummary {
                 n_runs_observed,
                 n_runs_strong_prior,
                 observed_run_fraction,
@@ -5356,11 +5290,13 @@ fn build_l3_peptide_eligibility_map(
     out
 }
 
-fn build_l3_anchor_map(
+fn build_reproducibility_anchor_map(
     features: &[DfFeature],
     settings: &FdrSettings,
-    peptide_eligibility_map: &FnvHashMap<u32, L3PeptideEligibilitySummary>,
-) -> FnvHashMap<u32, L3AnchorSummary> {
+    peptide_eligibility_map: &FnvHashMap<u32, PeptideEligibilitySummary>,
+) -> FnvHashMap<u32, ReproducibilityAnchorSummary> {
+    use crate::input::ReproducibilityAnchorMode;
+
     let pep_cfg = &settings.reproducibility.peptide_eligibility;
     let anchor_cfg = &settings.reproducibility.anchor;
 
@@ -5377,7 +5313,6 @@ fn build_l3_anchor_map(
             _ => continue,
         }
 
-        // Anchor selection must use the active prior stream.
         let q_ok = f
             .decoy_free_q_value
             .map(|q| q <= pep_cfg.strong_reference_q_threshold_physical as f32)
@@ -5398,7 +5333,7 @@ fn build_l3_anchor_map(
         }
     }
 
-    let mut out: FnvHashMap<u32, L3AnchorSummary> = FnvHashMap::default();
+    let mut out: FnvHashMap<u32, ReproducibilityAnchorSummary> = FnvHashMap::default();
 
     for (pep_id, vals) in strong_peps {
         if vals.is_empty() {
@@ -5408,11 +5343,11 @@ fn build_l3_anchor_map(
         let mut tmp = vals.clone();
 
         let anchor_value = match anchor_cfg.mode {
-            L3AnchorMode::Best => tmp.iter().copied().min_by(|a, b| a.total_cmp(b)),
-            L3AnchorMode::SecondBest => second_best_f64(&mut tmp),
-            L3AnchorMode::Mean => Some(tmp.iter().sum::<f64>() / (tmp.len() as f64)),
-            L3AnchorMode::Median => median_f64(tmp),
-            L3AnchorMode::TrimmedMean => {
+            ReproducibilityAnchorMode::Best => tmp.iter().copied().min_by(|a, b| a.total_cmp(b)),
+            ReproducibilityAnchorMode::SecondBest => second_best_f64(&mut tmp),
+            ReproducibilityAnchorMode::Mean => Some(tmp.iter().sum::<f64>() / (tmp.len() as f64)),
+            ReproducibilityAnchorMode::Median => median_f64(tmp),
+            ReproducibilityAnchorMode::TrimmedMean => {
                 let trim = anchor_cfg.trim_fraction.unwrap_or(0.1);
                 trimmed_mean(&mut tmp, trim)
             }
@@ -5421,7 +5356,7 @@ fn build_l3_anchor_map(
         if let Some(anchor_value) = anchor_value {
             out.insert(
                 pep_id,
-                L3AnchorSummary {
+                ReproducibilityAnchorSummary {
                     anchor_value: anchor_value.clamp(0.0, 1.0).max(1e-300),
                     n_anchor_observations: vals.len(),
                 },
@@ -5433,36 +5368,36 @@ fn build_l3_anchor_map(
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
-enum L3RescueBand {
+enum RescueBand {
     Strong,
     RescueEligible,
     TooWeak,
 }
 
-fn classify_l3_rescue_band(prior_pep: f64, settings: &FdrSettings) -> L3RescueBand {
+fn classify_rescue_band(prior_pep: f64, settings: &FdrSettings) -> RescueBand {
     let band = &settings.reproducibility.rescue_band;
 
-    // These setting names still contain "_l2" for backward JSON compatibility,
-    // but the value being classified is now the active prior stream.
-    let strong_cutoff = band.strong_cutoff_pep_l2;
-    let weak_cutoff = band.weak_cutoff_pep_l2;
+    let strong_cutoff = band.strong_cutoff_pep;
+    let weak_cutoff = band.weak_cutoff_pep;
 
     if prior_pep <= strong_cutoff {
-        L3RescueBand::Strong
+        RescueBand::Strong
     } else if prior_pep < weak_cutoff {
-        L3RescueBand::RescueEligible
+        RescueBand::RescueEligible
     } else {
-        L3RescueBand::TooWeak
+        RescueBand::TooWeak
     }
 }
 
-fn apply_l3_anchor_rescue(
+fn apply_reproducibility_anchor_rescue(
     prior_pep: f64,
     anchor_pep: f64,
     expert_support_shift: f64,
     recurrence_support_shift: f64,
     settings: &FdrSettings,
 ) -> (f64, f64) {
+    use crate::input::RescueMode;
+
     let band = &settings.reproducibility.rescue_band;
     let max_frac = band.max_rescue_fraction.clamp(0.0, 1.0);
 
@@ -5472,8 +5407,8 @@ fn apply_l3_anchor_rescue(
     let improved_target = anchor.min(prior);
 
     let rescued_pep = match band.rescue_mode {
-        L3RescueMode::Replace => improved_target,
-        L3RescueMode::BoundedShrinkage => prior + max_frac * (improved_target - prior),
+        RescueMode::Replace => improved_target,
+        RescueMode::BoundedShrinkage => prior + max_frac * (improved_target - prior),
     }
     .clamp(0.0, 1.0)
     .max(1e-300);
@@ -5511,7 +5446,7 @@ fn apply_bounded_repro_shift(
         };
     }
 
-    let protein_support_map = build_l3_protein_support_map(features, db, settings);
+    let protein_support_map = build_protein_support_map(features, db, settings);
 
     let total_unique_observed: usize = protein_support_map
         .values()
@@ -5524,7 +5459,7 @@ fn apply_bounded_repro_shift(
         .sum();
 
     log::debug!(
-        "L3 protein support: proteins={} eligible={} total_unique_observed={} total_unique_passing_prior={}",
+        "DF reproducibility protein support: proteins={} eligible={} total_unique_observed={} total_unique_passing_prior={}",
         protein_support_map.len(),
         protein_support_map.values().filter(|s| s.is_rescue_eligible).count(),
         total_unique_observed,
@@ -5532,7 +5467,7 @@ fn apply_bounded_repro_shift(
     );
 
     let peptide_eligibility_map =
-        build_l3_peptide_eligibility_map(features, db, settings, &protein_support_map);
+        build_peptide_eligibility_map(features, db, settings, &protein_support_map);
 
     let total_runs_observed: usize = peptide_eligibility_map
         .values()
@@ -5550,7 +5485,7 @@ fn apply_bounded_repro_shift(
         .count();
 
     log::debug!(
-        "L3 peptide eligibility: peptides={} eligible={} protein_backed={} total_runs_observed={} total_runs_strong_prior={}",
+        "DF reproducibility peptide eligibility: peptides={} eligible={} protein_backed={} total_runs_observed={} total_runs_strong_prior={}",
         peptide_eligibility_map.len(),
         peptide_eligibility_map.values().filter(|s| s.is_rescue_eligible).count(),
         protein_backed_peptides,
@@ -5558,13 +5493,13 @@ fn apply_bounded_repro_shift(
         total_runs_strong_prior
     );
 
-    let anchor_map = build_l3_anchor_map(features, settings, &peptide_eligibility_map);
+    let anchor_map = build_reproducibility_anchor_map(features, settings, &peptide_eligibility_map);
 
     let total_anchor_observations: usize =
         anchor_map.values().map(|s| s.n_anchor_observations).sum();
 
     log::debug!(
-        "L3 anchors: peptides_with_anchor={} total_anchor_observations={}",
+        "DF reproducibility anchors: peptides_with_anchor={} total_anchor_observations={}",
         anchor_map.len(),
         total_anchor_observations
     );
@@ -5606,12 +5541,12 @@ fn apply_bounded_repro_shift(
             .map(|elig| compute_cross_run_recurrence_support(elig, settings))
             .unwrap_or(0.0);
 
-        let band = classify_l3_rescue_band(prior_pep, settings);
+        let band = classify_rescue_band(prior_pep, settings);
 
         let (post_pep, shift_abs) = match (eligibility, band) {
-            (Some(elig), L3RescueBand::RescueEligible) if elig.is_rescue_eligible => {
+            (Some(elig), RescueBand::RescueEligible) if elig.is_rescue_eligible => {
                 if let Some(anchor) = anchor_map.get(&pep_id) {
-                    let (post, shift_abs) = apply_l3_anchor_rescue(
+                    let (post, shift_abs) = apply_reproducibility_anchor_rescue(
                         prior_pep,
                         anchor.anchor_value,
                         expert_s,
@@ -5626,11 +5561,11 @@ fn apply_bounded_repro_shift(
                     (prior_pep, 0.0)
                 }
             }
-            (_, L3RescueBand::Strong) => {
+            (_, RescueBand::Strong) => {
                 n_strong_unchanged_psms += 1;
                 (prior_pep, 0.0)
             }
-            (_, L3RescueBand::TooWeak) => {
+            (_, RescueBand::TooWeak) => {
                 n_too_weak_unrescued_psms += 1;
                 (prior_pep, 0.0)
             }
@@ -5682,6 +5617,10 @@ pub enum ActiveDfStream {
     ProteinRescue,
 }
 
+// Validate that the active stream is complete before peptide/protein inference.
+// This function checks the mutable `decoy_free_*` stream, not stage snapshots.
+// Optional-stage failures should already have preserved the last-good active
+// stream before this point.
 fn validate_final_df_stream_contract(features: &[DfFeature], final_stream: ActiveDfStream) {
     let mut n_rank1 = 0usize;
     let mut n_invalid = 0usize;
@@ -5734,6 +5673,9 @@ fn df_score_from_pep(pep: f64) -> f32 {
     (-10.0 * pep.clamp(1e-15, 1.0).log10()) as f32
 }
 
+// Copy the current active stream into the audit columns for a successfully
+// applied optional stage. This function must not be used for disabled,
+// failed-closed, or no-op stages.
 #[inline]
 fn snapshot_current_stream_to_stage(f: &mut DfFeature, stage: DfAdjustmentStage) {
     let p = f.decoy_free_p_value;
@@ -5769,6 +5711,9 @@ fn snapshot_current_stream_to_stage(f: &mut DfFeature, stage: DfAdjustmentStage)
     }
 }
 
+// Recompute q-values for a PEP-native active stream using cumulative mean PEP
+// after best-first sorting. `decoy_free_score` is larger-is-better; do not
+// negate it before calling q_from_pep_cummean.
 fn recalculate_active_pep_q_values(features: &mut [DfFeature]) {
     let mut rows: Vec<(f64, usize, f64)> = Vec::new();
 
@@ -5792,6 +5737,10 @@ fn recalculate_active_pep_q_values(features: &mut [DfFeature]) {
     }
 }
 
+// Freeze the mandatory base stream exactly once. RT/IMS anchor selection uses
+// this base snapshot so that physical reliability is estimated from unmodified
+// base evidence. This function is idempotent and must not overwrite an existing
+// base snapshot after optional stages have run.
 fn snapshot_base_stream_once(features: &mut [DfFeature]) {
     for f in features.iter_mut().filter(|f| f.core.rank == 1) {
         if f.decoy_free_pep_base.is_none()
@@ -5999,6 +5948,10 @@ fn write_model_stage_snapshot(f: &mut DfFeature, settings: &FdrSettings, stage: 
     }
 }
 
+// Finalize a successfully applied PEP-native optional stage by recalculating
+// active q-values and writing both generic stage snapshots and model-specific
+// audit fields. Call this only after the stage has already updated the active
+// `decoy_free_*` stream.
 fn finalize_stage_snapshot(
     features: &mut [DfFeature],
     settings: &FdrSettings,
@@ -6169,7 +6122,8 @@ pub fn run_df_layers(
     );
     }
 
-    // --- Explicit Active Stream Tracking ---
+    // Track the last-good active stream explicitly. Do not infer the final stream
+    // from populated audit/scratch fields.
     let mut active_stream = ActiveDfStream::Base;
 
     // 2A. Optional RT confidence adjustment.
@@ -6480,18 +6434,22 @@ fn combine_sidak_minp(p: &[f64]) -> f64 {
     p.clamp(0.0, 1.0).max(1e-300)
 }
 
-// DF aggregation/write-back contract: rank1-only; rank!=1 must be None to prevent stale leakage.
+// DF protein aggregation/write-back contract:
+// - consume only rank-1 PSMs from the finalized active stream;
+// - write protein q-values only to rank-1 rows;
+// - leave rank!=1 rows as None to prevent stale leakage.
 pub fn calculate_protein_q_df(
     features: &mut [DfFeature],
     db: &IndexedDatabase,
     settings: &FdrSettings,
 ) -> usize {
-    // Protein inference consumes the peptide-passing pool derived from the
-    // finalized active DF stream.
-    // Layer 3 may change which final PSMs survive into peptide inference,
-    // but it does not change the downstream protein-inference contract.
-    // Base-only remains p-value-native; Layer 2 and Layer 3 final streams are
-    // PEP-native.
+    // Protein inference consumes the peptide-passing pool derived from the finalized
+    // active DF stream. Optional stages may change which PSMs pass peptide-level DF,
+    // but they must not change the downstream aggregation contract.
+    //
+    // Base-only streams may be p-value-native. RT/IMS and reproducibility-adjusted
+    // streams are PEP-native unless a valid aligned p-value stream is explicitly
+    // introduced.
     let is_pep_native = features
         .iter()
         .find(|f| f.core.rank == 1)

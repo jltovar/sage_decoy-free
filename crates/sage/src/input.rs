@@ -251,7 +251,7 @@ pub enum JointMode {
 
 #[derive(Clone, Serialize, Deserialize, Debug, Default, PartialEq, Eq)]
 #[serde(rename_all = "snake_case")]
-pub enum L3AnchorMode {
+pub enum ReproducibilityAnchorMode {
     Best,
     #[default]
     SecondBest,
@@ -262,7 +262,7 @@ pub enum L3AnchorMode {
 
 #[derive(Clone, Serialize, Deserialize, Debug, Default, PartialEq, Eq)]
 #[serde(rename_all = "snake_case")]
-pub enum L3RescueMode {
+pub enum RescueMode {
     Replace,
     #[default]
     BoundedShrinkage,
@@ -328,7 +328,7 @@ pub struct PhysicalRescueConfig {
 }
 
 #[derive(Clone, Serialize, Deserialize, Debug, PartialEq)]
-pub struct L3ProteinEligibilityConfig {
+pub struct ProteinEligibilityConfig {
     pub enabled: bool,
     pub q_threshold_physical: f64,
     pub min_unique_passing_peptides: usize,
@@ -336,7 +336,7 @@ pub struct L3ProteinEligibilityConfig {
 }
 
 #[derive(Clone, Serialize, Deserialize, Debug, PartialEq)]
-pub struct L3PeptideEligibilityConfig {
+pub struct PeptideEligibilityConfig {
     pub min_run_fraction: f64,
     pub min_run_count: usize,
     pub strong_reference_q_threshold_physical: f64,
@@ -346,22 +346,24 @@ pub struct L3PeptideEligibilityConfig {
 }
 
 #[derive(Clone, Serialize, Deserialize, Debug, PartialEq)]
-pub struct L3AnchorConfig {
-    pub mode: L3AnchorMode,
+pub struct ReproducibilityAnchorConfig {
+    pub mode: ReproducibilityAnchorMode,
     pub trim_fraction: Option<f64>,
 }
 
 #[derive(Clone, Serialize, Deserialize, Debug, PartialEq)]
-pub struct L3RescueBandConfig {
-    pub strong_cutoff_pep_l2: f64,
-    pub weak_cutoff_pep_l2: f64,
+pub struct RescueBandConfig {
+    #[serde(alias = "strong_cutoff_pep_l2")]
+    pub strong_cutoff_pep: f64,
+    #[serde(alias = "weak_cutoff_pep_l2")]
+    pub weak_cutoff_pep: f64,
     pub max_rescue_fraction: f64,
-    pub rescue_mode: L3RescueMode,
+    pub rescue_mode: RescueMode,
 }
 
 #[derive(Clone, Serialize, Deserialize, Debug, PartialEq)]
 pub struct ReproducibilityConfig {
-    // Global Layer 3 controls
+    // Global Reproducibility controls
     pub enabled: bool,
     pub max_total_shift: f64,
     pub max_agreement_shift: f64,
@@ -371,12 +373,12 @@ pub struct ReproducibilityConfig {
     pub redundancy_discount: f64,
 
     // Eligibility controls
-    pub protein_eligibility: L3ProteinEligibilityConfig,
-    pub peptide_eligibility: L3PeptideEligibilityConfig,
+    pub protein_eligibility: ProteinEligibilityConfig,
+    pub peptide_eligibility: PeptideEligibilityConfig,
 
     // Anchor / rescue controls
-    pub anchor: L3AnchorConfig,
-    pub rescue_band: L3RescueBandConfig,
+    pub anchor: ReproducibilityAnchorConfig,
+    pub rescue_band: RescueBandConfig,
 }
 
 #[derive(Clone, Serialize, Deserialize, Debug, Default)]
@@ -797,14 +799,14 @@ impl From<FdrOptions> for FdrSettings {
                 use_cross_run_recurrence: false,
                 redundancy_discount: 1.0,
 
-                protein_eligibility: L3ProteinEligibilityConfig {
+                protein_eligibility: ProteinEligibilityConfig {
                     enabled: true,
                     q_threshold_physical: 0.01,
                     min_unique_passing_peptides: 2,
                     min_unique_passing_fraction: None,
                 },
 
-                peptide_eligibility: L3PeptideEligibilityConfig {
+                peptide_eligibility: PeptideEligibilityConfig {
                     min_run_fraction: 0.6,
                     min_run_count: 2,
                     strong_reference_q_threshold_physical: 0.01,
@@ -813,16 +815,16 @@ impl From<FdrOptions> for FdrSettings {
                     min_strong_run_count: 1,
                 },
 
-                anchor: L3AnchorConfig {
-                    mode: L3AnchorMode::SecondBest,
+                anchor: ReproducibilityAnchorConfig {
+                    mode: ReproducibilityAnchorMode::SecondBest,
                     trim_fraction: Some(0.1),
                 },
 
-                rescue_band: L3RescueBandConfig {
-                    strong_cutoff_pep_l2: 0.01,
-                    weak_cutoff_pep_l2: 0.25,
+                rescue_band: RescueBandConfig {
+                    strong_cutoff_pep: 0.01,
+                    weak_cutoff_pep: 0.25,
                     max_rescue_fraction: 0.5,
-                    rescue_mode: L3RescueMode::BoundedShrinkage,
+                    rescue_mode: RescueMode::BoundedShrinkage,
                 },
             });
 
