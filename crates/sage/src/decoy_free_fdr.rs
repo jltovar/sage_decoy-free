@@ -5218,14 +5218,14 @@ fn apply_bounded_physical_shift(
 #[derive(Clone, Debug, Default)]
 struct L3ProteinSupportSummary {
     pub n_unique_observed: usize,
-    pub n_unique_passing_l2: usize,
+    pub n_unique_passing_prior: usize,
     pub is_rescue_eligible: bool,
 }
 
 #[derive(Clone, Debug, Default)]
 struct L3PeptideEligibilitySummary {
     pub n_runs_observed: usize,
-    pub n_runs_strong_l2: usize,
+    pub n_runs_strong_prior: usize,
     pub observed_run_fraction: f64,
     pub strong_run_fraction: f64,
     pub is_rescue_eligible: bool,
@@ -5335,12 +5335,16 @@ fn build_l3_protein_support_map(
         };
 
         let peptide_seq = db[f.core.peptide_idx].to_string();
+
         observed
             .entry(protein_key.clone())
             .or_default()
             .insert(peptide_seq.clone());
 
-        if f.decoy_free_q_l2
+        // Reproducibility must consume the currently active DF stream.
+        // This may be base, RT-adjusted, IMS-adjusted, peptide-rescued,
+        // or protein-rescued depending on which stages have already run.
+        if f.decoy_free_q_value
             .map(|q| q <= cfg.q_threshold_physical as f32)
             .unwrap_or(false)
         {
@@ -5349,20 +5353,21 @@ fn build_l3_protein_support_map(
     }
 
     let mut out: FnvHashMap<String, L3ProteinSupportSummary> = FnvHashMap::default();
+
     for (protein_key, obs_set) in observed {
         let n_unique_observed = obs_set.len();
-        let n_unique_passing_l2 = passing.get(&protein_key).map(|s| s.len()).unwrap_or(0);
+        let n_unique_passing_prior = passing.get(&protein_key).map(|s| s.len()).unwrap_or(0);
 
         let frac_ok = match cfg.min_unique_passing_fraction {
             Some(frac) if n_unique_observed > 0 => {
-                (n_unique_passing_l2 as f64) / (n_unique_observed as f64) >= frac
+                (n_unique_passing_prior as f64) / (n_unique_observed as f64) >= frac
             }
             Some(_) => false,
             None => true,
         };
 
         let is_rescue_eligible = if cfg.enabled {
-            n_unique_passing_l2 >= cfg.min_unique_passing_peptides && frac_ok
+            n_unique_passing_prior >= cfg.min_unique_passing_peptides && frac_ok
         } else {
             true
         };
@@ -5371,7 +5376,7 @@ fn build_l3_protein_support_map(
             protein_key,
             L3ProteinSupportSummary {
                 n_unique_observed,
-                n_unique_passing_l2,
+                n_unique_passing_prior,
                 is_rescue_eligible,
             },
         );
@@ -5420,16 +5425,15 @@ fn build_l3_peptide_eligibility_map(
             .and_modify(|v| *v |= protein_rescue_eligible)
             .or_insert(protein_rescue_eligible);
 
+        // Reproducibility strong-reference eligibility must use the active
+        // stream, not the obsolete decoy_free_*_l2 physical stream.
         let q_ok = f
-            .decoy_free_q_l2
+            .decoy_free_q_value
             .map(|q| q <= cfg.strong_reference_q_threshold_physical as f32)
             .unwrap_or(false);
 
         let pep_ok = match cfg.strong_reference_pep_threshold_physical {
-            Some(thr) => f
-                .decoy_free_pep_l2
-                .map(|p| p <= thr as f32)
-                .unwrap_or(false),
+            Some(thr) => f.decoy_free_pep.map(|p| p <= thr as f32).unwrap_or(false),
             None => true,
         };
 
@@ -5442,19 +5446,20 @@ fn build_l3_peptide_eligibility_map(
     }
 
     let mut out: FnvHashMap<u32, L3PeptideEligibilitySummary> = FnvHashMap::default();
+
     for (pep_id, obs_set) in observed_runs {
         let n_runs_observed = obs_set.len();
-        let n_runs_strong_l2 = strong_runs.get(&pep_id).map(|s| s.len()).unwrap_or(0);
+        let n_runs_strong_prior = strong_runs.get(&pep_id).map(|s| s.len()).unwrap_or(0);
         let protein_rescue_eligible = protein_ok_by_peptide.get(&pep_id).copied().unwrap_or(false);
 
         let observed_run_fraction = (n_runs_observed as f64) / (total_runs as f64);
-        let strong_run_fraction = (n_runs_strong_l2 as f64) / (total_runs as f64);
+        let strong_run_fraction = (n_runs_strong_prior as f64) / (total_runs as f64);
 
         let observed_frac_ok = observed_run_fraction >= cfg.min_run_fraction;
         let observed_count_ok = n_runs_observed >= cfg.min_run_count;
 
         let strong_frac_ok = strong_run_fraction >= cfg.min_strong_run_fraction;
-        let strong_count_ok = n_runs_strong_l2 >= cfg.min_strong_run_count;
+        let strong_count_ok = n_runs_strong_prior >= cfg.min_strong_run_count;
 
         let is_rescue_eligible = protein_rescue_eligible
             && observed_frac_ok
@@ -5466,7 +5471,7 @@ fn build_l3_peptide_eligibility_map(
             pep_id,
             L3PeptideEligibilitySummary {
                 n_runs_observed,
-                n_runs_strong_l2,
+                n_runs_strong_prior,
                 observed_run_fraction,
                 strong_run_fraction,
                 is_rescue_eligible,
@@ -5493,23 +5498,20 @@ fn build_l3_anchor_map(
         .filter(|f| f.core.rank == 1 && f.core.label == 1)
     {
         let pep_id = f.core.peptide_idx.0;
-        let elig = match peptide_eligibility_map.get(&pep_id) {
-            Some(x) if x.is_rescue_eligible => x,
+
+        match peptide_eligibility_map.get(&pep_id) {
+            Some(x) if x.is_rescue_eligible => {}
             _ => continue,
-        };
+        }
 
-        let _ = elig;
-
+        // Anchor selection must use the active prior stream.
         let q_ok = f
-            .decoy_free_q_l2
+            .decoy_free_q_value
             .map(|q| q <= pep_cfg.strong_reference_q_threshold_physical as f32)
             .unwrap_or(false);
 
         let pep_ok = match pep_cfg.strong_reference_pep_threshold_physical {
-            Some(thr) => f
-                .decoy_free_pep_l2
-                .map(|p| p <= thr as f32)
-                .unwrap_or(false),
+            Some(thr) => f.decoy_free_pep.map(|p| p <= thr as f32).unwrap_or(false),
             None => true,
         };
 
@@ -5517,19 +5519,21 @@ fn build_l3_anchor_map(
             continue;
         }
 
-        if let Some(pep) = f.decoy_free_pep_l2 {
+        if let Some(pep) = f.decoy_free_pep {
             let pep = (pep as f64).clamp(0.0, 1.0).max(1e-300);
             strong_peps.entry(pep_id).or_default().push(pep);
         }
     }
 
     let mut out: FnvHashMap<u32, L3AnchorSummary> = FnvHashMap::default();
+
     for (pep_id, vals) in strong_peps {
         if vals.is_empty() {
             continue;
         }
 
         let mut tmp = vals.clone();
+
         let anchor_value = match anchor_cfg.mode {
             L3AnchorMode::Best => tmp.iter().copied().min_by(|a, b| a.total_cmp(b)),
             L3AnchorMode::SecondBest => second_best_f64(&mut tmp),
@@ -5562,14 +5566,17 @@ enum L3RescueBand {
     TooWeak,
 }
 
-fn classify_l3_rescue_band(prior_pep_l2: f64, settings: &FdrSettings) -> L3RescueBand {
+fn classify_l3_rescue_band(prior_pep: f64, settings: &FdrSettings) -> L3RescueBand {
     let band = &settings.reproducibility.rescue_band;
+
+    // These setting names still contain "_l2" for backward JSON compatibility,
+    // but the value being classified is now the active prior stream.
     let strong_cutoff = band.strong_cutoff_pep_l2;
     let weak_cutoff = band.weak_cutoff_pep_l2;
 
-    if prior_pep_l2 <= strong_cutoff {
+    if prior_pep <= strong_cutoff {
         L3RescueBand::Strong
-    } else if prior_pep_l2 < weak_cutoff {
+    } else if prior_pep < weak_cutoff {
         L3RescueBand::RescueEligible
     } else {
         L3RescueBand::TooWeak
@@ -5577,7 +5584,7 @@ fn classify_l3_rescue_band(prior_pep_l2: f64, settings: &FdrSettings) -> L3Rescu
 }
 
 fn apply_l3_anchor_rescue(
-    prior_pep_l2: f64,
+    prior_pep: f64,
     anchor_pep: f64,
     expert_support_shift: f64,
     recurrence_support_shift: f64,
@@ -5586,10 +5593,11 @@ fn apply_l3_anchor_rescue(
     let band = &settings.reproducibility.rescue_band;
     let max_frac = band.max_rescue_fraction.clamp(0.0, 1.0);
 
-    let prior = prior_pep_l2.clamp(0.0, 1.0).max(1e-300);
+    let prior = prior_pep.clamp(0.0, 1.0).max(1e-300);
     let anchor = anchor_pep.clamp(0.0, 1.0).max(1e-300);
 
     let improved_target = anchor.min(prior);
+
     let rescued_pep = match band.rescue_mode {
         L3RescueMode::Replace => improved_target,
         L3RescueMode::BoundedShrinkage => prior + max_frac * (improved_target - prior),
@@ -5644,14 +5652,14 @@ fn apply_bounded_repro_shift(
     //
     // Layer 3 does not grant a universal peptide-level recurrence bonus.
     // Rescue is allowed only for peptides that pass:
-    //   1) protein-support eligibility from Layer 2,
+    //   1) protein-support eligibility from the active prior stream,
     //   2) peptide recurrence eligibility,
     //   3) strong-reference eligibility.
     //
     // Only weaker-but-plausible PSMs are rescue candidates.
     // Strong PSMs are left unchanged.
     // Very weak PSMs are not rescued.
-    // Rescue-eligible PSMs move in a bounded way toward a Layer 2-derived anchor.
+    // Rescue-eligible PSMs move in a bounded way toward an active-stream-derived anchor.
     // Cross-run recurrence, when enabled, contributes only as an additional
     // bounded support term within that rescue path.
     features: &mut [DfFeature],
@@ -5661,11 +5669,12 @@ fn apply_bounded_repro_shift(
     if !settings.reproducibility.enabled {
         for f in features.iter_mut() {
             if f.core.rank == 1 {
-                f.decoy_free_pep_l3 = f.decoy_free_pep_l2;
-                f.decoy_free_score_l3 = f.decoy_free_score_l2;
-                f.decoy_free_q_l3 = f.decoy_free_q_l2;
+                f.decoy_free_pep_l3 = f.decoy_free_pep;
+                f.decoy_free_score_l3 = f.decoy_free_score;
+                f.decoy_free_q_l3 = f.decoy_free_q_value;
             }
         }
+
         return ReproducibilityResult {
             enabled: false,
             ..Default::default()
@@ -5679,18 +5688,18 @@ fn apply_bounded_repro_shift(
         .map(|s| s.n_unique_observed)
         .sum();
 
-    let total_unique_passing_l2: usize = protein_support_map
+    let total_unique_passing_prior: usize = protein_support_map
         .values()
-        .map(|s| s.n_unique_passing_l2)
+        .map(|s| s.n_unique_passing_prior)
         .sum();
 
     log::debug!(
-		"L3 protein support: proteins={} eligible={} total_unique_observed={} total_unique_passing_l2={}",
-		protein_support_map.len(),
-		protein_support_map.values().filter(|s| s.is_rescue_eligible).count(),
-		total_unique_observed,
-		total_unique_passing_l2
-	);
+        "L3 protein support: proteins={} eligible={} total_unique_observed={} total_unique_passing_prior={}",
+        protein_support_map.len(),
+        protein_support_map.values().filter(|s| s.is_rescue_eligible).count(),
+        total_unique_observed,
+        total_unique_passing_prior
+    );
 
     let peptide_eligibility_map =
         build_l3_peptide_eligibility_map(features, db, settings, &protein_support_map);
@@ -5700,9 +5709,9 @@ fn apply_bounded_repro_shift(
         .map(|s| s.n_runs_observed)
         .sum();
 
-    let total_runs_strong_l2: usize = peptide_eligibility_map
+    let total_runs_strong_prior: usize = peptide_eligibility_map
         .values()
-        .map(|s| s.n_runs_strong_l2)
+        .map(|s| s.n_runs_strong_prior)
         .sum();
 
     let protein_backed_peptides = peptide_eligibility_map
@@ -5711,13 +5720,13 @@ fn apply_bounded_repro_shift(
         .count();
 
     log::debug!(
-		"L3 peptide eligibility: peptides={} eligible={} protein_backed={} total_runs_observed={} total_runs_strong_l2={}",
-		peptide_eligibility_map.len(),
-		peptide_eligibility_map.values().filter(|s| s.is_rescue_eligible).count(),
-		protein_backed_peptides,
-		total_runs_observed,
-		total_runs_strong_l2
-	);
+        "L3 peptide eligibility: peptides={} eligible={} protein_backed={} total_runs_observed={} total_runs_strong_prior={}",
+        peptide_eligibility_map.len(),
+        peptide_eligibility_map.values().filter(|s| s.is_rescue_eligible).count(),
+        protein_backed_peptides,
+        total_runs_observed,
+        total_runs_strong_prior
+    );
 
     let anchor_map = build_l3_anchor_map(features, settings, &peptide_eligibility_map);
 
@@ -5755,7 +5764,10 @@ fn apply_bounded_repro_shift(
 
         cnt += 1;
 
-        let prior_pep = f.decoy_free_pep_l2.unwrap_or(1.0) as f64;
+        // Reproducibility rescue consumes the active prior stream.
+        // This preserves independence of base-only, RT-only, IMS-only,
+        // peptide-rescue, and protein-rescue execution.
+        let prior_pep = f.decoy_free_pep.unwrap_or(1.0) as f64;
         let pep_id = f.core.peptide_idx.0;
 
         let expert_s = compute_expert_agreement_support(f, settings)
