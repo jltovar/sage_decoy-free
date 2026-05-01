@@ -404,7 +404,6 @@ impl Input {
                 min_null_rank: None,
                 max_null_rank: None,
                 model_fit: None,
-                type_: None,
 
                 // Numerical safeguards and minimum sample constraints.
                 min_storey_n: None,

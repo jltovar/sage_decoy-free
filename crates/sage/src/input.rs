@@ -27,14 +27,6 @@ pub enum ModelFit {
 
 #[derive(Clone, Serialize, Deserialize, Debug, Default, PartialEq, Eq)]
 #[serde(rename_all = "snake_case")]
-pub enum FdrType {
-    #[default]
-    Bh, // Benjamini-Hochberg
-    Storey, // Storey-Tibshirani
-}
-
-#[derive(Clone, Serialize, Deserialize, Debug, Default, PartialEq, Eq)]
-#[serde(rename_all = "snake_case")]
 pub enum ProteinPCombine {
     #[default]
     Fisher,
@@ -50,6 +42,35 @@ pub enum PeptidePCombine {
     Cauchy,
     SidakMinP,
     Best,
+}
+
+#[derive(Clone, Serialize, Deserialize, Debug, Default, PartialEq, Eq)]
+#[serde(rename_all = "snake_case")]
+pub enum FinalEvidenceSpace {
+    /// Preserve legacy behavior:
+    /// Moments/MLE/LowerOrder use p-values;
+    /// MSFDR/Nokoi/Ensemble use PEP-native final q-values.
+    #[default]
+    Auto,
+    /// Force final selected Decoy-Free evidence to be p-value-native.
+    PValue,
+    /// Force final selected Decoy-Free evidence to be PEP-native.
+    Pep,
+}
+
+#[derive(Clone, Copy, Serialize, Deserialize, Debug, Default, PartialEq, Eq)]
+#[serde(rename_all = "snake_case")]
+pub enum QMethod {
+    /// Use the level-appropriate default.
+    #[default]
+    Auto,
+    /// Benjamini-Hochberg over p-values.
+    Bh,
+    /// Storey q-values over p-values.
+    Storey,
+    /// Cumulative mean over PEP-like values.
+    /// Only valid for PEP-native evidence.
+    Cummean,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
@@ -387,8 +408,18 @@ pub struct FdrOptions {
     // A) Global knobs
     // =========================================================================
     pub mode: Option<FdrMode>,
-    pub physical_rescue: Option<PhysicalRescueConfig>,
-    pub reproducibility: Option<ReproducibilityConfig>,
+    pub entrapment_report: Option<EntrapmentReportMode>,
+
+    // Model selection
+    pub model_fit: Option<ModelFit>,
+
+    // Final active evidence-space controls.
+    pub final_evidence_space: Option<FinalEvidenceSpace>,
+
+    // Explicit q-value method controls.
+    pub psm_q_method: Option<QMethod>,
+    pub peptide_q_method: Option<QMethod>,
+    pub protein_q_method: Option<QMethod>,
 
     // Explicit post-base Decoy-Free stage gates.
     // These control whether stage-specific TSV snapshots are produced and whether
@@ -397,29 +428,25 @@ pub struct FdrOptions {
     pub enable_ims_confidence_adjustment: Option<bool>,
     pub enable_peptide_reproducibility_rescue: Option<bool>,
     pub enable_protein_reproducibility_rescue: Option<bool>,
+
+    pub protein_p_combine: Option<ProteinPCombine>,
+    pub peptide_p_combine: Option<PeptidePCombine>,
+
     pub peptide_fdr: Option<f32>,
     pub protein_fdr: Option<f32>,
     pub precursor_fdr: Option<f32>,
-    pub entrapment_report: Option<EntrapmentReportMode>,
 
     // Global null window (superset pool builder)
     pub min_null_rank: Option<u32>,
     pub max_null_rank: Option<u32>,
 
     // Rank-null pool construction controls
-    pub purification_factor: Option<f64>, // default 0.20; clamp 0..0.9
+    pub min_null_size: Option<usize>,     // default 300
     pub min_rank_count: Option<usize>,    // default 10
-
-    // Model selection + global FDR type
-    pub model_fit: Option<ModelFit>,
-    #[serde(alias = "type")]
-    pub type_: Option<FdrType>,
-    pub protein_p_combine: Option<ProteinPCombine>,
-    pub peptide_p_combine: Option<PeptidePCombine>,
+    pub purification_factor: Option<f64>, // default 0.20; clamp 0..0.9
 
     // Configurable Safety Brakes (global)
     pub min_storey_n: Option<usize>,
-    pub min_null_size: Option<usize>,
 
     // Storey/π0 tuning knobs (decoy-free and general)
     pub storey_pi0_clamp_min: Option<f64>,
@@ -435,6 +462,126 @@ pub struct FdrOptions {
     pub storey_degen_eps: Option<f64>,
     pub storey_degen_pi0_eps: Option<f64>,
     pub storey_degen_fallback: Option<StoreyDegeneracyFallback>,
+
+    // =========================================================================
+    // B) Moments specific knobs
+    // =========================================================================
+    pub moments_min_null_rank: Option<u32>,
+    pub moments_max_null_rank: Option<u32>,
+
+    // =========================================================================
+    // C) MLE specific knobs
+    // =========================================================================
+    pub mle_min_null_rank: Option<u32>,
+    pub mle_max_null_rank: Option<u32>,
+
+    // =========================================================================
+    // D) LowerOrder specific knobs
+    // =========================================================================
+    pub lower_order_min_null_rank: Option<u32>,
+    pub lower_order_max_null_rank: Option<u32>,
+
+    // LowerOrder support threshold.
+    // This is not a rank-window selector. The selected LO ranks are controlled
+    // only by lower_order_min_null_rank..=lower_order_max_null_rank.
+    pub lo_min_count_per_rank: Option<usize>,
+
+    // LO (paper/PyLord) controls
+    pub lo_rank_key: Option<LoRankKey>, // lo_adjusted | hyperscore
+    pub lo_mode: Option<LoMode>,        // auto | linear_regression | mean_beta
+    pub lo_lom_estimator: Option<LoLomEstimator>, // auto | mm | mle
+
+    // Mean-β scheme controls (paper defaults: min_rank=8, count=3)
+    pub lo_mean_beta_mode: Option<LoMeanBetaMode>, // default consecutive
+
+    // PyLord parity knobs
+    pub lo_stratify: Option<LoStratify>, // default charge
+    pub lo_score: Option<LoScore>,       // default raw
+    pub lo_tev_cutoff: Option<f64>,      // default 0.18
+
+    // =========================================================================
+    // E) MSFDR specific knobs
+    // =========================================================================
+    pub msfdr_min_null_rank: Option<u32>,
+    pub msfdr_max_null_rank: Option<u32>,
+
+    // MSFDR init/drift knobs (needed by real models)
+    pub msfdr_seeded_top_frac_init: Option<f64>, // default 0.2
+    pub msfdr_multistart: Option<usize>,
+
+    // --- Specific clamps (overrides) ---
+    pub msfdr_pi_clamp_min: Option<f64>,
+    pub msfdr_pi_clamp_max: Option<f64>,
+
+    // =========================================================================
+    // Mixture knobs (MSFDR 1smix / 2smix)
+    // =========================================================================
+    pub mix_em_max_iter: Option<usize>, // default 200; clamp 1..10_000
+    pub mix_em_tol: Option<f64>,        // default 1e-6; must be >0
+    pub mix_pi_clamp_min: Option<f64>,  // default 0.01
+    pub mix_pi_clamp_max: Option<f64>,  // default 0.99
+    pub mix_anchor_incorrect: Option<bool>, // default true (for 2smix)
+
+    // =========================================================================
+    // F) MSFDR1_Smix specific knobs
+    // =========================================================================
+    pub msfdr1_smix_min_null_rank: Option<u32>,
+    pub msfdr1_smix_max_null_rank: Option<u32>,
+
+    // MSFDR1 init/drift knobs (needed by real models)
+    pub msfdr1_bottom_frac_init: Option<f64>, // default 0.7
+    pub msfdr1_top_frac_init: Option<f64>,    // default 0.2
+
+    // Expose drift clamps for MSFDR1
+    pub msfdr1_beta_drift_mult: Option<(f64, f64)>, // default (0.8, 1.25)
+    pub msfdr1_mu_drift_abs: Option<f64>,           // default 0.5
+
+    // --- Specific clamps (overrides) ---
+    pub msfdr1_pi_clamp_min: Option<f64>,
+    pub msfdr1_pi_clamp_max: Option<f64>,
+
+    // =========================================================================
+    // G) MSFDR2_Smix specific knobs
+    // =========================================================================
+    pub msfdr2_smix_min_null_rank: Option<u32>,
+    pub msfdr2_smix_max_null_rank: Option<u32>,
+
+    // MSFDR2 init/drift knobs (needed by real models)
+    pub msfdr2_top_frac_init: Option<f64>,
+
+    // Expose drift clamps for MSFDR2
+    pub msfdr2_beta_drift_mult: Option<(f64, f64)>, // default (0.5, 2.0)
+    pub msfdr2_mu_drift_abs: Option<f64>,           // default 5.0
+
+    // --- Specific clamps (overrides) ---
+    pub msfdr2_pi_clamp_min: Option<f64>,
+    pub msfdr2_pi_clamp_max: Option<f64>,
+
+    // =========================================================================
+    // H) Nokoi specific knobs
+    // =========================================================================
+    pub nokoi_min_null_rank: Option<u32>,
+    pub nokoi_max_null_rank: Option<u32>,
+
+    // Nokoi DF cross-fit calibration
+    pub nokoi_k_folds: Option<usize>,
+
+    // Nokoi L1 lambda grid (JSON-exposed)
+    pub nokoi_l1_lambda_min: Option<f64>,
+    pub nokoi_l1_lambda_max: Option<f64>,
+    pub nokoi_l1_lambda_steps: Option<usize>,
+
+    // =========================================================================
+    // I) Ensemble specific knobs
+    // =========================================================================
+    // Ensemble expert gates (Ensemble uses these; explicit model_fit variants override gates)
+    pub enable_moments: Option<bool>,      // default true
+    pub enable_mle: Option<bool>,          // default true
+    pub enable_lower_order: Option<bool>,  // default true
+    pub enable_msfdr_seeded: Option<bool>, // default true
+    pub enable_msfdr_1smix: Option<bool>,  // default true
+    pub enable_msfdr_2smix: Option<bool>,  // default true
+    pub enable_nokoi: Option<bool>,        // default true
 
     // Ensemble combination choices (global controls; used by ModelFit::Ensemble)
     pub ensemble_pep_combiner: Option<EnsemblePepCombiner>,
@@ -455,112 +602,11 @@ pub struct FdrOptions {
     pub ensemble_weight_nokoi: Option<f64>,   // default 1.0
 
     // =========================================================================
-    // B) Moments specific knobs
+    // J) Layer 2: Physical confidence adjustment: RT and IMS Knobs
+    //    Layer 3: Reproducibility rescue: peptide and protein
     // =========================================================================
-    pub moments_min_null_rank: Option<u32>,
-    pub moments_max_null_rank: Option<u32>,
-
-    // =========================================================================
-    // C) MLE specific knobs
-    // =========================================================================
-    pub mle_min_null_rank: Option<u32>,
-    pub mle_max_null_rank: Option<u32>,
-
-    // =========================================================================
-    // D) LowerOrder specific knobs
-    // =========================================================================
-    pub lower_order_min_null_rank: Option<u32>,
-    pub lower_order_max_null_rank: Option<u32>,
-
-    // LO (paper/PyLord) controls
-    pub lo_rank_key: Option<LoRankKey>, // unchanged: output rank key (lo_adjusted vs hyperscore)
-    pub lo_mode: Option<LoMode>,        // auto | linear_regression | mean_beta
-    pub lo_lom_estimator: Option<LoLomEstimator>, // auto | mm | mle
-
-    // LowerOrder support threshold.
-    // This is not a rank-window selector. The selected LO ranks are controlled
-    // only by lower_order_min_null_rank..=lower_order_max_null_rank.
-    pub lo_min_count_per_rank: Option<usize>,
-
-    // PyLord parity knobs
-    pub lo_stratify: Option<LoStratify>, // default Charge
-    pub lo_score: Option<LoScore>,       // default Raw
-    pub lo_tev_cutoff: Option<f64>,      // default 0.18
-
-    // Mean-β scheme controls (paper defaults: min_rank=8, count=3)
-    pub lo_mean_beta_mode: Option<LoMeanBetaMode>, // default consecutive
-
-    // =========================================================================
-    // E) MSFDR specific knobs
-    // =========================================================================
-    pub msfdr_min_null_rank: Option<u32>,
-    pub msfdr_max_null_rank: Option<u32>,
-    pub msfdr_multistart: Option<usize>,
-
-    // =========================================================================
-    // Mixture knobs (MSFDR 1smix / 2smix)
-    // =========================================================================
-    pub mix_em_max_iter: Option<usize>, // default 200; clamp 1..10_000
-    pub mix_em_tol: Option<f64>,        // default 1e-6; must be >0
-    pub mix_pi_clamp_min: Option<f64>,  // default 0.01
-    pub mix_pi_clamp_max: Option<f64>,  // default 0.99
-    pub mix_anchor_incorrect: Option<bool>, // default true (for 2smix)
-
-    // --- Specific clamps (overrides) ---
-    pub msfdr_pi_clamp_min: Option<f64>,
-    pub msfdr_pi_clamp_max: Option<f64>,
-    pub msfdr1_pi_clamp_min: Option<f64>,
-    pub msfdr1_pi_clamp_max: Option<f64>,
-    pub msfdr2_pi_clamp_min: Option<f64>,
-    pub msfdr2_pi_clamp_max: Option<f64>,
-
-    // =========================================================================
-    // F) MSFDR1_Smix specific knobs
-    // =========================================================================
-    pub msfdr1_smix_min_null_rank: Option<u32>,
-    pub msfdr1_smix_max_null_rank: Option<u32>,
-
-    // MSFDR init/drift knobs (needed by real models)
-    pub msfdr1_bottom_frac_init: Option<f64>, // default 0.7
-    pub msfdr_seeded_top_frac_init: Option<f64>, // default 0.2
-    pub msfdr1_top_frac_init: Option<f64>,    // default 0.2
-
-    // Expose drift clamps for MSFDR1
-    pub msfdr1_beta_drift_mult: Option<(f64, f64)>, // default (0.8, 1.25)
-    pub msfdr1_mu_drift_abs: Option<f64>,           // default 0.5
-
-    // =========================================================================
-    // G) MSFDR2_Smix specific knobs
-    // =========================================================================
-    pub msfdr2_smix_min_null_rank: Option<u32>,
-    pub msfdr2_smix_max_null_rank: Option<u32>,
-
-    pub msfdr2_beta_drift_mult: Option<(f64, f64)>, // default (0.5, 2.0)
-    pub msfdr2_mu_drift_abs: Option<f64>,           // default 5.0
-    pub msfdr2_top_frac_init: Option<f64>, // default = msfdr1_top_frac_init (optional but clean)
-
-    // Ensemble expert gates (Ensemble uses these; explicit model_fit variants override gates)
-    pub enable_moments: Option<bool>,      // default true
-    pub enable_mle: Option<bool>,          // default true
-    pub enable_lower_order: Option<bool>,  // default true
-    pub enable_msfdr_seeded: Option<bool>, // default true
-    pub enable_msfdr_1smix: Option<bool>,  // default true
-    pub enable_msfdr_2smix: Option<bool>,  // default true
-    pub enable_nokoi: Option<bool>,        // default true
-
-    // =========================================================================
-    // H) Nokoi specific knobs
-    // =========================================================================
-    pub nokoi_min_null_rank: Option<u32>,
-    pub nokoi_max_null_rank: Option<u32>,
-
-    // Nokoi DF cross-fit calibration
-    pub nokoi_k_folds: Option<usize>,
-
-    // Nokoi L1 lambda grid (JSON-exposed)
-    pub nokoi_l1_lambda_min: Option<f64>,
-    pub nokoi_l1_lambda_max: Option<f64>,
-    pub nokoi_l1_lambda_steps: Option<usize>,
+    pub physical_rescue: Option<PhysicalRescueConfig>,
+    pub reproducibility: Option<ReproducibilityConfig>,
 }
 
 #[derive(Clone, Serialize, Debug)]
@@ -569,8 +615,18 @@ pub struct FdrSettings {
     // A) Global knobs
     // =========================================================================
     pub mode: FdrMode,
-    pub physical_rescue: PhysicalRescueConfig,
-    pub reproducibility: ReproducibilityConfig,
+    pub entrapment_report: EntrapmentReportMode,
+
+    // Model selection
+    pub model_fit: ModelFit,
+
+    // Final active evidence-space controls.
+    pub final_evidence_space: FinalEvidenceSpace,
+
+    // Explicit q-value method controls
+    pub psm_q_method: QMethod,
+    pub peptide_q_method: QMethod,
+    pub protein_q_method: QMethod,
 
     // Explicit post-base Decoy-Free stage gates.
     pub enable_rt_confidence_adjustment: bool,
@@ -578,87 +634,25 @@ pub struct FdrSettings {
     pub enable_peptide_reproducibility_rescue: bool,
     pub enable_protein_reproducibility_rescue: bool,
 
+    // Protein/peptide p-value combiners
+    pub protein_p_combine: ProteinPCombine,
+    pub peptide_p_combine: PeptidePCombine,
+
     pub peptide_fdr: f32,
     pub protein_fdr: f32,
     pub precursor_fdr: f32,
-
-    #[serde(default)]
-    pub entrapment_report: EntrapmentReportMode,
 
     // Global null window (superset pool builder)
     pub min_null_rank: u32,
     pub max_null_rank: u32,
 
-    // =========================================================================
-    // B) Moments specific resolved null window
-    // =========================================================================
-    pub moments_min_null_rank: u32,
-    pub moments_max_null_rank: u32,
-
-    // =========================================================================
-    // C) MLE specific resolved null window
-    // =========================================================================
-    pub mle_min_null_rank: u32,
-    pub mle_max_null_rank: u32,
-
-    // =========================================================================
-    // D) LowerOrder specific resolved null window
-    // =========================================================================
-    pub lower_order_min_null_rank: u32,
-    pub lower_order_max_null_rank: u32,
-    pub lo_rank_key: LoRankKey,
-
-    // LO (paper/PyLord) settings
-    pub lo_mode: LoMode,
-    pub lo_lom_estimator: LoLomEstimator,
-
-    /// Minimum number of observations required for an individual selected
-    /// lower-order rank to contribute to the LowerOrder fit.
-    ///
-    /// This is not a rank-window selector. The selected LO ranks are controlled
-    /// only by lower_order_min_null_rank..=lower_order_max_null_rank.
-    pub lo_min_count_per_rank: usize,
-
-    // PyLord parity settings
-    pub lo_stratify: LoStratify, // Charge | Global
-    pub lo_score: LoScore,       // Raw | PerSpectrum
-    pub lo_tev_cutoff: f64,
-
-    pub lo_mean_beta_mode: LoMeanBetaMode,
-
-    // =========================================================================
-    // E) MSFDR specific resolved null window
-    // =========================================================================
-    pub msfdr_min_null_rank: u32,
-    pub msfdr_max_null_rank: u32,
-
-    // =========================================================================
-    // F) MSFDR1_Smix specific resolved null window
-    // =========================================================================
-    pub msfdr1_smix_min_null_rank: u32,
-    pub msfdr1_smix_max_null_rank: u32,
-
-    // =========================================================================
-    // G) MSFDR2_Smix specific resolved null window
-    // =========================================================================
-    pub msfdr2_smix_min_null_rank: u32,
-    pub msfdr2_smix_max_null_rank: u32,
-
-    // =========================================================================
-    // H) Nokoi specific resolved null window
-    // =========================================================================
-    pub nokoi_min_null_rank: u32,
-    pub nokoi_max_null_rank: u32,
-
-    // Global model selection + FDR type
-    pub model_fit: ModelFit,
-    pub type_: FdrType,
-    pub protein_p_combine: ProteinPCombine,
-    pub peptide_p_combine: PeptidePCombine,
+    // Rank-null pool construction controls
+    pub min_null_size: usize,
+    pub min_rank_count: usize,
+    pub purification_factor: f64,
 
     // Configurable Safety Brakes
     pub min_storey_n: usize,
-    pub min_null_size: usize,
 
     // Storey/π0 tuning knobs
     pub storey_pi0_clamp_min: f64,
@@ -675,24 +669,116 @@ pub struct FdrSettings {
     pub storey_degen_pi0_eps: f64,
     pub storey_degen_fallback: StoreyDegeneracyFallback,
 
-    // Nokoi DF cross-fit calibration
+    // =========================================================================
+    // B) Moments specific resolved null window
+    // =========================================================================
+    pub moments_min_null_rank: u32,
+    pub moments_max_null_rank: u32,
+
+    // =========================================================================
+    // C) MLE specific resolved null window
+    // =========================================================================
+    pub mle_min_null_rank: u32,
+    pub mle_max_null_rank: u32,
+
+    // =========================================================================
+    // D) LowerOrder specific resolved null window + knobs
+    // =========================================================================
+    pub lower_order_min_null_rank: u32,
+    pub lower_order_max_null_rank: u32,
+
+    pub lo_min_count_per_rank: usize,
+
+    pub lo_rank_key: LoRankKey,
+    pub lo_mode: LoMode,
+    pub lo_lom_estimator: LoLomEstimator,
+
+    pub lo_mean_beta_mode: LoMeanBetaMode,
+
+    pub lo_stratify: LoStratify,
+    pub lo_score: LoScore,
+    pub lo_tev_cutoff: f64,
+
+    // =========================================================================
+    // E) MSFDR specific resolved null window + knobs
+    // =========================================================================
+    pub msfdr_min_null_rank: u32,
+    pub msfdr_max_null_rank: u32,
+
+    pub msfdr_seeded_top_frac_init: f64,
+    pub msfdr_multistart: usize,
+
+    pub msfdr_pi_clamp_min: f64,
+    pub msfdr_pi_clamp_max: f64,
+
+    // =========================================================================
+    // Mixture knobs (MSFDR 1smix / 2smix)
+    // =========================================================================
+    pub mix_em_max_iter: usize,
+    pub mix_em_tol: f64,
+    pub mix_pi_clamp_min: f64,
+    pub mix_pi_clamp_max: f64,
+    pub mix_anchor_incorrect: bool,
+
+    // =========================================================================
+    // F) MSFDR1_Smix specific resolved null window + knobs
+    // =========================================================================
+    pub msfdr1_smix_min_null_rank: u32,
+    pub msfdr1_smix_max_null_rank: u32,
+
+    pub msfdr1_bottom_frac_init: f64,
+    pub msfdr1_top_frac_init: f64,
+
+    pub msfdr1_beta_drift_mult: (f64, f64),
+    pub msfdr1_mu_drift_abs: f64,
+
+    pub msfdr1_pi_clamp_min: f64,
+    pub msfdr1_pi_clamp_max: f64,
+
+    // =========================================================================
+    // G) MSFDR2_Smix specific resolved null window + knobs
+    // =========================================================================
+    pub msfdr2_smix_min_null_rank: u32,
+    pub msfdr2_smix_max_null_rank: u32,
+
+    pub msfdr2_top_frac_init: f64,
+
+    pub msfdr2_beta_drift_mult: (f64, f64),
+    pub msfdr2_mu_drift_abs: f64,
+
+    pub msfdr2_pi_clamp_min: f64,
+    pub msfdr2_pi_clamp_max: f64,
+
+    // =========================================================================
+    // H) Nokoi specific resolved null window + knobs
+    // =========================================================================
+    pub nokoi_min_null_rank: u32,
+    pub nokoi_max_null_rank: u32,
+
     pub nokoi_k_folds: usize,
 
-    // Nokoi L1 lambda grid
     pub nokoi_l1_lambda_min: f64,
     pub nokoi_l1_lambda_max: f64,
     pub nokoi_l1_lambda_steps: usize,
 
-    // Ensemble combination choices
+    // =========================================================================
+    // I) Ensemble specific knobs
+    // =========================================================================
+    pub enable_moments: bool,
+    pub enable_mle: bool,
+    pub enable_lower_order: bool,
+    pub enable_msfdr_seeded: bool,
+    pub enable_msfdr_1smix: bool,
+    pub enable_msfdr_2smix: bool,
+    pub enable_nokoi: bool,
+
     pub ensemble_pep_combiner: EnsemblePepCombiner,
 
-    // Shared robust-combiner knobs
     pub ensemble_pep_trim_frac: f64,
     pub ensemble_pep_quantile: f64,
     pub ensemble_pep_top_k: usize,
     pub ensemble_pep_logit_eps: f64,
 
-    // Static per-expert weights
     pub ensemble_weight_moments: f64,
     pub ensemble_weight_mle: f64,
     pub ensemble_weight_lower_order: f64,
@@ -701,46 +787,12 @@ pub struct FdrSettings {
     pub ensemble_weight_msfdr_2smix: f64,
     pub ensemble_weight_nokoi: f64,
 
-    // MSFDR controls
-    pub msfdr_multistart: usize,
-
-    // MSFDR init/drift knobs (needed by real models)
-    pub msfdr_seeded_top_frac_init: f64,
-    pub msfdr1_top_frac_init: f64,
-    pub msfdr1_bottom_frac_init: f64,
-    pub msfdr1_beta_drift_mult: (f64, f64),
-    pub msfdr1_mu_drift_abs: f64,
-    pub msfdr2_beta_drift_mult: (f64, f64),
-    pub msfdr2_mu_drift_abs: f64,
-    pub msfdr2_top_frac_init: f64, // optional but clean
-
-    // Ensemble expert gates (Ensemble uses these; explicit model_fit variants override gates)
-    pub enable_moments: bool,      // default true
-    pub enable_mle: bool,          // default true
-    pub enable_lower_order: bool,  // default true
-    pub enable_msfdr_seeded: bool, // default true
-    pub enable_msfdr_1smix: bool,  // default true
-    pub enable_msfdr_2smix: bool,  // default true
-    pub enable_nokoi: bool,        // default true
-
-    // Mixture knobs (MSFDR 1smix / 2smix)
-    pub mix_em_max_iter: usize,
-    pub mix_em_tol: f64,
-    pub mix_pi_clamp_min: f64,
-    pub mix_pi_clamp_max: f64,
-    pub mix_anchor_incorrect: bool,
-
-    // --- Specific clamps ---
-    pub msfdr_pi_clamp_min: f64,
-    pub msfdr_pi_clamp_max: f64,
-    pub msfdr1_pi_clamp_min: f64,
-    pub msfdr1_pi_clamp_max: f64,
-    pub msfdr2_pi_clamp_min: f64,
-    pub msfdr2_pi_clamp_max: f64,
-
-    // Rank-null pool construction controls
-    pub purification_factor: f64,
-    pub min_rank_count: usize,
+    // =========================================================================
+    // J) Layer 2: Physical confidence adjustment: RT and IMS Knobs
+    //    Layer 3: Reproducibility rescue: peptide and protein
+    // =========================================================================
+    pub physical_rescue: PhysicalRescueConfig,
+    pub reproducibility: ReproducibilityConfig,
 }
 
 impl From<FdrOptions> for FdrSettings {
@@ -859,9 +911,15 @@ impl From<FdrOptions> for FdrSettings {
             .unwrap_or(EntrapmentReportMode::Auto);
 
         let model_fit = options.model_fit.unwrap_or(ModelFit::Ensemble);
-        let type_ = options.type_.unwrap_or(FdrType::Storey);
         let protein_p_combine = options.protein_p_combine.unwrap_or(ProteinPCombine::Cauchy);
         let peptide_p_combine = options.peptide_p_combine.unwrap_or(PeptidePCombine::Cauchy);
+        let final_evidence_space = options
+            .final_evidence_space
+            .unwrap_or(FinalEvidenceSpace::Auto);
+
+        let psm_q_method = options.psm_q_method.unwrap_or(QMethod::Storey);
+        let peptide_q_method = options.peptide_q_method.unwrap_or(QMethod::Auto);
+        let protein_q_method = options.protein_q_method.unwrap_or(QMethod::Auto);
 
         let min_storey_n = options.min_storey_n.unwrap_or(300);
         let min_null_size = options.min_null_size.unwrap_or(300);
@@ -1177,87 +1235,44 @@ impl From<FdrOptions> for FdrSettings {
             // A) Global knobs
             // =========================================================================
             mode,
-            physical_rescue,
-            reproducibility,
+            entrapment_report,
 
+            // Model selection
+            model_fit,
+
+            // Final active evidence-space controls
+            final_evidence_space,
+
+            // Explicit q-value method controls
+            psm_q_method,
+            peptide_q_method,
+            protein_q_method,
+
+            // Explicit post-base Decoy-Free stage gates
             enable_rt_confidence_adjustment,
             enable_ims_confidence_adjustment,
             enable_peptide_reproducibility_rescue,
             enable_protein_reproducibility_rescue,
 
+            // Protein/peptide p-value combiners
+            protein_p_combine,
+            peptide_p_combine,
+
             peptide_fdr,
             protein_fdr,
             precursor_fdr,
-            entrapment_report,
 
             // Global null window (superset pool builder)
             min_null_rank,
             max_null_rank,
 
-            // =========================================================================
-            // B) Moments specific resolved null window
-            // =========================================================================
-            moments_min_null_rank,
-            moments_max_null_rank,
-
-            // =========================================================================
-            // C) MLE specific resolved null window
-            // =========================================================================
-            mle_min_null_rank,
-            mle_max_null_rank,
-
-            // =========================================================================
-            // D) LowerOrder specific resolved null window
-            // =========================================================================
-            lower_order_min_null_rank,
-            lower_order_max_null_rank,
-            lo_rank_key,
-
-            // LO (paper/PyLord) settings
-            lo_mode,
-            lo_lom_estimator,
-            lo_min_count_per_rank,
-
-            // PyLord parity settings
-            lo_stratify,
-            lo_score,
-            lo_tev_cutoff,
-
-            lo_mean_beta_mode,
-
-            // =========================================================================
-            // E) MSFDR specific resolved null window
-            // =========================================================================
-            msfdr_min_null_rank,
-            msfdr_max_null_rank,
-
-            // =========================================================================
-            // F) MSFDR1_Smix specific resolved null window
-            // =========================================================================
-            msfdr1_smix_min_null_rank,
-            msfdr1_smix_max_null_rank,
-
-            // =========================================================================
-            // G) MSFDR2_Smix specific resolved null window
-            // =========================================================================
-            msfdr2_smix_min_null_rank,
-            msfdr2_smix_max_null_rank,
-
-            // =========================================================================
-            // H) Nokoi specific resolved null window
-            // =========================================================================
-            nokoi_min_null_rank,
-            nokoi_max_null_rank,
-
-            // Global model selection + FDR type
-            model_fit,
-            type_,
-            protein_p_combine,
-            peptide_p_combine,
+            // Rank-null pool construction controls
+            min_null_size,
+            min_rank_count,
+            purification_factor,
 
             // Configurable Safety Brakes
             min_storey_n,
-            min_null_size,
 
             // Storey/π0 tuning knobs
             storey_pi0_clamp_min,
@@ -1274,46 +1289,101 @@ impl From<FdrOptions> for FdrSettings {
             storey_degen_pi0_eps,
             storey_degen_fallback,
 
-            // Nokoi DF cross-fit calibration
+            // =========================================================================
+            // B) Moments specific resolved null window
+            // =========================================================================
+            moments_min_null_rank,
+            moments_max_null_rank,
+
+            // =========================================================================
+            // C) MLE specific resolved null window
+            // =========================================================================
+            mle_min_null_rank,
+            mle_max_null_rank,
+
+            // =========================================================================
+            // D) LowerOrder specific resolved null window + knobs
+            // =========================================================================
+            lower_order_min_null_rank,
+            lower_order_max_null_rank,
+
+            lo_min_count_per_rank,
+
+            lo_rank_key,
+            lo_mode,
+            lo_lom_estimator,
+
+            lo_mean_beta_mode,
+
+            lo_stratify,
+            lo_score,
+            lo_tev_cutoff,
+
+            // =========================================================================
+            // E) MSFDR specific resolved null window + knobs
+            // =========================================================================
+            msfdr_min_null_rank,
+            msfdr_max_null_rank,
+
+            msfdr_seeded_top_frac_init,
+            msfdr_multistart,
+
+            msfdr_pi_clamp_min,
+            msfdr_pi_clamp_max,
+
+            // =========================================================================
+            // Mixture knobs (MSFDR 1smix / 2smix)
+            // =========================================================================
+            mix_em_max_iter,
+            mix_em_tol,
+            mix_pi_clamp_min,
+            mix_pi_clamp_max,
+            mix_anchor_incorrect,
+
+            // =========================================================================
+            // F) MSFDR1_Smix specific resolved null window + knobs
+            // =========================================================================
+            msfdr1_smix_min_null_rank,
+            msfdr1_smix_max_null_rank,
+
+            msfdr1_bottom_frac_init,
+            msfdr1_top_frac_init,
+
+            msfdr1_beta_drift_mult,
+            msfdr1_mu_drift_abs,
+
+            msfdr1_pi_clamp_min,
+            msfdr1_pi_clamp_max,
+
+            // =========================================================================
+            // G) MSFDR2_Smix specific resolved null window + knobs
+            // =========================================================================
+            msfdr2_smix_min_null_rank,
+            msfdr2_smix_max_null_rank,
+
+            msfdr2_top_frac_init,
+
+            msfdr2_beta_drift_mult,
+            msfdr2_mu_drift_abs,
+
+            msfdr2_pi_clamp_min,
+            msfdr2_pi_clamp_max,
+
+            // =========================================================================
+            // H) Nokoi specific resolved null window + knobs
+            // =========================================================================
+            nokoi_min_null_rank,
+            nokoi_max_null_rank,
+
             nokoi_k_folds,
 
-            // Nokoi L1 lambda grid
             nokoi_l1_lambda_min,
             nokoi_l1_lambda_max,
             nokoi_l1_lambda_steps,
 
-            // Ensemble combination choices
-            ensemble_pep_combiner,
-
-            // Shared robust-combiner knobs
-            ensemble_pep_trim_frac,
-            ensemble_pep_quantile,
-            ensemble_pep_top_k,
-            ensemble_pep_logit_eps,
-
-            // Static per-expert weights
-            ensemble_weight_moments,
-            ensemble_weight_mle,
-            ensemble_weight_lower_order,
-            ensemble_weight_msfdr_seeded,
-            ensemble_weight_msfdr_1smix,
-            ensemble_weight_msfdr_2smix,
-            ensemble_weight_nokoi,
-
-            // MSFDR controls
-            msfdr_multistart,
-
-            // MSFDR init/drift knobs (needed by real models)
-            msfdr_seeded_top_frac_init,
-            msfdr1_top_frac_init,
-            msfdr1_bottom_frac_init,
-            msfdr1_beta_drift_mult,
-            msfdr1_mu_drift_abs,
-            msfdr2_beta_drift_mult,
-            msfdr2_mu_drift_abs,
-            msfdr2_top_frac_init,
-
-            // Ensemble expert gates (Ensemble uses these; explicit model_fit variants override gates)
+            // =========================================================================
+            // I) Ensemble specific knobs
+            // =========================================================================
             enable_moments,
             enable_mle,
             enable_lower_order,
@@ -1322,24 +1392,27 @@ impl From<FdrOptions> for FdrSettings {
             enable_msfdr_2smix,
             enable_nokoi,
 
-            // Mixture knobs (MSFDR 1smix / 2smix)
-            mix_em_max_iter,
-            mix_em_tol,
-            mix_pi_clamp_min,
-            mix_pi_clamp_max,
-            mix_anchor_incorrect,
+            ensemble_pep_combiner,
 
-            // --- Specific clamps ---
-            msfdr_pi_clamp_min,
-            msfdr_pi_clamp_max,
-            msfdr1_pi_clamp_min,
-            msfdr1_pi_clamp_max,
-            msfdr2_pi_clamp_min,
-            msfdr2_pi_clamp_max,
+            ensemble_pep_trim_frac,
+            ensemble_pep_quantile,
+            ensemble_pep_top_k,
+            ensemble_pep_logit_eps,
 
-            // Rank-null pool construction controls
-            purification_factor,
-            min_rank_count,
+            ensemble_weight_moments,
+            ensemble_weight_mle,
+            ensemble_weight_lower_order,
+            ensemble_weight_msfdr_seeded,
+            ensemble_weight_msfdr_1smix,
+            ensemble_weight_msfdr_2smix,
+            ensemble_weight_nokoi,
+
+            // =========================================================================
+            // J) Layer 2: Physical confidence adjustment: RT and IMS Knobs
+            //    Layer 3: Reproducibility rescue: peptide and protein
+            // =========================================================================
+            physical_rescue,
+            reproducibility,
         }
     }
 }

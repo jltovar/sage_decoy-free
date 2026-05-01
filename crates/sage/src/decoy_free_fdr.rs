@@ -129,7 +129,7 @@ use crate::database::IndexedDatabase;
 use crate::input::LoStratify;
 use crate::input::{
     BoundedAuxUpdateSpace, DartNullRtModel, DartTrueRtModel, EnsemblePepCombiner, FdrSettings,
-    FdrType, JointMode, ModelFit, PeptidePCombine, PhysicalAnchorMode,
+    FinalEvidenceSpace, JointMode, ModelFit, PeptidePCombine, PhysicalAnchorMode, QMethod,
 };
 use crate::lfq::{Peak, PrecursorId};
 use crate::ml::lower_order::{
@@ -907,6 +907,119 @@ fn log_fit_failed_closed(label: &str) {
         "DF {} fit FAILED (None) — failing closed for this variant.",
         label
     );
+}
+
+// -----------------------------------------------------------------------------
+// 11B) Final evidence-space helpers
+// -----------------------------------------------------------------------------
+
+#[inline]
+fn final_evidence_is_pep_native(settings: &FdrSettings) -> bool {
+    match settings.final_evidence_space {
+        FinalEvidenceSpace::Pep => true,
+        FinalEvidenceSpace::PValue => false,
+        FinalEvidenceSpace::Auto => matches!(
+            settings.model_fit,
+            ModelFit::Msfdr
+                | ModelFit::Msfdr1Smix
+                | ModelFit::Msfdr2Smix
+                | ModelFit::Nokoi
+                | ModelFit::Ensemble
+        ),
+    }
+}
+
+#[inline]
+fn effective_psm_q_method(settings: &FdrSettings) -> QMethod {
+    match settings.psm_q_method {
+        QMethod::Auto => QMethod::Storey,
+        method => method,
+    }
+}
+
+#[inline]
+fn effective_peptide_q_method(settings: &FdrSettings) -> QMethod {
+    match settings.peptide_q_method {
+        QMethod::Auto => effective_psm_q_method(settings),
+        method => method,
+    }
+}
+
+#[inline]
+fn effective_protein_q_method(settings: &FdrSettings) -> QMethod {
+    match settings.protein_q_method {
+        QMethod::Auto => effective_psm_q_method(settings),
+        method => method,
+    }
+}
+
+fn q_values_from_p_values_with_method(
+    p_values: &[f64],
+    p_ref: &[f64],
+    settings: &FdrSettings,
+    method: QMethod,
+    level_name: &str,
+) -> Vec<f64> {
+    match method {
+        QMethod::Bh => stats::bh_q_value(p_values),
+
+        QMethod::Storey => {
+            if p_ref.len() < settings.min_storey_n {
+                log::warn!(
+                    "DF {} Storey: reference count {} < min_storey_n {}; falling back to BH.",
+                    level_name,
+                    p_ref.len(),
+                    settings.min_storey_n
+                );
+                stats::bh_q_value(p_values)
+            } else {
+                match estimate_pi0_from_reference_grid(p_ref, settings) {
+                    Some(pi0) => storey_q_value_with_pi0(p_values, pi0, settings),
+                    None => {
+                        log::warn!(
+                            "DF {} Storey: failed to estimate pi0; falling back to BH.",
+                            level_name
+                        );
+                        stats::bh_q_value(p_values)
+                    }
+                }
+            }
+        }
+
+        QMethod::Auto => q_values_from_p_values_with_method(
+            p_values,
+            p_ref,
+            settings,
+            effective_psm_q_method(settings),
+            level_name,
+        ),
+
+        QMethod::Cummean => {
+            log::warn!(
+                "DF {} q_method=cummean requested on p-value-native evidence; using BH instead.",
+                level_name
+            );
+            stats::bh_q_value(p_values)
+        }
+    }
+}
+
+#[inline]
+fn combine_p_values_for_ensemble(p_values: &[f64], settings: &FdrSettings) -> f64 {
+    if p_values.is_empty() {
+        return 1.0;
+    }
+
+    match settings.peptide_p_combine {
+        PeptidePCombine::Fisher => stats::combine_fisher(p_values).clamp(0.0, 1.0).max(1e-300),
+        PeptidePCombine::Cauchy => combine_cauchy(p_values),
+        PeptidePCombine::SidakMinP => combine_sidak_minp(p_values),
+        PeptidePCombine::Best => p_values
+            .iter()
+            .copied()
+            .filter(|p| p.is_finite())
+            .fold(1.0_f64, |a, b| a.min(b.clamp(0.0, 1.0).max(1e-300))),
+    }
 }
 
 // -----------------------------------------------------------------------------
@@ -2380,10 +2493,52 @@ fn write_base_method_outputs(
             None
         };
 
-        if !use_ensemble {
-            set_df_p_value(psm, r.p_final as f32);
+        let final_pep_native = final_evidence_is_pep_native(settings);
+
+        let p_consensus: f64 = if use_ensemble {
+            let mut p_experts: Vec<f64> = Vec::new();
+
+            if use_mom_expert {
+                p_experts.push(r.p_mom);
+            }
+            if use_mle_expert {
+                p_experts.push(r.p_mle);
+            }
+            if use_lo_expert {
+                p_experts.push(r.p_lo);
+            }
+            if use_seeded_expert {
+                if let Some(p) = r.p_msfdr {
+                    p_experts.push(p);
+                }
+            }
+            if use_1smix_expert {
+                if let Some(p) = r.p_1smix {
+                    p_experts.push(p);
+                }
+            }
+            if use_2smix_expert {
+                if let Some(p) = r.p_2smix {
+                    p_experts.push(p);
+                }
+            }
+            if use_nokoi_expert {
+                if let Some(p) = r.p_nokoi {
+                    p_experts.push(p);
+                }
+            }
+
+            combine_p_values_for_ensemble(&p_experts, settings)
         } else {
+            r.p_final
+        }
+        .clamp(0.0, 1.0)
+        .max(1e-300);
+
+        if final_pep_native {
             psm.decoy_free_p_value = None;
+        } else {
+            set_df_p_value(psm, p_consensus as f32);
         }
 
         let pep_consensus: f64 = if use_ensemble {
@@ -2485,7 +2640,12 @@ fn write_base_method_outputs(
         .clamp(0.0, 1.0)
         .max(1e-300);
 
-        let df_score = (-10.0 * pep_consensus.max(1e-15).log10()) as f32;
+        let df_score = if final_pep_native {
+            (-10.0 * pep_consensus.max(1e-15).log10()) as f32
+        } else {
+            (-10.0 * p_consensus.max(1e-15).log10()) as f32
+        };
+
         psm.decoy_free_pep = Some(pep_consensus as f32);
         psm.decoy_free_score = Some(df_score);
     }
@@ -2577,7 +2737,6 @@ fn finalize_base_q_values(
     db: &IndexedDatabase,
 ) {
     let use_ensemble = matches!(settings.model_fit, ModelFit::Ensemble);
-    let min_storey_n = settings.min_storey_n;
 
     let rank1_p: Vec<f64> = work
         .rank1_indices
@@ -2666,14 +2825,7 @@ fn finalize_base_q_values(
         }),
     );
 
-    if matches!(
-        settings.model_fit,
-        ModelFit::Msfdr
-            | ModelFit::Msfdr1Smix
-            | ModelFit::Msfdr2Smix
-            | ModelFit::Nokoi
-            | ModelFit::Ensemble
-    ) {
+    if final_evidence_is_pep_native(settings) {
         let rows: Vec<(f64, usize, f64)> = work
             .rank1_indices
             .iter()
@@ -2692,19 +2844,13 @@ fn finalize_base_q_values(
             set_df_q_value(&mut features[feat_idx], q as f32);
         }
     } else {
-        let q_values = match settings.type_ {
-            FdrType::Bh => stats::bh_q_value(&rank1_p),
-            FdrType::Storey => {
-                let pi0_opt = estimate_pi0_from_reference_grid(&rank1_p_ref, settings);
-                match pi0_opt {
-                    Some(pi0) => storey_q_value_with_pi0(&rank1_p, pi0, settings),
-                    None => {
-                        log::warn!("DF DEBUG Storey(grid): degenerate pi0 on reference set, falling back to BH.");
-                        stats::bh_q_value(&rank1_p)
-                    }
-                }
-            }
-        };
+        let q_values = q_values_from_p_values_with_method(
+            &rank1_p,
+            &rank1_p_ref,
+            settings,
+            effective_psm_q_method(settings),
+            "PSM",
+        );
 
         for (&idx, q) in work.rank1_indices.iter().zip(q_values) {
             set_df_q_value(&mut features[idx], q as f32);
@@ -2855,18 +3001,14 @@ fn finalize_base_q_values(
         if p_present.is_empty() {
             return Vec::new();
         }
-        match settings.type_ {
-            FdrType::Bh => stats::bh_q_value(p_present),
-            FdrType::Storey => {
-                if p_ref.len() < min_storey_n {
-                    return stats::bh_q_value(p_present);
-                }
-                match estimate_pi0_from_reference_grid(p_ref, settings) {
-                    Some(pi0) => storey_q_value_with_pi0(p_present, pi0, settings),
-                    None => stats::bh_q_value(p_present),
-                }
-            }
-        }
+
+        q_values_from_p_values_with_method(
+            p_present,
+            p_ref,
+            settings,
+            effective_psm_q_method(settings),
+            "expert diagnostic",
+        )
     };
 
     let q_mom_present = compute_q_present(&p_mom_present, &p_mom_ref);
@@ -6238,6 +6380,7 @@ pub fn calculate_peptide_q_df(
     struct PepEvidence {
         vals: Vec<f64>,
         is_entrapment: bool,
+        is_reference: bool,
     }
 
     let mut peptide_evidence_map: FnvHashMap<String, PepEvidence> = FnvHashMap::default();
@@ -6263,10 +6406,13 @@ pub fn calculate_peptide_q_df(
         let peptide = db[feat.core.peptide_idx].to_string();
         let proteins = db[feat.core.peptide_idx].proteins(&db.decoy_tag, db.generate_decoys);
         let is_ent = is_entrapment_str(&proteins);
+        let is_contam = is_contam_str(&proteins);
+        let is_ref = !is_ent && !is_contam;
 
         let entry = peptide_evidence_map.entry(peptide).or_default();
         entry.vals.push(v);
         entry.is_entrapment |= is_ent;
+        entry.is_reference |= is_ref;
     }
 
     log::debug!(
@@ -6277,6 +6423,7 @@ pub fn calculate_peptide_q_df(
 
     let mut peptide_keys = Vec::with_capacity(peptide_evidence_map.len());
     let mut peptide_combined_vals = Vec::with_capacity(peptide_evidence_map.len());
+    let mut peptide_ref_vals = Vec::new();
     let mut is_ent_flags = Vec::with_capacity(peptide_evidence_map.len());
 
     for (peptide, mut ev) in peptide_evidence_map {
@@ -6326,43 +6473,92 @@ pub fn calculate_peptide_q_df(
             }
         };
 
+        if !is_pep_native && ev.is_reference {
+            peptide_ref_vals.push(combined);
+        }
+
         peptide_keys.push(peptide);
         peptide_combined_vals.push(combined);
         is_ent_flags.push(ev.is_entrapment);
     }
 
     let q_values = if is_pep_native {
-        // PEP-native path: cumulative mean of peptide-level PEP-like values.
-        let mut rows: Vec<(f64, usize)> = peptide_combined_vals
-            .iter()
-            .copied()
-            .enumerate()
-            .map(|(i, pep)| (pep, i))
-            .collect();
+        // PEP-native peptide path: cumulative mean of peptide-level PEP-like values.
+        match settings.peptide_q_method {
+            QMethod::Auto | QMethod::Cummean => {
+                let mut rows: Vec<(f64, usize)> = peptide_combined_vals
+                    .iter()
+                    .copied()
+                    .enumerate()
+                    .map(|(i, pep)| (pep, i))
+                    .collect();
 
-        rows.sort_by(|a, b| a.0.total_cmp(&b.0));
+                rows.sort_by(|a, b| a.0.total_cmp(&b.0));
 
-        let mut q_sorted: Vec<f64> = Vec::with_capacity(rows.len());
-        let mut cum = 0.0f64;
+                let mut q_sorted: Vec<f64> = Vec::with_capacity(rows.len());
+                let mut cum = 0.0f64;
 
-        for (k, &(pep, _)) in rows.iter().enumerate() {
-            cum += pep.clamp(0.0, 1.0);
-            q_sorted.push((cum / ((k + 1) as f64)).clamp(0.0, 1.0));
+                for (k, &(pep, _)) in rows.iter().enumerate() {
+                    cum += pep.clamp(0.0, 1.0);
+                    q_sorted.push((cum / ((k + 1) as f64)).clamp(0.0, 1.0));
+                }
+
+                for i in (0..q_sorted.len().saturating_sub(1)).rev() {
+                    q_sorted[i] = q_sorted[i].min(q_sorted[i + 1]);
+                }
+
+                let mut out = vec![1.0f64; rows.len()];
+                for (k, &(_, orig_idx)) in rows.iter().enumerate() {
+                    out[orig_idx] = q_sorted[k];
+                }
+
+                out
+            }
+            QMethod::Bh | QMethod::Storey => {
+                log::warn!(
+                    "DF peptide_q_method={:?} requested on PEP-native peptide evidence; using cumulative-mean PEP q-values.",
+                    settings.peptide_q_method
+                );
+
+                let mut rows: Vec<(f64, usize)> = peptide_combined_vals
+                    .iter()
+                    .copied()
+                    .enumerate()
+                    .map(|(i, pep)| (pep, i))
+                    .collect();
+
+                rows.sort_by(|a, b| a.0.total_cmp(&b.0));
+
+                let mut q_sorted: Vec<f64> = Vec::with_capacity(rows.len());
+                let mut cum = 0.0f64;
+
+                for (k, &(pep, _)) in rows.iter().enumerate() {
+                    cum += pep.clamp(0.0, 1.0);
+                    q_sorted.push((cum / ((k + 1) as f64)).clamp(0.0, 1.0));
+                }
+
+                for i in (0..q_sorted.len().saturating_sub(1)).rev() {
+                    q_sorted[i] = q_sorted[i].min(q_sorted[i + 1]);
+                }
+
+                let mut out = vec![1.0f64; rows.len()];
+                for (k, &(_, orig_idx)) in rows.iter().enumerate() {
+                    out[orig_idx] = q_sorted[k];
+                }
+
+                out
+            }
         }
-
-        for i in (0..q_sorted.len().saturating_sub(1)).rev() {
-            q_sorted[i] = q_sorted[i].min(q_sorted[i + 1]);
-        }
-
-        let mut out = vec![1.0f64; rows.len()];
-        for (k, &(_, orig_idx)) in rows.iter().enumerate() {
-            out[orig_idx] = q_sorted[k];
-        }
-
-        out
     } else {
-        // P-value-native path: BH over configured-combined peptide-level p-values.
-        crate::ml::stats::bh_q_value(&peptide_combined_vals)
+        // P-value-native peptide path: configured p-value method over
+        // peptide-level p-values.
+        q_values_from_p_values_with_method(
+            &peptide_combined_vals,
+            &peptide_ref_vals,
+            settings,
+            effective_peptide_q_method(settings),
+            "peptide",
+        )
     };
 
     let mut best_q: FnvHashMap<String, (f32, bool)> = FnvHashMap::default();
@@ -6593,27 +6789,21 @@ pub fn calculate_protein_q_df(
         }
         out
     } else {
-        // P-value native path: Storey / BH
-        match settings.type_ {
-            FdrType::Bh => stats::bh_q_value(&protein_combined_vals),
-            FdrType::Storey => {
-                let mut protein_p_ref: Vec<f64> = Vec::new();
-                for (key, &p) in protein_keys.iter().zip(protein_combined_vals.iter()) {
-                    if !is_contam_str(key) && !is_entrapment_str(key) && p.is_finite() {
-                        protein_p_ref.push(p.clamp(0.0, 1.0).max(1e-300));
-                    }
-                }
-
-                if protein_p_ref.len() < settings.min_storey_n {
-                    stats::bh_q_value(&protein_combined_vals)
-                } else {
-                    match estimate_pi0_from_reference_grid(&protein_p_ref, settings) {
-                        Some(pi0) => storey_q_value_with_pi0(&protein_combined_vals, pi0, settings),
-                        None => stats::bh_q_value(&protein_combined_vals),
-                    }
-                }
+        // P-value-native protein path.
+        let mut protein_p_ref: Vec<f64> = Vec::new();
+        for (key, &p) in protein_keys.iter().zip(protein_combined_vals.iter()) {
+            if !is_contam_str(key) && !is_entrapment_str(key) && p.is_finite() {
+                protein_p_ref.push(p.clamp(0.0, 1.0).max(1e-300));
             }
         }
+
+        q_values_from_p_values_with_method(
+            &protein_combined_vals,
+            &protein_p_ref,
+            settings,
+            effective_protein_q_method(settings),
+            "protein",
+        )
     };
 
     // Map back: protein_key -> q
