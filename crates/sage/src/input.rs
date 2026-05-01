@@ -416,21 +416,13 @@ pub struct FdrOptions {
     // Final active evidence-space controls.
     pub final_evidence_space: Option<FinalEvidenceSpace>,
 
+    pub protein_p_combine: Option<ProteinPCombine>,
+    pub peptide_p_combine: Option<PeptidePCombine>,
+
     // Explicit q-value method controls.
     pub psm_q_method: Option<QMethod>,
     pub peptide_q_method: Option<QMethod>,
     pub protein_q_method: Option<QMethod>,
-
-    // Explicit post-base Decoy-Free stage gates.
-    // These control whether stage-specific TSV snapshots are produced and whether
-    // the stage is allowed to replace the active decoy_free_* stream.
-    pub enable_rt_confidence_adjustment: Option<bool>,
-    pub enable_ims_confidence_adjustment: Option<bool>,
-    pub enable_peptide_reproducibility_rescue: Option<bool>,
-    pub enable_protein_reproducibility_rescue: Option<bool>,
-
-    pub protein_p_combine: Option<ProteinPCombine>,
-    pub peptide_p_combine: Option<PeptidePCombine>,
 
     pub peptide_fdr: Option<f32>,
     pub protein_fdr: Option<f32>,
@@ -444,6 +436,14 @@ pub struct FdrOptions {
     pub min_null_size: Option<usize>,     // default 300
     pub min_rank_count: Option<usize>,    // default 10
     pub purification_factor: Option<f64>, // default 0.20; clamp 0..0.9
+
+    // Explicit post-base Decoy-Free stage gates.
+    // These control whether stage-specific TSV snapshots are produced and whether
+    // the stage is allowed to replace the active decoy_free_* stream.
+    pub enable_rt_confidence_adjustment: Option<bool>,
+    pub enable_ims_confidence_adjustment: Option<bool>,
+    pub enable_peptide_reproducibility_rescue: Option<bool>,
+    pub enable_protein_reproducibility_rescue: Option<bool>,
 
     // Configurable Safety Brakes (global)
     pub min_storey_n: Option<usize>,
@@ -623,20 +623,14 @@ pub struct FdrSettings {
     // Final active evidence-space controls.
     pub final_evidence_space: FinalEvidenceSpace,
 
+    // Protein/peptide p-value combiners
+    pub protein_p_combine: ProteinPCombine,
+    pub peptide_p_combine: PeptidePCombine,
+
     // Explicit q-value method controls
     pub psm_q_method: QMethod,
     pub peptide_q_method: QMethod,
     pub protein_q_method: QMethod,
-
-    // Explicit post-base Decoy-Free stage gates.
-    pub enable_rt_confidence_adjustment: bool,
-    pub enable_ims_confidence_adjustment: bool,
-    pub enable_peptide_reproducibility_rescue: bool,
-    pub enable_protein_reproducibility_rescue: bool,
-
-    // Protein/peptide p-value combiners
-    pub protein_p_combine: ProteinPCombine,
-    pub peptide_p_combine: PeptidePCombine,
 
     pub peptide_fdr: f32,
     pub protein_fdr: f32,
@@ -650,6 +644,12 @@ pub struct FdrSettings {
     pub min_null_size: usize,
     pub min_rank_count: usize,
     pub purification_factor: f64,
+
+    // Explicit post-base Decoy-Free stage gates.
+    pub enable_rt_confidence_adjustment: bool,
+    pub enable_ims_confidence_adjustment: bool,
+    pub enable_peptide_reproducibility_rescue: bool,
+    pub enable_protein_reproducibility_rescue: bool,
 
     // Configurable Safety Brakes
     pub min_storey_n: usize,
@@ -1243,20 +1243,14 @@ impl From<FdrOptions> for FdrSettings {
             // Final active evidence-space controls
             final_evidence_space,
 
+            // Protein/peptide p-value combiners
+            protein_p_combine,
+            peptide_p_combine,
+
             // Explicit q-value method controls
             psm_q_method,
             peptide_q_method,
             protein_q_method,
-
-            // Explicit post-base Decoy-Free stage gates
-            enable_rt_confidence_adjustment,
-            enable_ims_confidence_adjustment,
-            enable_peptide_reproducibility_rescue,
-            enable_protein_reproducibility_rescue,
-
-            // Protein/peptide p-value combiners
-            protein_p_combine,
-            peptide_p_combine,
 
             peptide_fdr,
             protein_fdr,
@@ -1270,6 +1264,12 @@ impl From<FdrOptions> for FdrSettings {
             min_null_size,
             min_rank_count,
             purification_factor,
+
+            // Explicit post-base Decoy-Free stage gates
+            enable_rt_confidence_adjustment,
+            enable_ims_confidence_adjustment,
+            enable_peptide_reproducibility_rescue,
+            enable_protein_reproducibility_rescue,
 
             // Configurable Safety Brakes
             min_storey_n,
