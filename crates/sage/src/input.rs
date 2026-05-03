@@ -105,14 +105,6 @@ impl Default for MsfdrSeedMode {
 // Decoy-free tuning knobs (configuration surface)
 // ---------------------------------------------------------------------------
 
-#[derive(Clone, Serialize, Deserialize, Debug, Default, PartialEq, Eq)]
-#[serde(rename_all = "snake_case")]
-pub enum LoMeanBetaMode {
-    #[default]
-    Consecutive, // Original paper behavior (n consecutive ranks)
-    All, // PyLord behavior (all ranks >= min_rank)
-}
-
 /// How to rank/monotonize LO-derived values.
 /// - hyperscore: sort by hyperscore (legacy)
 /// - lo_adjusted: sort by LO-adjusted evidence (recommended; fixes LO + PAVA mismatch)
@@ -122,24 +114,6 @@ pub enum LoRankKey {
     #[default]
     Hyperscore,
     LoAdjusted,
-}
-
-#[derive(Clone, Serialize, Deserialize, Debug, Default, PartialEq, Eq)]
-#[serde(rename_all = "snake_case")]
-pub enum LoMode {
-    #[default]
-    Auto, // evaluate both TNM constructions; pick best BIC
-    LinearRegression,
-    MeanBeta,
-}
-
-#[derive(Clone, Serialize, Deserialize, Debug, Default, PartialEq, Eq)]
-#[serde(rename_all = "snake_case")]
-pub enum LoLomEstimator {
-    #[default]
-    Auto, // evaluate MM and MLE; pick best BIC
-    Mm,
-    Mle,
 }
 
 #[derive(Clone, Serialize, Deserialize, Debug, Default, PartialEq, Eq)]
@@ -486,18 +460,10 @@ pub struct FdrOptions {
     // only by lower_order_min_null_rank..=lower_order_max_null_rank.
     pub lo_min_count_per_rank: Option<usize>,
 
-    // LO (paper/PyLord) controls
+    // LowerOrder controls
     pub lo_rank_key: Option<LoRankKey>, // lo_adjusted | hyperscore
-    pub lo_mode: Option<LoMode>,        // auto | linear_regression | mean_beta
-    pub lo_lom_estimator: Option<LoLomEstimator>, // auto | mm | mle
-
-    // Mean-β scheme controls (paper defaults: min_rank=8, count=3)
-    pub lo_mean_beta_mode: Option<LoMeanBetaMode>, // default consecutive
-
-    // PyLord parity knobs
     pub lo_stratify: Option<LoStratify>, // default charge
-    pub lo_score: Option<LoScore>,       // default raw
-    pub lo_tev_cutoff: Option<f64>,      // default 0.18
+    pub lo_score: Option<LoScore>,      // default raw
 
     // =========================================================================
     // E) MSFDR specific knobs
@@ -690,14 +656,8 @@ pub struct FdrSettings {
     pub lo_min_count_per_rank: usize,
 
     pub lo_rank_key: LoRankKey,
-    pub lo_mode: LoMode,
-    pub lo_lom_estimator: LoLomEstimator,
-
-    pub lo_mean_beta_mode: LoMeanBetaMode,
-
     pub lo_stratify: LoStratify,
     pub lo_score: LoScore,
-    pub lo_tev_cutoff: f64,
 
     // =========================================================================
     // E) MSFDR specific resolved null window + knobs
@@ -1041,16 +1001,9 @@ impl From<FdrOptions> for FdrSettings {
         );
 
         let lo_rank_key = options.lo_rank_key.unwrap_or(LoRankKey::LoAdjusted);
-        let lo_mode = options.lo_mode.unwrap_or(LoMode::Auto);
-        let lo_lom_estimator = options.lo_lom_estimator.unwrap_or(LoLomEstimator::Auto);
         let lo_min_count_per_rank = options.lo_min_count_per_rank.unwrap_or(10).max(1);
         let lo_stratify = options.lo_stratify.unwrap_or(LoStratify::Charge);
         let lo_score = options.lo_score.unwrap_or(LoScore::Raw);
-        let lo_tev_cutoff = options.lo_tev_cutoff.unwrap_or(0.18).clamp(0.01, 1.0);
-
-        let lo_mean_beta_mode = options
-            .lo_mean_beta_mode
-            .unwrap_or(LoMeanBetaMode::Consecutive);
 
         // ---------------------------------------------------------------------
         // E) MSFDR specific resolved null window + knobs
@@ -1310,14 +1263,8 @@ impl From<FdrOptions> for FdrSettings {
             lo_min_count_per_rank,
 
             lo_rank_key,
-            lo_mode,
-            lo_lom_estimator,
-
-            lo_mean_beta_mode,
-
             lo_stratify,
             lo_score,
-            lo_tev_cutoff,
 
             // =========================================================================
             // E) MSFDR specific resolved null window + knobs

@@ -1,6 +1,16 @@
 //! Decoy-free Lower-Order (LO) model fitting utilities.
 //!
-//! The methods in this module are based on the work of Dominik Madej and Henry Lam published here:
+//! This module implements Lower-Order statistics from the rank-specific
+//! transformed extreme-value likelihood.  For a selected null-rank window
+//! [min_null_rank, max_null_rank], each observed lower-order score keeps its
+//! actual hit rank k and contributes through the k-specific TEV likelihood.
+//!
+//! The fitted Target Null Model (TNM) is a single shared rank-1 null model
+//! obtained by minimizing the joint negative log-likelihood across all usable
+//! lower-order ranks in the configured window.  The window is therefore an
+//! actual likelihood window, not a menu from which one rank is selected.
+//!
+//! The methods in this module are inspired by the work of Dominik Madej and Henry Lam published here:
 //!
 //! Modeling Lower-Order Statistics to Enable Decoy-Free FDR Estimation in Proteomics
 //! Dominik Madej and Henry Lam
@@ -554,237 +564,214 @@ impl LowerOrderModel {
     }
 }
 
-// -----------------------------------------------------------------------------
-// Charge-stratified TNM fitter
-// -----------------------------------------------------------------------------
-//
-// Inputs:
-// - rank-null stream: (rank, TEV score, charge) for selected lower-order ranks.
-// - rank-1 stream:    (TEV score, charge) for top-scoring PSMs.
-//
-// Output:
-// - LowerOrderModel with params_by_charge[z] = (mu, beta) for the selected
-//   top null model (TNM) per charge.
-//
-// Paper/PyLord contract:
-// - LowerOrder is a transformed-e-value (TEV) order-statistics model.
-// - Lower-order ranks are selected only by:
-//       lower_order_min_null_rank..=lower_order_max_null_rank
-// - For each charge, LOMs are fit independently for each selected rank k.
-// - TNM candidates are constructed from the LOM parameter trends using:
-//       linear regression and/or mean-beta modes,
-//   separately for MLE and/or method-of-moments LOM estimates.
-// - The final TNM is chosen by minimum rank-1 TEV negative log-likelihood.
-//   For this one-degree-of-freedom candidate comparison, this is equivalent
-//   to BIC up to constants shared by the candidates.
-//
-// Support gating:
-// - lo_min_count_per_rank is the minimum number of finite observations required
-//   for an individual selected lower-order rank k to contribute.
-// - A charge is fit only if at least two selected lower-order ranks satisfy this
-//   support threshold and yield finite LOM parameters.
-//
-// Fail-closed behavior:
-// - No pooled/global fallback TNM is used. Missing charges return p=1.0 unless
-//   covered by explicit charge-sharing rules.
-
 #[inline]
-fn mean_finite(values: impl IntoIterator<Item = f64>) -> Option<f64> {
-    let xs: Vec<f64> = values.into_iter().filter(|x| x.is_finite()).collect();
-    if xs.is_empty() {
-        return None;
+fn joint_nll_tev(mu: f64, beta: f64, buckets: &[RankBucket]) -> f64 {
+    if !mu.is_finite() || !beta.is_finite() || beta <= 0.0 || buckets.is_empty() {
+        return f64::INFINITY;
     }
 
-    Some(xs.iter().sum::<f64>() / xs.len() as f64)
+    let mut total = 0.0f64;
+
+    for b in buckets {
+        if b.k < 2 || b.scores.is_empty() {
+            return f64::INFINITY;
+        }
+
+        let nll = nll_tev_k(mu, beta, &b.scores, b.k);
+        if !nll.is_finite() {
+            return f64::INFINITY;
+        }
+
+        total += nll;
+    }
+
+    total
 }
 
 #[inline]
-fn ols_beta_on_mu(loms: &[(u32, f64, f64)]) -> Option<(f64, f64)> {
-    let mut rows: Vec<(u32, f64, f64)> = loms
-        .iter()
-        .copied()
-        .filter(|(_, mu, beta)| mu.is_finite() && beta.is_finite() && *beta > 0.0)
-        .collect();
-
-    rows.sort_by_key(|(k, _, _)| *k);
-
-    // PyLord's best-linear-regression mode uses 5-rank windows.
-    // Do not allow 2-rank regressions; they are unstable and can create
-    // pathological late-window fits such as (12,13).
-    const LR_WINDOW: usize = 5;
-
-    if rows.len() < LR_WINDOW {
+fn finite_score_quantile(sorted: &[f64], q: f64) -> Option<f64> {
+    if sorted.is_empty() {
         return None;
     }
 
-    let mut best: Option<(f64, f64, f64)> = None; // slope, intercept, abs_r
-
-    for start in 0..=(rows.len() - LR_WINDOW) {
-        let window = &rows[start..start + LR_WINDOW];
-
-        let n = window.len() as f64;
-        let mean_mu = window.iter().map(|(_, mu, _)| *mu).sum::<f64>() / n;
-        let mean_beta = window.iter().map(|(_, _, beta)| *beta).sum::<f64>() / n;
-
-        let mut sxy = 0.0;
-        let mut sxx = 0.0;
-        let mut syy = 0.0;
-
-        for &(_, mu, beta) in window {
-            let dx = mu - mean_mu;
-            let dy = beta - mean_beta;
-            sxy += dx * dy;
-            sxx += dx * dx;
-            syy += dy * dy;
-        }
-
-        if !sxx.is_finite() || !syy.is_finite() || sxx <= 0.0 || syy <= 0.0 {
-            continue;
-        }
-
-        let slope = sxy / sxx;
-        let intercept = mean_beta - slope * mean_mu;
-        let abs_r = (sxy / (sxx.sqrt() * syy.sqrt())).abs();
-
-        if !slope.is_finite() || !intercept.is_finite() || !abs_r.is_finite() {
-            continue;
-        }
-
-        match best {
-            None => best = Some((slope, intercept, abs_r)),
-            Some((_, _, best_r)) if abs_r > best_r => {
-                best = Some((slope, intercept, abs_r));
-            }
-            _ => {}
-        }
-    }
-
-    best.map(|(slope, intercept, _)| (slope, intercept))
+    let q = q.clamp(0.0, 1.0);
+    let idx = (q * (sorted.len() as f64 - 1.0)).round() as usize;
+    sorted.get(idx.min(sorted.len() - 1)).copied()
 }
 
 #[inline]
-fn mean_beta_from_highest_ranks(loms: &[(u32, f64, f64)], req_count: usize) -> Option<f64> {
-    let mut xs: Vec<f64> = loms
+fn pooled_finite_scores(buckets: &[RankBucket]) -> Vec<f64> {
+    let mut xs: Vec<f64> = buckets
         .iter()
-        .filter_map(|(k, _, beta)| {
-            if *k >= 8 && beta.is_finite() && *beta > 0.0 {
-                Some(*beta)
-            } else {
-                None
-            }
-        })
-        .collect();
-
-    if xs.len() < req_count {
-        return None;
-    }
-
-    xs.sort_by(|a, b| a.total_cmp(b));
-    mean_finite(xs)
-}
-
-#[inline]
-fn lo_mu_scan_bounds(rank1_scores: &[f64]) -> Option<(f64, f64)> {
-    let mut sorted: Vec<f64> = rank1_scores
-        .iter()
-        .copied()
+        .flat_map(|b| b.scores.iter().copied())
         .filter(|x| x.is_finite())
         .collect();
 
-    if sorted.len() < 10 {
-        return None;
-    }
-
-    // Use empirical quantiles to guarantee a stable grid search domain
-    // and avoid zero-width windows caused by multiplier-based bounds.
-    sorted.sort_by(|a, b| a.total_cmp(b));
-
-    let n = sorted.len();
-    let q05 = sorted[((0.05 * (n as f64 - 1.0)).round() as usize).min(n - 1)];
-    let q95 = sorted[((0.95 * (n as f64 - 1.0)).round() as usize).min(n - 1)];
-
-    if q05.is_finite() && q95.is_finite() && q05 < q95 {
-        Some((q05, q95))
-    } else {
-        None
-    }
+    xs.sort_by(|a, b| a.total_cmp(b));
+    xs
 }
 
 #[inline]
-fn scan_mu_for_rank1_nll<F>(
-    name: &'static str,
-    rank1_scores: &[f64],
-    mu_min: f64,
-    mu_max: f64,
-    beta_at_mu: F,
-) -> Option<(&'static str, f64, f64, f64)>
-where
-    F: Fn(f64) -> Option<f64>,
-{
-    if !mu_min.is_finite() || !mu_max.is_finite() || mu_min >= mu_max {
-        return None;
-    }
+fn initial_joint_seed_from_lom_fits(buckets: &[RankBucket]) -> Option<(f64, f64)> {
+    let mut weighted_mu = 0.0f64;
+    let mut weighted_beta = 0.0f64;
+    let mut weight_sum = 0.0f64;
 
-    const N_GRID: usize = 251;
-    let step = (mu_max - mu_min) / ((N_GRID - 1) as f64);
+    for b in buckets {
+        let fit = fit_tev_k_mle(&b.scores, b.k).or_else(|| fit_tev_k_moments(&b.scores, b.k));
 
-    let mut best: Option<(&'static str, f64, f64, f64)> = None;
-
-    for i in 0..N_GRID {
-        let mu = mu_min + (i as f64) * step;
-        let beta = match beta_at_mu(mu) {
-            Some(beta) if beta.is_finite() && beta > 0.0 => beta,
-            _ => continue,
+        let Some((mu, beta)) = fit else {
+            continue;
         };
 
-        let nll = nll_tev_k(mu, beta, rank1_scores, 1);
-        if !nll.is_finite() {
+        if !mu.is_finite() || !beta.is_finite() || beta <= 0.0 {
             continue;
         }
 
-        match best {
-            None => best = Some((name, mu, beta, nll)),
-            Some((_, _, _, best_nll)) if nll < best_nll => {
-                best = Some((name, mu, beta, nll));
+        let w = b.scores.len() as f64;
+        weighted_mu += w * mu;
+        weighted_beta += w * beta;
+        weight_sum += w;
+    }
+
+    if weight_sum <= 0.0 {
+        return None;
+    }
+
+    let mu0 = weighted_mu / weight_sum;
+    let beta0 = weighted_beta / weight_sum;
+
+    (mu0.is_finite() && beta0.is_finite() && beta0 > 0.0).then_some((mu0, beta0))
+}
+
+#[inline]
+fn joint_search_bounds(buckets: &[RankBucket], beta0: f64) -> Option<(f64, f64)> {
+    let xs = pooled_finite_scores(buckets);
+    if xs.len() < 2 || !beta0.is_finite() || beta0 <= 0.0 {
+        return None;
+    }
+
+    let q05 = finite_score_quantile(&xs, 0.05)?;
+    let q95 = finite_score_quantile(&xs, 0.95)?;
+
+    let lo = q05 - 8.0 * beta0;
+    let hi = q95 + 8.0 * beta0;
+
+    (lo.is_finite() && hi.is_finite() && lo < hi).then_some((lo, hi))
+}
+
+fn fit_joint_tev_mle(buckets: &[RankBucket]) -> Option<(f64, f64, f64)> {
+    if buckets.is_empty() {
+        return None;
+    }
+
+    let total_n = buckets.iter().map(|b| b.scores.len()).sum::<usize>();
+    if total_n < 2 {
+        return None;
+    }
+
+    let (_, beta0) = initial_joint_seed_from_lom_fits(buckets)?;
+    let (mu_min, mu_max) = joint_search_bounds(buckets, beta0)?;
+
+    let mut best: Option<(f64, f64, f64)> = None;
+
+    // Coarse grid.  The beta grid is log-scaled around the weighted LO seed,
+    // which keeps the search scale-aware while still allowing large departures
+    // when the joint window demands them.
+    for p in -8..=8 {
+        let beta = beta0 * 2.0f64.powf((p as f64) / 2.0);
+        if !beta.is_finite() || beta <= 0.0 {
+            continue;
+        }
+
+        const MU_GRID: usize = 161;
+        let step = (mu_max - mu_min) / ((MU_GRID - 1) as f64);
+        if !step.is_finite() || step <= 0.0 {
+            continue;
+        }
+
+        for i in 0..MU_GRID {
+            let mu = mu_min + (i as f64) * step;
+            let nll = joint_nll_tev(mu, beta, buckets);
+
+            if !nll.is_finite() {
+                continue;
             }
-            _ => {}
+
+            match best {
+                None => best = Some((mu, beta, nll)),
+                Some((_, _, best_nll)) if nll < best_nll => best = Some((mu, beta, nll)),
+                _ => {}
+            }
         }
     }
 
-    best
+    let (mut mu_best, mut beta_best, mut nll_best) = best?;
+
+    // Local coordinate refinement.
+    for _ in 0..6 {
+        let mut improved = false;
+
+        let mu_half_width = (4.0 * beta_best).max(1e-6);
+        let mu_lo = (mu_best - mu_half_width).max(mu_min);
+        let mu_hi = (mu_best + mu_half_width).min(mu_max);
+
+        for b_step in [-0.50_f64, -0.25, 0.0, 0.25, 0.50] {
+            let beta = beta_best * 2.0f64.powf(b_step);
+            if !beta.is_finite() || beta <= 0.0 {
+                continue;
+            }
+
+            const MU_LOCAL_GRID: usize = 81;
+            let step = (mu_hi - mu_lo) / ((MU_LOCAL_GRID - 1) as f64);
+            if !step.is_finite() || step < 0.0 {
+                continue;
+            }
+
+            for i in 0..MU_LOCAL_GRID {
+                let mu = mu_lo + (i as f64) * step;
+                let nll = joint_nll_tev(mu, beta, buckets);
+
+                if !nll.is_finite() {
+                    continue;
+                }
+
+                if nll + 1e-9 < nll_best {
+                    mu_best = mu;
+                    beta_best = beta;
+                    nll_best = nll;
+                    improved = true;
+                }
+            }
+        }
+
+        if !improved {
+            break;
+        }
+    }
+
+    (mu_best.is_finite() && beta_best.is_finite() && beta_best > 0.0 && nll_best.is_finite())
+        .then_some((mu_best, beta_best, nll_best))
 }
 
 /// Fits a charge-stratified Lower Order Model.
 ///
-/// LO fitting contract (Decoy-Free)
-/// --------------------------------
-/// This module fits a charge-stratified Target Null Model (TNM) and uses it to
-/// produce rank-1 p-values.
-///
-/// Implementation Details (PyLord-Inspired LO):
-/// - Fits LOM parameters (μ_k, β_k) per charge for ranks k within the
-///   configured LO null-rank window using Method of Moments (MM) and/or MLE.
-/// - Derives Rank 1 TNM candidates using Linear Regression and/or Mean-β modes.
-/// - Evaluates candidates over a configured μ scan range.
-/// - Selects the best candidate by minimum negative log-likelihood (NLL).
-///   For the candidate TNMs compared here, this is equivalent to BIC up to an additive constant.
-/// - Fail-closed by default, with explicit charge-sharing rules for selected
-///   missing-charge cases (e.g. charge 1 inherits charge 2 when available, and
-///   charges above the fitted range inherit the highest fitted charge).
-///
+/// LO fitting contract
+/// -------------------
+/// - Rank 1 is never used for fitting.
+/// - Every usable lower-order rank k in the configured window contributes to
+///   one joint TEV likelihood.
+/// - Each score is evaluated under its own k-specific order-statistic density.
+/// - No autonomous single-rank selection is performed.
+/// - No rank-1 target-contaminated scores are used to choose the TNM.
+/// - Missing charge buckets fail closed unless covered by explicit charge-sharing.
 pub fn fit_decoy_free_model(
     rank_null_stream: &[(u32, f64, u8)],
     rank1_stream: &[(f64, u8)],
     min_null_rank: u32,
     max_null_rank: u32,
     lo_min_count_per_rank: usize,
-    lo_mode: crate::input::LoMode,
-    lo_lom_estimator: crate::input::LoLomEstimator,
-    lo_tev_cutoff: f64,
 ) -> Option<LowerOrderModel> {
-    // LowerOrder null evidence must come from non-top hits only.
-    // Rank 1 is the target-contaminated top-hit mixture and is never a valid
-    // lower-order null rank.
     let effective_min_null_rank = min_null_rank.max(2);
 
     if effective_min_null_rank > max_null_rank {
@@ -793,100 +780,85 @@ pub fn fit_decoy_free_model(
 
     if log::log_enabled!(log::Level::Debug) {
         log::debug!(
-            "LO DEBUG null-rank window: requested_min={} effective_min={} max={}",
+            "LO joint-MLE null-rank window: requested_min={} effective_min={} max={}",
             min_null_rank,
             effective_min_null_rank,
             max_null_rank
         );
     }
 
-    // -------------------------
-    // (A) Build per-charge datasets
-    // -------------------------
     // null_by_rank[z][k] -> Vec<f64>
     let mut null_by_rank: FnvHashMap<u8, FnvHashMap<u32, Vec<f64>>> = FnvHashMap::default();
-    let mut pooled_null_scores: Vec<f64> = Vec::new();
 
     for &(rank, score, charge) in rank_null_stream {
         if rank < effective_min_null_rank || rank > max_null_rank {
             continue;
         }
+
         if !score.is_finite() {
             continue;
         }
+
         null_by_rank
             .entry(charge)
             .or_default()
             .entry(rank)
             .or_default()
             .push(score);
+    }
 
-        pooled_null_scores.push(score);
+    // Track rank-1 charges only to avoid fitting buckets that are never evaluated.
+    let mut rank1_counts_by_charge: FnvHashMap<u8, usize> = FnvHashMap::default();
+    for &(score, charge) in rank1_stream {
+        if score.is_finite() {
+            *rank1_counts_by_charge.entry(charge).or_insert(0) += 1;
+        }
     }
 
     if log::log_enabled!(log::Level::Debug) {
-        let mut v: Vec<(u8, usize)> = null_by_rank
-            .iter()
-            .map(|(z, by_rank)| {
-                let n = by_rank.values().map(|scores| scores.len()).sum::<usize>();
-                (*z, n)
-            })
-            .collect();
+        let mut summaries: Vec<String> = Vec::new();
 
-        v.sort_by_key(|(z, _)| *z);
+        for (&charge, by_rank) in &null_by_rank {
+            let mut ranks: Vec<u32> = by_rank.keys().copied().collect();
+            ranks.sort_unstable();
 
-        let mut s = String::new();
-        for (z, n) in v {
-            if !s.is_empty() {
-                s.push_str(", ");
-            }
-            s.push_str(&format!("z{}={}", z, n));
+            let rank_summary = ranks
+                .into_iter()
+                .map(|k| {
+                    let n = by_rank.get(&k).map(|v| v.len()).unwrap_or(0);
+                    format!("{k}:{n}")
+                })
+                .collect::<Vec<_>>()
+                .join(",");
+
+            summaries.push(format!("z{charge}[{rank_summary}]"));
         }
 
-        log::debug!("LO DEBUG null totals by charge (post rank filter): {}", s);
+        summaries.sort();
+
         log::debug!(
-            "LO DEBUG pooled_null_scores.len()={}",
-            pooled_null_scores.len()
+            "LO joint-MLE usable null ranks by bucket before support gate: {}",
+            summaries.join(" ")
         );
     }
 
-    // top_scores[z] = Vec<f64>
-    let mut top_scores: FnvHashMap<u8, Vec<f64>> = FnvHashMap::default();
-    for &(score, charge) in rank1_stream {
-        if score.is_finite() {
-            top_scores.entry(charge).or_default().push(score);
-        }
-    }
-
-    // -------------------------
-    // (B)(C)(D) Fit & select TNM per charge
-    // -------------------------
     let mut params_by_charge: FnvHashMap<u8, (f64, f64)> = FnvHashMap::default();
 
     for (&charge, by_rank) in &null_by_rank {
-        // Require rank-1 scores for this charge so the fitted model is only built
-        // for charge states observed in the rank-1 evaluation stream.
-        if !top_scores
-            .get(&charge)
-            .map(|v| !v.is_empty())
-            .unwrap_or(false)
-        {
+        let rank1_n = rank1_counts_by_charge.get(&charge).copied().unwrap_or(0);
+        if rank1_n == 0 {
             continue;
         }
 
-        // Build rank buckets for k in [min_null_rank..=max_null_rank]
-        // using the per-rank null scores for this charge.
         let mut buckets: Vec<RankBucket> = Vec::new();
 
         for k in effective_min_null_rank..=max_null_rank {
-            let scores_k = match by_rank.get(&k) {
-                Some(v) if v.len() >= lo_min_count_per_rank => v,
-                _ => continue,
+            let Some(scores_k) = by_rank.get(&k) else {
+                continue;
             };
 
-            // Collect finite values only. A selected lower-order rank contributes
-            // only if it has enough finite observations for this charge.
             let scores: Vec<f64> = scores_k.iter().copied().filter(|x| x.is_finite()).collect();
+
             if scores.len() < lo_min_count_per_rank {
                 continue;
             }
@@ -894,197 +866,60 @@ pub fn fit_decoy_free_model(
             buckets.push(RankBucket { k, scores });
         }
 
-        // LowerOrder needs at least two usable selected ranks to estimate the
-        // rank-to-rank trend used by the TNM candidates.
-        if buckets.len() < 2 {
+        if buckets.is_empty() {
+            log::debug!(
+                "LO joint-MLE bucket {charge}: no ranks passed support gate min_count={}",
+                lo_min_count_per_rank
+            );
             continue;
         }
 
-        // ---------------------------------------------------------------------
-        // LowerOrder TNM construction
-        // ---------------------------------------------------------------------
-        //
-        // Paper-faithful flow:
-        //   1. Fit LOMs for selected lower-order ranks k.
-        //   2. Build TNM candidates using:
-        //        - linear-regression relation between mu and beta, and/or
-        //        - mean beta from deepest lower-order ranks.
-        //   3. Choose the TNM by minimum rank-1 TEV negative log-likelihood.
-        //
-        // This restores the constrained one-degree empirical optimization used by
-        // the paper/PyLord. Do not median-combine LOM parameters directly.
-        let ts_all = match top_scores.get(&charge) {
-            Some(v) if v.len() >= lo_min_count_per_rank => v,
-            _ => continue,
-        };
-
-        let cutoff = lo_tev_cutoff;
-
-        let filtered_ts: Vec<f64> = ts_all
+        let total_n = buckets.iter().map(|b| b.scores.len()).sum::<usize>();
+        let rank_summary = buckets
             .iter()
-            .copied()
-            .filter(|&x| x.is_finite() && x <= cutoff)
-            .collect();
+            .map(|b| format!("{}:{}", b.k, b.scores.len()))
+            .collect::<Vec<_>>()
+            .join(",");
 
-        // Strict fail-closed: Do NOT fall back to ts_all if cutoff isolates too few.
-        // Falling back ingests true targets and breaks the model.
-        if filtered_ts.len() < lo_min_count_per_rank {
+        let Some((mu, beta, nll)) = fit_joint_tev_mle(&buckets) else {
             log::warn!(
-    "LO DEBUG charge {charge}: insufficient rank-1 noise below fixed PyLord TEV cutoff; rank1_total={} cutoff={:.3}",
-    ts_all.len(),
-    cutoff
-);
+                "LO joint-MLE bucket {charge}: fit failed | ranks=[{}] total_null={}",
+                rank_summary,
+                total_n
+            );
             continue;
-        }
-
-        let ts = filtered_ts.as_slice();
-
-        let mut lom_mm: Vec<(u32, f64, f64)> = Vec::new();
-        let mut lom_mle: Vec<(u32, f64, f64)> = Vec::new();
-
-        for b in &buckets {
-            let k = b.k;
-
-            if let Some((mu_k, beta_k)) = fit_tev_k_moments(&b.scores, k) {
-                if mu_k.is_finite() && beta_k.is_finite() && beta_k > 0.0 {
-                    lom_mm.push((k, mu_k, beta_k));
-                }
-            }
-
-            if let Some((mu_k, beta_k)) = fit_tev_k_mle(&b.scores, k) {
-                if mu_k.is_finite() && beta_k.is_finite() && beta_k > 0.0 {
-                    lom_mle.push((k, mu_k, beta_k));
-                }
-            }
-        }
-
-        let use_mm = matches!(
-            lo_lom_estimator,
-            crate::input::LoLomEstimator::Auto | crate::input::LoLomEstimator::Mm
-        );
-        let use_mle = matches!(
-            lo_lom_estimator,
-            crate::input::LoLomEstimator::Auto | crate::input::LoLomEstimator::Mle
-        );
-        let use_lr = matches!(
-            lo_mode,
-            crate::input::LoMode::Auto | crate::input::LoMode::LinearRegression
-        );
-        let use_mean_beta = matches!(
-            lo_mode,
-            crate::input::LoMode::Auto | crate::input::LoMode::MeanBeta
-        );
-
-        let (mu_min, mu_max) = match lo_mu_scan_bounds(ts) {
-            Some(bounds) => bounds,
-            None => continue,
         };
 
-        let mut candidates: Vec<(&'static str, f64, f64, f64)> = Vec::new();
+        log::info!(
+            "LO joint-MLE bucket {charge}: mu={:.6} beta={:.6} joint_nll={:.4} ranks=[{}] total_null={} rank1_eval={}",
+            mu,
+            beta,
+            nll,
+            rank_summary,
+            total_n,
+            rank1_n
+        );
 
-        if use_mm && use_lr {
-            if let Some((slope, intercept)) = ols_beta_on_mu(&lom_mm) {
-                if let Some(c) = scan_mu_for_rank1_nll("MM/LR", ts, mu_min, mu_max, |mu| {
-                    Some(slope * mu + intercept)
-                }) {
-                    candidates.push(c);
-                }
-            }
-        }
-
-        if use_mle && use_lr {
-            if let Some((slope, intercept)) = ols_beta_on_mu(&lom_mle) {
-                if let Some(c) = scan_mu_for_rank1_nll("MLE/LR", ts, mu_min, mu_max, |mu| {
-                    Some(slope * mu + intercept)
-                }) {
-                    candidates.push(c);
-                }
-            }
-        }
-
-        if use_mm && use_mean_beta {
-            if let Some(beta) = mean_beta_from_highest_ranks(&lom_mm, 3) {
-                if let Some(c) =
-                    scan_mu_for_rank1_nll("MM/mean_beta", ts, mu_min, mu_max, |_| Some(beta))
-                {
-                    candidates.push(c);
-                }
-            }
-        }
-
-        if use_mle && use_mean_beta {
-            if let Some(beta) = mean_beta_from_highest_ranks(&lom_mle, 3) {
-                if let Some(c) =
-                    scan_mu_for_rank1_nll("MLE/mean_beta", ts, mu_min, mu_max, |_| Some(beta))
-                {
-                    candidates.push(c);
-                }
-            }
-        }
-
-        let best_cand = candidates
-            .into_iter()
-            .min_by(|a, b| a.3.partial_cmp(&b.3).unwrap_or(std::cmp::Ordering::Equal));
-
-        let (mu_final, beta_final) = match best_cand {
-            Some((name, mu, beta, nll)) => {
-                log::info!(
-                    "LO DEBUG charge {charge}: best TNM candidate = {name} (mu={:.6}, beta={:.6}, rank1_nll={:.4}) | ranks: MM={}, MLE={} scan=[{:.3},{:.3}] rank1_fit={}/{} cutoff={:.3}",
-                    mu,
-                    beta,
-                    nll,
-                    lom_mm.len(),
-                    lom_mle.len(),
-                    mu_min,
-                    mu_max,
-                    ts.len(),
-                    ts_all.len(),
-                    cutoff
-                );
-                (mu, beta)
-            }
-            None => {
-                log::warn!(
-                    "LO DEBUG charge {charge}: all TNM candidates failed | ranks: MM={}, MLE={} scan=[{:.3},{:.3}]",
-                    lom_mm.len(),
-                    lom_mle.len(),
-                    mu_min,
-                    mu_max
-                );
-                continue;
-            }
-        };
-
-        params_by_charge.insert(charge, (mu_final, beta_final));
+        params_by_charge.insert(charge, (mu, beta));
     }
 
-    // -------------------------
-    // Fallback params (global)
-    // -------------------------
-    // Fail-closed: LO must not fall back to any other model (including pooled moments).
-    // If a charge is missing params, resolve_params() will return fallback_params, and
-    // p_value() will return 1.0 when mu/beta are NaN.
     let fallback_params = (f64::NAN, f64::NAN);
 
-    // -------------------------
-    // Charge filling rules (fit-time + query-time)
-    // -------------------------
-
-    // Rule: charges above max fitted => copy max fitted
+    // Explicit charge-sharing rule: if charge 1 is absent but charge 2 exists,
+    // copy charge 2.  Other internal gaps remain fail-closed.
     if !params_by_charge.contains_key(&1) {
         if let Some(p2) = params_by_charge.get(&2).copied() {
             params_by_charge.insert(1, p2);
         }
     }
 
-    // Cache fitted charges + max fitted charge
-    let mut fitted_charges_sorted: Vec<u8> = params_by_charge.keys().copied().collect();
-    fitted_charges_sorted.sort_unstable();
-    let max_fitted_charge: u8 = fitted_charges_sorted.last().copied().unwrap_or(0);
-
     if params_by_charge.is_empty() {
         return None;
     }
+
+    let mut fitted_charges_sorted: Vec<u8> = params_by_charge.keys().copied().collect();
+    fitted_charges_sorted.sort_unstable();
+    let max_fitted_charge: u8 = fitted_charges_sorted.last().copied().unwrap_or(0);
 
     Some(LowerOrderModel {
         params_by_charge,
@@ -1145,7 +980,7 @@ mod tests {
     }
 
     #[test]
-    fn lo_estimators_recover_reasonable_params_and_selection_is_finite() {
+    fn lo_estimators_recover_reasonable_params_and_joint_fit_is_finite() {
         // Synthetic parameters
         let mu_true = 15.0;
         let beta_true = 3.0;

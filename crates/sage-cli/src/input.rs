@@ -409,10 +409,6 @@ impl Input {
                 min_storey_n: None,
                 min_null_size: None,
 
-                // Lower-order model controls.
-                lo_mode: None,
-                lo_lom_estimator: None,
-
                 // Additional inference controls.
                 purification_factor: None,
                 min_rank_count: None,

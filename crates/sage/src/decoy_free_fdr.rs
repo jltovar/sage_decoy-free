@@ -1814,12 +1814,11 @@ fn fit_engines(
                 })
                 .collect();
 
-            // LowerOrder rank-window selection is controlled only by
+            // LowerOrder joint-MLE uses every usable rank in
             // lower_order_min_null_rank..=lower_order_max_null_rank.
             //
-            // lo_min_count_per_rank is a fixed support threshold for each selected
-            // lower-order rank within the active LO bucket. It is not multiplied by
-            // the number of selected ranks.
+            // lo_min_count_per_rank is a per-rank support threshold. Ranks that pass
+            // this threshold contribute to one joint rank-specific TEV likelihood.
             let lo_min_count_per_rank = settings.lo_min_count_per_rank;
 
             lo_model = fit_decoy_free_model(
@@ -1828,9 +1827,6 @@ fn fit_engines(
                 settings.lower_order_min_null_rank,
                 settings.lower_order_max_null_rank,
                 lo_min_count_per_rank,
-                settings.lo_mode.clone(),
-                settings.lo_lom_estimator.clone(),
-                settings.lo_tev_cutoff,
             );
         }
     }
