@@ -413,82 +413,113 @@ fn fit_joint_tev_mle(buckets: &[RankBucket]) -> Option<(f64, f64, f64)> {
         return None;
     }
 
-    let mut n_total = 0usize;
-    let mut k_total = 0usize;
-    let mut x_wk_sum = 0.0f64;
-
-    let mut xs = Vec::new();
+    let mut obs: Vec<(u32, f64)> = Vec::new();
 
     for b in buckets {
-        let n_k = b.scores.len();
-        if n_k == 0 {
+        if b.k < 2 || b.scores.is_empty() {
             continue;
         }
 
-        n_total += n_k;
-        k_total += (b.k as usize) * n_k;
-
-        let k_f64 = b.k as f64;
         for &x in &b.scores {
             if x.is_finite() {
-                x_wk_sum += k_f64 * x;
-                xs.push(x);
+                obs.push((b.k, x));
             }
         }
     }
 
-    if n_total < 2 || xs.len() < 2 {
+    if obs.len() < 2 {
         return None;
     }
 
+    let x_min = obs.iter().map(|&(_, x)| x).fold(f64::INFINITY, f64::min);
+
+    if !x_min.is_finite() {
+        return None;
+    }
+
+    let n_total = obs.len();
     let n_f64 = n_total as f64;
-    let k_total_f64 = k_total as f64;
+
+    let mut k_total_f64 = 0.0f64;
+    let mut y_wk_sum = 0.0f64;
+    let mut ys = Vec::with_capacity(obs.len());
+
+    for &(k, x) in &obs {
+        let y = x - x_min;
+
+        if !y.is_finite() || y < 0.0 {
+            return None;
+        }
+
+        let k_f64 = k as f64;
+        k_total_f64 += k_f64;
+        y_wk_sum += k_f64 * y;
+        ys.push(y);
+    }
+
+    if k_total_f64 <= 0.0 {
+        return None;
+    }
+
     let r_factor = k_total_f64 / n_f64;
-    let x_wk_bar = x_wk_sum / n_f64;
+    let y_wk_bar = y_wk_sum / n_f64;
 
-    // Shift coordinates by MIN to prevent exponential overflow during Newton-Raphson.
-    // Since we compute exp(-(x - mu)/beta), the largest exponent occurs at the smallest x.
-    let x_min = xs.iter().copied().fold(f64::INFINITY, f64::min);
+    let y_mean = ys.iter().sum::<f64>() / n_f64;
+    let y_var = ys
+        .iter()
+        .map(|&y| {
+            let d = y - y_mean;
+            d * d
+        })
+        .sum::<f64>()
+        / n_f64;
 
-    let mean = xs.iter().sum::<f64>() / n_f64;
-    let var = xs.iter().map(|&x| (x - mean).powi(2)).sum::<f64>() / n_f64;
-    let mut beta = (var * 6.0 / std::f64::consts::PI.powi(2)).sqrt().max(1e-6);
+    let mut beta = (y_var * 6.0 / std::f64::consts::PI.powi(2))
+        .sqrt()
+        .max(1e-6);
 
-    const MAX_ITERS: usize = 50;
+    const MAX_ITERS: usize = 100;
     const TOL_ABS: f64 = 1e-8;
 
-    let mut final_b_sum_shift = 0.0f64;
+    let mut final_b_sum = 0.0f64;
 
     for _ in 0..MAX_ITERS {
         let mut b_sum = 0.0f64;
         let mut a_sum = 0.0f64;
         let mut c_sum = 0.0f64;
 
-        for &x in &xs {
-            // x >= x_min, so z <= 0. Thus exp(z) is strictly in (0, 1].
-            let z = -(x - x_min) / beta;
+        for &y in &ys {
+            let z = -y / beta;
             let e = z.exp();
-            if e.is_finite() {
-                b_sum += e;
-                a_sum += x * e;
-                c_sum += x * x * e;
+
+            if !e.is_finite() {
+                return None;
             }
+
+            b_sum += e;
+            a_sum += y * e;
+            c_sum += y * y * e;
         }
 
         if b_sum <= 0.0 || !b_sum.is_finite() {
             return None;
         }
 
-        final_b_sum_shift = b_sum;
+        final_b_sum = b_sum;
+
         let a_over_b = a_sum / b_sum;
 
-        // f(beta) objective
-        let f = beta - x_wk_bar + r_factor * a_over_b;
+        // Joint LO score equation in shifted coordinates.
+        let f = beta - y_wk_bar + r_factor * a_over_b;
 
-        // f'(beta) derivative
         let beta2 = beta * beta;
+
+        // d/dβ Σ y exp(-y/β) = Σ y^2 exp(-y/β) / β^2
         let d_a = c_sum / beta2;
+
+        // d/dβ Σ exp(-y/β) = Σ y exp(-y/β) / β^2
         let d_b = a_sum / beta2;
+
         let d_a_over_b = (d_a * b_sum - a_sum * d_b) / (b_sum * b_sum);
         let fp = 1.0 + r_factor * d_a_over_b;
 
@@ -496,17 +527,17 @@ fn fit_joint_tev_mle(buckets: &[RankBucket]) -> Option<(f64, f64, f64)> {
             return None;
         }
 
-        let mut next_beta = beta - (f / fp);
+        let mut next_beta = beta - f / fp;
+
         if !next_beta.is_finite() {
             return None;
         }
 
-        // Safeguard against negative beta overshoots due to initial linear extrapolation
         if next_beta <= 0.0 {
             next_beta = beta * 0.5;
         }
 
-        if (next_beta - beta).abs() < TOL_ABS {
+        if (next_beta - beta).abs() < TOL_ABS.max(TOL_ABS * beta.abs()) {
             beta = next_beta;
             break;
         }
@@ -514,17 +545,35 @@ fn fit_joint_tev_mle(buckets: &[RankBucket]) -> Option<(f64, f64, f64)> {
         beta = next_beta;
     }
 
-    // Exact closed-form mu utilizing the solved beta and restoring the shifted coordinates
-    let mu = x_min + beta * k_total_f64.ln() - beta * final_b_sum_shift.ln();
+    if final_b_sum <= 0.0 || !final_b_sum.is_finite() {
+        return None;
+    }
+
+    // For shifted y = x - x_min:
+    // exp(mu / beta) * Σ exp(-x / beta) = K
+    // Σ exp(-x / beta) = exp(-x_min / beta) * Σ exp(-y / beta)
+    // so:
+    // mu = x_min + beta * ln(K / Σ exp(-y / beta))
+    let mu = x_min + beta * (k_total_f64 / final_b_sum).ln();
 
     if !mu.is_finite() || !beta.is_finite() || beta <= 0.0 {
         return None;
     }
 
     let nll = joint_nll_tev(mu, beta, buckets);
+
     if !nll.is_finite() {
         return None;
     }
+
+    log::info!(
+        "LO joint-MLE solved: mu={:.6} beta={:.6} nll={:.4} total_obs={} k_total={:.1}",
+        mu,
+        beta,
+        nll,
+        n_total,
+        k_total_f64
+    );
 
     Some((mu, beta, nll))
 }
