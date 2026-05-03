@@ -446,8 +446,9 @@ fn fit_joint_tev_mle(buckets: &[RankBucket]) -> Option<(f64, f64, f64)> {
     let r_factor = k_total_f64 / n_f64;
     let x_wk_bar = x_wk_sum / n_f64;
 
-    // Shift coordinates by max to prevent exponential underflow/overflow during Newton-Raphson
-    let x_max = xs.iter().copied().fold(f64::NEG_INFINITY, f64::max);
+    // Shift coordinates by MIN to prevent exponential overflow during Newton-Raphson.
+    // Since we compute exp(-(x - mu)/beta), the largest exponent occurs at the smallest x.
+    let x_min = xs.iter().copied().fold(f64::INFINITY, f64::min);
 
     let mean = xs.iter().sum::<f64>() / n_f64;
     let var = xs.iter().map(|&x| (x - mean).powi(2)).sum::<f64>() / n_f64;
@@ -464,7 +465,8 @@ fn fit_joint_tev_mle(buckets: &[RankBucket]) -> Option<(f64, f64, f64)> {
         let mut c_sum = 0.0f64;
 
         for &x in &xs {
-            let z = -(x - x_max) / beta;
+            // x >= x_min, so z <= 0. Thus exp(z) is strictly in (0, 1].
+            let z = -(x - x_min) / beta;
             let e = z.exp();
             if e.is_finite() {
                 b_sum += e;
@@ -494,9 +496,14 @@ fn fit_joint_tev_mle(buckets: &[RankBucket]) -> Option<(f64, f64, f64)> {
             return None;
         }
 
-        let next_beta = beta - (f / fp);
-        if !next_beta.is_finite() || next_beta <= 0.0 {
+        let mut next_beta = beta - (f / fp);
+        if !next_beta.is_finite() {
             return None;
+        }
+
+        // Safeguard against negative beta overshoots due to initial linear extrapolation
+        if next_beta <= 0.0 {
+            next_beta = beta * 0.5;
         }
 
         if (next_beta - beta).abs() < TOL_ABS {
@@ -508,7 +515,7 @@ fn fit_joint_tev_mle(buckets: &[RankBucket]) -> Option<(f64, f64, f64)> {
     }
 
     // Exact closed-form mu utilizing the solved beta and restoring the shifted coordinates
-    let mu = beta * k_total_f64.ln() - beta * final_b_sum_shift.ln() + x_max;
+    let mu = x_min + beta * k_total_f64.ln() - beta * final_b_sum_shift.ln();
 
     if !mu.is_finite() || !beta.is_finite() || beta <= 0.0 {
         return None;
