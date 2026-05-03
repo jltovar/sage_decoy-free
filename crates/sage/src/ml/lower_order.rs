@@ -177,68 +177,6 @@ fn log_factorial_k_minus_1(k: u32) -> f64 {
 //
 
 #[inline]
-fn harmonic(m: u32) -> f64 {
-    if m == 0 {
-        return 0.0;
-    }
-    let mut s = 0.0f64;
-    for i in 1..=m {
-        s += 1.0 / (i as f64);
-    }
-    s
-}
-
-#[inline]
-fn psi_tail(m: u32) -> f64 {
-    // psi(m) in PyLord = pi^2/6 - sum_{i=1..m} 1/i^2
-    // NOTE: This is NOT digamma; it's the trigamma tail identity used in the paper/PyLord.
-    let mut s = 0.0f64;
-    for i in 1..=m {
-        let ii = i as f64;
-        s += 1.0 / (ii * ii);
-    }
-    (std::f64::consts::PI * std::f64::consts::PI) / 6.0 - s
-}
-
-#[inline]
-pub(crate) fn fit_tev_k_moments(scores: &[f64], k: u32) -> Option<(f64, f64)> {
-    // k is hit_rank in PyLord. LO uses k>=2.
-    if k < 2 {
-        return None;
-    }
-    let xs: Vec<f64> = scores.iter().copied().filter(|x| x.is_finite()).collect();
-    if xs.len() < 2 {
-        return None;
-    }
-
-    let n = xs.len() as f64;
-    let mean = xs.iter().sum::<f64>() / n;
-    let second = xs.iter().map(|x| x * x).sum::<f64>() / n;
-    let var = second - mean * mean;
-    if !var.is_finite() || var <= 0.0 {
-        return None;
-    }
-
-    let denom = psi_tail(k - 1);
-    if !denom.is_finite() || denom <= 0.0 {
-        return None;
-    }
-
-    let beta = (var / denom).sqrt();
-    if !beta.is_finite() || beta <= 0.0 {
-        return None;
-    }
-
-    // EulerGamma in PyLord: euler_m = -digamma(1) = EulerMascheroni
-    let location = mean - beta * (EULER_MASCHERONI - harmonic(k - 1));
-    if location.is_finite() {
-        Some((location, beta))
-    } else {
-        None
-    }
-}
-
-#[inline]
 fn nll_tev_k(mu: f64, beta: f64, scores: &[f64], k: u32) -> f64 {
     // Matches PyLord AsymptoticGumbelMLE.get_log_likelihood:
     //
@@ -327,124 +265,6 @@ fn tev_cdf_asymptotic(z: f64, k: u32) -> f64 {
     // exp(-t) * sum
     let cdf = (-t).clamp(-745.0, 745.0).exp() * sum;
     cdf.clamp(0.0, 1.0)
-}
-
-#[inline]
-fn mu_bounds_from_scores(beta0: f64, scores: &[f64]) -> Option<(f64, f64)> {
-    // Same spirit as your mu_search_bounds(): build a robust mu window on the score scale.
-    let mut xs: Vec<f64> = scores.iter().copied().filter(|x| x.is_finite()).collect();
-    if xs.len() < 10 || !beta0.is_finite() || beta0 <= 0.0 {
-        return None;
-    }
-    xs.sort_by(|a, b| a.partial_cmp(b).unwrap_or(std::cmp::Ordering::Equal));
-
-    let n = xs.len();
-    let p05 = xs[((0.05 * (n as f64 - 1.0)).round() as usize).min(n - 1)];
-    let p95 = xs[((0.95 * (n as f64 - 1.0)).round() as usize).min(n - 1)];
-
-    let lo = p05 - 4.0 * beta0;
-    let hi = p95 + 4.0 * beta0;
-
-    (lo.is_finite() && hi.is_finite() && lo < hi).then_some((lo, hi))
-}
-
-pub(crate) fn fit_tev_k_mle(scores: &[f64], k: u32) -> Option<(f64, f64)> {
-    if k < 2 {
-        return None;
-    }
-    let xs: Vec<f64> = scores.iter().copied().filter(|x| x.is_finite()).collect();
-    if xs.len() < 2 {
-        return None;
-    }
-
-    // Init from MM (PyLord uses mean/std, but MM is the best deterministic analog and
-    // keeps us in a sane region).
-    let (mu0, beta0) = fit_tev_k_moments(&xs, k)?;
-    if !mu0.is_finite() || !beta0.is_finite() || beta0 <= 0.0 {
-        return None;
-    }
-
-    let (mu_min, mu_max) = mu_bounds_from_scores(beta0, &xs).unwrap_or_else(|| {
-        // fallback to min/max if percentiles unavailable
-        let mut mn = f64::INFINITY;
-        let mut mx = f64::NEG_INFINITY;
-        for &v in &xs {
-            mn = mn.min(v);
-            mx = mx.max(v);
-        }
-        (mn, mx)
-    });
-
-    // ----- coarse search -----
-    let mut best: Option<(f64, f64, f64)> = None; // (mu, beta, nll)
-
-    // beta grid around beta0 in log2 space (stable, scale-aware)
-    for p in -6..=6 {
-        let beta = beta0 * 2.0f64.powi(p);
-        if !beta.is_finite() || beta <= 0.0 {
-            continue;
-        }
-
-        const MU_N: usize = 96;
-        let step = (mu_max - mu_min) / ((MU_N - 1) as f64);
-        if !step.is_finite() || step <= 0.0 {
-            continue;
-        }
-
-        for i in 0..MU_N {
-            let mu = mu_min + (i as f64) * step;
-            let nll = nll_tev_k(mu, beta, &xs, k);
-            if !nll.is_finite() {
-                continue;
-            }
-            match best {
-                None => best = Some((mu, beta, nll)),
-                Some((_, _, best_nll)) if nll < best_nll => best = Some((mu, beta, nll)),
-                _ => {}
-            }
-        }
-    }
-
-    let (mut mu_best, mut beta_best, mut nll_best) = best?;
-
-    // ----- refinement -----
-    // refine beta log2 step=0.25 around current best, and mu local window
-    for q in -8..=8 {
-        let beta = beta_best * 2.0f64.powf((q as f64) / 4.0);
-        if !beta.is_finite() || beta <= 0.0 {
-            continue;
-        }
-
-        const MU_LOCAL_HALF_WIDTH: f64 = 4.0; // score units; local refinement
-        let lo = (mu_best - MU_LOCAL_HALF_WIDTH).clamp(mu_min, mu_max);
-        let hi = (mu_best + MU_LOCAL_HALF_WIDTH).clamp(mu_min, mu_max);
-
-        const MU_N_LOCAL: usize = 81;
-        let step = if MU_N_LOCAL > 1 {
-            (hi - lo) / ((MU_N_LOCAL - 1) as f64)
-        } else {
-            0.0
-        };
-        if !step.is_finite() {
-            continue;
-        }
-
-        for i in 0..MU_N_LOCAL {
-            let mu = lo + (i as f64) * step;
-            let nll = nll_tev_k(mu, beta, &xs, k);
-            if !nll.is_finite() {
-                continue;
-            }
-            if nll < nll_best {
-                mu_best = mu;
-                beta_best = beta;
-                nll_best = nll;
-            }
-        }
-    }
-
-    (mu_best.is_finite() && beta_best.is_finite() && beta_best > 0.0)
-        .then_some((mu_best, beta_best))
 }
 
 #[derive(Debug, Clone)]
@@ -588,170 +408,118 @@ fn joint_nll_tev(mu: f64, beta: f64, buckets: &[RankBucket]) -> f64 {
     total
 }
 
-#[inline]
-fn finite_score_quantile(sorted: &[f64], q: f64) -> Option<f64> {
-    if sorted.is_empty() {
-        return None;
-    }
-
-    let q = q.clamp(0.0, 1.0);
-    let idx = (q * (sorted.len() as f64 - 1.0)).round() as usize;
-    sorted.get(idx.min(sorted.len() - 1)).copied()
-}
-
-#[inline]
-fn pooled_finite_scores(buckets: &[RankBucket]) -> Vec<f64> {
-    let mut xs: Vec<f64> = buckets
-        .iter()
-        .flat_map(|b| b.scores.iter().copied())
-        .filter(|x| x.is_finite())
-        .collect();
-
-    xs.sort_by(|a, b| a.total_cmp(b));
-    xs
-}
-
-#[inline]
-fn initial_joint_seed_from_lom_fits(buckets: &[RankBucket]) -> Option<(f64, f64)> {
-    let mut weighted_mu = 0.0f64;
-    let mut weighted_beta = 0.0f64;
-    let mut weight_sum = 0.0f64;
-
-    for b in buckets {
-        let fit = fit_tev_k_mle(&b.scores, b.k).or_else(|| fit_tev_k_moments(&b.scores, b.k));
-
-        let Some((mu, beta)) = fit else {
-            continue;
-        };
-
-        if !mu.is_finite() || !beta.is_finite() || beta <= 0.0 {
-            continue;
-        }
-
-        let w = b.scores.len() as f64;
-        weighted_mu += w * mu;
-        weighted_beta += w * beta;
-        weight_sum += w;
-    }
-
-    if weight_sum <= 0.0 {
-        return None;
-    }
-
-    let mu0 = weighted_mu / weight_sum;
-    let beta0 = weighted_beta / weight_sum;
-
-    (mu0.is_finite() && beta0.is_finite() && beta0 > 0.0).then_some((mu0, beta0))
-}
-
-#[inline]
-fn joint_search_bounds(buckets: &[RankBucket], beta0: f64) -> Option<(f64, f64)> {
-    let xs = pooled_finite_scores(buckets);
-    if xs.len() < 2 || !beta0.is_finite() || beta0 <= 0.0 {
-        return None;
-    }
-
-    let q05 = finite_score_quantile(&xs, 0.05)?;
-    let q95 = finite_score_quantile(&xs, 0.95)?;
-
-    let lo = q05 - 8.0 * beta0;
-    let hi = q95 + 8.0 * beta0;
-
-    (lo.is_finite() && hi.is_finite() && lo < hi).then_some((lo, hi))
-}
-
 fn fit_joint_tev_mle(buckets: &[RankBucket]) -> Option<(f64, f64, f64)> {
     if buckets.is_empty() {
         return None;
     }
 
-    let total_n = buckets.iter().map(|b| b.scores.len()).sum::<usize>();
-    if total_n < 2 {
+    let mut n_total = 0usize;
+    let mut k_total = 0usize;
+    let mut x_wk_sum = 0.0f64;
+
+    let mut xs = Vec::new();
+
+    for b in buckets {
+        let n_k = b.scores.len();
+        if n_k == 0 {
+            continue;
+        }
+
+        n_total += n_k;
+        k_total += (b.k as usize) * n_k;
+
+        let k_f64 = b.k as f64;
+        for &x in &b.scores {
+            if x.is_finite() {
+                x_wk_sum += k_f64 * x;
+                xs.push(x);
+            }
+        }
+    }
+
+    if n_total < 2 || xs.len() < 2 {
         return None;
     }
 
-    let (_, beta0) = initial_joint_seed_from_lom_fits(buckets)?;
-    let (mu_min, mu_max) = joint_search_bounds(buckets, beta0)?;
+    let n_f64 = n_total as f64;
+    let k_total_f64 = k_total as f64;
+    let r_factor = k_total_f64 / n_f64;
+    let x_wk_bar = x_wk_sum / n_f64;
 
-    let mut best: Option<(f64, f64, f64)> = None;
+    // Shift coordinates by max to prevent exponential underflow/overflow during Newton-Raphson
+    let x_max = xs.iter().copied().fold(f64::NEG_INFINITY, f64::max);
 
-    // Coarse grid.  The beta grid is log-scaled around the weighted LO seed,
-    // which keeps the search scale-aware while still allowing large departures
-    // when the joint window demands them.
-    for p in -8..=8 {
-        let beta = beta0 * 2.0f64.powf((p as f64) / 2.0);
-        if !beta.is_finite() || beta <= 0.0 {
-            continue;
-        }
+    let mean = xs.iter().sum::<f64>() / n_f64;
+    let var = xs.iter().map(|&x| (x - mean).powi(2)).sum::<f64>() / n_f64;
+    let mut beta = (var * 6.0 / std::f64::consts::PI.powi(2)).sqrt().max(1e-6);
 
-        const MU_GRID: usize = 161;
-        let step = (mu_max - mu_min) / ((MU_GRID - 1) as f64);
-        if !step.is_finite() || step <= 0.0 {
-            continue;
-        }
+    const MAX_ITERS: usize = 50;
+    const TOL_ABS: f64 = 1e-8;
 
-        for i in 0..MU_GRID {
-            let mu = mu_min + (i as f64) * step;
-            let nll = joint_nll_tev(mu, beta, buckets);
+    let mut final_b_sum_shift = 0.0f64;
 
-            if !nll.is_finite() {
-                continue;
-            }
+    for _ in 0..MAX_ITERS {
+        let mut b_sum = 0.0f64;
+        let mut a_sum = 0.0f64;
+        let mut c_sum = 0.0f64;
 
-            match best {
-                None => best = Some((mu, beta, nll)),
-                Some((_, _, best_nll)) if nll < best_nll => best = Some((mu, beta, nll)),
-                _ => {}
-            }
-        }
-    }
-
-    let (mut mu_best, mut beta_best, mut nll_best) = best?;
-
-    // Local coordinate refinement.
-    for _ in 0..6 {
-        let mut improved = false;
-
-        let mu_half_width = (4.0 * beta_best).max(1e-6);
-        let mu_lo = (mu_best - mu_half_width).max(mu_min);
-        let mu_hi = (mu_best + mu_half_width).min(mu_max);
-
-        for b_step in [-0.50_f64, -0.25, 0.0, 0.25, 0.50] {
-            let beta = beta_best * 2.0f64.powf(b_step);
-            if !beta.is_finite() || beta <= 0.0 {
-                continue;
-            }
-
-            const MU_LOCAL_GRID: usize = 81;
-            let step = (mu_hi - mu_lo) / ((MU_LOCAL_GRID - 1) as f64);
-            if !step.is_finite() || step < 0.0 {
-                continue;
-            }
-
-            for i in 0..MU_LOCAL_GRID {
-                let mu = mu_lo + (i as f64) * step;
-                let nll = joint_nll_tev(mu, beta, buckets);
-
-                if !nll.is_finite() {
-                    continue;
-                }
-
-                if nll + 1e-9 < nll_best {
-                    mu_best = mu;
-                    beta_best = beta;
-                    nll_best = nll;
-                    improved = true;
-                }
+        for &x in &xs {
+            let z = -(x - x_max) / beta;
+            let e = z.exp();
+            if e.is_finite() {
+                b_sum += e;
+                a_sum += x * e;
+                c_sum += x * x * e;
             }
         }
 
-        if !improved {
+        if b_sum <= 0.0 || !b_sum.is_finite() {
+            return None;
+        }
+
+        final_b_sum_shift = b_sum;
+        let a_over_b = a_sum / b_sum;
+
+        // f(beta) objective
+        let f = beta - x_wk_bar + r_factor * a_over_b;
+
+        // f'(beta) derivative
+        let beta2 = beta * beta;
+        let d_a = c_sum / beta2;
+        let d_b = a_sum / beta2;
+        let d_a_over_b = (d_a * b_sum - a_sum * d_b) / (b_sum * b_sum);
+        let fp = 1.0 + r_factor * d_a_over_b;
+
+        if !fp.is_finite() || fp.abs() < 1e-12 {
+            return None;
+        }
+
+        let next_beta = beta - (f / fp);
+        if !next_beta.is_finite() || next_beta <= 0.0 {
+            return None;
+        }
+
+        if (next_beta - beta).abs() < TOL_ABS {
+            beta = next_beta;
             break;
         }
+
+        beta = next_beta;
     }
 
-    (mu_best.is_finite() && beta_best.is_finite() && beta_best > 0.0 && nll_best.is_finite())
-        .then_some((mu_best, beta_best, nll_best))
+    // Exact closed-form mu utilizing the solved beta and restoring the shifted coordinates
+    let mu = beta * k_total_f64.ln() - beta * final_b_sum_shift.ln() + x_max;
+
+    if !mu.is_finite() || !beta.is_finite() || beta <= 0.0 {
+        return None;
+    }
+
+    let nll = joint_nll_tev(mu, beta, buckets);
+    if !nll.is_finite() {
+        return None;
+    }
+
+    Some((mu, beta, nll))
 }
 
 /// Fits a charge-stratified Lower Order Model.
