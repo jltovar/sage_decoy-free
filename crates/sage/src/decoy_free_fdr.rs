@@ -542,17 +542,14 @@ fn df_q_value(psm: &DfFeature) -> f32 {
 // IMPORTANT:
 // - `tev(...)` remains the raw hyperscore accessor used by the existing non-LO
 //   DF code paths.
-// - LowerOrder must not use `spectrum_p_value`.
-// - LowerOrder TEV is computed from scratch below by fitting a local Gumbel
-//   null to lower-ranked raw hyperscores within each spectrum/query, then
-//   converting the fitted rank-specific tail probability into a Madej/Lam
-//   scaled transformed e-value:
+// - LowerOrder TEV is computed from the observed candidate rank within each
+//   spectrum/query using an empirical e-value:
 //
-//       e_value = p_tail * n_candidates
+//       e_value = rank - 0.5
 //       TEV     = 0.02 * ln(1000 / e_value)
 //
-//   Here `p_tail` is computed from the local fitted hyperscore distribution,
-//   not read from `DfFeature.core.spectrum_p_value`.
+//   This is a stable diagnostic TEV construction that avoids both:
+//   - high-variance local per-spectrum Gumbel fitting
 #[inline(always)]
 fn tev(f: &DfFeature) -> Option<f64> {
     let x = f.core.hyperscore as f64;
@@ -582,109 +579,48 @@ fn madej_lam_scaled_tev_from_e_value(e_value: f64) -> Option<f64> {
     tev.is_finite().then_some(tev)
 }
 
-#[inline(always)]
-fn local_gumbel_tail_p_from_hyperscore(score: f64, mu: f64, beta: f64) -> Option<f64> {
-    if !score.is_finite() || !mu.is_finite() || !beta.is_finite() || beta <= 0.0 {
-        return None;
-    }
-
-    let z = (score - mu) / beta;
-    if !z.is_finite() {
-        return None;
-    }
-
-    // Standard Gumbel-max survival: p = 1 - exp(-exp(-z)).
-    let t = (-z).clamp(-745.0, 745.0).exp();
-    let cdf = (-t).clamp(-745.0, 745.0).exp();
-    let p = (1.0 - cdf).clamp(1e-300, 1.0);
-
-    p.is_finite().then_some(p)
-}
-
-fn build_lo_tev_from_local_hyperscore_fits(features: &[DfFeature]) -> LoTevByKey {
-    // Group all available candidate rows by spectrum/query.
-    let mut by_spec: FnvHashMap<(usize, String), Vec<&DfFeature>> = FnvHashMap::default();
-
-    for f in features {
-        if f.core.rank < 1 {
-            continue;
-        }
-
-        if tev(f).is_none() {
-            continue;
-        }
-
-        by_spec
-            .entry((f.core.file_id, f.core.spec_id.clone()))
-            .or_default()
-            .push(f);
-    }
-
+fn build_lo_tev_from_empirical_rank_evalue(features: &[DfFeature]) -> LoTevByKey {
     let mut by_key: FnvHashMap<(u32, u8, usize, String), f64> = FnvHashMap::default();
     let mut valid = 0usize;
     let mut invalid = 0usize;
 
-    for ((_file_id, _spec_id), mut rows) in by_spec {
-        rows.sort_by_key(|f| f.core.rank);
-
-        // Fit the local null from non-top candidates only. This is the scratch
-        // replacement for using `spectrum_p_value`.
-        let lower_scores: Vec<f64> = rows
-            .iter()
-            .filter(|f| f.core.rank >= 2)
-            .filter_map(|f| tev(f))
-            .collect();
-
-        if lower_scores.len() < 5 {
-            invalid += rows.len();
+    for f in features {
+        if f.core.rank < 1 {
+            invalid += 1;
             continue;
         }
 
-        let Some((mu, beta)) = fit_gumbel_mle(&lower_scores) else {
-            invalid += rows.len();
+        let rank = f.core.rank as f64;
+
+        if !rank.is_finite() || rank < 1.0 {
+            invalid += 1;
+            continue;
+        }
+
+        // Empirical rank e-value:
+        // rank 1 -> 0.5
+        // rank 2 -> 1.5
+        // rank 3 -> 2.5
+        //
+        // Gumbel fits from sparse per-spectrum candidate sets.
+        let e_value = (rank - 0.5).max(0.5);
+
+        let Some(x_lo) = madej_lam_scaled_tev_from_e_value(e_value) else {
+            invalid += 1;
             continue;
         };
 
-        if !mu.is_finite() || !beta.is_finite() || beta <= 0.0 {
-            invalid += rows.len();
-            continue;
-        }
+        by_key.insert(
+            (
+                f.core.rank,
+                f.core.charge,
+                f.core.file_id,
+                f.core.spec_id.clone(),
+            ),
+            x_lo,
+        );
 
-        // Use the number of observed candidate rows in this query as the local
-        // candidate count. This avoids `spectrum_p_value` entirely. If later you
-        // decide `scored_candidates` is vanilla Sage and trustworthy, only this
-        // line should change.
-        let n_candidates = rows.len().max(1) as f64;
-
-        for f in rows {
-            let Some(score) = tev(f) else {
-                invalid += 1;
-                continue;
-            };
-
-            let Some(p_tail) = local_gumbel_tail_p_from_hyperscore(score, mu, beta) else {
-                invalid += 1;
-                continue;
-            };
-
-            let e_value = (p_tail * n_candidates).clamp(1e-300, 1e300);
-
-            let Some(x_lo) = madej_lam_scaled_tev_from_e_value(e_value) else {
-                invalid += 1;
-                continue;
-            };
-
-            by_key.insert(
-                (
-                    f.core.rank,
-                    f.core.charge,
-                    f.core.file_id,
-                    f.core.spec_id.clone(),
-                ),
-                x_lo,
-            );
-            valid += 1;
-        }
+        valid += 1;
     }
 
     LoTevByKey {
@@ -1869,15 +1805,15 @@ fn fit_engines(
     let mut lo_tev_by_key: Option<Arc<FnvHashMap<(u32, u8, usize, String), f64>>> = None;
 
     if gates.run_lo {
-        let lo_tev_map = build_lo_tev_from_local_hyperscore_fits(features);
+        let lo_tev_map = build_lo_tev_from_empirical_rank_evalue(features);
 
         lo_tev_by_key = Some(Arc::new(lo_tev_map.by_key.clone()));
 
         log::info!(
-    "LO scratch TEV diagnostics: valid={} invalid={} source=local_hyperscore_gumbel no_spectrum_p_value",
-    lo_tev_map.valid,
-    lo_tev_map.invalid
-);
+            "LO empirical-rank TEV diagnostics: valid={} invalid={} source=rank_minus_half_evalue",
+            lo_tev_map.valid,
+            lo_tev_map.invalid
+        );
 
         let mut rank1_scores_by_charge: Vec<(f64, u8)> =
             Vec::with_capacity(work.rank1_indices.len());
@@ -1951,8 +1887,7 @@ fn fit_engines(
         );
             }
 
-            // LowerOrder uses scratch-computed Madej/Lam scaled TEV values.
-            // It does not read or depend on `spectrum_p_value`.
+            // LowerOrder uses empirical-rank Madej/Lam scaled TEV values.
             let lo_min_count_per_rank = settings.lo_min_count_per_rank;
 
             lo_model = fit_decoy_free_model(
@@ -2307,10 +2242,8 @@ fn score_base_rank1(
                         }
                     }
                     None => {
-                        // Scratch LO TEV is not guaranteed for every rank-1 row because
-                        // some spectra may lack enough lower-ranked candidates to fit a
-                        // local hyperscore null. Missing LO evidence must fail closed, not
-                        // remove the row from base DF finalization.
+                        // Empirical-rank LO TEV should exist for every valid ranked PSM.
+                        // Missing LO evidence still fails closed, not by removing the row.
                         1.0
                     }
                 }

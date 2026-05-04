@@ -350,14 +350,11 @@ pub fn score_psms(
         .flat_map_iter(|s| {
             let perc = &s.core;
 
-            let p = perc.spectrum_p_value as f64;
-            let p = if p.is_finite() && p > 0.0 {
-                p.min(1.0)
+            let poisson = if perc.poisson_log10_p_value.is_finite() {
+                (-perc.poisson_log10_p_value).max(0.0).ln_1p()
             } else {
-                f64::MIN_POSITIVE
+                0.0
             };
-
-            let poisson = (-p.log10()).ln_1p();
 
             let x: [f64; FEATURES] = [
                 (perc.rank as f64),

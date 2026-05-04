@@ -132,7 +132,6 @@ pub struct FeatureCore {
     pub missed_cleavages: u8,
     pub matched_intensity_pct: f32,
     pub scored_candidates: u32,
-    pub spectrum_p_value: f64,
     pub poisson_log10_p_value: f64,
     pub ms2_intensity: f32,
     pub fragments: Option<Fragments>,
@@ -888,82 +887,6 @@ fn poisson_sf_geq(k: u16, lambda: f64) -> f64 {
     tail.clamp(0.0, 1.0)
 }
 
-const EULER_GAMMA: f64 = 0.577_215_664_901_532_9;
-
-/// Method-of-moments Gumbel fit to the per-spectrum candidate hyperscore
-/// distribution. The fit is intentionally local to one spectrum/query.
-///
-/// We fit the retained, fully scored candidate hyperscores rather than the
-/// preliminary matched-peak counts. This gives LowerOrder a Sage-native
-/// score-tail p-value tied to the same statistic used for ranking.
-fn gumbel_moments_from_scores(scores: &[f64]) -> Option<(f64, f64)> {
-    let xs: Vec<f64> = scores.iter().copied().filter(|x| x.is_finite()).collect();
-
-    if xs.len() < 3 {
-        return None;
-    }
-
-    let n = xs.len() as f64;
-    let mean = xs.iter().sum::<f64>() / n;
-    let var = xs
-        .iter()
-        .map(|x| {
-            let d = *x - mean;
-            d * d
-        })
-        .sum::<f64>()
-        / n;
-
-    if !var.is_finite() || var <= 0.0 {
-        return None;
-    }
-
-    let beta = (6.0 * var).sqrt() / std::f64::consts::PI;
-    if !beta.is_finite() || beta <= 0.0 {
-        return None;
-    }
-
-    let mu = mean - EULER_GAMMA * beta;
-
-    if mu.is_finite() {
-        Some((mu, beta))
-    } else {
-        None
-    }
-}
-
-#[inline]
-fn gumbel_sf(score: f64, mu: f64, beta: f64) -> f64 {
-    if !score.is_finite() || !mu.is_finite() || !beta.is_finite() || beta <= 0.0 {
-        return 1.0;
-    }
-
-    let z = (score - mu) / beta;
-
-    if z >= 36.0 {
-        // For very high scores, SF ≈ exp(-z).
-        (-z).exp().clamp(1e-325, 1.0)
-    } else if z <= -36.0 {
-        1.0
-    } else {
-        let t = (-z).exp();
-        (-(-t).exp_m1()).clamp(1e-325, 1.0)
-    }
-}
-
-#[inline]
-fn empirical_sf_from_sorted_desc(sorted_scores: &[f64], score: f64) -> f64 {
-    if sorted_scores.is_empty() || !score.is_finite() {
-        return 1.0;
-    }
-
-    let ge = sorted_scores
-        .iter()
-        .filter(|x| x.is_finite() && **x >= score)
-        .count();
-    ((ge as f64 + 0.5) / (sorted_scores.len() as f64 + 1.0)).clamp(1e-325, 1.0)
-}
-
 impl ScoreType {
     pub fn score(&self, matched_b: u16, matched_y: u16, summed_b: f32, summed_y: f32) -> f64 {
         let score = match self {
@@ -1260,33 +1183,6 @@ impl<'db> Scorer<'db> {
 
         let lambda = filtered_matched_peaks as f64 / scored_len;
 
-        // Sage-native per-spectrum hyperscore tail model.
-        // Exclude rank 1 when possible so a true target does not dominate the local
-        // null fit. If too few lower candidates exist, use all retained candidates.
-        // This p-value is tied to hyperscore, unlike the old matched-peak Poisson SF.
-        let tail_fit_scores: Vec<f64> = if score_vector.len() >= 6 {
-            score_vector
-                .iter()
-                .skip(1)
-                .map(|(score, _)| score.hyperscore)
-                .filter(|x| x.is_finite())
-                .collect()
-        } else {
-            score_vector
-                .iter()
-                .map(|(score, _)| score.hyperscore)
-                .filter(|x| x.is_finite())
-                .collect()
-        };
-
-        let gumbel_tail = gumbel_moments_from_scores(&tail_fit_scores);
-
-        let sorted_hyperscores: Vec<f64> = score_vector
-            .iter()
-            .map(|(score, _)| score.hyperscore)
-            .filter(|x| x.is_finite())
-            .collect();
-
         let mz = precursor.mz - PROTON;
 
         for idx in 0..report_psms.min(score_vector.len()) {
@@ -1308,14 +1204,6 @@ impl<'db> Scorer<'db> {
 
             // Keep the matched-peak Poisson value for the existing diagnostic column only.
             let matched_peak_poisson_p_value = poisson_sf_geq(k, lambda).max(1e-325);
-
-            // Main spectrum_p_value is now the Sage-native hyperscore-tail p-value.
-            // This is the value LowerOrder should convert to e-value/TEV.
-            let spectrum_p_value = match gumbel_tail {
-                Some((mu, beta)) => gumbel_sf(score.hyperscore, mu, beta),
-                None => empirical_sf_from_sorted_desc(&sorted_hyperscores, score.hyperscore),
-            }
-            .max(1e-325);
 
             let isotope_error = score.isotope_error as f32 * NEUTRON;
             let delta_mass = (precursor_mass - peptide.monoisotopic - isotope_error) * 2E6
@@ -1361,7 +1249,6 @@ impl<'db> Scorer<'db> {
                 longest_y_pct,
                 peptide_len: peptide.sequence.len(),
                 scored_candidates: hits.scored_candidates as u32,
-                spectrum_p_value,
                 missed_cleavages: peptide.missed_cleavages,
                 predicted_rt: 0.0,
                 predicted_ims: 0.0,

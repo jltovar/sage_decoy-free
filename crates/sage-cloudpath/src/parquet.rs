@@ -243,7 +243,13 @@ pub fn serialize_features(
         write_col!(matched_intensity_pct, FloatType);
         write_col!(scored_candidates, Int32Type);
         write_col!(
-            |f: &TdcFeature| (-(f.core.spectrum_p_value.log10() as f32)).ln_1p(),
+            |f: &TdcFeature| {
+                if f.core.poisson_log10_p_value.is_finite() {
+                    (-(f.core.poisson_log10_p_value as f32)).max(0.0).ln_1p()
+                } else {
+                    0.0
+                }
+            },
             FloatType
         );
 

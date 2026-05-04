@@ -439,7 +439,7 @@ pub struct FdrOptions {
     pub lo_min_count_per_rank: Option<usize>,
 
     // LowerOrder controls.
-    // LO always uses Madej/Lam scaled TEV from spectrum_p_value * scored_candidates.
+    // LO always uses Madej/Lam scaled TEV.
     // The active TNM path is deterministic MLE/LR:
     // supported lower-order ranks -> MLE LOMs -> one β(μ) trend -> fixed μ scan.
     pub lo_stratify: Option<LoStratify>,

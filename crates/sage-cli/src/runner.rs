@@ -319,15 +319,13 @@ impl Runner {
 
         if !lda_ok {
             features.par_iter_mut().for_each(|feat| {
-                let p = feat.core.spectrum_p_value as f64;
-                let p = if p.is_finite() && p > 0.0 {
-                    p.min(1.0)
+                let poisson = if feat.core.poisson_log10_p_value.is_finite() {
+                    (-feat.core.poisson_log10_p_value).max(0.0).ln_1p() as f32
                 } else {
-                    f64::MIN_POSITIVE
+                    0.0
                 };
 
-                feat.discriminant_score =
-                    (-p.log10()).ln_1p() as f32 + feat.core.longest_y_pct / 3.0;
+                feat.discriminant_score = poisson + feat.core.longest_y_pct / 3.0;
             });
         }
 
@@ -335,7 +333,11 @@ impl Runner {
             b.discriminant_score
                 .total_cmp(&a.discriminant_score)
                 .then_with(|| b.core.hyperscore.total_cmp(&a.core.hyperscore))
-                .then_with(|| a.core.spectrum_p_value.total_cmp(&b.core.spectrum_p_value))
+                .then_with(|| {
+                    a.core
+                        .poisson_log10_p_value
+                        .total_cmp(&b.core.poisson_log10_p_value)
+                })
                 .then_with(|| a.core.psm_id.cmp(&b.core.psm_id))
         });
 
@@ -736,7 +738,11 @@ impl Runner {
                         .unwrap_or(f32::INFINITY)
                         .total_cmp(&b.decoy_free_q_value.unwrap_or(f32::INFINITY))
                         .then_with(|| b.core.hyperscore.total_cmp(&a.core.hyperscore))
-                        .then_with(|| a.core.spectrum_p_value.total_cmp(&b.core.spectrum_p_value))
+                        .then_with(|| {
+                            a.core
+                                .poisson_log10_p_value
+                                .total_cmp(&b.core.poisson_log10_p_value)
+                        })
                 });
 
                 self.parameters
@@ -774,8 +780,8 @@ impl Runner {
                 // TDC view only because qvalue::spectrum_q_value currently operates on
                 // TdcFeature, then select the admitted PSM ids for RT/IMS training.
                 outputs.features.par_sort_unstable_by(|a, b| {
-                    a.spectrum_p_value
-                        .total_cmp(&b.spectrum_p_value)
+                    a.poisson_log10_p_value
+                        .total_cmp(&b.poisson_log10_p_value)
                         .then_with(|| b.hyperscore.total_cmp(&a.hyperscore))
                         .then_with(|| a.psm_id.cmp(&b.psm_id))
                 });
@@ -1064,7 +1070,7 @@ impl Runner {
         );
         record.push_field(
             ryu::Buffer::new()
-                .format((-(core.spectrum_p_value.log10())).ln_1p())
+                .format((-core.poisson_log10_p_value).max(0.0).ln_1p())
                 .as_bytes(),
         );
 
@@ -1592,7 +1598,7 @@ impl Runner {
         );
         record.push_field(
             ryu::Buffer::new()
-                .format((-(core.spectrum_p_value.log10())).ln_1p())
+                .format((-core.poisson_log10_p_value).max(0.0).ln_1p())
                 .as_bytes(),
         );
 
@@ -2014,7 +2020,7 @@ impl Runner {
         );
         record.push_field(
             ryu::Buffer::new()
-                .format((-(core.spectrum_p_value.log10())).ln_1p())
+                .format((-core.poisson_log10_p_value).max(0.0).ln_1p())
                 .as_bytes(),
         );
         // Only TdcFeature has posterior_error
