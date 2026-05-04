@@ -958,6 +958,8 @@ fn first_precursor<'a>(query: &'a ProcessedSpectrum<Peak>) -> Option<&'a Precurs
 }
 
 const LO_LOCAL_MIN_CANDIDATES: usize = 10;
+const LO_LOCAL_MIN_FIT_SCORES: usize = 10;
+const LO_LOCAL_ROBUST_TRIM_TOP_FRAC: f64 = 0.10;
 const LO_LOCAL_GUMBEL_EULER_GAMMA: f64 = 0.577_215_664_901_532_9;
 
 #[inline(always)]
@@ -986,8 +988,48 @@ fn lo_local_gumbel_nll(mu: f64, beta: f64, scores: &[f64]) -> f64 {
     nll
 }
 
+fn robust_lo_local_null_scores(score_vector: &[(Score, Option<Fragments>)]) -> Vec<f64> {
+    // The spectrum-local null must not be fit from the top candidate because rank 1
+    // can be a true target. It should also not be dominated by the upper tail of
+    // non-top candidates, which may include near-target alternatives.
+    //
+    // This is label-free: it uses only local rank/score position, never
+    // target/decoy/entrapment labels.
+
+    let mut scores: Vec<f64> = score_vector
+        .iter()
+        .enumerate()
+        .filter_map(|(idx, (score, _))| {
+            if idx == 0 {
+                None
+            } else if score.hyperscore.is_finite() {
+                Some(score.hyperscore)
+            } else {
+                None
+            }
+        })
+        .collect();
+
+    if scores.len() < LO_LOCAL_MIN_FIT_SCORES {
+        return scores;
+    }
+
+    scores.sort_by(|a, b| a.total_cmp(b));
+
+    let trim_top = ((scores.len() as f64) * LO_LOCAL_ROBUST_TRIM_TOP_FRAC).floor() as usize;
+
+    // Always keep enough data for a stable fit. If the spectrum has only a small
+    // number of usable null candidates, trimming is disabled automatically.
+    if trim_top > 0 && scores.len().saturating_sub(trim_top) >= LO_LOCAL_MIN_FIT_SCORES {
+        let keep = scores.len() - trim_top;
+        scores.truncate(keep);
+    }
+
+    scores
+}
+
 fn fit_lo_local_gumbel_mle(scores: &[f64]) -> Option<(f64, f64)> {
-    if scores.len() < LO_LOCAL_MIN_CANDIDATES {
+    if scores.len() < LO_LOCAL_MIN_FIT_SCORES {
         return None;
     }
 
@@ -1096,7 +1138,18 @@ fn assign_lo_spectrum_evalues(score_vector: &[(Score, Option<Fragments>)]) -> Ve
         return fail_closed();
     }
 
-    // Exclude rank 1 from the local null fit. Rank 1 is the candidate most likely
+    // Robust local null fit:
+    //   - exclude rank 1
+    //   - trim the highest-scoring non-top candidates
+    //
+    // This prevents upper-tail target-like alternatives from stretching the local
+    // Gumbel null while preserving a deterministic, label-free spectrum-local fit.
+    let null_scores = robust_lo_local_null_scores(score_vector);
+
+    if null_scores.len() < LO_LOCAL_MIN_FIT_SCORES {
+        return fail_closed();
+    }
+
     // to contain true target signal.
     let null_scores: Vec<f64> = score_vector
         .iter()
@@ -1112,13 +1165,22 @@ fn assign_lo_spectrum_evalues(score_vector: &[(Score, Option<Fragments>)]) -> Ve
         })
         .collect();
 
-    if null_scores.len() < LO_LOCAL_MIN_CANDIDATES {
+    if null_scores.len() < LO_LOCAL_MIN_FIT_SCORES {
         return fail_closed();
     }
 
     let Some((mu, beta)) = fit_lo_local_gumbel_mle(&null_scores) else {
         return fail_closed();
     };
+
+    log::trace!(
+        "LO robust spectrum-local E-value fit: candidates={} fit_scores={} trim_top_frac={:.3} mu={:.6} beta={:.6}",
+        n_candidates,
+        null_scores.len(),
+        LO_LOCAL_ROBUST_TRIM_TOP_FRAC,
+        mu,
+        beta
+    );
 
     score_vector
         .iter()
