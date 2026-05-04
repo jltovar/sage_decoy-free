@@ -680,28 +680,13 @@ fn scan_mu_on_fixed_mle_lr_tnm(
         return None;
     }
 
-    let mut sorted: Vec<f64> = rank1_scores
+    let rank1_scores: Vec<f64> = rank1_scores
         .iter()
         .copied()
         .filter(|x| x.is_finite())
         .collect();
 
-    if sorted.len() < 10 {
-        return None;
-    }
-
-    sorted.sort_by(|a, b| a.total_cmp(b));
-
-    let cutoff_idx = (0.80 * ((sorted.len() - 1) as f64)).round() as usize;
-    let cutoff = sorted[cutoff_idx.min(sorted.len() - 1)];
-
-    let rank1_null_like: Vec<f64> = sorted.into_iter().filter(|x| *x <= cutoff).collect();
-
-    if rank1_null_like.len() < 10 {
-        return None;
-    }
-
-    if !slope.is_finite() || !intercept.is_finite() {
+    if rank1_scores.len() < 10 {
         return None;
     }
 
@@ -718,7 +703,7 @@ fn scan_mu_on_fixed_mle_lr_tnm(
             continue;
         }
 
-        let nll = nll_tev_k(mu, beta, &rank1_null_like, 1);
+        let nll = nll_tev_k(mu, beta, &rank1_scores, 1);
         if !nll.is_finite() {
             continue;
         }
@@ -729,13 +714,6 @@ fn scan_mu_on_fixed_mle_lr_tnm(
             _ => {}
         }
     }
-
-    log::info!(
-        "LO TNM μ scan null-like rank1 subset: total={} used={} cutoff_q80={:.6}",
-        rank1_scores.len(),
-        rank1_null_like.len(),
-        cutoff
-    );
 
     best
 }
