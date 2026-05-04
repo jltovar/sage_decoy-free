@@ -119,6 +119,7 @@ pub enum LoTailCalibration {
     #[default]
     Gumbel,
     Empirical,
+    Hybrid,
 }
 
 /// How Nokoi defines the "positive" class in DF mode.
@@ -457,6 +458,10 @@ pub struct FdrOptions {
     // empirical: empirical survival from sorted lower-rank hyperscores.
     pub lo_tail_calibration: Option<LoTailCalibration>,
 
+    // Used only when lo_tail_calibration="hybrid".
+    // 0.0 = pure Gumbel tail, 1.0 = pure empirical tail.
+    pub lo_tail_empirical_weight: Option<f64>,
+
     // LowerOrder TEV e-value calibration.
     // TEV is computed as:
     //   e_value = p_tail * observed_candidate_count.powf(lo_evalue_candidate_count_power) * lo_evalue_scale
@@ -657,6 +662,7 @@ pub struct FdrSettings {
     pub lo_stratify: LoStratify,
 
     pub lo_tail_calibration: LoTailCalibration,
+    pub lo_tail_empirical_weight: f64,
 
     pub lo_evalue_candidate_count_power: f64,
     pub lo_evalue_scale: f64,
@@ -1009,6 +1015,11 @@ impl From<FdrOptions> for FdrSettings {
             .lo_tail_calibration
             .unwrap_or(LoTailCalibration::Gumbel);
 
+        let lo_tail_empirical_weight = options
+            .lo_tail_empirical_weight
+            .unwrap_or(0.50)
+            .clamp(0.0, 1.0);
+
         let lo_evalue_candidate_count_power = options
             .lo_evalue_candidate_count_power
             .unwrap_or(0.75)
@@ -1276,6 +1287,7 @@ impl From<FdrOptions> for FdrSettings {
             lo_stratify,
 
             lo_tail_calibration,
+            lo_tail_empirical_weight,
 
             lo_evalue_candidate_count_power,
             lo_evalue_scale,

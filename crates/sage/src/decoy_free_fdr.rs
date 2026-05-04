@@ -619,6 +619,20 @@ fn empirical_survival_from_sorted_asc(sorted_scores: &[f64], score: f64) -> Opti
     p.is_finite().then_some(p)
 }
 
+#[inline]
+fn hybrid_survival_logspace(gumbel_p: f64, empirical_p: f64, empirical_weight: f64) -> Option<f64> {
+    if !gumbel_p.is_finite() || !empirical_p.is_finite() || gumbel_p <= 0.0 || empirical_p <= 0.0 {
+        return None;
+    }
+
+    let w = empirical_weight.clamp(0.0, 1.0);
+    let log_p =
+        (1.0 - w) * gumbel_p.clamp(1e-300, 1.0).ln() + w * empirical_p.clamp(1e-300, 1.0).ln();
+
+    let p = log_p.exp().clamp(1e-300, 1.0);
+    p.is_finite().then_some(p)
+}
+
 fn observed_candidate_counts_by_spectrum(
     features: &[DfFeature],
 ) -> FnvHashMap<(usize, String), usize> {
@@ -726,8 +740,10 @@ fn build_lo_tev_from_global_hyperscore_evalue(
             }
         };
 
-        if matches!(settings.lo_tail_calibration, LoTailCalibration::Gumbel)
-            && gumbel_params.is_none()
+        if matches!(
+            settings.lo_tail_calibration,
+            LoTailCalibration::Gumbel | LoTailCalibration::Hybrid
+        ) && gumbel_params.is_none()
         {
             continue;
         }
@@ -800,6 +816,36 @@ fn build_lo_tev_from_global_hyperscore_evalue(
                 let Some(p) =
                     empirical_survival_from_sorted_asc(&tail_bucket.sorted_scores_asc, score)
                 else {
+                    invalid += 1;
+                    continue;
+                };
+
+                p
+            }
+
+            LoTailCalibration::Hybrid => {
+                let Some((mu, beta)) = tail_bucket.gumbel_params else {
+                    invalid += 1;
+                    continue;
+                };
+
+                let Some(p_gumbel) = gumbel_max_survival(score, mu, beta) else {
+                    invalid += 1;
+                    continue;
+                };
+
+                let Some(p_empirical) =
+                    empirical_survival_from_sorted_asc(&tail_bucket.sorted_scores_asc, score)
+                else {
+                    invalid += 1;
+                    continue;
+                };
+
+                let Some(p) = hybrid_survival_logspace(
+                    p_gumbel,
+                    p_empirical,
+                    settings.lo_tail_empirical_weight,
+                ) else {
                     invalid += 1;
                     continue;
                 };
@@ -2020,10 +2066,11 @@ fn fit_engines(
         lo_tev_by_key = Some(Arc::new(lo_tev_map.by_key.clone()));
 
         log::info!(
-    		"LO global-hyperscore TEV diagnostics: valid={} invalid={} source=global_lower_rank_hyperscore_evalue tail={:?} no_spectrum_p_value n_power={:.3} e_scale={:.3}",
+    		"LO global-hyperscore TEV diagnostics: valid={} invalid={} source=global_lower_rank_hyperscore_evalue tail={:?} empirical_weight={:.3} no_spectrum_p_value n_power={:.3} e_scale={:.3}",
     		lo_tev_map.valid,
     		lo_tev_map.invalid,
     		settings.lo_tail_calibration,
+    		settings.lo_tail_empirical_weight,
     		settings.lo_evalue_candidate_count_power,
     		settings.lo_evalue_scale
 		);
