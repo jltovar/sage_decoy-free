@@ -133,6 +133,20 @@ pub struct FeatureCore {
     pub matched_intensity_pct: f32,
     pub scored_candidates: u32,
     pub poisson_log10_p_value: f64,
+
+    // Spectrum-local lower-order calibration.
+    //
+    // These are computed during scoring, while the full per-spectrum candidate
+    // hyperscore distribution is still available. Decoy-Free LowerOrder consumes
+    // `lo_spectrum_e_value` to construct the Madej/Lam TEV:
+    //
+    //     TEV = 0.02 * ln(1000 / E)
+    //
+    // Do not derive these downstream from retained rank rows.
+    pub lo_spectrum_p_value: f64,
+    pub lo_spectrum_e_value: f64,
+    pub lo_spectrum_candidate_count: u32,
+
     pub ms2_intensity: f32,
     pub fragments: Option<Fragments>,
 }
@@ -943,6 +957,183 @@ fn first_precursor<'a>(query: &'a ProcessedSpectrum<Peak>) -> Option<&'a Precurs
     precursor
 }
 
+const LO_LOCAL_MIN_CANDIDATES: usize = 10;
+const LO_LOCAL_GUMBEL_EULER_GAMMA: f64 = 0.577_215_664_901_532_9;
+
+#[inline(always)]
+fn lo_local_gumbel_nll(mu: f64, beta: f64, scores: &[f64]) -> f64 {
+    if !mu.is_finite() || !beta.is_finite() || beta <= 0.0 || scores.is_empty() {
+        return f64::INFINITY;
+    }
+
+    let log_beta = beta.ln();
+    let mut nll = 0.0f64;
+
+    for &x in scores {
+        if !x.is_finite() {
+            return f64::INFINITY;
+        }
+
+        let z = (x - mu) / beta;
+        if !z.is_finite() {
+            return f64::INFINITY;
+        }
+
+        let ez = (-z).clamp(-745.0, 745.0).exp();
+        nll += log_beta + z + ez;
+    }
+
+    nll
+}
+
+fn fit_lo_local_gumbel_mle(scores: &[f64]) -> Option<(f64, f64)> {
+    if scores.len() < LO_LOCAL_MIN_CANDIDATES {
+        return None;
+    }
+
+    let n = scores.len() as f64;
+    let mean = scores.iter().copied().sum::<f64>() / n;
+
+    let var = scores
+        .iter()
+        .map(|x| {
+            let d = *x - mean;
+            d * d
+        })
+        .sum::<f64>()
+        / n.max(1.0);
+
+    if !mean.is_finite() || !var.is_finite() || var <= 0.0 {
+        return None;
+    }
+
+    let beta0 = (var.sqrt() * (6.0_f64).sqrt() / std::f64::consts::PI).max(1e-6);
+    let mu0 = mean - LO_LOCAL_GUMBEL_EULER_GAMMA * beta0;
+
+    let mut best_mu = mu0;
+    let mut best_log_beta = beta0.ln();
+    let mut best_nll = lo_local_gumbel_nll(best_mu, best_log_beta.exp(), scores);
+
+    if !best_nll.is_finite() {
+        return None;
+    }
+
+    let score_min = scores.iter().copied().fold(f64::INFINITY, f64::min);
+    let score_max = scores.iter().copied().fold(f64::NEG_INFINITY, f64::max);
+    let span = (score_max - score_min).abs().max(1.0);
+
+    let mut step_mu = 0.25 * span;
+    let mut step_log_beta = 0.25f64;
+
+    for _ in 0..80 {
+        let mut improved = false;
+
+        let candidates = [
+            (best_mu - step_mu, best_log_beta),
+            (best_mu + step_mu, best_log_beta),
+            (best_mu, best_log_beta - step_log_beta),
+            (best_mu, best_log_beta + step_log_beta),
+            (best_mu - step_mu, best_log_beta - step_log_beta),
+            (best_mu - step_mu, best_log_beta + step_log_beta),
+            (best_mu + step_mu, best_log_beta - step_log_beta),
+            (best_mu + step_mu, best_log_beta + step_log_beta),
+        ];
+
+        for (mu, log_beta) in candidates {
+            let beta = log_beta.exp();
+            let nll = lo_local_gumbel_nll(mu, beta, scores);
+
+            if nll.is_finite() && nll < best_nll {
+                best_mu = mu;
+                best_log_beta = log_beta;
+                best_nll = nll;
+                improved = true;
+            }
+        }
+
+        if !improved {
+            step_mu *= 0.5;
+            step_log_beta *= 0.5;
+
+            if step_mu < 1e-8 && step_log_beta < 1e-8 {
+                break;
+            }
+        }
+    }
+
+    let beta = best_log_beta.exp();
+
+    if best_mu.is_finite() && beta.is_finite() && beta > 0.0 {
+        Some((best_mu, beta))
+    } else {
+        None
+    }
+}
+
+#[inline(always)]
+fn lo_local_gumbel_survival(score: f64, mu: f64, beta: f64) -> Option<f64> {
+    if !score.is_finite() || !mu.is_finite() || !beta.is_finite() || beta <= 0.0 {
+        return None;
+    }
+
+    let z = (score - mu) / beta;
+    if !z.is_finite() {
+        return None;
+    }
+
+    let t = (-z).clamp(-745.0, 745.0).exp();
+    let p = (-(-t).exp_m1()).clamp(1e-300, 1.0);
+
+    p.is_finite().then_some(p)
+}
+
+fn assign_lo_spectrum_evalues(score_vector: &[(Score, Option<Fragments>)]) -> Vec<(f64, f64, u32)> {
+    let n_candidates = score_vector.len().max(1);
+    let fail_closed =
+        || vec![(1.0f64, n_candidates as f64, n_candidates as u32); score_vector.len()];
+
+    if score_vector.len() < LO_LOCAL_MIN_CANDIDATES {
+        return fail_closed();
+    }
+
+    // Exclude rank 1 from the local null fit. Rank 1 is the candidate most likely
+    // to contain true target signal.
+    let null_scores: Vec<f64> = score_vector
+        .iter()
+        .enumerate()
+        .filter_map(|(idx, (score, _))| {
+            if idx == 0 {
+                None
+            } else if score.hyperscore.is_finite() {
+                Some(score.hyperscore)
+            } else {
+                None
+            }
+        })
+        .collect();
+
+    if null_scores.len() < LO_LOCAL_MIN_CANDIDATES {
+        return fail_closed();
+    }
+
+    let Some((mu, beta)) = fit_lo_local_gumbel_mle(&null_scores) else {
+        return fail_closed();
+    };
+
+    score_vector
+        .iter()
+        .map(|(score, _)| {
+            let p = lo_local_gumbel_survival(score.hyperscore, mu, beta)
+                .unwrap_or(1.0)
+                .clamp(1e-300, 1.0);
+
+            let e = (p * n_candidates as f64).clamp(1e-300, 1e300);
+
+            (p, e, n_candidates as u32)
+        })
+        .collect()
+}
+
 impl<'db> Scorer<'db> {
     #[inline(always)]
     fn resolved_max_fragment_charge(&self, precursor_charge: u8) -> u8 {
@@ -1171,6 +1362,11 @@ impl<'db> Scorer<'db> {
 
         score_vector.sort_by(|a, b| b.0.hyperscore.total_cmp(&a.0.hyperscore));
 
+        // Compute spectrum-local LO p/E-values before output pruning.
+        // This is the only point where the full per-spectrum scored candidate
+        // hyperscore distribution is still available.
+        let lo_spectrum_evalues = assign_lo_spectrum_evalues(&score_vector);
+
         let scored_len = score_vector.len().max(1) as f64;
 
         // Fix the old lambda fragility: estimate the matched-peak-count background
@@ -1187,6 +1383,14 @@ impl<'db> Scorer<'db> {
 
         for idx in 0..report_psms.min(score_vector.len()) {
             let score = score_vector[idx].0;
+
+            let (lo_spectrum_p_value, lo_spectrum_e_value, lo_spectrum_candidate_count) =
+                lo_spectrum_evalues.get(idx).copied().unwrap_or((
+                    1.0,
+                    score_vector.len().max(1) as f64,
+                    score_vector.len().max(1) as u32,
+                ));
+
             let fragments: Option<Fragments> = score_vector[idx].1.take();
             let psm_id = increment_psm_counter();
             let peptide = &self.db[score.peptide];
@@ -1249,6 +1453,9 @@ impl<'db> Scorer<'db> {
                 longest_y_pct,
                 peptide_len: peptide.sequence.len(),
                 scored_candidates: hits.scored_candidates as u32,
+                lo_spectrum_p_value,
+                lo_spectrum_e_value,
+                lo_spectrum_candidate_count,
                 missed_cleavages: peptide.missed_cleavages,
                 predicted_rt: 0.0,
                 predicted_ims: 0.0,

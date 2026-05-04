@@ -126,11 +126,11 @@ Never rely on an implicit or ambiguous “score” definition.
 ============================================================================= */
 
 use crate::database::IndexedDatabase;
+use crate::input::LoStratify;
 use crate::input::{
     BoundedAuxUpdateSpace, DartNullRtModel, DartTrueRtModel, EnsemblePepCombiner, FdrSettings,
     FinalEvidenceSpace, JointMode, ModelFit, PeptidePCombine, PhysicalAnchorMode, QMethod,
 };
-use crate::input::{LoStratify, LoTailCalibration};
 use crate::lfq::{Peak, PrecursorId};
 use crate::ml::lower_order::{
     fit_decoy_free_model, fit_gumbel_mle, fit_gumbel_moments, LowerOrderModel,
@@ -540,24 +540,34 @@ fn df_q_value(psm: &DfFeature) -> f32 {
 // -----------------------------------------------------------------------------
 //
 // IMPORTANT:
-// - `tev(...)` remains the raw hyperscore accessor used by the existing non-LO
-//   DF code paths.
-// - LowerOrder must not use `spectrum_p_value`.
-// - LowerOrder TEV is computed from scratch using a stable dataset-level
-//   hyperscore null fit from lower-ranked candidate PSMs:
+// - `tev(...)` remains the raw hyperscore accessor used by existing non-LO DF
+//   code paths.
+// - LowerOrder does not derive TEV from raw hyperscore downstream.
+// - LowerOrder consumes `FeatureCore::lo_spectrum_e_value`, computed upstream
+//   during scoring while the full per-spectrum candidate hyperscore distribution
+//   is still available:
 //
-//       p_tail  = P(global/charge lower-rank hyperscore null >= observed hyperscore)
-//       e_value = p_tail * observed_candidate_count_for_spectrum
-//       TEV     = 0.02 * ln(1000 / e_value)
+//       local p_tail = P(local spectrum null >= observed hyperscore)
+//       E            = local p_tail * scored_candidate_count_for_spectrum
+//       LO TEV       = 0.02 * ln(1000 / E)
 //
-//   This preserves hyperscore discrimination while avoiding:
-//   - high-variance local per-spectrum Gumbel fits
-//   - rank-only TEV collapse where all rank-1 PSMs get the same score
+//   This is the Tide/Comet-like spectrum-local E-value object LO expects.
 #[inline(always)]
 fn tev(f: &DfFeature) -> Option<f64> {
     let x = f.core.hyperscore as f64;
     if x.is_finite() {
         Some(x)
+    } else {
+        None
+    }
+}
+
+#[inline(always)]
+fn lo_spectrum_e_value(f: &DfFeature) -> Option<f64> {
+    let e = f.core.lo_spectrum_e_value;
+
+    if e.is_finite() && e > 0.0 {
+        Some(e.clamp(1e-300, 1e300))
     } else {
         None
     }
@@ -582,86 +592,7 @@ fn madej_lam_scaled_tev_from_e_value(e_value: f64) -> Option<f64> {
     tev.is_finite().then_some(tev)
 }
 
-fn gumbel_max_survival(score: f64, mu: f64, beta: f64) -> Option<f64> {
-    if !score.is_finite() || !mu.is_finite() || !beta.is_finite() || beta <= 0.0 {
-        return None;
-    }
-
-    let z = (score - mu) / beta;
-    if !z.is_finite() {
-        return None;
-    }
-
-    // Gumbel(max) survival:
-    //   S(x) = 1 - exp(-exp(-(x - mu) / beta))
-    //
-    // Use expm1 form for numerical stability near the far-right tail:
-    //   1 - exp(-t) = -expm1(-t)
-    let t = (-z).clamp(-745.0, 745.0).exp();
-    let p = (-(-t).exp_m1()).clamp(1e-300, 1.0);
-
-    p.is_finite().then_some(p)
-}
-
-fn empirical_survival_from_sorted_asc(sorted_scores: &[f64], score: f64) -> Option<f64> {
-    if sorted_scores.len() < 10 || !score.is_finite() {
-        return None;
-    }
-
-    let n = sorted_scores.len();
-
-    // sorted ascending. First index whose value is >= observed score.
-    let idx = sorted_scores.partition_point(|&x| x < score);
-    let count_ge = n.saturating_sub(idx) as f64;
-
-    let p = ((count_ge + 1.0) / ((n as f64) + 1.0)).clamp(1e-300, 1.0);
-
-    p.is_finite().then_some(p)
-}
-
-#[inline]
-fn hybrid_survival_logspace(gumbel_p: f64, empirical_p: f64, empirical_weight: f64) -> Option<f64> {
-    if !gumbel_p.is_finite() || !empirical_p.is_finite() || gumbel_p <= 0.0 || empirical_p <= 0.0 {
-        return None;
-    }
-
-    let w = empirical_weight.clamp(0.0, 1.0);
-    let log_p =
-        (1.0 - w) * gumbel_p.clamp(1e-300, 1.0).ln() + w * empirical_p.clamp(1e-300, 1.0).ln();
-
-    let p = log_p.exp().clamp(1e-300, 1.0);
-    p.is_finite().then_some(p)
-}
-
-fn observed_candidate_counts_by_spectrum(
-    features: &[DfFeature],
-) -> FnvHashMap<(usize, String), usize> {
-    let mut n_by_spec: FnvHashMap<(usize, String), usize> = FnvHashMap::default();
-
-    for f in features {
-        if f.core.rank < 1 {
-            continue;
-        }
-
-        if tev(f).is_none() {
-            continue;
-        }
-
-        *n_by_spec
-            .entry((f.core.file_id, f.core.spec_id.clone()))
-            .or_insert(0) += 1;
-    }
-
-    n_by_spec
-}
-
-#[derive(Clone, Debug)]
-struct LoHyperscoreTailBucket {
-    sorted_scores_asc: Vec<f64>,
-    gumbel_params: Option<(f64, f64)>,
-}
-
-fn build_lo_tev_from_global_hyperscore_evalue(
+fn build_lo_tev_from_stored_spectrum_evalue(
     features: &[DfFeature],
     settings: &FdrSettings,
 ) -> LoTevByKey {
@@ -669,197 +600,18 @@ fn build_lo_tev_from_global_hyperscore_evalue(
     let mut valid = 0usize;
     let mut invalid = 0usize;
 
-    // This replaces non-vanilla `scored_candidates` with the number of observed
-    // ranked candidate rows available for the spectrum in the current Sage
-    // feature table.
-    let n_by_spec = observed_candidate_counts_by_spectrum(features);
-
-    // Build stable lower-rank hyperscore nulls by the same bucket used for LO:
-    // global bucket 0 if lo_stratify=global; charge bucket otherwise.
-    let mut null_scores_by_bucket: FnvHashMap<u8, Vec<f64>> = FnvHashMap::default();
-
-    for f in features {
-        if f.core.rank < 2 {
-            continue;
-        }
-
-        let Some(x) = tev(f) else {
-            continue;
-        };
-
-        let bid = lo_bucket_id(settings, f.core.charge);
-        null_scores_by_bucket.entry(bid).or_default().push(x);
-    }
-
-    let mut tail_by_bucket: FnvHashMap<u8, LoHyperscoreTailBucket> = FnvHashMap::default();
-
-    for (&bid, scores) in &null_scores_by_bucket {
-        if scores.len() < settings.min_null_size {
-            log::warn!(
-            "LO global-hyperscore TEV: bucket={} lower-rank null too small: n={} < min_null_size={}",
-            bid,
-            scores.len(),
-            settings.min_null_size
-        );
-            continue;
-        }
-
-        let mut sorted_scores_asc: Vec<f64> =
-            scores.iter().copied().filter(|x| x.is_finite()).collect();
-
-        if sorted_scores_asc.len() < settings.min_null_size {
-            log::warn!(
-            "LO global-hyperscore TEV: bucket={} finite lower-rank null too small: n={} < min_null_size={}",
-            bid,
-            sorted_scores_asc.len(),
-            settings.min_null_size
-        );
-            continue;
-        }
-
-        sorted_scores_asc.sort_by(|a, b| a.total_cmp(b));
-
-        let gumbel_params = match fit_gumbel_mle(&sorted_scores_asc) {
-            Some((mu, beta)) if mu.is_finite() && beta.is_finite() && beta > 0.0 => {
-                log::info!(
-                "LO global-hyperscore TEV: bucket={} tail=gumbel null_mu={:.6} null_beta={:.6} n={}",
-                bid,
-                mu,
-                beta,
-                sorted_scores_asc.len()
-            );
-                Some((mu, beta))
-            }
-            _ => {
-                log::warn!(
-                    "LO global-hyperscore TEV: bucket={} Gumbel hyperscore null fit failed n={}",
-                    bid,
-                    sorted_scores_asc.len()
-                );
-                None
-            }
-        };
-
-        if matches!(
-            settings.lo_tail_calibration,
-            LoTailCalibration::Gumbel | LoTailCalibration::Hybrid
-        ) && gumbel_params.is_none()
-        {
-            continue;
-        }
-
-        log::info!(
-            "LO global-hyperscore TEV: bucket={} tail_mode={:?} empirical_null_n={}",
-            bid,
-            settings.lo_tail_calibration,
-            sorted_scores_asc.len()
-        );
-
-        tail_by_bucket.insert(
-            bid,
-            LoHyperscoreTailBucket {
-                sorted_scores_asc,
-                gumbel_params,
-            },
-        );
-    }
-
-    if tail_by_bucket.is_empty() {
-        log::warn!("LO global-hyperscore TEV: no usable lower-rank hyperscore tail buckets.");
-        return LoTevByKey {
-            by_key,
-            valid,
-            invalid: features.len(),
-        };
-    }
-
     for f in features {
         if f.core.rank < 1 {
             invalid += 1;
             continue;
         }
 
-        let Some(score) = tev(f) else {
+        let Some(e_raw) = lo_spectrum_e_value(f) else {
             invalid += 1;
             continue;
         };
 
-        let bid = lo_bucket_id(settings, f.core.charge);
-
-        let Some(tail_bucket) = tail_by_bucket.get(&bid) else {
-            invalid += 1;
-            continue;
-        };
-
-        let n_candidates = n_by_spec
-            .get(&(f.core.file_id, f.core.spec_id.clone()))
-            .copied()
-            .unwrap_or(0)
-            .max(1) as f64;
-
-        let p_tail = match settings.lo_tail_calibration {
-            LoTailCalibration::Gumbel => {
-                let Some((mu, beta)) = tail_bucket.gumbel_params else {
-                    invalid += 1;
-                    continue;
-                };
-
-                let Some(p) = gumbel_max_survival(score, mu, beta) else {
-                    invalid += 1;
-                    continue;
-                };
-
-                p
-            }
-
-            LoTailCalibration::Empirical => {
-                let Some(p) =
-                    empirical_survival_from_sorted_asc(&tail_bucket.sorted_scores_asc, score)
-                else {
-                    invalid += 1;
-                    continue;
-                };
-
-                p
-            }
-
-            LoTailCalibration::Hybrid => {
-                let Some((mu, beta)) = tail_bucket.gumbel_params else {
-                    invalid += 1;
-                    continue;
-                };
-
-                let Some(p_gumbel) = gumbel_max_survival(score, mu, beta) else {
-                    invalid += 1;
-                    continue;
-                };
-
-                let Some(p_empirical) =
-                    empirical_survival_from_sorted_asc(&tail_bucket.sorted_scores_asc, score)
-                else {
-                    invalid += 1;
-                    continue;
-                };
-
-                let Some(p) = hybrid_survival_logspace(
-                    p_gumbel,
-                    p_empirical,
-                    settings.lo_tail_empirical_weight,
-                ) else {
-                    invalid += 1;
-                    continue;
-                };
-
-                p
-            }
-        };
-
-        let effective_n = n_candidates
-            .max(1.0)
-            .powf(settings.lo_evalue_candidate_count_power)
-            .max(1.0);
-
-        let e_value = (p_tail * effective_n * settings.lo_evalue_scale).clamp(1e-300, 1e300);
+        let e_value = (e_raw * settings.lo_evalue_scale).clamp(1e-300, 1e300);
 
         let Some(x_lo) = madej_lam_scaled_tev_from_e_value(e_value) else {
             invalid += 1;
@@ -878,6 +630,13 @@ fn build_lo_tev_from_global_hyperscore_evalue(
 
         valid += 1;
     }
+
+    log::info!(
+        "LO stored spectrum-E-value TEV diagnostics: valid={} invalid={} source=core.lo_spectrum_e_value e_scale={:.3}",
+        valid,
+        invalid,
+        settings.lo_evalue_scale
+    );
 
     LoTevByKey {
         by_key,
@@ -2061,19 +1820,16 @@ fn fit_engines(
     let mut lo_tev_by_key: Option<Arc<FnvHashMap<(u32, u8, usize, String), f64>>> = None;
 
     if gates.run_lo {
-        let lo_tev_map = build_lo_tev_from_global_hyperscore_evalue(features, settings);
+        let lo_tev_map = build_lo_tev_from_stored_spectrum_evalue(features, settings);
 
         lo_tev_by_key = Some(Arc::new(lo_tev_map.by_key.clone()));
 
         log::info!(
-    		"LO global-hyperscore TEV diagnostics: valid={} invalid={} source=global_lower_rank_hyperscore_evalue tail={:?} empirical_weight={:.3} no_spectrum_p_value n_power={:.3} e_scale={:.3}",
-    		lo_tev_map.valid,
-    		lo_tev_map.invalid,
-    		settings.lo_tail_calibration,
-    		settings.lo_tail_empirical_weight,
-    		settings.lo_evalue_candidate_count_power,
-    		settings.lo_evalue_scale
-		);
+            "LO stored spectrum-E-value TEV diagnostics: valid={} invalid={} source=core.lo_spectrum_e_value e_scale={:.3}",
+            lo_tev_map.valid,
+            lo_tev_map.invalid,
+            settings.lo_evalue_scale
+        );
 
         let mut rank1_scores_by_charge: Vec<(f64, u8)> =
             Vec::with_capacity(work.rank1_indices.len());
@@ -2147,8 +1903,8 @@ fn fit_engines(
         );
             }
 
-            // LowerOrder uses global/charge lower-rank hyperscore-tail TEV values.
-            // It does not read or depend on `spectrum_p_value`.
+            // LowerOrder uses Sage spectrum-level p-value-derived E-value TEV.
+            // This matches the Tide/Comet-style object expected by the LO order-statistic model.
             let lo_min_count_per_rank = settings.lo_min_count_per_rank;
 
             lo_model = fit_decoy_free_model(

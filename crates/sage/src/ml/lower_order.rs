@@ -572,12 +572,13 @@ impl LowerOrderModel {
 // - Each selected lower-order rank k is modeled with its k-specific TEV likelihood.
 // - Only MLE LOMs are used; MM is not used in the production TNM path.
 // - All supported selected ranks contribute to one β(μ) linear trend.
-// - The TNM is chosen by a fixed μ scan over the Madej/Lam scaled TEV range.
+// - The TNM is chosen by a fixed-cutoff calibration along that deterministic β(μ)
+//   path.
+// - No rank-1 score likelihood is used to fit or select the null.
 // - No PyLord-style autonomous selection is performed:
 //     no best 5-rank LR window,
 //     no MM/MLE switching,
 //     no mean-beta fallback,
-//     no fixed rank-1 TEV cutoff,
 //     no candidate-family competition.
 //
 // Support gating:
@@ -615,125 +616,141 @@ fn finite_quantiles(xs: &[f64]) -> Option<(f64, f64, f64, f64, f64, f64, f64)> {
     ))
 }
 
+const LO_MIN_LOM_RANKS: usize = 2;
+const LO_TNM_MU_MIN: f64 = -0.20;
+const LO_TNM_MU_MAX: f64 = 1.00;
+
 #[inline]
-fn pooled_lower_order_nll(mu: f64, beta: f64, buckets: &[RankBucket]) -> f64 {
-    if !mu.is_finite() || !beta.is_finite() || beta <= 0.0 {
-        return f64::INFINITY;
-    }
-
-    let mut total = 0.0f64;
-
-    for b in buckets {
-        let nll = nll_tev_k(mu, beta, &b.scores, b.k);
-        if !nll.is_finite() {
-            return f64::INFINITY;
-        }
-        total += nll;
-    }
-
-    total
-}
-
-fn fit_pooled_lower_order_joint_mle(buckets: &[RankBucket]) -> Option<(f64, f64, f64)> {
-    if buckets.len() < 2 {
-        return None;
-    }
-
-    let mut starts: Vec<(f64, f64)> = Vec::new();
-
-    for b in buckets {
-        if let Some((mu, beta)) = fit_tev_k_mle(&b.scores, b.k) {
-            if mu.is_finite() && beta.is_finite() && beta > 0.0 {
-                starts.push((mu, beta));
-            }
-        }
-    }
-
-    if starts.is_empty() {
-        return None;
-    }
-
-    starts.sort_by(|a, b| a.0.total_cmp(&b.0));
-
-    let mid = starts.len() / 2;
-    let mu0 = starts[mid].0;
-
-    let mut betas: Vec<f64> = starts
+fn ols_beta_on_mu_all_supported_ranks(loms: &[(u32, f64, f64)]) -> Option<(f64, f64, f64)> {
+    let rows: Vec<(f64, f64)> = loms
         .iter()
-        .map(|(_, beta)| *beta)
-        .filter(|b| b.is_finite() && *b > 0.0)
+        .filter_map(|(_, mu, beta)| {
+            if mu.is_finite() && beta.is_finite() && *beta > 0.0 {
+                Some((*mu, *beta))
+            } else {
+                None
+            }
+        })
         .collect();
 
-    betas.sort_by(|a, b| a.total_cmp(b));
-    let beta0 = betas[betas.len() / 2];
-
-    let mut best_mu = mu0;
-    let mut best_log_beta = beta0.ln();
-    let mut best_nll = pooled_lower_order_nll(best_mu, best_log_beta.exp(), buckets);
-
-    if !best_nll.is_finite() {
+    if rows.len() < 2 {
         return None;
     }
 
-    let mut step_mu = 0.10f64;
-    let mut step_log_beta = 0.20f64;
+    let n = rows.len() as f64;
+    let mean_x = rows.iter().map(|(mu, _)| *mu).sum::<f64>() / n;
+    let mean_y = rows.iter().map(|(_, beta)| *beta).sum::<f64>() / n;
 
-    for _ in 0..80 {
-        let mut improved = false;
+    let mut sxx = 0.0f64;
+    let mut syy = 0.0f64;
+    let mut sxy = 0.0f64;
 
-        let candidates = [
-            (best_mu - step_mu, best_log_beta),
-            (best_mu + step_mu, best_log_beta),
-            (best_mu, best_log_beta - step_log_beta),
-            (best_mu, best_log_beta + step_log_beta),
-            (best_mu - step_mu, best_log_beta - step_log_beta),
-            (best_mu - step_mu, best_log_beta + step_log_beta),
-            (best_mu + step_mu, best_log_beta - step_log_beta),
-            (best_mu + step_mu, best_log_beta + step_log_beta),
-        ];
-
-        for (mu, log_beta) in candidates {
-            let beta = log_beta.exp();
-
-            if !mu.is_finite() || !beta.is_finite() || beta <= 0.0 {
-                continue;
-            }
-
-            let nll = pooled_lower_order_nll(mu, beta, buckets);
-
-            if nll.is_finite() && nll < best_nll {
-                best_mu = mu;
-                best_log_beta = log_beta;
-                best_nll = nll;
-                improved = true;
-            }
-        }
-
-        if !improved {
-            step_mu *= 0.5;
-            step_log_beta *= 0.5;
-
-            if step_mu < 1e-6 && step_log_beta < 1e-6 {
-                break;
-            }
-        }
+    for (x, y) in &rows {
+        let dx = *x - mean_x;
+        let dy = *y - mean_y;
+        sxx += dx * dx;
+        syy += dy * dy;
+        sxy += dx * dy;
     }
 
-    let beta = best_log_beta.exp();
+    if !sxx.is_finite() || sxx <= 0.0 {
+        return None;
+    }
 
-    if best_mu.is_finite() && beta.is_finite() && beta > 0.0 && best_nll.is_finite() {
-        Some((best_mu, beta, best_nll))
+    let slope = sxy / sxx;
+    let intercept = mean_y - slope * mean_x;
+
+    if !slope.is_finite() || !intercept.is_finite() {
+        return None;
+    }
+
+    let r = if sxx > 0.0 && syy > 0.0 {
+        (sxy / (sxx.sqrt() * syy.sqrt())).clamp(-1.0, 1.0)
     } else {
-        None
+        0.0
+    };
+
+    Some((slope, intercept, r))
+}
+
+#[inline]
+fn rank1_survival_at_cutoff(mu: f64, beta: f64, cutoff: f64) -> Option<f64> {
+    if !mu.is_finite() || !beta.is_finite() || beta <= 0.0 || !cutoff.is_finite() {
+        return None;
     }
+
+    let z = (cutoff - mu) / beta;
+    if !z.is_finite() {
+        return None;
+    }
+
+    let cdf = tev_cdf_asymptotic(z, 1);
+    if !cdf.is_finite() {
+        return None;
+    }
+
+    Some((1.0 - cdf).clamp(1e-300, 1.0))
+}
+
+#[inline]
+fn scan_mu_for_fixed_cutoff(
+    slope: f64,
+    intercept: f64,
+    cutoff: f64,
+    target_p_at_cutoff: f64,
+) -> Option<(f64, f64, f64, f64)> {
+    if !slope.is_finite()
+        || !intercept.is_finite()
+        || !cutoff.is_finite()
+        || !target_p_at_cutoff.is_finite()
+        || target_p_at_cutoff <= 0.0
+    {
+        return None;
+    }
+
+    const N_GRID: usize = 701;
+
+    let step = (LO_TNM_MU_MAX - LO_TNM_MU_MIN) / ((N_GRID - 1) as f64);
+    let target_log_p = target_p_at_cutoff.ln();
+
+    let mut best: Option<(f64, f64, f64, f64)> = None;
+
+    for i in 0..N_GRID {
+        let mu = LO_TNM_MU_MIN + (i as f64) * step;
+        let beta = slope * mu + intercept;
+
+        if !mu.is_finite() || !beta.is_finite() || beta <= 0.0 {
+            continue;
+        }
+
+        let Some(p_cutoff) = rank1_survival_at_cutoff(mu, beta, cutoff) else {
+            continue;
+        };
+
+        let err = (p_cutoff.ln() - target_log_p).abs();
+        if !err.is_finite() {
+            continue;
+        }
+
+        match best {
+            None => best = Some((mu, beta, p_cutoff, err)),
+            Some((_, _, _, best_err)) if err < best_err => {
+                best = Some((mu, beta, p_cutoff, err));
+            }
+            _ => {}
+        }
+    }
+
+    best
 }
 
 /// Fits a charge-stratified Lower Order Model.
 ///
 /// Production LO path:
 /// - Uses every supported selected lower-order rank in the configured window.
-/// - Fits one parent rank-1 TNM by joint MLE over the lower-order TEV-k
-///   likelihoods.
+/// - Fits MLE LOM parameters for each supported lower-order rank.
+/// - Fits one deterministic β(μ) trend across those LOMs.
+/// - Chooses the rank-1 TNM by fixed-cutoff calibration along that β(μ) path.
 /// - Never uses rank-1 scores to fit or select the null.
 /// - Does not perform PyLord-style autonomous candidate selection.
 /// - Preserves one external null-rank window -> one deterministic LO model.
@@ -886,30 +903,21 @@ pub fn fit_decoy_free_model(
         }
 
         // ---------------------------------------------------------------------
-        // Deterministic lower-order joint MLE TNM construction
+        // Deterministic Madej/Lam MLE/LR TNM construction
         // ---------------------------------------------------------------------
         //
-        // This is the deterministic, externally optimizable LO fit.
-        //
-        // Critical rule:
-        //   Rank-1 scores are never used to fit/select the null.
-        //
-        // Instead, estimate one parent rank-1 TNM from the selected lower-order
-        // rank buckets using the correct TEV-k likelihood for each bucket.
-        //
-        // This preserves:
-        //   one external null-rank window -> one deterministic LO model
-        //
-        // and avoids both:
-        //   - target contamination from rank-1 NLL fitting
-        //   - invalid ordinary-Gumbel pooling of k>=2 order statistics
+        // One external null-rank window produces one deterministic LO fit.
+        // Rank-1 scores are not used to fit the null. The final rank-1 TNM is
+        // chosen by fixed-cutoff calibration along the deterministic β(μ) path.
+
+        let mut lom_mle: Vec<(u32, f64, f64)> = Vec::new();
 
         for b in &buckets {
             match fit_tev_k_mle(&b.scores, b.k) {
                 Some((mu_k, beta_k)) if mu_k.is_finite() && beta_k.is_finite() && beta_k > 0.0 => {
                     let nll_k = nll_tev_k(mu_k, beta_k, &b.scores, b.k);
                     log::info!(
-                        "LO bucket MLE diagnostics charge={} rank={} n={} mu_k={:.6} beta_k={:.6} nll_k={:.4}",
+                        "LO LOM MLE diagnostics charge={} rank={} n={} mu_k={:.6} beta_k={:.6} nll_k={:.4}",
                         charge,
                         b.k,
                         b.scores.len(),
@@ -917,10 +925,11 @@ pub fn fit_decoy_free_model(
                         beta_k,
                         nll_k
                     );
+                    lom_mle.push((b.k, mu_k, beta_k));
                 }
                 _ => {
                     log::warn!(
-                        "LO bucket MLE diagnostics charge={} rank={} n={} fit_failed",
+                        "LO LOM MLE diagnostics charge={} rank={} n={} fit_failed",
                         charge,
                         b.k,
                         b.scores.len()
@@ -929,29 +938,60 @@ pub fn fit_decoy_free_model(
             }
         }
 
-        let Some((mu_final, beta_final, joint_nll)) = fit_pooled_lower_order_joint_mle(&buckets)
-        else {
+        if lom_mle.len() < LO_MIN_LOM_RANKS {
             log::warn!(
-                "LO deterministic joint MLE charge {charge}: pooled lower-order fit failed across {} buckets",
-                buckets.len()
+                "LO deterministic MLE/LR charge {charge}: insufficient supported LOM ranks: have={} need={}",
+                lom_mle.len(),
+                LO_MIN_LOM_RANKS
+            );
+            continue;
+        }
+
+        let Some((slope, intercept, r)) = ols_beta_on_mu_all_supported_ranks(&lom_mle) else {
+            log::warn!(
+                "LO deterministic MLE/LR charge {charge}: failed β(μ) regression across {} LOM ranks",
+                lom_mle.len()
             );
             continue;
         };
 
-        let bucket_summary = buckets
+        let cutoff = 0.18_f64;
+        let target_cutoff_p = (1000.0_f64 * (-cutoff / 0.02_f64).exp()).clamp(1e-300, 1.0);
+
+        let Some((mu_final, beta_final, cutoff_p, cutoff_error)) =
+            scan_mu_for_fixed_cutoff(slope, intercept, cutoff, target_cutoff_p)
+        else {
+            log::warn!(
+                "LO deterministic MLE/LR charge {charge}: fixed-cutoff TNM scan failed | slope={:.6} intercept={:.6} r={:.4} scan=[{:.4},{:.4}]",
+                slope,
+                intercept,
+                r,
+                LO_TNM_MU_MIN,
+                LO_TNM_MU_MAX
+            );
+            continue;
+        };
+
+        let rank_summary = lom_mle
             .iter()
-            .map(|b| format!("{}:{}", b.k, b.scores.len()))
+            .map(|(k, mu, beta)| format!("{}:{:.5}/{:.5}", k, mu, beta))
             .collect::<Vec<_>>()
             .join(",");
 
         log::info!(
-            "LO deterministic joint MLE charge={} mu={:.6} beta={:.6} joint_nll={:.4} buckets={} bucket_sizes=[{}]",
+            "LO deterministic MLE/LR charge={} mu={:.6} beta={:.6} slope={:.6} intercept={:.6} r={:.4} cutoff={:.4} cutoff_p={:.6e} target_cutoff_p={:.6e} cutoff_error={:.6} lom_ranks={} loms=[{}]",
             charge,
             mu_final,
             beta_final,
-            joint_nll,
-            buckets.len(),
-            bucket_summary
+            slope,
+            intercept,
+            r,
+            cutoff,
+            cutoff_p,
+            target_cutoff_p,
+            cutoff_error,
+            lom_mle.len(),
+            rank_summary
         );
 
         params_by_charge.insert(charge, (mu_final, beta_final));
