@@ -2291,20 +2291,28 @@ fn score_base_rank1(
             let p_lo = if let (Some(ref m), Some(ref tev_map)) = (&lo_model, &lo_tev_by_key) {
                 let bid = lo_bucket_id(settings, psm.core.charge);
 
-                let Some(&x_eval) = tev_map.get(&(
+                match tev_map.get(&(
                     psm.core.rank,
                     psm.core.charge,
                     psm.core.file_id,
                     psm.core.spec_id.clone(),
-                )) else {
-                    return None;
-                };
-
-                let p = m.p_value(x_eval, bid);
-                if p.is_finite() {
-                    p.clamp(0.0, 1.0).max(1e-300)
-                } else {
-                    return None;
+                )) {
+                    Some(&x_eval) => {
+                        let p = m.p_value(x_eval, bid);
+                        if p.is_finite() {
+                            p.clamp(0.0, 1.0).max(1e-300)
+                        } else {
+                            // Fail closed for malformed LO evaluation, but keep the PSM.
+                            1.0
+                        }
+                    }
+                    None => {
+                        // Scratch LO TEV is not guaranteed for every rank-1 row because
+                        // some spectra may lack enough lower-ranked candidates to fit a
+                        // local hyperscore null. Missing LO evidence must fail closed, not
+                        // remove the row from base DF finalization.
+                        1.0
+                    }
                 }
             } else {
                 1.0
