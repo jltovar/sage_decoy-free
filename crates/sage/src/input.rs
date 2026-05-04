@@ -113,6 +113,14 @@ pub enum LoStratify {
     Charge,
 }
 
+#[derive(Clone, Serialize, Deserialize, Debug, Default, PartialEq, Eq)]
+#[serde(rename_all = "snake_case")]
+pub enum LoTailCalibration {
+    #[default]
+    Gumbel,
+    Empirical,
+}
+
 /// How Nokoi defines the "positive" class in DF mode.
 ///
 /// - or:      top-slice OR provisional p-threshold  (current behavior)
@@ -444,6 +452,11 @@ pub struct FdrOptions {
     // supported lower-order ranks -> MLE LOMs -> one β(μ) trend -> fixed μ scan.
     pub lo_stratify: Option<LoStratify>,
 
+    // LowerOrder hyperscore-tail calibration used to construct TEV.
+    // gumbel:    fitted Gumbel survival from lower-rank hyperscores.
+    // empirical: empirical survival from sorted lower-rank hyperscores.
+    pub lo_tail_calibration: Option<LoTailCalibration>,
+
     // LowerOrder TEV e-value calibration.
     // TEV is computed as:
     //   e_value = p_tail * observed_candidate_count.powf(lo_evalue_candidate_count_power) * lo_evalue_scale
@@ -642,6 +655,8 @@ pub struct FdrSettings {
     pub lo_min_count_per_rank: usize,
 
     pub lo_stratify: LoStratify,
+
+    pub lo_tail_calibration: LoTailCalibration,
 
     pub lo_evalue_candidate_count_power: f64,
     pub lo_evalue_scale: f64,
@@ -990,6 +1005,10 @@ impl From<FdrOptions> for FdrSettings {
         let lo_min_count_per_rank = options.lo_min_count_per_rank.unwrap_or(10).max(1);
         let lo_stratify = options.lo_stratify.unwrap_or(LoStratify::Charge);
 
+        let lo_tail_calibration = options
+            .lo_tail_calibration
+            .unwrap_or(LoTailCalibration::Gumbel);
+
         let lo_evalue_candidate_count_power = options
             .lo_evalue_candidate_count_power
             .unwrap_or(0.75)
@@ -1255,6 +1274,8 @@ impl From<FdrOptions> for FdrSettings {
             lo_min_count_per_rank,
 
             lo_stratify,
+
+            lo_tail_calibration,
 
             lo_evalue_candidate_count_power,
             lo_evalue_scale,

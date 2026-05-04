@@ -126,11 +126,11 @@ Never rely on an implicit or ambiguous “score” definition.
 ============================================================================= */
 
 use crate::database::IndexedDatabase;
-use crate::input::LoStratify;
 use crate::input::{
     BoundedAuxUpdateSpace, DartNullRtModel, DartTrueRtModel, EnsemblePepCombiner, FdrSettings,
     FinalEvidenceSpace, JointMode, ModelFit, PeptidePCombine, PhysicalAnchorMode, QMethod,
 };
+use crate::input::{LoStratify, LoTailCalibration};
 use crate::lfq::{Peak, PrecursorId};
 use crate::ml::lower_order::{
     fit_decoy_free_model, fit_gumbel_mle, fit_gumbel_moments, LowerOrderModel,
@@ -603,6 +603,22 @@ fn gumbel_max_survival(score: f64, mu: f64, beta: f64) -> Option<f64> {
     p.is_finite().then_some(p)
 }
 
+fn empirical_survival_from_sorted_asc(sorted_scores: &[f64], score: f64) -> Option<f64> {
+    if sorted_scores.len() < 10 || !score.is_finite() {
+        return None;
+    }
+
+    let n = sorted_scores.len();
+
+    // sorted ascending. First index whose value is >= observed score.
+    let idx = sorted_scores.partition_point(|&x| x < score);
+    let count_ge = n.saturating_sub(idx) as f64;
+
+    let p = ((count_ge + 1.0) / ((n as f64) + 1.0)).clamp(1e-300, 1.0);
+
+    p.is_finite().then_some(p)
+}
+
 fn observed_candidate_counts_by_spectrum(
     features: &[DfFeature],
 ) -> FnvHashMap<(usize, String), usize> {
@@ -623,6 +639,12 @@ fn observed_candidate_counts_by_spectrum(
     }
 
     n_by_spec
+}
+
+#[derive(Clone, Debug)]
+struct LoHyperscoreTailBucket {
+    sorted_scores_asc: Vec<f64>,
+    gumbel_params: Option<(f64, f64)>,
 }
 
 fn build_lo_tev_from_global_hyperscore_evalue(
@@ -655,42 +677,79 @@ fn build_lo_tev_from_global_hyperscore_evalue(
         null_scores_by_bucket.entry(bid).or_default().push(x);
     }
 
-    let mut params_by_bucket: FnvHashMap<u8, (f64, f64)> = FnvHashMap::default();
+    let mut tail_by_bucket: FnvHashMap<u8, LoHyperscoreTailBucket> = FnvHashMap::default();
 
     for (&bid, scores) in &null_scores_by_bucket {
         if scores.len() < settings.min_null_size {
             log::warn!(
-                "LO global-hyperscore TEV: bucket={} lower-rank null too small: n={} < min_null_size={}",
-                bid,
-                scores.len(),
-                settings.min_null_size
-            );
+            "LO global-hyperscore TEV: bucket={} lower-rank null too small: n={} < min_null_size={}",
+            bid,
+            scores.len(),
+            settings.min_null_size
+        );
             continue;
         }
 
-        match fit_gumbel_mle(scores) {
+        let mut sorted_scores_asc: Vec<f64> =
+            scores.iter().copied().filter(|x| x.is_finite()).collect();
+
+        if sorted_scores_asc.len() < settings.min_null_size {
+            log::warn!(
+            "LO global-hyperscore TEV: bucket={} finite lower-rank null too small: n={} < min_null_size={}",
+            bid,
+            sorted_scores_asc.len(),
+            settings.min_null_size
+        );
+            continue;
+        }
+
+        sorted_scores_asc.sort_by(|a, b| a.total_cmp(b));
+
+        let gumbel_params = match fit_gumbel_mle(&sorted_scores_asc) {
             Some((mu, beta)) if mu.is_finite() && beta.is_finite() && beta > 0.0 => {
                 log::info!(
-                    "LO global-hyperscore TEV: bucket={} null_mu={:.6} null_beta={:.6} n={}",
-                    bid,
-                    mu,
-                    beta,
-                    scores.len()
-                );
-                params_by_bucket.insert(bid, (mu, beta));
+                "LO global-hyperscore TEV: bucket={} tail=gumbel null_mu={:.6} null_beta={:.6} n={}",
+                bid,
+                mu,
+                beta,
+                sorted_scores_asc.len()
+            );
+                Some((mu, beta))
             }
             _ => {
                 log::warn!(
-                    "LO global-hyperscore TEV: bucket={} hyperscore null fit failed n={}",
+                    "LO global-hyperscore TEV: bucket={} Gumbel hyperscore null fit failed n={}",
                     bid,
-                    scores.len()
+                    sorted_scores_asc.len()
                 );
+                None
             }
+        };
+
+        if matches!(settings.lo_tail_calibration, LoTailCalibration::Gumbel)
+            && gumbel_params.is_none()
+        {
+            continue;
         }
+
+        log::info!(
+            "LO global-hyperscore TEV: bucket={} tail_mode={:?} empirical_null_n={}",
+            bid,
+            settings.lo_tail_calibration,
+            sorted_scores_asc.len()
+        );
+
+        tail_by_bucket.insert(
+            bid,
+            LoHyperscoreTailBucket {
+                sorted_scores_asc,
+                gumbel_params,
+            },
+        );
     }
 
-    if params_by_bucket.is_empty() {
-        log::warn!("LO global-hyperscore TEV: no usable lower-rank hyperscore null buckets.");
+    if tail_by_bucket.is_empty() {
+        log::warn!("LO global-hyperscore TEV: no usable lower-rank hyperscore tail buckets.");
         return LoTevByKey {
             by_key,
             valid,
@@ -711,7 +770,7 @@ fn build_lo_tev_from_global_hyperscore_evalue(
 
         let bid = lo_bucket_id(settings, f.core.charge);
 
-        let Some((mu, beta)) = params_by_bucket.get(&bid).copied() else {
+        let Some(tail_bucket) = tail_by_bucket.get(&bid) else {
             invalid += 1;
             continue;
         };
@@ -722,9 +781,31 @@ fn build_lo_tev_from_global_hyperscore_evalue(
             .unwrap_or(0)
             .max(1) as f64;
 
-        let Some(p_tail) = gumbel_max_survival(score, mu, beta) else {
-            invalid += 1;
-            continue;
+        let p_tail = match settings.lo_tail_calibration {
+            LoTailCalibration::Gumbel => {
+                let Some((mu, beta)) = tail_bucket.gumbel_params else {
+                    invalid += 1;
+                    continue;
+                };
+
+                let Some(p) = gumbel_max_survival(score, mu, beta) else {
+                    invalid += 1;
+                    continue;
+                };
+
+                p
+            }
+
+            LoTailCalibration::Empirical => {
+                let Some(p) =
+                    empirical_survival_from_sorted_asc(&tail_bucket.sorted_scores_asc, score)
+                else {
+                    invalid += 1;
+                    continue;
+                };
+
+                p
+            }
         };
 
         let effective_n = n_candidates
@@ -1939,9 +2020,10 @@ fn fit_engines(
         lo_tev_by_key = Some(Arc::new(lo_tev_map.by_key.clone()));
 
         log::info!(
-        	"LO global-hyperscore TEV diagnostics: valid={} invalid={} source=global_lower_rank_hyperscore_evalue no_spectrum_p_value n_power={:.3} e_scale={:.3}",
+    		"LO global-hyperscore TEV diagnostics: valid={} invalid={} source=global_lower_rank_hyperscore_evalue tail={:?} no_spectrum_p_value n_power={:.3} e_scale={:.3}",
     		lo_tev_map.valid,
     		lo_tev_map.invalid,
+    		settings.lo_tail_calibration,
     		settings.lo_evalue_candidate_count_power,
     		settings.lo_evalue_scale
 		);
