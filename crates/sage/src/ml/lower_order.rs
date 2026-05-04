@@ -617,8 +617,8 @@ fn finite_quantiles(xs: &[f64]) -> Option<(f64, f64, f64, f64, f64, f64, f64)> {
 }
 
 const LO_MIN_LOM_RANKS: usize = 2;
-const LO_TNM_MU_MIN: f64 = -0.20;
-const LO_TNM_MU_MAX: f64 = 1.00;
+const LO_TNM_MU_MIN: f64 = -10.0;
+const LO_TNM_MU_MAX: f64 = 20.0;
 
 #[inline]
 fn ols_beta_on_mu_all_supported_ranks(loms: &[(u32, f64, f64)]) -> Option<(f64, f64, f64)> {
@@ -955,8 +955,8 @@ pub fn fit_decoy_free_model(
             continue;
         };
 
-        let cutoff = 0.18_f64;
-        let target_cutoff_p = (1000.0_f64 * (-cutoff / 0.02_f64).exp()).clamp(1e-300, 1.0);
+        let cutoff = 2.0_f64;
+        let target_cutoff_p = (-cutoff).exp().clamp(1e-300, 1.0);
 
         let Some((mu_final, beta_final, cutoff_p, cutoff_error)) =
             scan_mu_for_fixed_cutoff(slope, intercept, cutoff, target_cutoff_p)

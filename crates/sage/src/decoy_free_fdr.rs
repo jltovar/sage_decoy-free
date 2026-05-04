@@ -549,9 +549,10 @@ fn df_q_value(psm: &DfFeature) -> f32 {
 //
 //       local p_tail = P(local spectrum null >= observed hyperscore)
 //       E            = local p_tail * scored_candidate_count_for_spectrum
-//       LO TEV       = 0.02 * ln(1000 / E)
+//       LO score     = -ln(E)
 //
-//   This is the Tide/Comet-like spectrum-local E-value object LO expects.
+//   This is the Tide/Comet-like spectrum-local E-value evidence object consumed
+//   by the LowerOrder order-statistic model.
 #[inline(always)]
 fn tev(f: &DfFeature) -> Option<f64> {
     let x = f.core.hyperscore as f64;
@@ -587,7 +588,7 @@ fn madej_lam_scaled_tev_from_e_value(e_value: f64) -> Option<f64> {
     }
 
     let e = e_value.clamp(1e-300, 1e300);
-    let tev = 0.02 * (1000.0_f64.ln() - e.ln());
+    let tev = -e.ln();
 
     tev.is_finite().then_some(tev)
 }
