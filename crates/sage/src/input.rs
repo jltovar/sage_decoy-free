@@ -444,6 +444,13 @@ pub struct FdrOptions {
     // supported lower-order ranks -> MLE LOMs -> one β(μ) trend -> fixed μ scan.
     pub lo_stratify: Option<LoStratify>,
 
+    // LowerOrder TEV e-value calibration.
+    // TEV is computed as:
+    //   e_value = p_tail * observed_candidate_count.powf(lo_evalue_candidate_count_power) * lo_evalue_scale
+    //   TEV     = 0.02 * ln(1000 / e_value)
+    pub lo_evalue_candidate_count_power: Option<f64>,
+    pub lo_evalue_scale: Option<f64>,
+
     // =========================================================================
     // E) MSFDR specific knobs
     // =========================================================================
@@ -635,6 +642,9 @@ pub struct FdrSettings {
     pub lo_min_count_per_rank: usize,
 
     pub lo_stratify: LoStratify,
+
+    pub lo_evalue_candidate_count_power: f64,
+    pub lo_evalue_scale: f64,
 
     // =========================================================================
     // E) MSFDR specific resolved null window + knobs
@@ -980,6 +990,13 @@ impl From<FdrOptions> for FdrSettings {
         let lo_min_count_per_rank = options.lo_min_count_per_rank.unwrap_or(10).max(1);
         let lo_stratify = options.lo_stratify.unwrap_or(LoStratify::Charge);
 
+        let lo_evalue_candidate_count_power = options
+            .lo_evalue_candidate_count_power
+            .unwrap_or(0.75)
+            .clamp(0.0, 1.0);
+
+        let lo_evalue_scale = options.lo_evalue_scale.unwrap_or(1.0).clamp(1e-6, 1e6);
+
         // ---------------------------------------------------------------------
         // E) MSFDR specific resolved null window + knobs
         // ---------------------------------------------------------------------
@@ -1238,6 +1255,9 @@ impl From<FdrOptions> for FdrSettings {
             lo_min_count_per_rank,
 
             lo_stratify,
+
+            lo_evalue_candidate_count_power,
+            lo_evalue_scale,
 
             // =========================================================================
             // E) MSFDR specific resolved null window + knobs

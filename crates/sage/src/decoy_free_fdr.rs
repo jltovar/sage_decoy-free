@@ -727,7 +727,12 @@ fn build_lo_tev_from_global_hyperscore_evalue(
             continue;
         };
 
-        let e_value = (p_tail * n_candidates).clamp(1e-300, 1e300);
+        let effective_n = n_candidates
+            .max(1.0)
+            .powf(settings.lo_evalue_candidate_count_power)
+            .max(1.0);
+
+        let e_value = (p_tail * effective_n * settings.lo_evalue_scale).clamp(1e-300, 1e300);
 
         let Some(x_lo) = madej_lam_scaled_tev_from_e_value(e_value) else {
             invalid += 1;
@@ -1934,10 +1939,12 @@ fn fit_engines(
         lo_tev_by_key = Some(Arc::new(lo_tev_map.by_key.clone()));
 
         log::info!(
-    "LO global-hyperscore TEV diagnostics: valid={} invalid={} source=global_lower_rank_hyperscore_evalue",
-    lo_tev_map.valid,
-    lo_tev_map.invalid
-);
+        	"LO global-hyperscore TEV diagnostics: valid={} invalid={} source=global_lower_rank_hyperscore_evalue no_spectrum_p_value n_power={:.3} e_scale={:.3}",
+    		lo_tev_map.valid,
+    		lo_tev_map.invalid,
+    		settings.lo_evalue_candidate_count_power,
+    		settings.lo_evalue_scale
+		);
 
         let mut rank1_scores_by_charge: Vec<(f64, u8)> =
             Vec::with_capacity(work.rank1_indices.len());
