@@ -590,12 +590,6 @@ impl LowerOrderModel {
 // - No pooled/global fallback TNM is used. Missing charges return p=1.0 unless
 //   covered by explicit charge-sharing rules.
 
-const LO_MIN_LOM_RANKS: usize = 5;
-// Diagnostic range. Use this to test whether scratch Sage TEV lands outside
-// the Madej/Lam paper-style 0.05..0.40 range.
-const LO_TNM_MU_MIN: f64 = -0.20;
-const LO_TNM_MU_MAX: f64 = 1.00;
-
 #[inline]
 fn finite_quantiles(xs: &[f64]) -> Option<(f64, f64, f64, f64, f64, f64, f64)> {
     let mut v: Vec<f64> = xs.iter().copied().filter(|x| x.is_finite()).collect();
@@ -622,111 +616,127 @@ fn finite_quantiles(xs: &[f64]) -> Option<(f64, f64, f64, f64, f64, f64, f64)> {
 }
 
 #[inline]
-fn ols_beta_on_mu_all_supported_ranks(loms: &[(u32, f64, f64)]) -> Option<(f64, f64, f64)> {
-    let mut rows: Vec<(u32, f64, f64)> = loms
+fn pooled_lower_order_nll(mu: f64, beta: f64, buckets: &[RankBucket]) -> f64 {
+    if !mu.is_finite() || !beta.is_finite() || beta <= 0.0 {
+        return f64::INFINITY;
+    }
+
+    let mut total = 0.0f64;
+
+    for b in buckets {
+        let nll = nll_tev_k(mu, beta, &b.scores, b.k);
+        if !nll.is_finite() {
+            return f64::INFINITY;
+        }
+        total += nll;
+    }
+
+    total
+}
+
+fn fit_pooled_lower_order_joint_mle(buckets: &[RankBucket]) -> Option<(f64, f64, f64)> {
+    if buckets.len() < 2 {
+        return None;
+    }
+
+    let mut starts: Vec<(f64, f64)> = Vec::new();
+
+    for b in buckets {
+        if let Some((mu, beta)) = fit_tev_k_mle(&b.scores, b.k) {
+            if mu.is_finite() && beta.is_finite() && beta > 0.0 {
+                starts.push((mu, beta));
+            }
+        }
+    }
+
+    if starts.is_empty() {
+        return None;
+    }
+
+    starts.sort_by(|a, b| a.0.total_cmp(&b.0));
+
+    let mid = starts.len() / 2;
+    let mu0 = starts[mid].0;
+
+    let mut betas: Vec<f64> = starts
         .iter()
-        .copied()
-        .filter(|(_, mu, beta)| mu.is_finite() && beta.is_finite() && *beta > 0.0)
+        .map(|(_, beta)| *beta)
+        .filter(|b| b.is_finite() && *b > 0.0)
         .collect();
 
-    rows.sort_by_key(|(k, _, _)| *k);
+    betas.sort_by(|a, b| a.total_cmp(b));
+    let beta0 = betas[betas.len() / 2];
 
-    if rows.len() < LO_MIN_LOM_RANKS {
+    let mut best_mu = mu0;
+    let mut best_log_beta = beta0.ln();
+    let mut best_nll = pooled_lower_order_nll(best_mu, best_log_beta.exp(), buckets);
+
+    if !best_nll.is_finite() {
         return None;
     }
 
-    let n = rows.len() as f64;
-    let mean_mu = rows.iter().map(|(_, mu, _)| *mu).sum::<f64>() / n;
-    let mean_beta = rows.iter().map(|(_, _, beta)| *beta).sum::<f64>() / n;
+    let mut step_mu = 0.10f64;
+    let mut step_log_beta = 0.20f64;
 
-    let mut sxy = 0.0f64;
-    let mut sxx = 0.0f64;
-    let mut syy = 0.0f64;
+    for _ in 0..80 {
+        let mut improved = false;
 
-    for &(_, mu, beta) in &rows {
-        let dx = mu - mean_mu;
-        let dy = beta - mean_beta;
-        sxy += dx * dy;
-        sxx += dx * dx;
-        syy += dy * dy;
+        let candidates = [
+            (best_mu - step_mu, best_log_beta),
+            (best_mu + step_mu, best_log_beta),
+            (best_mu, best_log_beta - step_log_beta),
+            (best_mu, best_log_beta + step_log_beta),
+            (best_mu - step_mu, best_log_beta - step_log_beta),
+            (best_mu - step_mu, best_log_beta + step_log_beta),
+            (best_mu + step_mu, best_log_beta - step_log_beta),
+            (best_mu + step_mu, best_log_beta + step_log_beta),
+        ];
+
+        for (mu, log_beta) in candidates {
+            let beta = log_beta.exp();
+
+            if !mu.is_finite() || !beta.is_finite() || beta <= 0.0 {
+                continue;
+            }
+
+            let nll = pooled_lower_order_nll(mu, beta, buckets);
+
+            if nll.is_finite() && nll < best_nll {
+                best_mu = mu;
+                best_log_beta = log_beta;
+                best_nll = nll;
+                improved = true;
+            }
+        }
+
+        if !improved {
+            step_mu *= 0.5;
+            step_log_beta *= 0.5;
+
+            if step_mu < 1e-6 && step_log_beta < 1e-6 {
+                break;
+            }
+        }
     }
 
-    if !sxx.is_finite() || !syy.is_finite() || sxx <= 0.0 || syy <= 0.0 {
-        return None;
-    }
+    let beta = best_log_beta.exp();
 
-    let slope = sxy / sxx;
-    let intercept = mean_beta - slope * mean_mu;
-    let r = sxy / (sxx.sqrt() * syy.sqrt());
-
-    if slope.is_finite() && intercept.is_finite() && r.is_finite() {
-        Some((slope, intercept, r))
+    if best_mu.is_finite() && beta.is_finite() && beta > 0.0 && best_nll.is_finite() {
+        Some((best_mu, beta, best_nll))
     } else {
         None
     }
 }
 
-#[inline]
-fn scan_mu_on_fixed_mle_lr_tnm(
-    rank1_scores: &[f64],
-    slope: f64,
-    intercept: f64,
-) -> Option<(f64, f64, f64)> {
-    if rank1_scores.len() < 10 {
-        return None;
-    }
-
-    if !slope.is_finite() || !intercept.is_finite() {
-        return None;
-    }
-
-    let rank1_scores: Vec<f64> = rank1_scores
-        .iter()
-        .copied()
-        .filter(|x| x.is_finite())
-        .collect();
-
-    if rank1_scores.len() < 10 {
-        return None;
-    }
-
-    const N_GRID: usize = 351;
-    let step = (LO_TNM_MU_MAX - LO_TNM_MU_MIN) / ((N_GRID - 1) as f64);
-
-    let mut best: Option<(f64, f64, f64)> = None;
-
-    for i in 0..N_GRID {
-        let mu = LO_TNM_MU_MIN + (i as f64) * step;
-        let beta = slope * mu + intercept;
-
-        if !mu.is_finite() || !beta.is_finite() || beta <= 0.0 {
-            continue;
-        }
-
-        let nll = nll_tev_k(mu, beta, &rank1_scores, 1);
-        if !nll.is_finite() {
-            continue;
-        }
-
-        match best {
-            None => best = Some((mu, beta, nll)),
-            Some((_, _, best_nll)) if nll < best_nll => best = Some((mu, beta, nll)),
-            _ => {}
-        }
-    }
-
-    best
-}
-
 /// Fits a charge-stratified Lower Order Model.
 ///
 /// Production LO path:
-/// - Uses rank-specific MLE LOMs only.
-/// - Uses every supported selected rank in the configured window.
-/// - Fits one β(μ) trend across all supported MLE LOMs.
-/// - Scans μ over the Madej/Lam scaled TEV range 0.05..0.40.
-/// - Selects the TNM along that single deterministic path by rank-1 TEV NLL.
+/// - Uses every supported selected lower-order rank in the configured window.
+/// - Fits one parent rank-1 TNM by joint MLE over the lower-order TEV-k
+///   likelihoods.
+/// - Never uses rank-1 scores to fit or select the null.
 /// - Does not perform PyLord-style autonomous candidate selection.
+/// - Preserves one external null-rank window -> one deterministic LO model.
 ///
 /// Fail-closed by default, with explicit charge-sharing rules for selected
 /// missing-charge cases.
@@ -876,128 +886,73 @@ pub fn fit_decoy_free_model(
         }
 
         // ---------------------------------------------------------------------
-        // Deterministic Madej/Lam MLE/LR TNM construction
+        // Deterministic lower-order joint MLE TNM construction
         // ---------------------------------------------------------------------
         //
-        // This intentionally removes PyLord-style autonomous selection.
-        // For each charge:
-        //   1. Fit MLE LOMs for every supported selected lower-order rank.
-        //   2. Fit one β(μ) linear trend across all supported MLE LOM ranks.
-        //   3. Scan μ over the fixed Madej/Lam scaled TEV range.
-        //   4. Select μ only along that one deterministic MLE/LR path.
-
-        let ts_all = match top_scores.get(&charge) {
-            Some(v) if v.len() >= lo_min_count_per_rank => v,
-            _ => continue,
-        };
-
-        let mut lom_mle: Vec<(u32, f64, f64)> = Vec::new();
+        // This is the deterministic, externally optimizable LO fit.
+        //
+        // Critical rule:
+        //   Rank-1 scores are never used to fit/select the null.
+        //
+        // Instead, estimate one parent rank-1 TNM from the selected lower-order
+        // rank buckets using the correct TEV-k likelihood for each bucket.
+        //
+        // This preserves:
+        //   one external null-rank window -> one deterministic LO model
+        //
+        // and avoids both:
+        //   - target contamination from rank-1 NLL fitting
+        //   - invalid ordinary-Gumbel pooling of k>=2 order statistics
 
         for b in &buckets {
-            let k = b.k;
-
-            match fit_tev_k_mle(&b.scores, k) {
+            match fit_tev_k_mle(&b.scores, b.k) {
                 Some((mu_k, beta_k)) if mu_k.is_finite() && beta_k.is_finite() && beta_k > 0.0 => {
-                    let nll_k = nll_tev_k(mu_k, beta_k, &b.scores, k);
+                    let nll_k = nll_tev_k(mu_k, beta_k, &b.scores, b.k);
                     log::info!(
-                "LO LOM MLE diagnostics charge={} rank={} n={} mu_k={:.6} beta_k={:.6} nll_k={:.4}",
-                charge,
-                k,
-                b.scores.len(),
-                mu_k,
-                beta_k,
-                nll_k
-            );
-                    lom_mle.push((k, mu_k, beta_k));
+                        "LO bucket MLE diagnostics charge={} rank={} n={} mu_k={:.6} beta_k={:.6} nll_k={:.4}",
+                        charge,
+                        b.k,
+                        b.scores.len(),
+                        mu_k,
+                        beta_k,
+                        nll_k
+                    );
                 }
                 _ => {
                     log::warn!(
-                        "LO LOM MLE diagnostics charge={} rank={} n={} fit_failed",
+                        "LO bucket MLE diagnostics charge={} rank={} n={} fit_failed",
                         charge,
-                        k,
+                        b.k,
                         b.scores.len()
                     );
                 }
             }
         }
 
-        if lom_mle.len() < LO_MIN_LOM_RANKS {
-            log::warn!(
-        "LO deterministic MLE/LR charge {charge}: insufficient supported LOM ranks: have={} need={}",
-        lom_mle.len(),
-        LO_MIN_LOM_RANKS
-    );
-            continue;
-        }
-
-        let Some((slope, intercept, r)) = ols_beta_on_mu_all_supported_ranks(&lom_mle) else {
-            log::warn!(
-        "LO deterministic MLE/LR charge {charge}: failed β(μ) regression across {} LOM ranks",
-        lom_mle.len()
-    );
-            continue;
-        };
-
-        if let Some((q0, q1, q10, q50, q90, q99, q100)) = finite_quantiles(ts_all) {
-            log::info!(
-        "LO rank1 diagnostics charge={} n={} tev_q=[{:.5},{:.5},{:.5},{:.5},{:.5},{:.5},{:.5}]",
-        charge,
-        ts_all.len(),
-        q0,
-        q1,
-        q10,
-        q50,
-        q90,
-        q99,
-        q100
-    );
-        }
-
-        log::info!(
-    "LO LR diagnostics charge={} lom_ranks={} slope={:.6} intercept={:.6} r={:.4} mu_scan=[{:.4},{:.4}]",
-    charge,
-    lom_mle.len(),
-    slope,
-    intercept,
-    r,
-    LO_TNM_MU_MIN,
-    LO_TNM_MU_MAX
-);
-
-        let Some((mu_final, beta_final, nll)) =
-            scan_mu_on_fixed_mle_lr_tnm(ts_all, slope, intercept)
+        let Some((mu_final, beta_final, joint_nll)) = fit_pooled_lower_order_joint_mle(&buckets)
         else {
             log::warn!(
-        "LO deterministic MLE/LR charge {charge}: μ scan failed | slope={:.6} intercept={:.6} r={:.4} scan=[{:.4},{:.4}]",
-        slope,
-        intercept,
-        r,
-        LO_TNM_MU_MIN,
-        LO_TNM_MU_MAX
-    );
+                "LO deterministic joint MLE charge {charge}: pooled lower-order fit failed across {} buckets",
+                buckets.len()
+            );
             continue;
         };
 
-        let rank_summary = lom_mle
+        let bucket_summary = buckets
             .iter()
-            .map(|(k, mu, beta)| format!("{}:{:.5}/{:.5}", k, mu, beta))
+            .map(|b| format!("{}:{}", b.k, b.scores.len()))
             .collect::<Vec<_>>()
             .join(",");
 
         log::info!(
-    "LO deterministic MLE/LR charge {charge}: mu={:.6} beta={:.6} rank1_nll={:.4} lom_ranks={} slope={:.6} intercept={:.6} r={:.4} scan=[{:.4},{:.4}] rank1_n={} loms=[{}]",
-    mu_final,
-    beta_final,
-    nll,
-    lom_mle.len(),
-    slope,
-    intercept,
-    r,
-    LO_TNM_MU_MIN,
-    LO_TNM_MU_MAX,
-    ts_all.len(),
-    rank_summary
-);
+            "LO deterministic joint MLE charge={} mu={:.6} beta={:.6} joint_nll={:.4} buckets={} bucket_sizes=[{}]",
+            charge,
+            mu_final,
+            beta_final,
+            joint_nll,
+            buckets.len(),
+            bucket_summary
+        );
 
         params_by_charge.insert(charge, (mu_final, beta_final));
     }
