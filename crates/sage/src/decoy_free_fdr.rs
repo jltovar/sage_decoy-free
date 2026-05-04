@@ -540,39 +540,19 @@ fn df_q_value(psm: &DfFeature) -> f32 {
 // -----------------------------------------------------------------------------
 //
 // IMPORTANT:
-// - `tev(...)` below remains the raw hyperscore accessor used by the existing
-//   non-LO DF code paths (Moments / MLE / MSFDR / sorting that already expect
-//   raw hyperscore semantics).
-// - `lo_tev(...)` is the LowerOrder TEV accessor and is what LO uses for both
-//   fit-time and eval-time.
+// - `tev(...)` remains the raw hyperscore accessor used by the existing non-LO
+//   DF code paths.
+// - LowerOrder must not use `spectrum_p_value`.
+// - LowerOrder TEV is computed from scratch below by fitting a local Gumbel
+//   null to lower-ranked raw hyperscores within each spectrum/query, then
+//   converting the fitted rank-specific tail probability into a Madej/Lam
+//   scaled transformed e-value:
 //
-// Madej/Lam TEV score:
-//   LowerOrder is defined on transformed e-values:
+//       e_value = p_tail * n_candidates
+//       TEV     = 0.02 * ln(1000 / e_value)
 //
-//       TEV = 0.02 * ln(1000 / e_value)
-//
-//   where:
-//
-//       e_value = p_value * num_candidates
-//
-//   In Sage we use:
-//
-//       p_value        = spectrum_p_value
-//       num_candidates = scored_candidates
-//
-//   Therefore:
-//
-//       lo_tev = 0.02 * ln(1000 / (spectrum_p_value * scored_candidates))
-//
-//   This is affine-equivalent to -ln(e_value), so it preserves the same score
-//   ordering, but it also preserves the Madej/Lam numerical TEV scale. That
-//   matters because the deterministic LO TNM scan below uses the paper-style
-//   scaled TEV μ range.
-//
-// NOTE:
-// If your `DfFeature` field names differ, map the two lines below to the fields
-// that hold Sage's original `spectrum_p_value` and `scored_candidates`.
-//
+//   Here `p_tail` is computed from the local fitted hyperscore distribution,
+//   not read from `DfFeature.core.spectrum_p_value`.
 #[inline(always)]
 fn tev(f: &DfFeature) -> Option<f64> {
     let x = f.core.hyperscore as f64;
@@ -583,26 +563,135 @@ fn tev(f: &DfFeature) -> Option<f64> {
     }
 }
 
-#[inline(always)]
-fn lo_tev(f: &DfFeature) -> Option<f64> {
-    let p = f.core.spectrum_p_value as f64;
-    let n = f.core.scored_candidates as f64;
+#[derive(Clone, Debug)]
+struct LoTevByKey {
+    by_key: FnvHashMap<(u32, u8, usize, String), f64>,
+    valid: usize,
+    invalid: usize,
+}
 
-    if !p.is_finite() || !n.is_finite() || p <= 0.0 || n < 1.0 {
+#[inline(always)]
+fn madej_lam_scaled_tev_from_e_value(e_value: f64) -> Option<f64> {
+    if !e_value.is_finite() || e_value <= 0.0 {
         return None;
     }
 
-    let e_value = (p * n).clamp(1e-300, 1e300);
-
-    // Madej-Lam / PyLord scaled transformed e-value:
-    //
-    //     TEV = 0.02 * ln(1000 / e_value)
-    //
-    // Here p is Sage's local hyperscore-tail probability and n is the number
-    // of scored candidates for this spectrum/query.
-    let tev = 0.02 * (1000.0_f64.ln() - e_value.ln());
+    let e = e_value.clamp(1e-300, 1e300);
+    let tev = 0.02 * (1000.0_f64.ln() - e.ln());
 
     tev.is_finite().then_some(tev)
+}
+
+#[inline(always)]
+fn local_gumbel_tail_p_from_hyperscore(score: f64, mu: f64, beta: f64) -> Option<f64> {
+    if !score.is_finite() || !mu.is_finite() || !beta.is_finite() || beta <= 0.0 {
+        return None;
+    }
+
+    let z = (score - mu) / beta;
+    if !z.is_finite() {
+        return None;
+    }
+
+    // Standard Gumbel-max survival: p = 1 - exp(-exp(-z)).
+    let t = (-z).clamp(-745.0, 745.0).exp();
+    let cdf = (-t).clamp(-745.0, 745.0).exp();
+    let p = (1.0 - cdf).clamp(1e-300, 1.0);
+
+    p.is_finite().then_some(p)
+}
+
+fn build_lo_tev_from_local_hyperscore_fits(features: &[DfFeature]) -> LoTevByKey {
+    // Group all available candidate rows by spectrum/query.
+    let mut by_spec: FnvHashMap<(usize, String), Vec<&DfFeature>> = FnvHashMap::default();
+
+    for f in features {
+        if f.core.rank < 1 {
+            continue;
+        }
+
+        if tev(f).is_none() {
+            continue;
+        }
+
+        by_spec
+            .entry((f.core.file_id, f.core.spec_id.clone()))
+            .or_default()
+            .push(f);
+    }
+
+    let mut by_key: FnvHashMap<(u32, u8, usize, String), f64> = FnvHashMap::default();
+    let mut valid = 0usize;
+    let mut invalid = 0usize;
+
+    for ((_file_id, _spec_id), mut rows) in by_spec {
+        rows.sort_by_key(|f| f.core.rank);
+
+        // Fit the local null from non-top candidates only. This is the scratch
+        // replacement for using `spectrum_p_value`.
+        let lower_scores: Vec<f64> = rows
+            .iter()
+            .filter(|f| f.core.rank >= 2)
+            .filter_map(|f| tev(f))
+            .collect();
+
+        if lower_scores.len() < 5 {
+            invalid += rows.len();
+            continue;
+        }
+
+        let Some((mu, beta)) = fit_gumbel_mle(&lower_scores) else {
+            invalid += rows.len();
+            continue;
+        };
+
+        if !mu.is_finite() || !beta.is_finite() || beta <= 0.0 {
+            invalid += rows.len();
+            continue;
+        }
+
+        // Use the number of observed candidate rows in this query as the local
+        // candidate count. This avoids `spectrum_p_value` entirely. If later you
+        // decide `scored_candidates` is vanilla Sage and trustworthy, only this
+        // line should change.
+        let n_candidates = rows.len().max(1) as f64;
+
+        for f in rows {
+            let Some(score) = tev(f) else {
+                invalid += 1;
+                continue;
+            };
+
+            let Some(p_tail) = local_gumbel_tail_p_from_hyperscore(score, mu, beta) else {
+                invalid += 1;
+                continue;
+            };
+
+            let e_value = (p_tail * n_candidates).clamp(1e-300, 1e300);
+
+            let Some(x_lo) = madej_lam_scaled_tev_from_e_value(e_value) else {
+                invalid += 1;
+                continue;
+            };
+
+            by_key.insert(
+                (
+                    f.core.rank,
+                    f.core.charge,
+                    f.core.file_id,
+                    f.core.spec_id.clone(),
+                ),
+                x_lo,
+            );
+            valid += 1;
+        }
+    }
+
+    LoTevByKey {
+        by_key,
+        valid,
+        invalid,
+    }
 }
 
 // -----------------------------------------------------------------------------
@@ -1479,6 +1568,7 @@ struct Engines {
     mle_params: Option<(f64, f64)>,
 
     lo_model: Option<LowerOrderModel>,
+    lo_tev_by_key: Option<Arc<FnvHashMap<(u32, u8, usize, String), f64>>>,
 
     msfdr_seeded: Option<MsfdrSeededModel>,
     msfdr_1smix: Option<Msfdr1SmixModel>,
@@ -1776,13 +1866,30 @@ fn fit_engines(
 
     // 2) LO
     let mut lo_model = None;
+    let mut lo_tev_by_key: Option<Arc<FnvHashMap<(u32, u8, usize, String), f64>>> = None;
 
     if gates.run_lo {
+        let lo_tev_map = build_lo_tev_from_local_hyperscore_fits(features);
+
+        lo_tev_by_key = Some(Arc::new(lo_tev_map.by_key.clone()));
+
+        log::info!(
+    "LO scratch TEV diagnostics: valid={} invalid={} source=local_hyperscore_gumbel no_spectrum_p_value",
+    lo_tev_map.valid,
+    lo_tev_map.invalid
+);
+
         let mut rank1_scores_by_charge: Vec<(f64, u8)> =
             Vec::with_capacity(work.rank1_indices.len());
+
         for &i in &work.rank1_indices {
             let f = &features[i];
-            if let Some(x_lo) = lo_tev(f) {
+            if let Some(&x_lo) = lo_tev_map.by_key.get(&(
+                f.core.rank,
+                f.core.charge,
+                f.core.file_id,
+                f.core.spec_id.clone(),
+            )) {
                 let bid = lo_bucket_id(settings, f.core.charge);
                 rank1_scores_by_charge.push((x_lo, bid));
             }
@@ -1799,36 +1906,53 @@ fn fit_engines(
             settings.lower_order_max_null_rank,
             lo_raw.len(),
         ) {
-            // Build a direct lookup once, instead of scanning `features` for every pooled row.
-            let mut lo_tev_by_key: FnvHashMap<(u32, u8, usize, String), f64> =
-                FnvHashMap::default();
-
-            for f in features.iter() {
-                if let Some(x_lo) = lo_tev(f) {
-                    lo_tev_by_key.insert(
-                        (
-                            f.core.rank,
-                            f.core.charge,
-                            f.core.file_id,
-                            f.core.spec_id.clone(),
-                        ),
-                        x_lo,
-                    );
-                }
-            }
-
             let lo_fit_data: Vec<(u32, f64, u8)> = lo_raw
                 .into_iter()
                 .filter_map(|(k, _x_raw, charge, file_id, spec_id)| {
-                    let x_lo = lo_tev_by_key.get(&(k, charge, file_id, spec_id.clone()))?;
+                    let x_lo = lo_tev_map
+                        .by_key
+                        .get(&(k, charge, file_id, spec_id.clone()))?;
                     Some((k, *x_lo, lo_bucket_id(settings, charge)))
                 })
                 .collect();
 
-            // LowerOrder uses the Madej/Lam scaled TEV score from lo_tev().
-            // The selected rank window controls which lower-order ranks are fit.
-            // All supported selected ranks contribute to one deterministic MLE/LR TNM path.
-            // There is no autonomous PyLord-style rank/model/candidate selection.
+            if log::log_enabled!(log::Level::Info) {
+                let mut by_rank: FnvHashMap<u32, (usize, f64, f64)> = FnvHashMap::default();
+
+                for &(k, x, _) in &lo_fit_data {
+                    let entry =
+                        by_rank
+                            .entry(k)
+                            .or_insert((0usize, f64::INFINITY, f64::NEG_INFINITY));
+                    entry.0 += 1;
+                    entry.1 = entry.1.min(x);
+                    entry.2 = entry.2.max(x);
+                }
+
+                let mut ranks: Vec<u32> = by_rank.keys().copied().collect();
+                ranks.sort_unstable();
+
+                let summary = ranks
+                    .into_iter()
+                    .map(|k| {
+                        let (n, lo, hi) = by_rank.get(&k).copied().unwrap();
+                        format!("k{}:n{}:[{:.4},{:.4}]", k, n, lo, hi)
+                    })
+                    .collect::<Vec<_>>()
+                    .join(" ");
+
+                log::info!(
+            "LO TEV fit-data diagnostics: window=[{}..={}] rank1_rows={} fit_rows={} ranks={}",
+            settings.lower_order_min_null_rank,
+            settings.lower_order_max_null_rank,
+            rank1_scores_by_charge.len(),
+            lo_fit_data.len(),
+            summary
+        );
+            }
+
+            // LowerOrder uses scratch-computed Madej/Lam scaled TEV values.
+            // It does not read or depend on `spectrum_p_value`.
             let lo_min_count_per_rank = settings.lo_min_count_per_rank;
 
             lo_model = fit_decoy_free_model(
@@ -2017,6 +2141,7 @@ fn fit_engines(
         mom_params,
         mle_params,
         lo_model,
+        lo_tev_by_key,
         msfdr_seeded,
         msfdr_1smix,
         msfdr_2smix,
@@ -2126,6 +2251,7 @@ fn score_base_rank1(
     let mom_params = engines.mom_params;
     let mle_params = engines.mle_params;
     let lo_model = engines.lo_model.clone();
+    let lo_tev_by_key = engines.lo_tev_by_key.clone();
     let msfdr_seeded = engines.msfdr_seeded.clone();
     let msfdr_1smix = engines.msfdr_1smix.clone();
     let msfdr_2smix = engines.msfdr_2smix.clone();
@@ -2162,9 +2288,17 @@ fn score_base_rank1(
                 1.0
             };
 
-            let p_lo = if let Some(ref m) = lo_model {
+            let p_lo = if let (Some(ref m), Some(ref tev_map)) = (&lo_model, &lo_tev_by_key) {
                 let bid = lo_bucket_id(settings, psm.core.charge);
-                let x_eval = lo_tev(psm)?;
+
+                let Some(&x_eval) = tev_map.get(&(
+                    psm.core.rank,
+                    psm.core.charge,
+                    psm.core.file_id,
+                    psm.core.spec_id.clone(),
+                )) else {
+                    return None;
+                };
 
                 let p = m.p_value(x_eval, bid);
                 if p.is_finite() {

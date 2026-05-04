@@ -591,8 +591,35 @@ impl LowerOrderModel {
 //   covered by explicit charge-sharing rules.
 
 const LO_MIN_LOM_RANKS: usize = 5;
-const LO_TNM_MU_MIN: f64 = 0.05;
-const LO_TNM_MU_MAX: f64 = 0.40;
+// Diagnostic range. Use this to test whether scratch Sage TEV lands outside
+// the Madej/Lam paper-style 0.05..0.40 range.
+const LO_TNM_MU_MIN: f64 = -0.20;
+const LO_TNM_MU_MAX: f64 = 1.00;
+
+#[inline]
+fn finite_quantiles(xs: &[f64]) -> Option<(f64, f64, f64, f64, f64, f64, f64)> {
+    let mut v: Vec<f64> = xs.iter().copied().filter(|x| x.is_finite()).collect();
+    if v.is_empty() {
+        return None;
+    }
+
+    v.sort_by(|a, b| a.total_cmp(b));
+
+    let q = |p: f64| -> f64 {
+        let idx = (p.clamp(0.0, 1.0) * ((v.len() - 1) as f64)).round() as usize;
+        v[idx.min(v.len() - 1)]
+    };
+
+    Some((
+        q(0.00),
+        q(0.01),
+        q(0.10),
+        q(0.50),
+        q(0.90),
+        q(0.99),
+        q(1.00),
+    ))
+}
 
 #[inline]
 fn ols_beta_on_mu_all_supported_ranks(loms: &[(u32, f64, f64)]) -> Option<(f64, f64, f64)> {
@@ -818,6 +845,26 @@ pub fn fit_decoy_free_model(
             continue;
         }
 
+        if log::log_enabled!(log::Level::Info) {
+            for b in &buckets {
+                if let Some((q0, q1, q10, q50, q90, q99, q100)) = finite_quantiles(&b.scores) {
+                    log::info!(
+                "LO bucket diagnostics charge={} rank={} n={} tev_q=[{:.5},{:.5},{:.5},{:.5},{:.5},{:.5},{:.5}]",
+                charge,
+                b.k,
+                b.scores.len(),
+                q0,
+                q1,
+                q10,
+                q50,
+                q90,
+                q99,
+                q100
+            );
+                }
+            }
+        }
+
         // ---------------------------------------------------------------------
         // Deterministic Madej/Lam MLE/LR TNM construction
         // ---------------------------------------------------------------------
@@ -839,9 +886,27 @@ pub fn fit_decoy_free_model(
         for b in &buckets {
             let k = b.k;
 
-            if let Some((mu_k, beta_k)) = fit_tev_k_mle(&b.scores, k) {
-                if mu_k.is_finite() && beta_k.is_finite() && beta_k > 0.0 {
+            match fit_tev_k_mle(&b.scores, k) {
+                Some((mu_k, beta_k)) if mu_k.is_finite() && beta_k.is_finite() && beta_k > 0.0 => {
+                    let nll_k = nll_tev_k(mu_k, beta_k, &b.scores, k);
+                    log::info!(
+                "LO LOM MLE diagnostics charge={} rank={} n={} mu_k={:.6} beta_k={:.6} nll_k={:.4}",
+                charge,
+                k,
+                b.scores.len(),
+                mu_k,
+                beta_k,
+                nll_k
+            );
                     lom_mle.push((k, mu_k, beta_k));
+                }
+                _ => {
+                    log::warn!(
+                        "LO LOM MLE diagnostics charge={} rank={} n={} fit_failed",
+                        charge,
+                        k,
+                        b.scores.len()
+                    );
                 }
             }
         }
@@ -862,6 +927,32 @@ pub fn fit_decoy_free_model(
     );
             continue;
         };
+
+        if let Some((q0, q1, q10, q50, q90, q99, q100)) = finite_quantiles(ts_all) {
+            log::info!(
+        "LO rank1 diagnostics charge={} n={} tev_q=[{:.5},{:.5},{:.5},{:.5},{:.5},{:.5},{:.5}]",
+        charge,
+        ts_all.len(),
+        q0,
+        q1,
+        q10,
+        q50,
+        q90,
+        q99,
+        q100
+    );
+        }
+
+        log::info!(
+    "LO LR diagnostics charge={} lom_ranks={} slope={:.6} intercept={:.6} r={:.4} mu_scan=[{:.4},{:.4}]",
+    charge,
+    lom_mle.len(),
+    slope,
+    intercept,
+    r,
+    LO_TNM_MU_MIN,
+    LO_TNM_MU_MAX
+);
 
         let Some((mu_final, beta_final, nll)) =
             scan_mu_on_fixed_mle_lr_tnm(ts_all, slope, intercept)
