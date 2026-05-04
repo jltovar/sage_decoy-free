@@ -543,24 +543,35 @@ fn df_q_value(psm: &DfFeature) -> f32 {
 // - `tev(...)` below remains the raw hyperscore accessor used by the existing
 //   non-LO DF code paths (Moments / MLE / MSFDR / sorting that already expect
 //   raw hyperscore semantics).
-// - `lo_tev(...)` is the PyLord-style LO score accessor and is what LO should
-//   use for both fit-time and eval-time.
-// - PyLord's Sage parser constructed:
+// - `lo_tev(...)` is the LowerOrder TEV accessor and is what LO uses for both
+//   fit-time and eval-time.
 //
-//       tev = par_a * ln(p_value * num_candidates / par_n0)
+// Madej/Lam TEV score:
+//   LowerOrder is defined on transformed e-values:
 //
-//   For LO fitting, `par_a` and `par_n0` only induce an affine transform if
-//   applied consistently to both fit and eval. So the drop-in Rust equivalent
-//   below uses the monotone / affine-equivalent form:
+//       TEV = 0.02 * ln(1000 / e_value)
 //
-//       lo_tev = -ln(p_value * num_candidates)
+//   where:
 //
-//   which preserves the PyLord score ordering and gives the LO fitter the
-//   intended parser-style TEV scale.
+//       e_value = p_value * num_candidates
+//
+//   In Sage we use:
+//
+//       p_value        = spectrum_p_value
+//       num_candidates = scored_candidates
+//
+//   Therefore:
+//
+//       lo_tev = 0.02 * ln(1000 / (spectrum_p_value * scored_candidates))
+//
+//   This is affine-equivalent to -ln(e_value), so it preserves the same score
+//   ordering, but it also preserves the Madej/Lam numerical TEV scale. That
+//   matters because the deterministic LO TNM scan below uses the paper-style
+//   scaled TEV μ range.
 //
 // NOTE:
 // If your `DfFeature` field names differ, map the two lines below to the fields
-// that hold the original Sage `spectrum_p_value` and `scored_candidates`.
+// that hold Sage's original `spectrum_p_value` and `scored_candidates`.
 //
 #[inline(always)]
 fn tev(f: &DfFeature) -> Option<f64> {
@@ -1814,11 +1825,10 @@ fn fit_engines(
                 })
                 .collect();
 
-            // LowerOrder joint-MLE uses every usable rank in
-            // lower_order_min_null_rank..=lower_order_max_null_rank.
-            //
-            // lo_min_count_per_rank is a per-rank support threshold. Ranks that pass
-            // this threshold contribute to one joint rank-specific TEV likelihood.
+            // LowerOrder uses the Madej/Lam scaled TEV score from lo_tev().
+            // The selected rank window controls which lower-order ranks are fit.
+            // All supported selected ranks contribute to one deterministic MLE/LR TNM path.
+            // There is no autonomous PyLord-style rank/model/candidate selection.
             let lo_min_count_per_rank = settings.lo_min_count_per_rank;
 
             lo_model = fit_decoy_free_model(

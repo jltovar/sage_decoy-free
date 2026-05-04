@@ -105,34 +105,12 @@ impl Default for MsfdrSeedMode {
 // Decoy-free tuning knobs (configuration surface)
 // ---------------------------------------------------------------------------
 
-/// How to rank/monotonize LO-derived values.
-/// - hyperscore: sort by hyperscore (legacy)
-/// - lo_adjusted: sort by LO-adjusted evidence (recommended; fixes LO + PAVA mismatch)
-#[derive(Clone, Serialize, Deserialize, Debug, Default, PartialEq, Eq)]
-#[serde(rename_all = "snake_case")]
-pub enum LoRankKey {
-    #[default]
-    Hyperscore,
-    LoAdjusted,
-}
-
 #[derive(Clone, Serialize, Deserialize, Debug, Default, PartialEq, Eq)]
 #[serde(rename_all = "snake_case")]
 pub enum LoStratify {
     Global,
     #[default]
     Charge,
-}
-
-#[derive(Clone, Serialize, Deserialize, Debug, Default, PartialEq, Eq)]
-#[serde(rename_all = "snake_case")]
-pub enum LoScore {
-    /// Use existing tev(f) selection (hyperscore vs lo_adjusted) — no extra normalization.
-    #[default]
-    Raw,
-
-    /// PyLord-style per-spectrum normalization (implemented in decoy_free_fdr.rs).
-    PerSpectrum,
 }
 
 /// How Nokoi defines the "positive" class in DF mode.
@@ -460,10 +438,11 @@ pub struct FdrOptions {
     // only by lower_order_min_null_rank..=lower_order_max_null_rank.
     pub lo_min_count_per_rank: Option<usize>,
 
-    // LowerOrder controls
-    pub lo_rank_key: Option<LoRankKey>, // lo_adjusted | hyperscore
-    pub lo_stratify: Option<LoStratify>, // default charge
-    pub lo_score: Option<LoScore>,      // default raw
+    // LowerOrder controls.
+    // LO always uses Madej/Lam scaled TEV from spectrum_p_value * scored_candidates.
+    // The active TNM path is deterministic MLE/LR:
+    // supported lower-order ranks -> MLE LOMs -> one β(μ) trend -> fixed μ scan.
+    pub lo_stratify: Option<LoStratify>,
 
     // =========================================================================
     // E) MSFDR specific knobs
@@ -655,9 +634,7 @@ pub struct FdrSettings {
 
     pub lo_min_count_per_rank: usize,
 
-    pub lo_rank_key: LoRankKey,
     pub lo_stratify: LoStratify,
-    pub lo_score: LoScore,
 
     // =========================================================================
     // E) MSFDR specific resolved null window + knobs
@@ -1000,10 +977,8 @@ impl From<FdrOptions> for FdrSettings {
             12,
         );
 
-        let lo_rank_key = options.lo_rank_key.unwrap_or(LoRankKey::LoAdjusted);
         let lo_min_count_per_rank = options.lo_min_count_per_rank.unwrap_or(10).max(1);
         let lo_stratify = options.lo_stratify.unwrap_or(LoStratify::Charge);
-        let lo_score = options.lo_score.unwrap_or(LoScore::Raw);
 
         // ---------------------------------------------------------------------
         // E) MSFDR specific resolved null window + knobs
@@ -1262,9 +1237,7 @@ impl From<FdrOptions> for FdrSettings {
 
             lo_min_count_per_rank,
 
-            lo_rank_key,
             lo_stratify,
-            lo_score,
 
             // =========================================================================
             // E) MSFDR specific resolved null window + knobs
