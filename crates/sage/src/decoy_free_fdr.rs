@@ -1695,48 +1695,21 @@ fn fit_msfdr_seeded(
 }
 
 #[inline]
-fn fit_msfdr_1smix(
-    rank1_scores: &[f64],
-    pool_scores: &[f64],
-    settings: &FdrSettings,
-) -> Option<Msfdr1SmixModel> {
+fn fit_msfdr_1smix(rank1_scores: &[f64], settings: &FdrSettings) -> Option<Msfdr1SmixModel> {
     let iters = settings.mix_em_max_iter;
     let em_tol = settings.mix_em_tol;
     let pi_clamp = (settings.msfdr1_pi_clamp_min, settings.msfdr1_pi_clamp_max);
+    let bottom_frac_init = settings.msfdr1_bottom_frac_init; // Initialize null from bottom of Rank 1
     let top_frac_init = settings.msfdr1_top_frac_init;
     let mu_drift_abs = settings.msfdr1_mu_drift_abs;
     let beta_drift_mult = settings.msfdr1_beta_drift_mult;
 
-    let seed = {
-        let xs: Vec<f64> = pool_scores
-            .iter()
-            .copied()
-            .filter(|x| x.is_finite())
-            .collect();
-        if xs.len() < 20 {
-            None
-        } else {
-            let mean = xs.iter().sum::<f64>() / (xs.len() as f64);
-            let var = xs.iter().map(|v| (v - mean).powi(2)).sum::<f64>() / (xs.len() as f64);
-            let beta = ((6.0 * var).sqrt() / std::f64::consts::PI).max(1e-6);
-            let mu = mean - 0.5772156649015329_f64 * beta;
-            if mu.is_finite() && beta.is_finite() && beta > 0.0 {
-                Some((mu, beta))
-            } else {
-                None
-            }
-        }
-    };
-
-    let (mu, beta) = seed?;
-
-    Msfdr1SmixModel::fit_rank1_with_null_seed(
+    Msfdr1SmixModel::fit_rank1(
         rank1_scores,
         iters,
         em_tol,
         pi_clamp,
-        mu,
-        beta,
+        bottom_frac_init,
         top_frac_init,
         mu_drift_abs,
         beta_drift_mult,
@@ -1746,27 +1719,16 @@ fn fit_msfdr_1smix(
 #[inline]
 fn fit_msfdr_2smix(
     rank1_scores: &[f64],
-    pool_scores: &[f64],
+    pooled_rank_scores: &[f64],
     settings: &FdrSettings,
 ) -> Option<Msfdr2SmixModel> {
-    let iters = settings.mix_em_max_iter;
-    let em_tol = settings.mix_em_tol;
-    let pi_clamp = (settings.msfdr2_pi_clamp_min, settings.msfdr2_pi_clamp_max);
-    let top_frac_init = settings.msfdr2_top_frac_init;
-    let mix_anchor_incorrect = settings.mix_anchor_incorrect;
-    let beta_drift_mult = settings.msfdr2_beta_drift_mult;
-    let mu_drift_abs = settings.msfdr2_mu_drift_abs;
-
-    Msfdr2SmixModel::fit_rank1_with_pool(
+    Msfdr2SmixModel::fit_top_two_pooled(
         rank1_scores,
-        pool_scores,
-        iters,
-        em_tol,
-        pi_clamp,
-        top_frac_init,
-        mix_anchor_incorrect,
-        beta_drift_mult,
-        mu_drift_abs,
+        pooled_rank_scores,
+        settings.mix_em_max_iter,
+        settings.mix_em_tol,
+        (settings.msfdr2_pi_clamp_min, settings.msfdr2_pi_clamp_max),
+        settings.msfdr2_top_frac_init,
     )
 }
 
@@ -1973,11 +1935,7 @@ fn fit_engines(
     };
 
     let msfdr_1smix = if gates.run_msfdr_1smix {
-        let pool_1smix = pool.scores_in_window(
-            settings.msfdr1_smix_min_null_rank,
-            settings.msfdr1_smix_max_null_rank,
-        );
-        let m = fit_msfdr_1smix(&rank1_scores, &pool_1smix, settings);
+        let m = fit_msfdr_1smix(&rank1_scores, settings);
         if let Some(ref model) = m {
             log_fit_ok("MSFDR 1smix", model);
         } else {
@@ -1989,21 +1947,22 @@ fn fit_engines(
     };
 
     let msfdr_2smix = if gates.run_msfdr_2smix {
-        let pool_2smix = pool.scores_in_window(
+        let pooled_s2_scores = pool.scores_in_window(
             settings.msfdr2_smix_min_null_rank,
             settings.msfdr2_smix_max_null_rank,
         );
+
         if window_ok(
-            "MSFDR 2smix",
+            "MSFDR pooled-rank 2smix",
             settings.msfdr2_smix_min_null_rank,
             settings.msfdr2_smix_max_null_rank,
-            pool_2smix.len(),
+            pooled_s2_scores.len(),
         ) {
-            let m = fit_msfdr_2smix(&rank1_scores, &pool_2smix, settings);
+            let m = fit_msfdr_2smix(&rank1_scores, &pooled_s2_scores, settings);
             if let Some(ref model) = m {
-                log_fit_ok("MSFDR 2smix", model);
+                log_fit_ok("MSFDR pooled-rank 2smix", model);
             } else {
-                log_fit_failed_closed("MSFDR 2smix");
+                log_fit_failed_closed("MSFDR pooled-rank 2smix");
             }
             m
         } else {

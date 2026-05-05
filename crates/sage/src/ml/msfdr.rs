@@ -15,13 +15,9 @@ use crate::ml::skew_normal::SkewNormal;
 use serde::{Deserialize, Serialize};
 use statrs::consts::EULER_MASCHERONI;
 use statrs::distribution::{Continuous, ContinuousCDF, Gumbel};
-use std::f64::consts::PI;
 
 /// Small floor to prevent log(0) and divide-by-zero cascades.
 const TINY: f64 = 1e-300;
-
-/// Minimum Gumbel scale used for MSFDR1 null initialization to avoid var/scale collapse.
-const MSFDR1_MIN_NULL_SCALE: f64 = 1e-6;
 
 // --- Formatting helpers for parameter summaries ---
 #[inline]
@@ -111,19 +107,22 @@ fn weighted_moments(x: &[f64], w: &[f64]) -> Option<(f64, f64, f64)> {
     Some((mean, var, skew))
 }
 
-/// Gumbel moments inversion:
-/// mean = mu + gamma*beta, var = (pi^2 * beta^2)/6
-fn gumbel_from_mean_var(mean: f64, var: f64) -> Option<(f64, f64)> {
-    if !mean.is_finite() || !var.is_finite() || var <= 0.0 {
-        return None;
+fn sample_skewness(x: &[f64], mean: f64, var: f64) -> f64 {
+    if x.len() < 3 || !mean.is_finite() || !var.is_finite() || var <= 0.0 {
+        return 0.0;
     }
-    let beta = ((6.0 * var).sqrt() / PI).max(1e-9);
-    let mu = mean - EULER_MASCHERONI * beta;
-    if mu.is_finite() && beta.is_finite() && beta > 0.0 {
-        Some((mu, beta))
-    } else {
-        None
+
+    let sd = var.sqrt().max(1e-12);
+    let mut m3 = 0.0;
+
+    for &xi in x {
+        if xi.is_finite() {
+            let z = (xi - mean) / sd;
+            m3 += z * z * z;
+        }
     }
+
+    (m3 / x.len() as f64).clamp(-0.99, 0.99)
 }
 
 /// Seeded two-component mixture model for rank-1 scores.
@@ -316,28 +315,27 @@ impl MsfdrParamTuple for MsfdrSeededModel {
     }
 }
 
-/// Unanchored two-component mixture model for rank-1 scores.
+/// One-sample skew-normal mixture model for rank-1 scores.
 ///
-/// This variant fits a Gumbel null component and a skew-normal target
-/// component directly from the rank-1 score distribution. Both components,
-/// together with the target mixture proportion, are updated by
-/// expectation-maximization. Initialization uses lower-score observations for
-/// the null component and upper-score observations for the target component.
+/// This is the Sage Decoy-Free implementation of MSFDR 1SMix:
+///
+///   S1 ~ a * SN(hc) + (1 - a) * SN(h1)
+///
+/// where:
+/// - `correct` is the high-score correct-PSM component C
+/// - `incorrect1` is the rank-1 incorrect-PSM component I1
+/// - `a` is the mixture weight of the correct component
+///
+/// This model is rank-1-only. It does not use a lower-rank null pool and does
+/// not use an externally seeded null.
 #[derive(Clone, Debug, Serialize, Deserialize)]
 pub struct Msfdr1SmixModel {
-    pub null_loc: f64,
-    pub null_scale: f64,
-    pub target: SkewNormal,
-    pub pi: f64, // mixture weight of target
+    pub correct: SkewNormal,
+    pub incorrect1: SkewNormal,
+    pub a: f64,
 }
 
 impl Msfdr1SmixModel {
-    /// Fit on rank1 only.
-    ///
-    /// Initialization:
-    /// - null init from bottom slice (bottom_frac_init)
-    /// - target init from top slice (top_frac_init)
-    /// - pi init from fraction above null mean proxy, clamped by pi_clamp
     pub fn fit_rank1(
         rank1_scores: &[f64],
         iters: usize,
@@ -345,326 +343,128 @@ impl Msfdr1SmixModel {
         pi_clamp: (f64, f64),
         bottom_frac_init: f64,
         top_frac_init: f64,
-        mu_drift_abs: f64,
-        beta_drift_mult: (f64, f64),
+        _mu_drift_abs: f64,
+        _beta_drift_mult: (f64, f64),
     ) -> Option<Self> {
         let mut xs: Vec<f64> = rank1_scores
             .iter()
             .copied()
             .filter(|x| x.is_finite())
             .collect();
+
         if xs.len() < 20 {
             return None;
         }
-        xs.sort_by(|a, b| a.total_cmp(b)); // ascending for slices
 
+        xs.sort_by(|a, b| a.total_cmp(b));
         let n = xs.len();
 
-        // --- init null from bottom slice ---
-        let bfrac = bottom_frac_init.clamp(0.5, 0.9);
-        let b_n = ((n as f64) * bfrac).round() as usize;
-        let b_n = b_n.max(10).min(n);
-        let bottom = &xs[..b_n];
+        // Incorrect I1 initialization from the lower part of S1.
+        let bottom_frac = bottom_frac_init.clamp(0.10, 0.90);
+        let bottom_n = ((n as f64) * bottom_frac).round() as usize;
+        let bottom_n = bottom_n.max(10).min(n);
+        let bottom = &xs[..bottom_n];
 
-        let b_mean = bottom.iter().sum::<f64>() / (bottom.len() as f64);
-        let b_var_raw =
-            bottom.iter().map(|v| (v - b_mean).powi(2)).sum::<f64>() / (bottom.len() as f64);
+        let b_mean = bottom.iter().sum::<f64>() / bottom.len() as f64;
+        let b_var = bottom.iter().map(|v| (v - b_mean).powi(2)).sum::<f64>() / bottom.len() as f64;
+        let b_skew = sample_skewness(bottom, b_mean, b_var);
 
-        // Clamp variance so gumbel init cannot fail on var<=0 (tie-heavy / discretized bottoms).
-        // var_min derived from: var = (pi^2 / 6) * scale^2  =>  var_min = (pi*scale_min)^2 / 6
-        let var_min = (PI * MSFDR1_MIN_NULL_SCALE).powi(2) / 6.0;
-        let b_var = if b_var_raw < var_min {
-            if log::log_enabled!(log::Level::Debug) {
-                log::debug!(
-                    "MSFDR1 DEBUG init clamp: b_var_raw={:.6e} < var_min={:.6e}; clamping (scale_min={:.3e})",
-                    b_var_raw,
-                    var_min,
-                    MSFDR1_MIN_NULL_SCALE
-                );
-            }
-            var_min
-        } else {
-            b_var_raw
-        };
+        let mut incorrect1 = SkewNormal::from_moments(b_mean, b_var.max(1e-12), b_skew)
+            .unwrap_or_else(|| SkewNormal::new(b_mean, b_var.sqrt().max(1e-6), 0.0));
 
-        let (mut null_loc, mut null_scale) = gumbel_from_mean_var(b_mean, b_var)?;
+        // Correct C initialization from the upper part of S1.
+        let top_frac = top_frac_init.clamp(0.05, 0.50);
+        let top_n = ((n as f64) * top_frac).round() as usize;
+        let top_n = top_n.max(10).min(n);
+        let top = &xs[(n - top_n)..];
 
-        // Optional second clamp: ensure the initialized scale is not absurdly tiny.
-        if null_scale < MSFDR1_MIN_NULL_SCALE {
-            if log::log_enabled!(log::Level::Debug) {
-                log::debug!(
-                    "MSFDR1 DEBUG init clamp: null_scale_raw={:.6e} < scale_min={:.3e}; clamping",
-                    null_scale,
-                    MSFDR1_MIN_NULL_SCALE
-                );
-            }
-            null_scale = MSFDR1_MIN_NULL_SCALE;
-        }
+        let t_mean = top.iter().sum::<f64>() / top.len() as f64;
+        let t_var = top.iter().map(|v| (v - t_mean).powi(2)).sum::<f64>() / top.len() as f64;
+        let t_skew = sample_skewness(top, t_mean, t_var);
 
-        if log::log_enabled!(log::Level::Debug) {
-            log::debug!(
-                "MSFDR1 DEBUG init: n={} bfrac={:.3} b_n={} b_mean={:.6} b_var_raw={:.6e} b_var_used={:.6e} null_loc={:.6} null_scale_used={:.6e} top_frac_init={:.3}",
-                n,
-                bfrac,
-                b_n,
-                b_mean,
-                b_var_raw,
-                b_var,
-                null_loc,
-                null_scale,
-                top_frac_init
-            );
-        }
+        let mut correct = SkewNormal::from_moments(t_mean, t_var.max(1e-12), t_skew)
+            .unwrap_or_else(|| SkewNormal::new(t_mean, t_var.sqrt().max(1e-6), 0.0));
 
-        // --- init target from top slice ---
-        let mut desc = xs.clone();
-        desc.sort_by(|a, b| b.total_cmp(a));
-        let tfrac = top_frac_init.clamp(0.05, 0.5);
-        let t_n = ((n as f64) * tfrac).round() as usize;
-        let t_n = t_n.max(10).min(n);
-        let top = &desc[..t_n];
+        // Paper initializes a at 0.5. Keep clamp to preserve your safety controls.
+        let mut a_mix = 0.5f64.clamp(pi_clamp.0, pi_clamp.1);
 
-        let t_mean = top.iter().sum::<f64>() / (top.len() as f64);
-        let t_var = top.iter().map(|v| (v - t_mean).powi(2)).sum::<f64>() / (top.len() as f64);
-        let t_std = t_var.sqrt().max(1e-6);
-
-        let mut target = SkewNormal::new(t_mean, t_std, 2.0);
-
-        // --- init pi from fraction above null mean proxy ---
-        let null_mean_proxy = null_loc + EULER_MASCHERONI * null_scale;
-        let frac_above = (xs.iter().filter(|&&v| v > null_mean_proxy).count() as f64) / (n as f64);
-        let mut pi = frac_above.clamp(pi_clamp.0, pi_clamp.1);
-
-        // Capture initialization constraints to prevent runaway null drift.
-        let init_null_loc = null_loc;
-        let init_null_scale = null_scale;
-
-        // EM
         let iters = iters.max(10).min(500);
-        let mut prev_ll = -f64::INFINITY;
+        let mut prev_ll = f64::NEG_INFINITY;
 
         for _ in 0..iters {
-            let null_dist = match Gumbel::new(null_loc, null_scale.max(1e-9)) {
-                Ok(d) => d,
-                Err(_) => return None,
-            };
+            let a0 = a_mix.clamp(1e-6, 1.0 - 1e-6);
 
-            let pi0 = pi.clamp(1e-6, 1.0 - 1e-6);
-            let log_pi = pi0.ln();
-            let log_1m_pi = (1.0 - pi0).ln();
+            let log_a = a0.ln();
+            let log_1ma = (1.0 - a0).ln();
 
-            // E-step: r_i = P(target | x_i)
-            let mut r: Vec<f64> = Vec::with_capacity(n);
+            let mut pc = Vec::with_capacity(n);
+            let mut p1 = Vec::with_capacity(n);
             let mut ll = 0.0;
 
             for &x in &xs {
-                let f0 = null_dist.pdf(x).max(TINY);
-                let f1 = target.pdf(x).max(TINY);
+                let fc = correct.pdf(x).max(TINY);
+                let f1 = incorrect1.pdf(x).max(TINY);
 
-                let log_f0 = f0.ln();
-                let log_f1 = f1.ln();
+                let lc = log_a + fc.ln();
+                let l1 = log_1ma + f1.ln();
+                let den = log_add_exp(lc, l1);
 
-                let log_num = log_pi + log_f1;
-                let log_den = log_add_exp(log_1m_pi + log_f0, log_num);
+                ll += den;
 
-                ll += log_den;
-                let ri = (log_num - log_den).exp();
-                r.push(if ri.is_finite() { ri } else { 0.0 });
+                let rc = (lc - den).exp();
+                let ri = (l1 - den).exp();
+
+                pc.push(if rc.is_finite() { rc } else { 0.0 });
+                p1.push(if ri.is_finite() { ri } else { 1.0 });
             }
 
-            let avg_ll = ll / (n as f64);
+            let avg_ll = ll / n as f64;
             if prev_ll.is_finite() && (avg_ll - prev_ll).abs() < em_tol {
                 break;
             }
             prev_ll = avg_ll;
 
-            // M-step: update pi
-            let sum_r = r.iter().sum::<f64>();
-            if sum_r < 1e-8 || sum_r > (n as f64 - 1e-8) {
+            let sum_pc = pc.iter().sum::<f64>();
+            if sum_pc <= 1e-8 || sum_pc >= n as f64 - 1e-8 {
                 break;
             }
-            pi = (sum_r / (n as f64)).clamp(pi_clamp.0, pi_clamp.1);
 
-            // Update target skew-normal by weighted moments with weights r
-            if let Some((m, v, s)) = weighted_moments(&xs, &r) {
-                if let Some(sn) = SkewNormal::from_moments(m, v, s) {
-                    target = sn;
+            a_mix = (sum_pc / n as f64).clamp(pi_clamp.0, pi_clamp.1);
+
+            if let Some((m, v, s)) = weighted_moments(&xs, &pc) {
+                if let Some(sn) = SkewNormal::from_moments(m, v.max(1e-12), s) {
+                    correct = sn;
                 }
             }
 
-            // Update null gumbel by weighted moments with weights (1-r)
-            let w0: Vec<f64> = r.iter().map(|&ri| (1.0 - ri).max(0.0)).collect();
-            if let Some((m0, v0, _s0)) = weighted_moments(&xs, &w0) {
-                if let Some((mu0, beta0)) = gumbel_from_mean_var(m0, v0) {
-                    // Tighten constraints relative to initialization using passed params
-                    let clamped_mu =
-                        mu0.clamp(init_null_loc - mu_drift_abs, init_null_loc + mu_drift_abs);
-                    let clamped_beta = beta0.clamp(
-                        init_null_scale * beta_drift_mult.0,
-                        init_null_scale * beta_drift_mult.1,
-                    );
-
-                    null_loc = clamped_mu;
-                    null_scale = clamped_beta.max(1e-9);
+            if let Some((m, v, s)) = weighted_moments(&xs, &p1) {
+                if let Some(sn) = SkewNormal::from_moments(m, v.max(1e-12), s) {
+                    incorrect1 = sn;
                 }
             }
         }
 
         Some(Self {
-            null_loc,
-            null_scale,
-            target,
-            pi,
+            correct,
+            incorrect1,
+            a: a_mix,
         })
     }
 
-    /// Fit on rank1 only, but initialize the null from an external seed
-    /// (e.g. rank-null pool window), rather than bottom slice of rank1.
-    pub fn fit_rank1_with_null_seed(
-        rank1_scores: &[f64],
-        iters: usize,
-        em_tol: f64,
-        pi_clamp: (f64, f64),
-        null_loc_seed: f64,
-        null_scale_seed: f64,
-        top_frac_init: f64,
-        mu_drift_abs: f64,
-        beta_drift_mult: (f64, f64),
-    ) -> Option<Self> {
-        let mut xs: Vec<f64> = rank1_scores
-            .iter()
-            .copied()
-            .filter(|x| x.is_finite())
-            .collect();
-        if xs.len() < 20 {
-            return None;
-        }
-        xs.sort_by(|a, b| a.total_cmp(b)); // ascending for slices
-
-        let n = xs.len();
-
-        // --- init null from external seed ---
-        let mut null_loc = null_loc_seed;
-        let mut null_scale = null_scale_seed;
-
-        if !null_loc.is_finite() || !null_scale.is_finite() {
-            return None;
-        }
-
-        if null_scale < MSFDR1_MIN_NULL_SCALE {
-            null_scale = MSFDR1_MIN_NULL_SCALE;
-        }
-
-        // --- init target from top slice ---
-        let mut desc = xs.clone();
-        desc.sort_by(|a, b| b.total_cmp(a));
-        let tfrac = top_frac_init.clamp(0.05, 0.5);
-        let t_n = ((n as f64) * tfrac).round() as usize;
-        let t_n = t_n.max(10).min(n);
-        let top = &desc[..t_n];
-
-        let t_mean = top.iter().sum::<f64>() / (top.len() as f64);
-        let t_var = top.iter().map(|v| (v - t_mean).powi(2)).sum::<f64>() / (top.len() as f64);
-        let t_std = t_var.sqrt().max(1e-6);
-
-        let mut target = SkewNormal::new(t_mean, t_std, 2.0);
-
-        // --- init pi from fraction above null mean proxy ---
-        let null_mean_proxy = null_loc + EULER_MASCHERONI * null_scale;
-        let frac_above = (xs.iter().filter(|&&v| v > null_mean_proxy).count() as f64) / (n as f64);
-        let mut pi = frac_above.clamp(pi_clamp.0, pi_clamp.1);
-
-        // EM (same as fit_rank1)
-        let iters = iters.max(10).min(500);
-        let mut prev_ll = -f64::INFINITY;
-
-        for _ in 0..iters {
-            let null_dist = match Gumbel::new(null_loc, null_scale.max(1e-9)) {
-                Ok(d) => d,
-                Err(_) => return None,
-            };
-
-            let pi0 = pi.clamp(1e-6, 1.0 - 1e-6);
-            let log_pi = pi0.ln();
-            let log_1m_pi = (1.0 - pi0).ln();
-
-            let mut r: Vec<f64> = Vec::with_capacity(n);
-            let mut ll = 0.0;
-
-            for &x in &xs {
-                let f0 = null_dist.pdf(x).max(TINY);
-                let f1 = target.pdf(x).max(TINY);
-
-                let log_f0 = f0.ln();
-                let log_f1 = f1.ln();
-
-                let log_num = log_pi + log_f1;
-                let log_den = log_add_exp(log_1m_pi + log_f0, log_num);
-
-                ll += log_den;
-                let ri = (log_num - log_den).exp();
-                r.push(if ri.is_finite() { ri } else { 0.0 });
-            }
-
-            let avg_ll = ll / (n as f64);
-            if prev_ll.is_finite() && (avg_ll - prev_ll).abs() < em_tol {
-                break;
-            }
-            prev_ll = avg_ll;
-
-            let sum_r = r.iter().sum::<f64>();
-            if sum_r < 1e-8 || sum_r > (n as f64 - 1e-8) {
-                break;
-            }
-            pi = (sum_r / (n as f64)).clamp(pi_clamp.0, pi_clamp.1);
-
-            if let Some((m, v, s)) = weighted_moments(&xs, &r) {
-                if let Some(sn) = SkewNormal::from_moments(m, v, s) {
-                    target = sn;
-                }
-            }
-
-            // Update null gumbel by weighted moments with weights (1-r)
-            let w0: Vec<f64> = r.iter().map(|&ri| (1.0 - ri).max(0.0)).collect();
-            if let Some((m0, v0, _s0)) = weighted_moments(&xs, &w0) {
-                if let Some((mu0, beta0)) = gumbel_from_mean_var(m0, v0) {
-                    // Tighten constraints relative to seed using passed params
-                    let clamped_mu =
-                        mu0.clamp(null_loc_seed - mu_drift_abs, null_loc_seed + mu_drift_abs);
-                    let clamped_beta = beta0.clamp(
-                        null_scale_seed * beta_drift_mult.0,
-                        null_scale_seed * beta_drift_mult.1,
-                    );
-
-                    null_loc = clamped_mu;
-                    null_scale = clamped_beta.max(1e-9);
-                }
-            }
-        }
-
-        Some(Self {
-            null_loc,
-            null_scale,
-            target,
-            pi,
-        })
-    }
-
-    /// PEP = P(null | x)
+    /// Local posterior error probability: P(I1 | x).
     pub fn pep(&self, x: f64) -> f64 {
         if !x.is_finite() {
             return 1.0;
         }
-        let null_dist = match Gumbel::new(self.null_loc, self.null_scale.max(1e-9)) {
-            Ok(d) => d,
-            Err(_) => return 1.0,
-        };
-        let f0 = null_dist.pdf(x).max(TINY);
-        let f1 = self.target.pdf(x).max(TINY);
 
-        let pi = self.pi.clamp(1e-6, 1.0 - 1e-6);
-        let num = (1.0 - pi) * f0;
-        let den = num + pi * f1;
+        let a = self.a.clamp(1e-6, 1.0 - 1e-6);
+
+        let fc = self.correct.pdf(x).max(TINY);
+        let f1 = self.incorrect1.pdf(x).max(TINY);
+
+        let num = (1.0 - a) * f1;
+        let den = a * fc + num;
+
         if den > 0.0 && den.is_finite() {
             (num / den).clamp(0.0, 1.0)
         } else {
@@ -672,222 +472,286 @@ impl Msfdr1SmixModel {
         }
     }
 
-    /// Null tail p-value under the learned null.
-    pub fn p_value(&self, x: f64) -> f64 {
+    /// Paper-style FDR estimate at score threshold x:
+    ///
+    /// FDR(x) = (1-a) * P(I1 > x) / P(S1 > x)
+    pub fn fdr_at_score(&self, x: f64) -> f64 {
         if !x.is_finite() {
             return 1.0;
         }
-        let null_dist = match Gumbel::new(self.null_loc, self.null_scale.max(1e-9)) {
-            Ok(d) => d,
-            Err(_) => return 1.0,
-        };
-        clamp_p01(null_dist.sf(x))
+
+        let a = self.a.clamp(1e-6, 1.0 - 1e-6);
+
+        let sf_c = self.correct.sf(x).max(TINY);
+        let sf_i1 = self.incorrect1.sf(x).max(TINY);
+
+        let num = (1.0 - a) * sf_i1;
+        let den = a * sf_c + (1.0 - a) * sf_i1;
+
+        if den > 0.0 && den.is_finite() {
+            (num / den).clamp(0.0, 1.0).max(TINY)
+        } else {
+            1.0
+        }
+    }
+
+    /// Keep the existing pipeline API name.
+    ///
+    /// For the skew-normal MSFDR models, this returns the paper-style
+    /// threshold FDR estimate, not a Gumbel-null survival p-value.
+    pub fn p_value(&self, x: f64) -> f64 {
+        self.fdr_at_score(x)
     }
 }
 
 impl MsfdrParamTuple for Msfdr1SmixModel {
     fn param_tuple(&self) -> String {
         format!(
-            "pi={}, null=({},{}), target=({},{},{})",
-            fmt_f64(self.pi),
-            fmt_f64(self.null_loc),
-            fmt_f64(self.null_scale),
-            fmt_f64(self.target.location),
-            fmt_f64(self.target.scale),
-            fmt_f64(self.target.shape),
+            "a={}, correct=({},{},{}), incorrect1=({},{},{})",
+            fmt_f64(self.a),
+            fmt_f64(self.correct.location),
+            fmt_f64(self.correct.scale),
+            fmt_f64(self.correct.shape),
+            fmt_f64(self.incorrect1.location),
+            fmt_f64(self.incorrect1.scale),
+            fmt_f64(self.incorrect1.shape),
         )
     }
 }
 
-/// Anchored two-component mixture model for rank-1 scores.
+/// Pooled-rank two-sample skew-normal mixture model.
 ///
-/// This variant fits the target mixture on rank-1 observations while using an
-/// external null-score pool to estimate the Gumbel null component. The pooled
-/// null fit provides the initial null location and scale. When
-/// `mix_anchor_incorrect` is `true`, the null component is held fixed during
-/// expectation-maximization. Otherwise, the null component may adapt from the
-/// pooled estimate, subject to explicit drift limits on location and scale.
+/// This is the Sage adaptation of MSFDR 2SMix:
+///
+///   S1 ~ a * SN(hc) + (1 - a) * SN(h1)
+///   S2 ~ a * SN(h1) + (1 - a - b) * SN(h2) + b * SN(hc)
+///
+/// where:
+/// - S1 is rank-1 scores
+/// - S2 is the pooled lower-rank score sample selected by
+///   msfdr2_smix_min_null_rank..=msfdr2_smix_max_null_rank
+/// - C  is the correct component
+/// - I1 is the first-incorrect component
+/// - I2 is the second/lower-rank incorrect component
+///
+/// If S2 is rank 2 only, this matches the paper more closely. If S2 includes
+/// ranks 2..K, this is a pooled-rank generalization.
 #[derive(Clone, Debug, Serialize, Deserialize)]
 pub struct Msfdr2SmixModel {
-    pub null_seed_loc: f64,
-    pub null_seed_scale: f64,
-
-    pub null_loc: f64,
-    pub null_scale: f64,
-
-    pub target: SkewNormal,
-    pub pi: f64,
-    pub mix_anchor_incorrect: bool,
-
-    // drift clamps (only used when mix_anchor_incorrect == false)
-    pub beta_drift_mult: (f64, f64),
-    pub mu_drift_abs: f64,
+    pub correct: SkewNormal,
+    pub incorrect1: SkewNormal,
+    pub incorrect2: SkewNormal,
+    pub a: f64,
+    pub b: f64,
 }
 
 impl Msfdr2SmixModel {
-    /// Fit with a pure-null pool.
-    ///
-    /// pool_scores are assumed to be null-only and are used to seed the null Gumbel.
-    pub fn fit_rank1_with_pool(
+    pub fn fit_top_two_pooled(
         rank1_scores: &[f64],
-        pool_scores: &[f64],
+        pooled_rank_scores: &[f64],
         iters: usize,
         em_tol: f64,
         pi_clamp: (f64, f64),
         top_frac_init: f64,
-        mix_anchor_incorrect: bool,
-        beta_drift_mult: (f64, f64),
-        mu_drift_abs: f64,
     ) -> Option<Self> {
-        let mut xs: Vec<f64> = rank1_scores
+        let mut s1: Vec<f64> = rank1_scores
             .iter()
             .copied()
             .filter(|x| x.is_finite())
             .collect();
-        if xs.len() < 20 {
-            return None;
-        }
-        xs.sort_by(|a, b| a.total_cmp(b));
-        let n = xs.len();
 
-        let pool: Vec<f64> = pool_scores
+        let mut s2: Vec<f64> = pooled_rank_scores
             .iter()
             .copied()
             .filter(|x| x.is_finite())
             .collect();
-        if pool.len() < 20 {
+
+        if s1.len() < 20 || s2.len() < 20 {
             return None;
         }
 
-        // Seed null from pool moments (consistent, robust).
-        let pool_mean = pool.iter().sum::<f64>() / (pool.len() as f64);
-        let pool_var =
-            pool.iter().map(|v| (v - pool_mean).powi(2)).sum::<f64>() / (pool.len() as f64);
-        let (seed_loc, seed_scale) = gumbel_from_mean_var(pool_mean, pool_var)?;
+        s1.sort_by(|a, b| a.total_cmp(b));
+        s2.sort_by(|a, b| a.total_cmp(b));
 
-        let mut null_loc = seed_loc;
-        let mut null_scale = seed_scale.max(1e-9);
+        let n1 = s1.len();
+        let n2 = s2.len();
 
-        // Target init from top slice of rank1.
-        let mut desc = xs.clone();
-        desc.sort_by(|a, b| b.total_cmp(a));
-        let tfrac = top_frac_init.clamp(0.05, 0.5);
-        let t_n = ((n as f64) * tfrac).round() as usize;
-        let t_n = t_n.max(10).min(n);
-        let top = &desc[..t_n];
+        // Initialize I1 from lower half of S1.
+        let s1_mid = n1 / 2;
+        let s1_low = &s1[..s1_mid.max(10).min(n1)];
 
-        let t_mean = top.iter().sum::<f64>() / (top.len() as f64);
-        let t_var = top.iter().map(|v| (v - t_mean).powi(2)).sum::<f64>() / (top.len() as f64);
-        let t_std = t_var.sqrt().max(1e-6);
-        let mut target = SkewNormal::new(t_mean, t_std, 2.0);
+        let i1_mean = s1_low.iter().sum::<f64>() / s1_low.len() as f64;
+        let i1_var =
+            s1_low.iter().map(|v| (v - i1_mean).powi(2)).sum::<f64>() / s1_low.len() as f64;
+        let i1_skew = sample_skewness(s1_low, i1_mean, i1_var);
 
-        // pi init based on seed null mean proxy.
-        let null_mean_proxy = seed_loc + EULER_MASCHERONI * seed_scale;
-        let frac_above = (xs.iter().filter(|&&v| v > null_mean_proxy).count() as f64) / (n as f64);
-        let mut pi = frac_above.clamp(pi_clamp.0, pi_clamp.1);
+        let mut incorrect1 = SkewNormal::from_moments(i1_mean, i1_var.max(1e-12), i1_skew)
+            .unwrap_or_else(|| SkewNormal::new(i1_mean, i1_var.sqrt().max(1e-6), 0.0));
+
+        // Initialize C from top fraction of S1.
+        let top_frac = top_frac_init.clamp(0.05, 0.50);
+        let top_n = ((n1 as f64) * top_frac).round() as usize;
+        let top_n = top_n.max(10).min(n1);
+        let s1_top = &s1[(n1 - top_n)..];
+
+        let c_mean = s1_top.iter().sum::<f64>() / s1_top.len() as f64;
+        let c_var = s1_top.iter().map(|v| (v - c_mean).powi(2)).sum::<f64>() / s1_top.len() as f64;
+        let c_skew = sample_skewness(s1_top, c_mean, c_var);
+
+        let mut correct = SkewNormal::from_moments(c_mean, c_var.max(1e-12), c_skew)
+            .unwrap_or_else(|| SkewNormal::new(c_mean, c_var.sqrt().max(1e-6), 0.0));
+
+        // Initialize I2 from pooled lower-rank scores.
+        let i2_mean = s2.iter().sum::<f64>() / n2 as f64;
+        let i2_var = s2.iter().map(|v| (v - i2_mean).powi(2)).sum::<f64>() / n2 as f64;
+        let i2_skew = sample_skewness(&s2, i2_mean, i2_var);
+
+        let mut incorrect2 = SkewNormal::from_moments(i2_mean, i2_var.max(1e-12), i2_skew)
+            .unwrap_or_else(|| SkewNormal::new(i2_mean, i2_var.sqrt().max(1e-6), 0.0));
+
+        // Paper initializes a and b at 0.5, subject to a+b<=1.
+        // Use conservative valid starting point to avoid immediate degeneracy.
+        let mut a_mix = 0.45f64.clamp(pi_clamp.0, pi_clamp.1);
+        let mut b_mix = 0.05f64;
+        if a_mix + b_mix >= 0.95 {
+            b_mix = (0.95 - a_mix).max(1e-6);
+        }
 
         let iters = iters.max(10).min(500);
-        let mut prev_ll = -f64::INFINITY;
+        let mut prev_ll = f64::NEG_INFINITY;
 
         for _ in 0..iters {
-            let null_dist = match Gumbel::new(null_loc, null_scale.max(1e-9)) {
-                Ok(d) => d,
-                Err(_) => return None,
-            };
+            let a0 = a_mix.clamp(1e-6, 1.0 - 1e-6);
+            let b0 = b_mix.clamp(1e-6, 1.0 - a0 - 1e-6);
+            let i2_weight = (1.0 - a0 - b0).clamp(1e-6, 1.0);
 
-            let pi0 = pi.clamp(1e-6, 1.0 - 1e-6);
-            let log_pi = pi0.ln();
-            let log_1m_pi = (1.0 - pi0).ln();
+            // ---------- E-step for S1 ----------
+            let mut pc_s1 = Vec::with_capacity(n1);
+            let mut p1_s1 = Vec::with_capacity(n1);
 
-            // E-step: r_i = P(target | x_i)
-            let mut r: Vec<f64> = Vec::with_capacity(n);
             let mut ll = 0.0;
 
-            for &x in &xs {
-                let f0 = null_dist.pdf(x).max(TINY);
-                let f1 = target.pdf(x).max(TINY);
+            for &x in &s1 {
+                let fc = correct.pdf(x).max(TINY);
+                let f1 = incorrect1.pdf(x).max(TINY);
 
-                let log_f0 = f0.ln();
-                let log_f1 = f1.ln();
+                let lc = a0.ln() + fc.ln();
+                let l1 = (1.0 - a0).ln() + f1.ln();
+                let den = log_add_exp(lc, l1);
 
-                let log_num = log_pi + log_f1;
-                let log_den = log_add_exp(log_1m_pi + log_f0, log_num);
+                ll += den;
 
-                ll += log_den;
-                let ri = (log_num - log_den).exp();
-                r.push(if ri.is_finite() { ri } else { 0.0 });
+                pc_s1.push((lc - den).exp().clamp(0.0, 1.0));
+                p1_s1.push((l1 - den).exp().clamp(0.0, 1.0));
             }
 
-            let avg_ll = ll / (n as f64);
+            // ---------- E-step for S2 ----------
+            let mut rc_s2 = Vec::with_capacity(n2);
+            let mut r1_s2 = Vec::with_capacity(n2);
+            let mut r2_s2 = Vec::with_capacity(n2);
+
+            for &x in &s2 {
+                let fc = correct.pdf(x).max(TINY);
+                let f1 = incorrect1.pdf(x).max(TINY);
+                let f2 = incorrect2.pdf(x).max(TINY);
+
+                let lc = b0.ln() + fc.ln();
+                let l1 = a0.ln() + f1.ln();
+                let l2 = i2_weight.ln() + f2.ln();
+
+                let den12 = log_add_exp(l1, l2);
+                let den = log_add_exp(lc, den12);
+
+                ll += den;
+
+                rc_s2.push((lc - den).exp().clamp(0.0, 1.0));
+                r1_s2.push((l1 - den).exp().clamp(0.0, 1.0));
+                r2_s2.push((l2 - den).exp().clamp(0.0, 1.0));
+            }
+
+            let avg_ll = ll / (n1 + n2) as f64;
             if prev_ll.is_finite() && (avg_ll - prev_ll).abs() < em_tol {
                 break;
             }
             prev_ll = avg_ll;
 
-            // M-step: update pi
-            let sum_r = r.iter().sum::<f64>();
-            if sum_r < 1e-8 || sum_r > (n as f64 - 1e-8) {
-                break;
-            }
-            pi = (sum_r / (n as f64)).clamp(pi_clamp.0, pi_clamp.1);
+            // ---------- M-step mixture weights ----------
+            let sum_pc_s1 = pc_s1.iter().sum::<f64>();
+            let sum_r1_s2 = r1_s2.iter().sum::<f64>();
+            let sum_rc_s2 = rc_s2.iter().sum::<f64>();
 
-            // Update target by weighted moments with weights r
-            if let Some((m, v, s)) = weighted_moments(&xs, &r) {
-                if let Some(sn) = SkewNormal::from_moments(m, v, s) {
-                    target = sn;
+            let new_a =
+                ((sum_pc_s1 + sum_r1_s2) / ((n1 + n2) as f64)).clamp(pi_clamp.0, pi_clamp.1);
+
+            let mut new_b = (sum_rc_s2 / n2 as f64).clamp(1e-6, 1.0 - new_a - 1e-6);
+
+            if new_a + new_b >= 0.999 {
+                new_b = (0.999 - new_a).max(1e-6);
+            }
+
+            a_mix = new_a;
+            b_mix = new_b;
+
+            // ---------- M-step component parameters ----------
+            // C is updated from S1 pc + S2 rc.
+            let mut c_x = Vec::with_capacity(n1 + n2);
+            let mut c_w = Vec::with_capacity(n1 + n2);
+            c_x.extend_from_slice(&s1);
+            c_w.extend_from_slice(&pc_s1);
+            c_x.extend_from_slice(&s2);
+            c_w.extend_from_slice(&rc_s2);
+
+            if let Some((m, v, s)) = weighted_moments(&c_x, &c_w) {
+                if let Some(sn) = SkewNormal::from_moments(m, v.max(1e-12), s) {
+                    correct = sn;
                 }
             }
 
-            // Update null only if not anchored
-            if !mix_anchor_incorrect {
-                let w0: Vec<f64> = r.iter().map(|&ri| (1.0 - ri).max(0.0)).collect();
-                if let Some((m0, v0, _s0)) = weighted_moments(&xs, &w0) {
-                    if let Some((mu0, beta0)) = gumbel_from_mean_var(m0, v0) {
-                        // clamp drift
-                        let min_beta = seed_scale * beta_drift_mult.0.max(0.1);
-                        let max_beta = seed_scale * beta_drift_mult.1.max(beta_drift_mult.0 + 0.01);
-                        let beta_clamped = beta0.clamp(min_beta, max_beta);
+            // I1 is updated from S1 p1 + S2 r1.
+            let mut i1_x = Vec::with_capacity(n1 + n2);
+            let mut i1_w = Vec::with_capacity(n1 + n2);
+            i1_x.extend_from_slice(&s1);
+            i1_w.extend_from_slice(&p1_s1);
+            i1_x.extend_from_slice(&s2);
+            i1_w.extend_from_slice(&r1_s2);
 
-                        let mu_clamped =
-                            mu0.clamp(seed_loc - mu_drift_abs.abs(), seed_loc + mu_drift_abs.abs());
-
-                        null_loc = mu_clamped;
-                        null_scale = beta_clamped.max(1e-9);
-                    }
+            if let Some((m, v, s)) = weighted_moments(&i1_x, &i1_w) {
+                if let Some(sn) = SkewNormal::from_moments(m, v.max(1e-12), s) {
+                    incorrect1 = sn;
                 }
-            } else {
-                null_loc = seed_loc;
-                null_scale = seed_scale.max(1e-9);
+            }
+
+            // I2 is updated from S2 r2 only.
+            if let Some((m, v, s)) = weighted_moments(&s2, &r2_s2) {
+                if let Some(sn) = SkewNormal::from_moments(m, v.max(1e-12), s) {
+                    incorrect2 = sn;
+                }
             }
         }
 
         Some(Self {
-            null_seed_loc: seed_loc,
-            null_seed_scale: seed_scale,
-            null_loc,
-            null_scale,
-            target,
-            pi,
-            mix_anchor_incorrect,
-            beta_drift_mult,
-            mu_drift_abs,
+            correct,
+            incorrect1,
+            incorrect2,
+            a: a_mix,
+            b: b_mix,
         })
     }
 
+    /// Local posterior error probability for an S1/rank1 score: P(I1 | S1=x).
     pub fn pep(&self, x: f64) -> f64 {
         if !x.is_finite() {
             return 1.0;
         }
-        let null_dist = match Gumbel::new(self.null_loc, self.null_scale.max(1e-9)) {
-            Ok(d) => d,
-            Err(_) => return 1.0,
-        };
-        let f0 = null_dist.pdf(x).max(TINY);
-        let f1 = self.target.pdf(x).max(TINY);
 
-        let pi = self.pi.clamp(1e-6, 1.0 - 1e-6);
-        let num = (1.0 - pi) * f0;
-        let den = num + pi * f1;
+        let a = self.a.clamp(1e-6, 1.0 - 1e-6);
+
+        let fc = self.correct.pdf(x).max(TINY);
+        let f1 = self.incorrect1.pdf(x).max(TINY);
+
+        let num = (1.0 - a) * f1;
+        let den = a * fc + num;
+
         if den > 0.0 && den.is_finite() {
             (num / den).clamp(0.0, 1.0)
         } else {
@@ -895,32 +759,51 @@ impl Msfdr2SmixModel {
         }
     }
 
-    pub fn p_value(&self, x: f64) -> f64 {
+    /// Paper-style FDR estimate for accepting rank1 scores above x.
+    pub fn fdr_at_score(&self, x: f64) -> f64 {
         if !x.is_finite() {
             return 1.0;
         }
-        let null_dist = match Gumbel::new(self.null_loc, self.null_scale.max(1e-9)) {
-            Ok(d) => d,
-            Err(_) => return 1.0,
-        };
-        clamp_p01(null_dist.sf(x))
+
+        let a = self.a.clamp(1e-6, 1.0 - 1e-6);
+
+        let sf_c = self.correct.sf(x).max(TINY);
+        let sf_i1 = self.incorrect1.sf(x).max(TINY);
+
+        let num = (1.0 - a) * sf_i1;
+        let den = a * sf_c + (1.0 - a) * sf_i1;
+
+        if den > 0.0 && den.is_finite() {
+            (num / den).clamp(0.0, 1.0).max(TINY)
+        } else {
+            1.0
+        }
+    }
+
+    /// Keep the existing pipeline API name.
+    pub fn p_value(&self, x: f64) -> f64 {
+        self.fdr_at_score(x)
     }
 }
 
 impl MsfdrParamTuple for Msfdr2SmixModel {
     fn param_tuple(&self) -> String {
         format!(
-            "pi={}, null=({},{}), target=({},{},{})",
-            fmt_f64(self.pi),
-            fmt_f64(self.null_loc),
-            fmt_f64(self.null_scale),
-            fmt_f64(self.target.location),
-            fmt_f64(self.target.scale),
-            fmt_f64(self.target.shape),
+            "a={}, b={}, correct=({},{},{}), incorrect1=({},{},{}), incorrect2=({},{},{})",
+            fmt_f64(self.a),
+            fmt_f64(self.b),
+            fmt_f64(self.correct.location),
+            fmt_f64(self.correct.scale),
+            fmt_f64(self.correct.shape),
+            fmt_f64(self.incorrect1.location),
+            fmt_f64(self.incorrect1.scale),
+            fmt_f64(self.incorrect1.shape),
+            fmt_f64(self.incorrect2.location),
+            fmt_f64(self.incorrect2.scale),
+            fmt_f64(self.incorrect2.shape),
         )
     }
 }
-
 // -----------------------------------------------------------------------------
 // Backward-compatibility adapter preserving the legacy `MsfdrModel` interface.
 // -----------------------------------------------------------------------------
@@ -1094,20 +977,17 @@ mod tests {
     }
 
     #[test]
-    fn twosmix_bounds_pep_and_p_value_are_finite_in_unit_interval() {
+    fn pooled_rank_twosmix_bounds_pep_and_p_value_are_finite_in_unit_interval() {
         let xs = synthetic_rank1_scores();
         let pool = synthetic_pool_scores();
 
-        let m = Msfdr2SmixModel::fit_rank1_with_pool(
+        let m = Msfdr2SmixModel::fit_top_two_pooled(
             &xs,
             &pool,
             /*iters*/ 100,
             /*em_tol*/ 1e-6,
             /*pi_clamp*/ (0.01, 0.99),
             /*top_frac_init*/ 0.2,
-            /*mix_anchor_incorrect*/ true, // anchored (null fixed to pool)
-            /*beta_drift_mult*/ (0.8, 1.25),
-            /*mu_drift_abs*/ 0.5,
         )
         .expect("2Smix should fit on synthetic input");
 

@@ -484,19 +484,14 @@ pub struct FdrOptions {
     pub msfdr_pi_clamp_max: Option<f64>,
 
     // =========================================================================
-    // Mixture knobs (MSFDR 1smix / 2smix)
+    // Mixture knobs (MSFDR 1smix / pooled-rank 2smix)
     // =========================================================================
     pub mix_em_max_iter: Option<usize>, // default 200; clamp 1..10_000
     pub mix_em_tol: Option<f64>,        // default 1e-6; must be >0
-    pub mix_pi_clamp_min: Option<f64>,  // default 0.01
-    pub mix_pi_clamp_max: Option<f64>,  // default 0.99
-    pub mix_anchor_incorrect: Option<bool>, // default true (for 2smix)
 
     // =========================================================================
     // F) MSFDR1_Smix specific knobs
     // =========================================================================
-    pub msfdr1_smix_min_null_rank: Option<u32>,
-    pub msfdr1_smix_max_null_rank: Option<u32>,
 
     // MSFDR1 init/drift knobs (needed by real models)
     pub msfdr1_bottom_frac_init: Option<f64>, // default 0.7
@@ -516,12 +511,8 @@ pub struct FdrOptions {
     pub msfdr2_smix_min_null_rank: Option<u32>,
     pub msfdr2_smix_max_null_rank: Option<u32>,
 
-    // MSFDR2 init/drift knobs (needed by real models)
+    // MSFDR2 initialization knob.
     pub msfdr2_top_frac_init: Option<f64>,
-
-    // Expose drift clamps for MSFDR2
-    pub msfdr2_beta_drift_mult: Option<(f64, f64)>, // default (0.5, 2.0)
-    pub msfdr2_mu_drift_abs: Option<f64>,           // default 5.0
 
     // --- Specific clamps (overrides) ---
     pub msfdr2_pi_clamp_min: Option<f64>,
@@ -680,20 +671,14 @@ pub struct FdrSettings {
     pub msfdr_pi_clamp_max: f64,
 
     // =========================================================================
-    // Mixture knobs (MSFDR 1smix / 2smix)
+    // Mixture knobs (MSFDR 1smix / pooled-rank 2smix)
     // =========================================================================
     pub mix_em_max_iter: usize,
     pub mix_em_tol: f64,
-    pub mix_pi_clamp_min: f64,
-    pub mix_pi_clamp_max: f64,
-    pub mix_anchor_incorrect: bool,
 
     // =========================================================================
     // F) MSFDR1_Smix specific resolved null window + knobs
     // =========================================================================
-    pub msfdr1_smix_min_null_rank: u32,
-    pub msfdr1_smix_max_null_rank: u32,
-
     pub msfdr1_bottom_frac_init: f64,
     pub msfdr1_top_frac_init: f64,
 
@@ -710,9 +695,6 @@ pub struct FdrSettings {
     pub msfdr2_smix_max_null_rank: u32,
 
     pub msfdr2_top_frac_init: f64,
-
-    pub msfdr2_beta_drift_mult: (f64, f64),
-    pub msfdr2_mu_drift_abs: f64,
 
     pub msfdr2_pi_clamp_min: f64,
     pub msfdr2_pi_clamp_max: f64,
@@ -1054,27 +1036,14 @@ impl From<FdrOptions> for FdrSettings {
             _ => 1e-6,
         };
 
-        let mix_pi_clamp_min = options.mix_pi_clamp_min.unwrap_or(0.01).clamp(0.0, 1.0);
-
-        let mix_pi_clamp_max = options
-            .mix_pi_clamp_max
-            .unwrap_or(0.565)
-            .clamp(0.0, 1.0)
-            .max(mix_pi_clamp_min);
-
-        let mix_anchor_incorrect = options.mix_anchor_incorrect.unwrap_or(true);
-
         // ---------------------------------------------------------------------
         // Specific pi clamps
         // ---------------------------------------------------------------------
-        let msfdr_pi_clamp_min = options
-            .msfdr_pi_clamp_min
-            .unwrap_or(mix_pi_clamp_min)
-            .clamp(0.0, 1.0);
+        let msfdr_pi_clamp_min = options.msfdr_pi_clamp_min.unwrap_or(0.01).clamp(0.0, 1.0);
 
         let msfdr_pi_clamp_max = options
             .msfdr_pi_clamp_max
-            .unwrap_or(mix_pi_clamp_max)
+            .unwrap_or(0.565)
             .clamp(0.0, 1.0)
             .max(msfdr_pi_clamp_min);
 
@@ -1098,13 +1067,6 @@ impl From<FdrOptions> for FdrSettings {
         // F) MSFDR1_Smix specific resolved null window + knobs
         // ---------------------------------------------------------------------
         let enable_msfdr_1smix = options.enable_msfdr_1smix.unwrap_or(true);
-
-        let (msfdr1_smix_min_null_rank, msfdr1_smix_max_null_rank) = resolve_window(
-            options.msfdr1_smix_min_null_rank,
-            options.msfdr1_smix_max_null_rank,
-            5,
-            50,
-        );
 
         let msfdr1_bottom_frac_init =
             clamp_frac(options.msfdr1_bottom_frac_init.unwrap_or(0.50), 0.50);
@@ -1137,16 +1099,6 @@ impl From<FdrOptions> for FdrSettings {
             options.msfdr2_top_frac_init.unwrap_or(msfdr1_top_frac_init),
             msfdr1_top_frac_init,
         );
-
-        let msfdr2_beta_drift_mult = match options.msfdr2_beta_drift_mult {
-            Some((a, b)) if a.is_finite() && b.is_finite() && a > 0.0 && b >= a => (a, b),
-            _ => (0.5, 2.0),
-        };
-
-        let msfdr2_mu_drift_abs = match options.msfdr2_mu_drift_abs {
-            Some(x) if x.is_finite() && x >= 0.0 => x,
-            _ => 0.5,
-        };
 
         // ---------------------------------------------------------------------
         // H) Nokoi specific resolved null window + knobs
@@ -1305,20 +1257,14 @@ impl From<FdrOptions> for FdrSettings {
             msfdr_pi_clamp_max,
 
             // =========================================================================
-            // Mixture knobs (MSFDR 1smix / 2smix)
+            // Mixture knobs (MSFDR 1smix / pooled-rank 2smix)
             // =========================================================================
             mix_em_max_iter,
             mix_em_tol,
-            mix_pi_clamp_min,
-            mix_pi_clamp_max,
-            mix_anchor_incorrect,
 
             // =========================================================================
             // F) MSFDR1_Smix specific resolved null window + knobs
             // =========================================================================
-            msfdr1_smix_min_null_rank,
-            msfdr1_smix_max_null_rank,
-
             msfdr1_bottom_frac_init,
             msfdr1_top_frac_init,
 
@@ -1335,9 +1281,6 @@ impl From<FdrOptions> for FdrSettings {
             msfdr2_smix_max_null_rank,
 
             msfdr2_top_frac_init,
-
-            msfdr2_beta_drift_mult,
-            msfdr2_mu_drift_abs,
 
             msfdr2_pi_clamp_min,
             msfdr2_pi_clamp_max,
