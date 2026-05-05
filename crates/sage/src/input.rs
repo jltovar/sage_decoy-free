@@ -493,15 +493,11 @@ pub struct FdrOptions {
     // F) MSFDR1_Smix specific knobs
     // =========================================================================
 
-    // MSFDR1 init/drift knobs (needed by real models)
-    pub msfdr1_bottom_frac_init: Option<f64>, // default 0.7
-    pub msfdr1_top_frac_init: Option<f64>,    // default 0.2
+    // MSFDR1 initialization knobs.
+    pub msfdr1_bottom_frac_init: Option<f64>, // default 0.50
+    pub msfdr1_top_frac_init: Option<f64>,    // default 0.20
 
-    // Expose drift clamps for MSFDR1
-    pub msfdr1_beta_drift_mult: Option<(f64, f64)>, // default (0.8, 1.25)
-    pub msfdr1_mu_drift_abs: Option<f64>,           // default 0.5
-
-    // --- Specific clamps (overrides) ---
+    // MSFDR1 mixture-weight clamps.
     pub msfdr1_pi_clamp_min: Option<f64>,
     pub msfdr1_pi_clamp_max: Option<f64>,
 
@@ -681,9 +677,6 @@ pub struct FdrSettings {
     // =========================================================================
     pub msfdr1_bottom_frac_init: f64,
     pub msfdr1_top_frac_init: f64,
-
-    pub msfdr1_beta_drift_mult: (f64, f64),
-    pub msfdr1_mu_drift_abs: f64,
 
     pub msfdr1_pi_clamp_min: f64,
     pub msfdr1_pi_clamp_max: f64,
@@ -1073,16 +1066,6 @@ impl From<FdrOptions> for FdrSettings {
 
         let msfdr1_top_frac_init = clamp_frac(options.msfdr1_top_frac_init.unwrap_or(0.20), 0.20);
 
-        let msfdr1_beta_drift_mult = match options.msfdr1_beta_drift_mult {
-            Some((a, b)) if a.is_finite() && b.is_finite() && a > 0.0 && b >= a => (a, b),
-            _ => (0.9, 1.1),
-        };
-
-        let msfdr1_mu_drift_abs = match options.msfdr1_mu_drift_abs {
-            Some(x) if x.is_finite() && x >= 0.0 => x,
-            _ => 0.5,
-        };
-
         // ---------------------------------------------------------------------
         // G) MSFDR2_Smix specific resolved null window + knobs
         // ---------------------------------------------------------------------
@@ -1267,9 +1250,6 @@ impl From<FdrOptions> for FdrSettings {
             // =========================================================================
             msfdr1_bottom_frac_init,
             msfdr1_top_frac_init,
-
-            msfdr1_beta_drift_mult,
-            msfdr1_mu_drift_abs,
 
             msfdr1_pi_clamp_min,
             msfdr1_pi_clamp_max,

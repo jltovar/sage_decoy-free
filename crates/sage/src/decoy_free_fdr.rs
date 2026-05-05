@@ -153,10 +153,15 @@ struct Rank1Computed {
     p_mle: f64,
     p_lo: f64,
 
-    // MSFDR family p's (independent streams)
+    // MSFDR family p-value streams.
     p_msfdr: Option<f64>, // seeded MSFDR fitted-null tail p-like stream
-    p_1smix: Option<f64>,
-    p_2smix: Option<f64>,
+    p_1smix: Option<f64>, // 1SMix I1 survival p-like stream
+    p_2smix: Option<f64>, // 2SMix I1 survival p-like stream
+
+    // MSFDR family native posterior-error streams.
+    pep_msfdr: Option<f64>,
+    pep_1smix: Option<f64>,
+    pep_2smix: Option<f64>,
 
     p_nokoi: Option<f64>,
 
@@ -1696,23 +1701,13 @@ fn fit_msfdr_seeded(
 
 #[inline]
 fn fit_msfdr_1smix(rank1_scores: &[f64], settings: &FdrSettings) -> Option<Msfdr1SmixModel> {
-    let iters = settings.mix_em_max_iter;
-    let em_tol = settings.mix_em_tol;
-    let pi_clamp = (settings.msfdr1_pi_clamp_min, settings.msfdr1_pi_clamp_max);
-    let bottom_frac_init = settings.msfdr1_bottom_frac_init; // Initialize null from bottom of Rank 1
-    let top_frac_init = settings.msfdr1_top_frac_init;
-    let mu_drift_abs = settings.msfdr1_mu_drift_abs;
-    let beta_drift_mult = settings.msfdr1_beta_drift_mult;
-
     Msfdr1SmixModel::fit_rank1(
         rank1_scores,
-        iters,
-        em_tol,
-        pi_clamp,
-        bottom_frac_init,
-        top_frac_init,
-        mu_drift_abs,
-        beta_drift_mult,
+        settings.mix_em_max_iter,
+        settings.mix_em_tol,
+        (settings.msfdr1_pi_clamp_min, settings.msfdr1_pi_clamp_max),
+        settings.msfdr1_bottom_frac_init,
+        settings.msfdr1_top_frac_init,
     )
 }
 
@@ -2228,25 +2223,34 @@ fn score_base_rank1(
                 1.0
             };
 
-            let p_msfdr = if use_seeded_expert {
+            let (p_msfdr, pep_msfdr) = if use_seeded_expert {
                 let m = msfdr_seeded.as_ref().unwrap();
-                Some(m.p_value(x).clamp(0.0, 1.0).max(1e-300))
+                (
+                    Some(m.p_value(x).clamp(0.0, 1.0).max(1e-300)),
+                    Some(m.pep(x).clamp(0.0, 1.0).max(1e-300)),
+                )
             } else {
-                None
+                (None, None)
             };
 
-            let p_1smix = if use_1smix_expert {
+            let (p_1smix, pep_1smix) = if use_1smix_expert {
                 let m = msfdr_1smix.as_ref().unwrap();
-                Some(m.p_value(x).clamp(0.0, 1.0).max(1e-300))
+                (
+                    Some(m.p_value(x).clamp(0.0, 1.0).max(1e-300)),
+                    Some(m.pep(x).clamp(0.0, 1.0).max(1e-300)),
+                )
             } else {
-                None
+                (None, None)
             };
 
-            let p_2smix = if use_2smix_expert {
+            let (p_2smix, pep_2smix) = if use_2smix_expert {
                 let m = msfdr_2smix.as_ref().unwrap();
-                Some(m.p_value(x).clamp(0.0, 1.0).max(1e-300))
+                (
+                    Some(m.p_value(x).clamp(0.0, 1.0).max(1e-300)),
+                    Some(m.pep(x).clamp(0.0, 1.0).max(1e-300)),
+                )
             } else {
-                None
+                (None, None)
             };
 
             let p_nokoi = if use_nokoi_expert {
@@ -2306,6 +2310,9 @@ fn score_base_rank1(
                 p_msfdr,
                 p_1smix,
                 p_2smix,
+                pep_msfdr,
+                pep_1smix,
+                pep_2smix,
                 p_nokoi,
                 p_final,
             })
@@ -2401,15 +2408,6 @@ fn score_base_rank1(
         .unwrap_or(1.0)
         .clamp(0.0, 1.0);
 
-    let pi0_msfdr = estimate_pi0_from_reference_grid(&p_msfdr_ref, settings)
-        .unwrap_or(1.0)
-        .clamp(0.0, 1.0);
-    let pi0_1smix = estimate_pi0_from_reference_grid(&p_1smix_ref, settings)
-        .unwrap_or(1.0)
-        .clamp(0.0, 1.0);
-    let pi0_2smix = estimate_pi0_from_reference_grid(&p_2smix_ref, settings)
-        .unwrap_or(1.0)
-        .clamp(0.0, 1.0);
     let pi0_nokoi = estimate_pi0_from_reference_grid(&p_nokoi_ref, settings)
         .unwrap_or(1.0)
         .clamp(0.0, 1.0);
@@ -2418,10 +2416,27 @@ fn score_base_rank1(
     let pep_mle_vec = grenander_pep_from_p(&p_mle_all, pi0_mle);
     let pep_lo_vec = grenander_pep_from_p(&p_lo_all, pi0_lo);
 
-    // MSFDR: calibrate fitted-null tail p-values, not raw mixture posterior PEPs.
-    let pep_msfdr_vec = grenander_pep_from_p(&p_msfdr_all, pi0_msfdr);
-    let pep_1smix_vec = grenander_pep_from_p(&p_1smix_all, pi0_1smix);
-    let pep_2smix_vec = grenander_pep_from_p(&p_2smix_all, pi0_2smix);
+    // MSFDR-family models expose both streams:
+    // - p_*     = native p-like null/incorrect tail probability
+    // - pep_*   = native model posterior error probability
+    //
+    // Do not derive 1SMix/2SMix PEPs from the threshold-FDR curve, and do not
+    // overwrite native model posteriors with Grenander unless a separate
+    // calibration experiment explicitly justifies that.
+    let pep_msfdr_vec: Vec<f64> = rank1_out
+        .iter()
+        .map(|r| r.pep_msfdr.unwrap_or(1.0).clamp(0.0, 1.0).max(1e-300))
+        .collect();
+
+    let pep_1smix_vec: Vec<f64> = rank1_out
+        .iter()
+        .map(|r| r.pep_1smix.unwrap_or(1.0).clamp(0.0, 1.0).max(1e-300))
+        .collect();
+
+    let pep_2smix_vec: Vec<f64> = rank1_out
+        .iter()
+        .map(|r| r.pep_2smix.unwrap_or(1.0).clamp(0.0, 1.0).max(1e-300))
+        .collect();
 
     // Nokoi: calibrate empirical null-survival p-values from classifier scores,
     // not raw 1 - P(target).

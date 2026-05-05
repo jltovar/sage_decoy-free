@@ -343,8 +343,6 @@ impl Msfdr1SmixModel {
         pi_clamp: (f64, f64),
         bottom_frac_init: f64,
         top_frac_init: f64,
-        _mu_drift_abs: f64,
-        _beta_drift_mult: (f64, f64),
     ) -> Option<Self> {
         let mut xs: Vec<f64> = rank1_scores
             .iter()
@@ -495,12 +493,17 @@ impl Msfdr1SmixModel {
         }
     }
 
-    /// Keep the existing pipeline API name.
+    /// Native p-like tail probability under the rank-1 incorrect component.
     ///
-    /// For the skew-normal MSFDR models, this returns the paper-style
-    /// threshold FDR estimate, not a Gumbel-null survival p-value.
+    /// This is the correct stream for `decoy_free_p_value`.
+    /// The paper-style threshold FDR curve is available separately as
+    /// `fdr_at_score(x)` and must not be used as a per-PSM p-value.
     pub fn p_value(&self, x: f64) -> f64 {
-        self.fdr_at_score(x)
+        if !x.is_finite() {
+            return 1.0;
+        }
+
+        self.incorrect1.sf(x).clamp(0.0, 1.0).max(TINY)
     }
 }
 
@@ -780,9 +783,17 @@ impl Msfdr2SmixModel {
         }
     }
 
-    /// Keep the existing pipeline API name.
+    /// Native p-like tail probability under the rank-1 incorrect component.
+    ///
+    /// For rank-1 acceptance, the null/incorrect comparator is I1, not I2.
+    /// The paper-style threshold FDR curve is available separately as
+    /// `fdr_at_score(x)` and must not be used as a per-PSM p-value.
     pub fn p_value(&self, x: f64) -> f64 {
-        self.fdr_at_score(x)
+        if !x.is_finite() {
+            return 1.0;
+        }
+
+        self.incorrect1.sf(x).clamp(0.0, 1.0).max(TINY)
     }
 }
 
@@ -958,8 +969,6 @@ mod tests {
             /*pi_clamp*/ (0.01, 0.99),
             /*bottom_frac_init*/ 0.7,
             /*top_frac_init*/ 0.2,
-            /*mu_drift*/ 0.5,
-            /*beta_drift*/ (0.8, 1.25),
         )
         .expect("1Smix should fit on synthetic input");
 
@@ -1039,9 +1048,8 @@ mod tests {
     #[test]
     fn p_value_is_generally_nonincreasing_in_x_for_onesmix() {
         let xs = synthetic_rank1_scores();
-        let m =
-            Msfdr1SmixModel::fit_rank1(&xs, 100, 1e-6, (0.01, 0.99), 0.7, 0.2, 0.5, (0.8, 1.25))
-                .expect("1Smix model should fit");
+        let m = Msfdr1SmixModel::fit_rank1(&xs, 100, 1e-6, (0.01, 0.99), 0.7, 0.2)
+            .expect("1Smix model should fit");
 
         let g = grid(-5.0, 10.0, 801);
         let mut prev = m.p_value(g[0]);
@@ -1115,17 +1123,7 @@ mod tests {
         // 1Smix requires xs.len() >= 20
         let too_small_19: Vec<f64> = (0..19).map(|i| i as f64).collect();
         assert!(
-            Msfdr1SmixModel::fit_rank1(
-                &too_small_19,
-                50,
-                1e-6,
-                (0.01, 0.99),
-                0.7,
-                0.2,
-                0.5,
-                (0.8, 1.25)
-            )
-            .is_none(),
+            Msfdr1SmixModel::fit_rank1(&too_small_19, 50, 1e-6, (0.01, 0.99), 0.7, 0.2,).is_none(),
             "1Smix fit should return None for <20 rank1 scores"
         );
 
@@ -1178,9 +1176,7 @@ mod tests {
 
         let seeded =
             MsfdrSeededModel::fit_rank1_seeded(&xs, 0.0, 1.0, 50, 1e-6, (0.01, 0.99), 0.2).unwrap();
-        let onesmix =
-            Msfdr1SmixModel::fit_rank1(&xs, 100, 1e-6, (0.01, 0.99), 0.7, 0.2, 0.5, (0.8, 1.25))
-                .unwrap();
+        let onesmix = Msfdr1SmixModel::fit_rank1(&xs, 100, 1e-6, (0.01, 0.99), 0.7, 0.2).unwrap();
         let twosmix = Msfdr2SmixModel::fit_rank1_with_pool(
             &xs,
             &pool,
