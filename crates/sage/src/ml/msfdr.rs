@@ -733,16 +733,18 @@ impl Msfdr2SmixModel {
                 }
             }
 
-            // I1 is updated from S1 p1 + S2 r1. The S2 I1 responsibilities are already
-            // diluted in the E-step by `a_s2`, so do not multiply them again here.
-            let mut i1_x = Vec::with_capacity(n1 + n2);
-            let mut i1_w = Vec::with_capacity(n1 + n2);
-            i1_x.extend_from_slice(&s1);
-            i1_w.extend_from_slice(&p1_s1);
-            i1_x.extend_from_slice(&s2);
-            i1_w.extend_from_slice(&r1_s2);
-
-            if let Some((m, v, s)) = weighted_moments(&i1_x, &i1_w) {
+            // I1 is the rank-1 incorrect component used as the null comparator for
+            // rank-1 PSM p-values:
+            //
+            //     p_2smix(x) = SF_I1(x)
+            //
+            // Therefore its shape must be learned from the rank-1 distribution only.
+            // Letting pooled lower-rank S2 update the I1 moments broadens I1 and creates
+            // an artificially fat right tail, which suppresses strict PSM-level p-values.
+            //
+            // S2 still contributes to the mixture-weight estimate through r1_s2 above,
+            // but it does not define the rank-1 null shape.
+            if let Some((m, v, s)) = weighted_moments(&s1, &p1_s1) {
                 if let Some(sn) = SkewNormal::from_moments(m, v.max(1e-12), s) {
                     incorrect1 = sn;
                 }
@@ -755,6 +757,21 @@ impl Msfdr2SmixModel {
                 }
             }
         }
+
+        log::info!(
+			"MSFDR2 pooled-rank fit final: a={:.6e} b={:.6e} C(loc={:.4},scale={:.4},shape={:.4}) I1(loc={:.4},scale={:.4},shape={:.4}) I2(loc={:.4},scale={:.4},shape={:.4})",
+			a_mix,
+			b_mix,
+			correct.location,
+			correct.scale,
+			correct.shape,
+			incorrect1.location,
+			incorrect1.scale,
+			incorrect1.shape,
+			incorrect2.location,
+			incorrect2.scale,
+			incorrect2.shape,
+		);
 
         Some(Self {
             correct,
