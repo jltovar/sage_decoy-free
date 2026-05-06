@@ -635,7 +635,13 @@ impl Msfdr2SmixModel {
 
         for _ in 0..iters {
             let a0 = a_mix.clamp(1e-6, 1.0 - 1e-6);
+
+            // In strict paper 2SMix, S2 is one rank-2 score per spectrum, so the
+            // I1 prior in S2 is `a`. In pooled-rank Sage 2SMix, S2 contains many
+            // lower-rank scores per rank-1 score. Therefore the I1 prior inside S2
+            // must be diluted by the effective S1/S2 sampling ratio.
             let a_s2 = (a0 * s2_balance).clamp(1e-6, 1.0 - 1e-6);
+
             let b0 = b_mix.clamp(1e-6, 1.0 - a_s2 - 1e-6);
             let i2_weight = (1.0 - a_s2 - b0).clamp(1e-6, 1.0);
 
@@ -659,7 +665,7 @@ impl Msfdr2SmixModel {
                 p1_s1.push((l1 - den).exp().clamp(0.0, 1.0));
             }
 
-            // ---------- E-step for S2 ----------
+            // ---------- E-step for pooled S2 ----------
             let mut rc_s2 = Vec::with_capacity(n2);
             let mut r1_s2 = Vec::with_capacity(n2);
             let mut r2_s2 = Vec::with_capacity(n2);
@@ -694,12 +700,19 @@ impl Msfdr2SmixModel {
             let sum_r1_s2 = r1_s2.iter().sum::<f64>();
             let sum_rc_s2 = rc_s2.iter().sum::<f64>();
 
-            let new_a = ((sum_pc_s1 + sum_r1_s2) / (2.0 * n1 as f64)).clamp(pi_clamp.0, pi_clamp.1);
+            // Effective S2 size is balanced to approximately match S1. This prevents
+            // pooled lower-rank depth from dominating the estimate of `a`.
+            let effective_n2 = (n2 as f64) * s2_balance;
 
-            let mut new_b = (sum_rc_s2 / n2 as f64).clamp(1e-6, 1.0 - (new_a * s2_balance) - 1e-6);
+            let new_a = ((sum_pc_s1 + sum_r1_s2) / (n1 as f64 + effective_n2))
+                .clamp(pi_clamp.0, pi_clamp.1);
 
-            if new_a + new_b >= 0.999 {
-                new_b = (0.999 - new_a).max(1e-6);
+            let new_a_s2 = (new_a * s2_balance).clamp(1e-6, 1.0 - 1e-6);
+
+            let mut new_b = (sum_rc_s2 / n2 as f64).clamp(1e-6, 1.0 - new_a_s2 - 1e-6);
+
+            if new_a_s2 + new_b >= 0.999 {
+                new_b = (0.999 - new_a_s2).max(1e-6);
             }
 
             a_mix = new_a;
@@ -720,7 +733,8 @@ impl Msfdr2SmixModel {
                 }
             }
 
-            // I1 is updated from S1 p1 + S2 r1.
+            // I1 is updated from S1 p1 + S2 r1. The S2 I1 responsibilities are already
+            // diluted in the E-step by `a_s2`, so do not multiply them again here.
             let mut i1_x = Vec::with_capacity(n1 + n2);
             let mut i1_w = Vec::with_capacity(n1 + n2);
             i1_x.extend_from_slice(&s1);
