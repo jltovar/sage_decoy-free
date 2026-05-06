@@ -557,6 +557,7 @@ impl Msfdr2SmixModel {
         pi_clamp: (f64, f64),
         bottom_frac_init: f64,
         top_frac_init: f64,
+        s2_target_frac_init: f64,
     ) -> Option<Self> {
         let mut s1: Vec<f64> = rank1_scores
             .iter()
@@ -580,45 +581,60 @@ impl Msfdr2SmixModel {
         let n1 = s1.len();
         let n2 = s2.len();
 
-        // ---------- Component Initialization ----------
-        // Incorrect1 initialization from the lower part of S1.
+        // Initialize I1 from the lower part of S1.
         let bottom_frac = bottom_frac_init.clamp(0.10, 0.90);
-        let b1_n = ((n1 as f64) * bottom_frac).round() as usize;
-        let b1_n = b1_n.max(10).min(n1);
-        let b1 = &s1[..b1_n];
-        let b1_mean = b1.iter().sum::<f64>() / b1.len() as f64;
-        let b1_var = b1.iter().map(|v| (v - b1_mean).powi(2)).sum::<f64>() / b1.len() as f64;
-        let b1_skew = sample_skewness(b1, b1_mean, b1_var);
-        let mut incorrect1 = SkewNormal::from_moments(b1_mean, b1_var.max(1e-12), b1_skew)
-            .unwrap_or_else(|| SkewNormal::new(b1_mean, b1_var.sqrt().max(1e-6), 0.0));
+        let bottom_n = ((n1 as f64) * bottom_frac).round() as usize;
+        let bottom_n = bottom_n.max(10).min(n1);
+        let s1_low = &s1[..bottom_n];
 
-        // Correct C initialization from the upper part of S1.
+        let i1_mean = s1_low.iter().sum::<f64>() / s1_low.len() as f64;
+        let i1_var =
+            s1_low.iter().map(|v| (v - i1_mean).powi(2)).sum::<f64>() / s1_low.len() as f64;
+        let i1_skew = sample_skewness(s1_low, i1_mean, i1_var);
+
+        let mut incorrect1 = SkewNormal::from_moments(i1_mean, i1_var.max(1e-12), i1_skew)
+            .unwrap_or_else(|| SkewNormal::new(i1_mean, i1_var.sqrt().max(1e-6), 0.0));
+
+        // Initialize C from top fraction of S1.
         let top_frac = top_frac_init.clamp(0.05, 0.50);
-        let t1_n = ((n1 as f64) * top_frac).round() as usize;
-        let t1_n = t1_n.max(10).min(n1);
-        let t1 = &s1[(n1 - t1_n)..];
-        let t1_mean = t1.iter().sum::<f64>() / t1.len() as f64;
-        let t1_var = t1.iter().map(|v| (v - t1_mean).powi(2)).sum::<f64>() / t1.len() as f64;
-        let t1_skew = sample_skewness(t1, t1_mean, t1_var);
-        let mut correct = SkewNormal::from_moments(t1_mean, t1_var.max(1e-12), t1_skew)
-            .unwrap_or_else(|| SkewNormal::new(t1_mean, t1_var.sqrt().max(1e-6), 0.0));
+        let top_n = ((n1 as f64) * top_frac).round() as usize;
+        let top_n = top_n.max(10).min(n1);
+        let s1_top = &s1[(n1 - top_n)..];
 
-        // Incorrect2 initialization from S2 (pooled nulls).
-        let b2_mean = s2.iter().sum::<f64>() / n2 as f64;
-        let b2_var = s2.iter().map(|v| (v - b2_mean).powi(2)).sum::<f64>() / n2 as f64;
-        let b2_skew = sample_skewness(&s2, b2_mean, b2_var);
-        let mut incorrect2 = SkewNormal::from_moments(b2_mean, b2_var.max(1e-12), b2_skew)
-            .unwrap_or_else(|| SkewNormal::new(b2_mean, b2_var.sqrt().max(1e-6), 0.0));
+        let c_mean = s1_top.iter().sum::<f64>() / s1_top.len() as f64;
+        let c_var = s1_top.iter().map(|v| (v - c_mean).powi(2)).sum::<f64>() / s1_top.len() as f64;
+        let c_skew = sample_skewness(s1_top, c_mean, c_var);
 
-        // By pooling distant lower ranks into S2 (e.g. ranks 9..13), we break the original
-        // 2SMix assumption that S2 is exactly rank-2 and contains I1. Instead, S2 is an
-        // independent mixture of targets (C) and the generic null for that rank pool (I2).
-        // S1 ~ a * C + (1 - a) * I1
-        // S2 ~ b * C + (1 - b) * I2
-        // C is shared, improving target shape estimation without I1/I2 null contamination.
+        let mut correct = SkewNormal::from_moments(c_mean, c_var.max(1e-12), c_skew)
+            .unwrap_or_else(|| SkewNormal::new(c_mean, c_var.sqrt().max(1e-6), 0.0));
 
+        // Initialize I2 from pooled lower-rank scores.
+        let i2_mean = s2.iter().sum::<f64>() / n2 as f64;
+        let i2_var = s2.iter().map(|v| (v - i2_mean).powi(2)).sum::<f64>() / n2 as f64;
+        let i2_skew = sample_skewness(&s2, i2_mean, i2_var);
+
+        let mut incorrect2 = SkewNormal::from_moments(i2_mean, i2_var.max(1e-12), i2_skew)
+            .unwrap_or_else(|| SkewNormal::new(i2_mean, i2_var.sqrt().max(1e-6), 0.0));
+
+        // Pooled-rank Sage 2SMix generalization.
+        //
+        // Strict paper 2SMix assumes:
+        //   S1 ~ a*C + (1-a)*I1
+        //   S2 ~ b*C + a*I1 + (1-a-b)*I2
+        //
+        // That coupling is only appropriate when S2 is exactly rank 2. Once S2 is a
+        // generic pooled lower-rank sample, especially distant ranks such as 9..13,
+        // forcing I1 into S2 can collapse `a` and distort rank-1 p-values.
+        //
+        // For the pooled-rank variant, use two independent mixtures sharing C:
+        //
+        //   S1 ~ a*C + (1-a)*I1
+        //   S2 ~ b*C + (1-b)*I2
+        //
+        // C is shared. I1 remains the rank-1 incorrect component used for
+        // p_2smix(x) = SF_I1(x). I2 models the pooled lower-rank null.
         let mut a_mix = 0.5f64.clamp(pi_clamp.0, pi_clamp.1);
-        let mut b_mix = bottom_frac_init.clamp(1e-6, 0.5);
+        let mut b_mix = s2_target_frac_init.clamp(1e-6, 0.50);
 
         let iters = iters.max(10).min(500);
         let mut prev_ll = f64::NEG_INFINITY;
@@ -647,7 +663,7 @@ impl Msfdr2SmixModel {
                 p1_s1.push((l1 - den).exp().clamp(0.0, 1.0));
             }
 
-            // ---------- E-step for S2 ----------
+            // ---------- E-step for pooled S2 ----------
             let mut rc_s2 = Vec::with_capacity(n2);
             let mut r2_s2 = Vec::with_capacity(n2);
 
@@ -679,7 +695,7 @@ impl Msfdr2SmixModel {
             b_mix = (sum_rc_s2 / n2 as f64).clamp(1e-6, 1.0 - 1e-6);
 
             // ---------- M-step component parameters ----------
-            // C is updated from S1 pc + S2 rc.
+            // C is updated from both S1 and S2 target responsibilities.
             let mut c_x = Vec::with_capacity(n1 + n2);
             let mut c_w = Vec::with_capacity(n1 + n2);
             c_x.extend_from_slice(&s1);
@@ -693,14 +709,14 @@ impl Msfdr2SmixModel {
                 }
             }
 
-            // I1 is updated from S1 p1 only.
+            // I1 is the rank-1 incorrect component. It is updated only from S1.
             if let Some((m, v, s)) = weighted_moments(&s1, &p1_s1) {
                 if let Some(sn) = SkewNormal::from_moments(m, v.max(1e-12), s) {
                     incorrect1 = sn;
                 }
             }
 
-            // I2 is updated from S2 r2 only.
+            // I2 is the pooled lower-rank null component. It is updated only from S2.
             if let Some((m, v, s)) = weighted_moments(&s2, &r2_s2) {
                 if let Some(sn) = SkewNormal::from_moments(m, v.max(1e-12), s) {
                     incorrect2 = sn;
@@ -1066,8 +1082,17 @@ mod tests {
     fn p_value_is_generally_nonincreasing_in_x_for_twosmix() {
         let xs = synthetic_rank1_scores();
         let pool = synthetic_pool_scores();
-        let m = Msfdr2SmixModel::fit_top_two_pooled(&xs, &pool, 100, 1e-6, (0.01, 0.99), 0.5, 0.2)
-            .expect("2Smix model should fit");
+        let m = Msfdr2SmixModel::fit_top_two_pooled(
+            &xs,
+            &pool,
+            100,
+            1e-6,
+            (0.01, 0.99),
+            0.5,
+            0.2,
+            0.05,
+        )
+        .expect("2Smix model should fit");
 
         let g = grid(-5.0, 10.0, 801);
         let mut prev = m.p_value(g[0]);
@@ -1155,9 +1180,17 @@ mod tests {
         let seeded =
             MsfdrSeededModel::fit_rank1_seeded(&xs, 0.0, 1.0, 50, 1e-6, (0.01, 0.99), 0.2).unwrap();
         let onesmix = Msfdr1SmixModel::fit_rank1(&xs, 100, 1e-6, (0.01, 0.99), 0.7, 0.2).unwrap();
-        let twosmix =
-            Msfdr2SmixModel::fit_top_two_pooled(&xs, &pool, 100, 1e-6, (0.01, 0.99), 0.5, 0.2)
-                .unwrap();
+        let twosmix = Msfdr2SmixModel::fit_top_two_pooled(
+            &xs,
+            &pool,
+            100,
+            1e-6,
+            (0.01, 0.99),
+            0.5,
+            0.2,
+            0.05,
+        )
+        .unwrap();
 
         for x in grid(-10.0, 15.0, 501) {
             // seeded

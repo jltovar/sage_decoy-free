@@ -514,9 +514,14 @@ pub struct FdrOptions {
     pub msfdr2_smix_min_null_rank: Option<u32>,
     pub msfdr2_smix_max_null_rank: Option<u32>,
 
-    // MSFDR2 initialization knob.
+    // MSFDR2 initialization knobs.
     pub msfdr2_bottom_frac_init: Option<f64>,
     pub msfdr2_top_frac_init: Option<f64>,
+
+    // Initial target-component fraction in the pooled S2 distribution.
+    // This is separate from `a`, because pooled-rank S2 is no longer assumed
+    // to contain the same I1/C mixture structure as strict rank-2-only 2SMix.
+    pub msfdr2_s2_target_frac_init: Option<f64>,
 
     // --- Specific clamps (overrides) ---
     pub msfdr2_pi_clamp_min: Option<f64>,
@@ -703,6 +708,7 @@ pub struct FdrSettings {
 
     pub msfdr2_bottom_frac_init: f64,
     pub msfdr2_top_frac_init: f64,
+    pub msfdr2_s2_target_frac_init: f64,
 
     pub msfdr2_pi_clamp_min: f64,
     pub msfdr2_pi_clamp_max: f64,
@@ -1106,6 +1112,9 @@ impl From<FdrOptions> for FdrSettings {
             msfdr1_top_frac_init,
         );
 
+        let msfdr2_s2_target_frac_init =
+            clamp_frac(options.msfdr2_s2_target_frac_init.unwrap_or(0.05), 0.05);
+
         // ---------------------------------------------------------------------
         // H) Nokoi specific resolved null window + knobs
         // ---------------------------------------------------------------------
@@ -1287,6 +1296,7 @@ impl From<FdrOptions> for FdrSettings {
 
             msfdr2_bottom_frac_init,
             msfdr2_top_frac_init,
+            msfdr2_s2_target_frac_init,
 
             msfdr2_pi_clamp_min,
             msfdr2_pi_clamp_max,
