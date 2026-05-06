@@ -639,6 +639,19 @@ impl Runner {
                 sage_core::decoy_free_fdr::run_df_layers(&features, &fdr_settings, &self.database);
             features.retain(|f| f.core.rank == 1);
 
+            // Aggregate rank-1 Decoy-Free PSMs to peptide- and protein-level q-values.
+            let (q_peptide, _ent_peptide) = sage_core::decoy_free_fdr::calculate_peptide_q_df(
+                &mut features,
+                &self.database,
+                &fdr_settings,
+                fdr_settings.peptide_fdr,
+            );
+
+            sage_core::decoy_free_fdr::apply_peptide_q_to_psm_reporting_df(
+                &mut features,
+                &fdr_settings,
+            );
+
             let q_psm = features
                 .iter()
                 .filter(|f| {
@@ -651,19 +664,6 @@ impl Runner {
                 "discovered {} target peptide-spectrum matches at {}% FDR (Decoy-Free; using peptide_fdr as the primary DF reporting threshold)",
                 q_psm,
                 fdr_settings.peptide_fdr * 100.0
-            );
-
-            // Aggregate rank-1 Decoy-Free PSMs to peptide- and protein-level q-values.
-            let (q_peptide, _ent_peptide) = sage_core::decoy_free_fdr::calculate_peptide_q_df(
-                &mut features,
-                &self.database,
-                &fdr_settings,
-                fdr_settings.peptide_fdr,
-            );
-
-            sage_core::decoy_free_fdr::apply_peptide_q_to_psm_reporting_df(
-                &mut features,
-                &fdr_settings,
             );
 
             let q_protein = sage_core::decoy_free_fdr::calculate_protein_q_df(
