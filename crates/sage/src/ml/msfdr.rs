@@ -544,8 +544,17 @@ pub struct Msfdr2SmixModel {
     pub correct: SkewNormal,
     pub incorrect1: SkewNormal,
     pub incorrect2: SkewNormal,
+
+    /// Rank-1 target/correct fraction in S1.
     pub a: f64,
+
+    /// Correct-component fraction in pooled S2.
     pub b: f64,
+
+    /// I1-component fraction in pooled S2.
+    /// This generalizes strict 2SMix, where the S2 I1 fraction is rigidly tied
+    /// to `a`. In pooled-rank Sage 2SMix, `a2` is free.
+    pub a2: f64,
 }
 
 impl Msfdr2SmixModel {
@@ -616,32 +625,47 @@ impl Msfdr2SmixModel {
         let mut incorrect2 = SkewNormal::from_moments(i2_mean, i2_var.max(1e-12), i2_skew)
             .unwrap_or_else(|| SkewNormal::new(i2_mean, i2_var.sqrt().max(1e-6), 0.0));
 
-        // Pooled-rank Sage 2SMix generalization.
+        // Generalized pooled-rank Sage 2SMix.
         //
         // Strict paper 2SMix assumes:
         //   S1 ~ a*C + (1-a)*I1
         //   S2 ~ b*C + a*I1 + (1-a-b)*I2
         //
-        // That coupling is only appropriate when S2 is exactly rank 2. Once S2 is a
-        // generic pooled lower-rank sample, especially distant ranks such as 9..13,
-        // forcing I1 into S2 can collapse `a` and distort rank-1 p-values.
+        // That rigid coupling is valid only when S2 is exactly rank 2. For pooled
+        // lower-rank S2, especially distant ranks, the amount of I1-like mass in S2
+        // must be learned independently.
         //
-        // For the pooled-rank variant, use two independent mixtures sharing C:
-        //
+        // Generalized model:
         //   S1 ~ a*C + (1-a)*I1
-        //   S2 ~ b*C + (1-b)*I2
+        //   S2 ~ b*C + a2*I1 + (1-b-a2)*I2
         //
-        // C is shared. I1 remains the rank-1 incorrect component used for
+        // C is shared. I1 remains the rank-1 incorrect/null comparator used for
         // p_2smix(x) = SF_I1(x). I2 models the pooled lower-rank null.
         let mut a_mix = 0.5f64.clamp(pi_clamp.0, pi_clamp.1);
         let mut b_mix = s2_target_frac_init.clamp(1e-6, 0.50);
+
+        // Initialize a2 as a pooled-rank-aware fraction.
+        // For strict rank-2 S2, n1 ~= n2, so this starts near 0.5.
+        // For pooled ranks 2..K, n2 >> n1, so this starts smaller and avoids
+        // forcing I1 to absorb the whole pooled lower-rank distribution.
+        let mut a2_mix = (0.5 * (n1 as f64 / n2 as f64)).clamp(1e-6, 0.50);
 
         let iters = iters.max(10).min(500);
         let mut prev_ll = f64::NEG_INFINITY;
 
         for _ in 0..iters {
             let a0 = a_mix.clamp(1e-6, 1.0 - 1e-6);
-            let b0 = b_mix.clamp(1e-6, 1.0 - 1e-6);
+
+            let mut b0 = b_mix.clamp(1e-6, 1.0 - 1e-6);
+            let mut a2_0 = a2_mix.clamp(1e-6, 1.0 - b0 - 1e-6);
+
+            if b0 + a2_0 >= 0.999 {
+                let scale = 0.999 / (b0 + a2_0);
+                b0 *= scale;
+                a2_0 *= scale;
+            }
+
+            let i2_weight = (1.0 - b0 - a2_0).clamp(1e-6, 1.0);
 
             // ---------- E-step for S1 ----------
             let mut pc_s1 = Vec::with_capacity(n1);
@@ -665,19 +689,25 @@ impl Msfdr2SmixModel {
 
             // ---------- E-step for pooled S2 ----------
             let mut rc_s2 = Vec::with_capacity(n2);
+            let mut r1_s2 = Vec::with_capacity(n2);
             let mut r2_s2 = Vec::with_capacity(n2);
 
             for &x in &s2 {
                 let fc = correct.pdf(x).max(TINY);
+                let f1 = incorrect1.pdf(x).max(TINY);
                 let f2 = incorrect2.pdf(x).max(TINY);
 
                 let lc = b0.ln() + fc.ln();
-                let l2 = (1.0 - b0).ln() + f2.ln();
-                let den = log_add_exp(lc, l2);
+                let l1 = a2_0.ln() + f1.ln();
+                let l2 = i2_weight.ln() + f2.ln();
+
+                let den12 = log_add_exp(l1, l2);
+                let den = log_add_exp(lc, den12);
 
                 ll += den;
 
                 rc_s2.push((lc - den).exp().clamp(0.0, 1.0));
+                r1_s2.push((l1 - den).exp().clamp(0.0, 1.0));
                 r2_s2.push((l2 - den).exp().clamp(0.0, 1.0));
             }
 
@@ -690,12 +720,24 @@ impl Msfdr2SmixModel {
             // ---------- M-step mixture weights ----------
             let sum_pc_s1 = pc_s1.iter().sum::<f64>();
             let sum_rc_s2 = rc_s2.iter().sum::<f64>();
+            let sum_r1_s2 = r1_s2.iter().sum::<f64>();
 
             a_mix = (sum_pc_s1 / n1 as f64).clamp(pi_clamp.0, pi_clamp.1);
-            b_mix = (sum_rc_s2 / n2 as f64).clamp(1e-6, 1.0 - 1e-6);
+
+            let mut new_b = (sum_rc_s2 / n2 as f64).clamp(1e-6, 1.0 - 1e-6);
+            let mut new_a2 = (sum_r1_s2 / n2 as f64).clamp(1e-6, 1.0 - 1e-6);
+
+            if new_b + new_a2 >= 0.999 {
+                let scale = 0.999 / (new_b + new_a2);
+                new_b *= scale;
+                new_a2 *= scale;
+            }
+
+            b_mix = new_b;
+            a2_mix = new_a2;
 
             // ---------- M-step component parameters ----------
-            // C is updated from both S1 and S2 target responsibilities.
+            // C is updated from both S1 and S2 target/correct responsibilities.
             let mut c_x = Vec::with_capacity(n1 + n2);
             let mut c_w = Vec::with_capacity(n1 + n2);
             c_x.extend_from_slice(&s1);
@@ -709,14 +751,22 @@ impl Msfdr2SmixModel {
                 }
             }
 
-            // I1 is the rank-1 incorrect component. It is updated only from S1.
-            if let Some((m, v, s)) = weighted_moments(&s1, &p1_s1) {
+            // I1 is the rank-1 incorrect component. S2 may contribute only through
+            // its freely estimated a2 responsibility, not through rigid coupling to `a`.
+            let mut i1_x = Vec::with_capacity(n1 + n2);
+            let mut i1_w = Vec::with_capacity(n1 + n2);
+            i1_x.extend_from_slice(&s1);
+            i1_w.extend_from_slice(&p1_s1);
+            i1_x.extend_from_slice(&s2);
+            i1_w.extend_from_slice(&r1_s2);
+
+            if let Some((m, v, s)) = weighted_moments(&i1_x, &i1_w) {
                 if let Some(sn) = SkewNormal::from_moments(m, v.max(1e-12), s) {
                     incorrect1 = sn;
                 }
             }
 
-            // I2 is the pooled lower-rank null component. It is updated only from S2.
+            // I2 is the pooled lower-rank null component.
             if let Some((m, v, s)) = weighted_moments(&s2, &r2_s2) {
                 if let Some(sn) = SkewNormal::from_moments(m, v.max(1e-12), s) {
                     incorrect2 = sn;
@@ -725,9 +775,10 @@ impl Msfdr2SmixModel {
         }
 
         log::info!(
-			"MSFDR2 pooled-rank fit final: a={:.6e} b={:.6e} C(loc={:.4},scale={:.4},shape={:.4}) I1(loc={:.4},scale={:.4},shape={:.4}) I2(loc={:.4},scale={:.4},shape={:.4})",
+			"MSFDR2 pooled-rank fit final: a={:.6e} b={:.6e} a2={:.6e} C(loc={:.4},scale={:.4},shape={:.4}) I1(loc={:.4},scale={:.4},shape={:.4}) I2(loc={:.4},scale={:.4},shape={:.4})",
 			a_mix,
 			b_mix,
+			a2_mix,
 			correct.location,
 			correct.scale,
 			correct.shape,
@@ -745,6 +796,7 @@ impl Msfdr2SmixModel {
             incorrect2,
             a: a_mix,
             b: b_mix,
+            a2: a2_mix,
         })
     }
 
