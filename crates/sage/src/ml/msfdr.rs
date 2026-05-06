@@ -555,6 +555,7 @@ impl Msfdr2SmixModel {
         iters: usize,
         em_tol: f64,
         pi_clamp: (f64, f64),
+        bottom_frac_init: f64,
         top_frac_init: f64,
     ) -> Option<Self> {
         let mut s1: Vec<f64> = rank1_scores
@@ -579,9 +580,18 @@ impl Msfdr2SmixModel {
         let n1 = s1.len();
         let n2 = s2.len();
 
-        // Initialize I1 from lower half of S1.
-        let s1_mid = n1 / 2;
-        let s1_low = &s1[..s1_mid.max(10).min(n1)];
+        // In strict paper 2SMix, S2 is one second-best score per spectrum,
+        // so |S2| is comparable to |S1|. In the pooled-rank Sage variant,
+        // S2 may contain many lower-rank scores per spectrum. Without this
+        // balancing factor, broad S2 rank windows dominate the EM updates and
+        // can drive over-permissive, entrapment-heavy fits.
+        let s2_balance = ((n1 as f64) / (n2 as f64)).clamp(1e-6, 1.0);
+
+        // Initialize I1 from the lower part of S1.
+        let bottom_frac = bottom_frac_init.clamp(0.10, 0.90);
+        let bottom_n = ((n1 as f64) * bottom_frac).round() as usize;
+        let bottom_n = bottom_n.max(10).min(n1);
+        let s1_low = &s1[..bottom_n];
 
         let i1_mean = s1_low.iter().sum::<f64>() / s1_low.len() as f64;
         let i1_var =
@@ -683,9 +693,13 @@ impl Msfdr2SmixModel {
             let sum_r1_s2 = r1_s2.iter().sum::<f64>();
             let sum_rc_s2 = rc_s2.iter().sum::<f64>();
 
-            let new_a =
-                ((sum_pc_s1 + sum_r1_s2) / ((n1 + n2) as f64)).clamp(pi_clamp.0, pi_clamp.1);
+            let weighted_n2 = s2_balance * n2 as f64;
 
+            let new_a = ((sum_pc_s1 + s2_balance * sum_r1_s2) / (n1 as f64 + weighted_n2))
+                .clamp(pi_clamp.0, pi_clamp.1);
+
+            // b is the posterior fraction of correct-component assignments within S2.
+            // Keep it normalized within S2, not across S1+S2.
             let mut new_b = (sum_rc_s2 / n2 as f64).clamp(1e-6, 1.0 - new_a - 1e-6);
 
             if new_a + new_b >= 0.999 {
@@ -702,7 +716,7 @@ impl Msfdr2SmixModel {
             c_x.extend_from_slice(&s1);
             c_w.extend_from_slice(&pc_s1);
             c_x.extend_from_slice(&s2);
-            c_w.extend_from_slice(&rc_s2);
+            c_w.extend(rc_s2.iter().map(|w| s2_balance * *w));
 
             if let Some((m, v, s)) = weighted_moments(&c_x, &c_w) {
                 if let Some(sn) = SkewNormal::from_moments(m, v.max(1e-12), s) {
@@ -716,7 +730,7 @@ impl Msfdr2SmixModel {
             i1_x.extend_from_slice(&s1);
             i1_w.extend_from_slice(&p1_s1);
             i1_x.extend_from_slice(&s2);
-            i1_w.extend_from_slice(&r1_s2);
+            i1_w.extend(r1_s2.iter().map(|w| s2_balance * *w));
 
             if let Some((m, v, s)) = weighted_moments(&i1_x, &i1_w) {
                 if let Some(sn) = SkewNormal::from_moments(m, v.max(1e-12), s) {
@@ -996,6 +1010,7 @@ mod tests {
             /*iters*/ 100,
             /*em_tol*/ 1e-6,
             /*pi_clamp*/ (0.01, 0.99),
+            /*bottom_frac_init*/ 0.5,
             /*top_frac_init*/ 0.2,
         )
         .expect("2Smix should fit on synthetic input");
@@ -1074,18 +1089,8 @@ mod tests {
     fn p_value_is_generally_nonincreasing_in_x_for_twosmix() {
         let xs = synthetic_rank1_scores();
         let pool = synthetic_pool_scores();
-        let m = Msfdr2SmixModel::fit_rank1_with_pool(
-            &xs,
-            &pool,
-            100,
-            1e-6,
-            (0.01, 0.99),
-            0.2,
-            true,
-            (0.8, 1.25),
-            0.5,
-        )
-        .expect("2Smix model should fit");
+        let m = Msfdr2SmixModel::fit_top_two_pooled(&xs, &pool, 100, 1e-6, (0.01, 0.99), 0.5, 0.2)
+            .expect("2Smix model should fit");
 
         let g = grid(-5.0, 10.0, 801);
         let mut prev = m.p_value(g[0]);
@@ -1123,7 +1128,7 @@ mod tests {
         // 1Smix requires xs.len() >= 20
         let too_small_19: Vec<f64> = (0..19).map(|i| i as f64).collect();
         assert!(
-            Msfdr1SmixModel::fit_rank1(&too_small_19, 50, 1e-6, (0.01, 0.99), 0.7, 0.2,).is_none(),
+            Msfdr1SmixModel::fit_rank1(&too_small_19, 50, 1e-6, (0.01, 0.99), 0.7, 0.2).is_none(),
             "1Smix fit should return None for <20 rank1 scores"
         );
 
@@ -1131,36 +1136,32 @@ mod tests {
         let rank1_19: Vec<f64> = (0..19).map(|i| i as f64).collect();
         let pool_50: Vec<f64> = (0..50).map(|i| (i as f64) * 0.1).collect();
         assert!(
-            Msfdr2SmixModel::fit_rank1_with_pool(
+            Msfdr2SmixModel::fit_top_two_pooled(
                 &rank1_19,
                 &pool_50,
                 50,
                 1e-6,
                 (0.01, 0.99),
+                0.5,
                 0.2,
-                true,
-                (0.8, 1.25),
-                0.5
             )
-            .is_none(),
+            .is_none()
             "2Smix fit should return None for rank1 <20"
         );
 
         let rank1_50: Vec<f64> = (0..50).map(|i| (i as f64) * 0.1).collect();
         let pool_19: Vec<f64> = (0..19).map(|i| i as f64).collect();
         assert!(
-            Msfdr2SmixModel::fit_rank1_with_pool(
+            Msfdr2SmixModel::fit_top_two_pooled(
                 &rank1_50,
                 &pool_19,
                 50,
                 1e-6,
                 (0.01, 0.99),
+                0.5,
                 0.2,
-                true,
-                (0.8, 1.25),
-                0.5
             )
-            .is_none(),
+            .is_none()
             "2Smix fit should return None for pool <20"
         );
     }
@@ -1177,18 +1178,9 @@ mod tests {
         let seeded =
             MsfdrSeededModel::fit_rank1_seeded(&xs, 0.0, 1.0, 50, 1e-6, (0.01, 0.99), 0.2).unwrap();
         let onesmix = Msfdr1SmixModel::fit_rank1(&xs, 100, 1e-6, (0.01, 0.99), 0.7, 0.2).unwrap();
-        let twosmix = Msfdr2SmixModel::fit_rank1_with_pool(
-            &xs,
-            &pool,
-            100,
-            1e-6,
-            (0.01, 0.99),
-            0.2,
-            true,
-            (0.8, 1.25),
-            0.5,
-        )
-        .unwrap();
+        let twosmix =
+            Msfdr2SmixModel::fit_top_two_pooled(&xs, &pool, 100, 1e-6, (0.01, 0.99), 0.5, 0.2)
+                .unwrap();
 
         for x in grid(-10.0, 15.0, 501) {
             // seeded

@@ -508,6 +508,7 @@ pub struct FdrOptions {
     pub msfdr2_smix_max_null_rank: Option<u32>,
 
     // MSFDR2 initialization knob.
+    pub msfdr2_bottom_frac_init: Option<f64>,
     pub msfdr2_top_frac_init: Option<f64>,
 
     // --- Specific clamps (overrides) ---
@@ -687,6 +688,7 @@ pub struct FdrSettings {
     pub msfdr2_smix_min_null_rank: u32,
     pub msfdr2_smix_max_null_rank: u32,
 
+    pub msfdr2_bottom_frac_init: f64,
     pub msfdr2_top_frac_init: f64,
 
     pub msfdr2_pi_clamp_min: f64,
@@ -1078,6 +1080,13 @@ impl From<FdrOptions> for FdrSettings {
             50,
         );
 
+        let msfdr2_bottom_frac_init = clamp_frac(
+            options
+                .msfdr2_bottom_frac_init
+                .unwrap_or(msfdr1_bottom_frac_init),
+            msfdr1_bottom_frac_init,
+        );
+
         let msfdr2_top_frac_init = clamp_frac(
             options.msfdr2_top_frac_init.unwrap_or(msfdr1_top_frac_init),
             msfdr1_top_frac_init,
@@ -1260,6 +1269,7 @@ impl From<FdrOptions> for FdrSettings {
             msfdr2_smix_min_null_rank,
             msfdr2_smix_max_null_rank,
 
+            msfdr2_bottom_frac_init,
             msfdr2_top_frac_init,
 
             msfdr2_pi_clamp_min,

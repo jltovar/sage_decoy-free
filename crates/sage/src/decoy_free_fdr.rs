@@ -1723,6 +1723,7 @@ fn fit_msfdr_2smix(
         settings.mix_em_max_iter,
         settings.mix_em_tol,
         (settings.msfdr2_pi_clamp_min, settings.msfdr2_pi_clamp_max),
+        settings.msfdr2_bottom_frac_init,
         settings.msfdr2_top_frac_init,
     )
 }
