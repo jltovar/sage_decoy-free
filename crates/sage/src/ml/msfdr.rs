@@ -635,8 +635,9 @@ impl Msfdr2SmixModel {
 
         for _ in 0..iters {
             let a0 = a_mix.clamp(1e-6, 1.0 - 1e-6);
-            let b0 = b_mix.clamp(1e-6, 1.0 - a0 - 1e-6);
-            let i2_weight = (1.0 - a0 - b0).clamp(1e-6, 1.0);
+            let a_s2 = (a0 * s2_balance).clamp(1e-6, 1.0 - 1e-6);
+            let b0 = b_mix.clamp(1e-6, 1.0 - a_s2 - 1e-6);
+            let i2_weight = (1.0 - a_s2 - b0).clamp(1e-6, 1.0);
 
             // ---------- E-step for S1 ----------
             let mut pc_s1 = Vec::with_capacity(n1);
@@ -669,7 +670,7 @@ impl Msfdr2SmixModel {
                 let f2 = incorrect2.pdf(x).max(TINY);
 
                 let lc = b0.ln() + fc.ln();
-                let l1 = a0.ln() + f1.ln();
+                let l1 = a_s2.ln() + f1.ln();
                 let l2 = i2_weight.ln() + f2.ln();
 
                 let den12 = log_add_exp(l1, l2);
@@ -693,14 +694,9 @@ impl Msfdr2SmixModel {
             let sum_r1_s2 = r1_s2.iter().sum::<f64>();
             let sum_rc_s2 = rc_s2.iter().sum::<f64>();
 
-            let weighted_n2 = s2_balance * n2 as f64;
+            let new_a = ((sum_pc_s1 + sum_r1_s2) / (2.0 * n1 as f64)).clamp(pi_clamp.0, pi_clamp.1);
 
-            let new_a = ((sum_pc_s1 + s2_balance * sum_r1_s2) / (n1 as f64 + weighted_n2))
-                .clamp(pi_clamp.0, pi_clamp.1);
-
-            // b is the posterior fraction of correct-component assignments within S2.
-            // Keep it normalized within S2, not across S1+S2.
-            let mut new_b = (sum_rc_s2 / n2 as f64).clamp(1e-6, 1.0 - new_a - 1e-6);
+            let mut new_b = (sum_rc_s2 / n2 as f64).clamp(1e-6, 1.0 - (new_a * s2_balance) - 1e-6);
 
             if new_a + new_b >= 0.999 {
                 new_b = (0.999 - new_a).max(1e-6);
@@ -716,7 +712,7 @@ impl Msfdr2SmixModel {
             c_x.extend_from_slice(&s1);
             c_w.extend_from_slice(&pc_s1);
             c_x.extend_from_slice(&s2);
-            c_w.extend(rc_s2.iter().map(|w| s2_balance * *w));
+            c_w.extend_from_slice(&rc_s2);
 
             if let Some((m, v, s)) = weighted_moments(&c_x, &c_w) {
                 if let Some(sn) = SkewNormal::from_moments(m, v.max(1e-12), s) {
@@ -730,7 +726,7 @@ impl Msfdr2SmixModel {
             i1_x.extend_from_slice(&s1);
             i1_w.extend_from_slice(&p1_s1);
             i1_x.extend_from_slice(&s2);
-            i1_w.extend(r1_s2.iter().map(|w| s2_balance * *w));
+            i1_w.extend_from_slice(&r1_s2);
 
             if let Some((m, v, s)) = weighted_moments(&i1_x, &i1_w) {
                 if let Some(sn) = SkewNormal::from_moments(m, v.max(1e-12), s) {
