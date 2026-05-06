@@ -661,6 +661,11 @@ impl Runner {
                 fdr_settings.peptide_fdr,
             );
 
+            sage_core::decoy_free_fdr::apply_peptide_q_to_psm_reporting_df(
+                &mut features,
+                &fdr_settings,
+            );
+
             let q_protein = sage_core::decoy_free_fdr::calculate_protein_q_df(
                 &mut features,
                 &self.database,

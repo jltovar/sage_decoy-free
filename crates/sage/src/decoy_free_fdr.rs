@@ -6429,7 +6429,15 @@ pub fn calculate_q_values(
     settings: &FdrSettings,
     db: &IndexedDatabase,
 ) -> Vec<DfFeature> {
-    run_df_layers(psms, settings, db)
+    let mut features = run_df_layers(psms, settings, db);
+
+    let _ = calculate_peptide_q_df(&mut features, db, settings, settings.peptide_fdr);
+
+    apply_peptide_q_to_psm_reporting_df(&mut features, settings);
+
+    let _ = calculate_protein_q_df(&mut features, db, settings);
+
+    features
 }
 
 pub fn calculate_peptide_q_df(
@@ -6677,6 +6685,52 @@ pub fn calculate_peptide_q_df(
     }
 
     (passing_total, passing_entrapments)
+}
+
+/// Reporting-only PSM expansion from accepted peptide discoveries.
+///
+/// This does not alter model-native p-values, PEPs, peptide q-values, or protein
+/// q-values. It only adjusts `decoy_free_q_value` for rank-1 target PSM rows so
+/// the runner can report PSM observations supporting accepted peptides.
+///
+/// Rationale:
+/// - The DF publication/default path remains p-value-native.
+/// - Peptide/protein inference remains unchanged.
+/// - PSM reporting can reflect peptide-level discoveries when the user is using
+///   peptide_fdr as the primary DF reporting threshold.
+pub fn apply_peptide_q_to_psm_reporting_df(features: &mut [DfFeature], settings: &FdrSettings) {
+    if !settings.report_psms_by_peptide_q {
+        return;
+    }
+
+    let mut adjusted = 0usize;
+
+    for feat in features.iter_mut() {
+        if feat.core.rank != 1 || feat.core.label != 1 {
+            continue;
+        }
+
+        let Some(peptide_q) = feat.decoy_free_peptide_q else {
+            continue;
+        };
+
+        if peptide_q > settings.peptide_fdr {
+            continue;
+        }
+
+        let old_q = feat.decoy_free_q_value.unwrap_or(1.0);
+        let new_q = old_q.min(peptide_q);
+
+        if new_q < old_q {
+            feat.decoy_free_q_value = Some(new_q);
+            adjusted += 1;
+        }
+    }
+
+    log::info!(
+        "DF reporting: peptide-q PSM reporting enabled adjusted_rank1_target_psms={}",
+        adjusted
+    );
 }
 
 fn combine_cauchy(p: &[f64]) -> f64 {

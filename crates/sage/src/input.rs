@@ -389,6 +389,13 @@ pub struct FdrOptions {
     pub protein_fdr: Option<f32>,
     pub precursor_fdr: Option<f32>,
 
+    /// Reporting-only option.
+    /// If true, accepted peptide-level discoveries may report all rank-1 PSMs
+    /// supporting accepted target peptides. This does not change the native
+    /// p-value stream or peptide/protein inference; it only changes the PSM-level
+    /// reporting q-value used by the runner's reported PSM count.
+    pub report_psms_by_peptide_q: Option<bool>,
+
     // Global null window (superset pool builder)
     pub min_null_rank: Option<u32>,
     pub max_null_rank: Option<u32>,
@@ -593,6 +600,12 @@ pub struct FdrSettings {
     pub peptide_fdr: f32,
     pub protein_fdr: f32,
     pub precursor_fdr: f32,
+
+    /// Reporting-only option.
+    /// When true, peptide-accepted rank-1 target PSMs receive a reporting q-value
+    /// no worse than their peptide q-value. The original model p-value and PEP
+    /// streams remain unchanged.
+    pub report_psms_by_peptide_q: bool,
 
     // Global null window (superset pool builder)
     pub min_null_rank: u32,
@@ -851,6 +864,7 @@ impl From<FdrOptions> for FdrSettings {
         let precursor_fdr = options.precursor_fdr.unwrap_or(0.01);
         let peptide_fdr = options.peptide_fdr.unwrap_or(0.01);
         let protein_fdr = options.protein_fdr.unwrap_or(0.01);
+        let report_psms_by_peptide_q = options.report_psms_by_peptide_q.unwrap_or(false);
         let entrapment_report = options
             .entrapment_report
             .unwrap_or(EntrapmentReportMode::Auto);
@@ -1174,6 +1188,8 @@ impl From<FdrOptions> for FdrSettings {
             peptide_fdr,
             protein_fdr,
             precursor_fdr,
+
+            report_psms_by_peptide_q,
 
             // Global null window (superset pool builder)
             min_null_rank,
