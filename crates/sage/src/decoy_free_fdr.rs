@@ -1943,18 +1943,48 @@ fn fit_engines(
     };
 
     let msfdr_2smix = if gates.run_msfdr_2smix {
-        let pooled_s2_scores = pool.scores_in_window(
-            settings.msfdr2_smix_min_null_rank,
-            settings.msfdr2_smix_max_null_rank,
-        );
+        // MSFDR2 is a joint S1/S2 mixture model. Unlike Moments/MLE/LO,
+        // it should not receive the purified rank-null pool because the
+        // model explicitly includes a correct-in-S2 component (`b`).
+        //
+        // Use raw lower-rank scores directly from features. Also enforce
+        // rank >= 2 because S2 must not contain the rank-1 S1 scores.
+        let effective_min_rank = settings.msfdr2_smix_min_null_rank.max(2);
+        let effective_max_rank = settings.msfdr2_smix_max_null_rank.max(effective_min_rank);
+
+        if settings.msfdr2_smix_min_null_rank < 2 {
+            log::warn!(
+				"MSFDR pooled-rank 2smix: requested min rank {} includes S1; using effective S2 min rank {}",
+				settings.msfdr2_smix_min_null_rank,
+				effective_min_rank
+			);
+        }
+
+        let unpurified_s2_scores: Vec<f64> = features
+            .iter()
+            .filter(|f| {
+                let r = f.core.rank as u32;
+                r >= effective_min_rank && r <= effective_max_rank
+            })
+            .filter_map(|f| tev(f))
+            .filter(|x| x.is_finite())
+            .collect();
+
+        log::info!(
+			"DF MSFDR pooled-rank 2smix S2 source: unpurified_features ranks={}..{} n_s1={} n_s2={}",
+			effective_min_rank,
+			effective_max_rank,
+			rank1_scores.len(),
+			unpurified_s2_scores.len()
+		);
 
         if window_ok(
             "MSFDR pooled-rank 2smix",
-            settings.msfdr2_smix_min_null_rank,
-            settings.msfdr2_smix_max_null_rank,
-            pooled_s2_scores.len(),
+            effective_min_rank,
+            effective_max_rank,
+            unpurified_s2_scores.len(),
         ) {
-            let m = fit_msfdr_2smix(&rank1_scores, &pooled_s2_scores, settings);
+            let m = fit_msfdr_2smix(&rank1_scores, &unpurified_s2_scores, settings);
             if let Some(ref model) = m {
                 log_fit_ok("MSFDR pooled-rank 2smix", model);
             } else {
