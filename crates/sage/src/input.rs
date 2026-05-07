@@ -514,7 +514,7 @@ pub struct FdrOptions {
     pub msfdr2_smix_min_null_rank: Option<u32>,
     pub msfdr2_smix_max_null_rank: Option<u32>,
 
-    // MSFDR2 initialization knobs.
+    // MSFDR2 initialization knob.
     pub msfdr2_bottom_frac_init: Option<f64>,
     pub msfdr2_top_frac_init: Option<f64>,
 
