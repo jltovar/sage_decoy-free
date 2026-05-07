@@ -727,14 +727,26 @@ impl Msfdr2SmixModel {
                 }
             }
 
-            // I1 is the rank-1 incorrect component used as the null comparator:
+            // I1 is updated from S1 p1 plus pooled S2 r1.
             //
-            //     p_2smix(x) = SF_I1(x)
+            // This is the best clean pooled-rank state we observed. The S2 influence is
+            // controlled in the E-step by the diluted prior:
             //
-            // The clean 5250/324/16 state used S1-only I1 shape updates. S2 still
-            // contributes to mixture-weight estimation through r1_s2 above, but does
-            // not define the rank-1 null shape.
-            if let Some((m, v, s)) = weighted_moments(&s1, &p1_s1) {
+            //     a_s2 = a * s2_balance
+            //
+            // Do not multiply r1_s2 by s2_balance again here, and do not restrict I1 to
+            // S1-only. The S1-only I1 update was the later change that dropped the model
+            // back to the ~4750/322/16 behavior.
+            let mut i1_x = Vec::with_capacity(n1 + n2);
+            let mut i1_w = Vec::with_capacity(n1 + n2);
+
+            i1_x.extend_from_slice(&s1);
+            i1_w.extend_from_slice(&p1_s1);
+
+            i1_x.extend_from_slice(&s2);
+            i1_w.extend_from_slice(&r1_s2);
+
+            if let Some((m, v, s)) = weighted_moments(&i1_x, &i1_w) {
                 if let Some(sn) = SkewNormal::from_moments(m, v.max(1e-12), s) {
                     incorrect1 = sn;
                 }
