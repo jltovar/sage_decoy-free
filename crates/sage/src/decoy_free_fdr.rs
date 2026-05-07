@@ -1725,7 +1725,6 @@ fn fit_msfdr_2smix(
         (settings.msfdr2_pi_clamp_min, settings.msfdr2_pi_clamp_max),
         settings.msfdr2_bottom_frac_init,
         settings.msfdr2_top_frac_init,
-        settings.msfdr2_s2_target_frac_init,
     )
 }
 
@@ -1944,12 +1943,12 @@ fn fit_engines(
     };
 
     let msfdr_2smix = if gates.run_msfdr_2smix {
-        // MSFDR2 is a joint S1/S2 mixture model. Unlike Moments/MLE/LO,
-        // it should not receive the purified rank-null pool because the
-        // model explicitly includes a correct-in-S2 component (`b`).
+        // MSFDR2 pooled-rank extension:
+        // Use raw, unpurified lower-rank scores directly from features.
+        // Do not use the purified rank-null pool here; MSFDR2 explicitly models
+        // correct-like and incorrect-like structure in S2.
         //
-        // Use raw lower-rank scores directly from features. Also enforce
-        // rank >= 2 because S2 must not contain the rank-1 S1 scores.
+        // S2 must never contain rank 1, because rank 1 is S1.
         let effective_min_rank = settings.msfdr2_smix_min_null_rank.max(2);
         let effective_max_rank = settings.msfdr2_smix_max_null_rank.max(effective_min_rank);
 
