@@ -590,6 +590,11 @@ impl Msfdr2SmixModel {
         let n1 = s1.len();
         let n2 = s2.len();
 
+        // Pooled S2 can contain many more observations than S1.
+        // Use S2 at full size for E-step responsibilities and S2 mixture fractions,
+        // but downweight S2 when updating shared/rank-1 component shapes.
+        let s2_scale = ((n1 as f64) / (n2 as f64)).clamp(1e-6, 1.0);
+
         // Initialize I1 from the lower part of S1.
         let bottom_frac = bottom_frac_init.clamp(0.10, 0.90);
         let bottom_n = ((n1 as f64) * bottom_frac).round() as usize;
@@ -737,13 +742,15 @@ impl Msfdr2SmixModel {
             a2_mix = new_a2;
 
             // ---------- M-step component parameters ----------
-            // C is updated from both S1 and S2 target/correct responsibilities.
+            // C is updated from S1 and S2 target/correct responsibilities.
+            // S2 is downweighted so a large pooled lower-rank sample regularizes
+            // the target shape without overwhelming the rank-1 target evidence.
             let mut c_x = Vec::with_capacity(n1 + n2);
             let mut c_w = Vec::with_capacity(n1 + n2);
             c_x.extend_from_slice(&s1);
             c_w.extend_from_slice(&pc_s1);
             c_x.extend_from_slice(&s2);
-            c_w.extend_from_slice(&rc_s2);
+            c_w.extend(rc_s2.iter().map(|w| *w * s2_scale));
 
             if let Some((m, v, s)) = weighted_moments(&c_x, &c_w) {
                 if let Some(sn) = SkewNormal::from_moments(m, v.max(1e-12), s) {
@@ -751,14 +758,15 @@ impl Msfdr2SmixModel {
                 }
             }
 
-            // I1 is the rank-1 incorrect component. S2 may contribute only through
-            // its freely estimated a2 responsibility, not through rigid coupling to `a`.
+            // I1 is the rank-1 incorrect component used for p_2smix(x) = SF_I1(x).
+            // S2 may contribute through the free a2 responsibility, but it is
+            // downweighted to prevent pooled lower-rank mass from broadening I1.
             let mut i1_x = Vec::with_capacity(n1 + n2);
             let mut i1_w = Vec::with_capacity(n1 + n2);
             i1_x.extend_from_slice(&s1);
             i1_w.extend_from_slice(&p1_s1);
             i1_x.extend_from_slice(&s2);
-            i1_w.extend_from_slice(&r1_s2);
+            i1_w.extend(r1_s2.iter().map(|w| *w * s2_scale));
 
             if let Some((m, v, s)) = weighted_moments(&i1_x, &i1_w) {
                 if let Some(sn) = SkewNormal::from_moments(m, v.max(1e-12), s) {
@@ -775,10 +783,11 @@ impl Msfdr2SmixModel {
         }
 
         log::info!(
-			"MSFDR2 pooled-rank fit final: a={:.6e} b={:.6e} a2={:.6e} C(loc={:.4},scale={:.4},shape={:.4}) I1(loc={:.4},scale={:.4},shape={:.4}) I2(loc={:.4},scale={:.4},shape={:.4})",
+			"MSFDR2 pooled-rank fit final: a={:.6e} b={:.6e} a2={:.6e} s2_scale={:.6e} C(loc={:.4},scale={:.4},shape={:.4}) I1(loc={:.4},scale={:.4},shape={:.4}) I2(loc={:.4},scale={:.4},shape={:.4})",
 			a_mix,
 			b_mix,
 			a2_mix,
+			s2_scale,
 			correct.location,
 			correct.scale,
 			correct.shape,
