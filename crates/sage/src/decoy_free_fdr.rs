@@ -128,8 +128,9 @@ Never rely on an implicit or ambiguous “score” definition.
 use crate::database::IndexedDatabase;
 use crate::input::LoStratify;
 use crate::input::{
-    BoundedAuxUpdateSpace, DartNullRtModel, DartTrueRtModel, EnsemblePepCombiner, FdrSettings,
-    FinalEvidenceSpace, JointMode, ModelFit, PeptidePCombine, PhysicalAnchorMode, QMethod,
+    BoundedAuxUpdateSpace, DartNullRtModel, DartTrueRtModel, EnsemblePCombiner,
+    EnsemblePepCombiner, FdrSettings, FinalEvidenceSpace, JointMode, ModelFit, PeptidePCombine,
+    PhysicalAnchorMode, QMethod,
 };
 use crate::lfq::{Peak, PrecursorId};
 use crate::ml::lower_order::{
@@ -142,6 +143,7 @@ use crate::scoring::{DfFeature, TdcFeature};
 use fnv::{FnvHashMap, FnvHashSet};
 use rayon::prelude::*;
 use statrs::distribution::{ContinuousCDF, Gumbel};
+use std::collections::HashMap;
 use std::sync::Arc;
 
 #[derive(Clone, Debug)]
@@ -164,8 +166,9 @@ struct Rank1Computed {
     pep_2smix: Option<f64>,
 
     p_nokoi: Option<f64>,
+    pep_nokoi: Option<f64>,
 
-    // final DF p output (pep/score computed later, after lfdr mapping)
+    // final DF p output; companion PEP streams are computed/stored separately.
     p_final: f64,
 }
 
@@ -521,23 +524,36 @@ fn combine_peps(
 // -----------------------------------------------------------------------------
 
 #[inline(always)]
-fn set_df_p_value(psm: &mut DfFeature, p: f32) {
-    psm.decoy_free_p_value = Some(p);
-}
-
-#[inline(always)]
 fn set_df_q_value(psm: &mut DfFeature, q: f32) {
     psm.decoy_free_q_value = Some(q);
 }
 
 #[inline(always)]
-fn df_p_value(psm: &DfFeature) -> f32 {
-    psm.decoy_free_p_value.unwrap_or(1.0)
+fn df_q_value(psm: &DfFeature) -> f32 {
+    psm.decoy_free_q_value.unwrap_or(1.0)
 }
 
 #[inline(always)]
-fn df_q_value(psm: &DfFeature) -> f32 {
-    psm.decoy_free_q_value.unwrap_or(1.0)
+fn df_score_from_p_value(p: f64) -> f32 {
+    (-10.0 * p.clamp(1e-300, 1.0).log10()) as f32
+}
+
+#[inline(always)]
+fn df_score_from_active(active: ActiveEvidenceSpace, p_value: f64, pep: f64) -> f32 {
+    match active {
+        ActiveEvidenceSpace::PValue => df_score_from_p_value(p_value),
+        ActiveEvidenceSpace::Pep => df_score_from_pep(pep),
+    }
+}
+
+#[inline(always)]
+fn set_df_evidence_pair(psm: &mut DfFeature, active: ActiveEvidenceSpace, p_value: f64, pep: f64) {
+    let p_value = p_value.clamp(1e-300, 1.0);
+    let pep = pep.clamp(1e-300, 1.0);
+
+    psm.decoy_free_p_value = Some(p_value as f32);
+    psm.decoy_free_pep = Some(pep as f32);
+    psm.decoy_free_score = Some(df_score_from_active(active, p_value, pep));
 }
 
 // -----------------------------------------------------------------------------
@@ -719,13 +735,6 @@ fn df_rank_score(f: &DfFeature) -> f64 {
     tev(f).unwrap_or_else(|| f.decoy_free_score.unwrap_or(0.0) as f64)
 }
 
-#[inline(always)]
-fn df_rank_score_base_pep(f: &DfFeature) -> f64 {
-    f.decoy_free_score
-        .map(|x| x as f64)
-        .unwrap_or_else(|| tev(f).unwrap_or(0.0))
-}
-
 // -----------------------------------------------------------------------------
 // 8) Protein-string classification (contam / entrapment)
 // -----------------------------------------------------------------------------
@@ -850,22 +859,6 @@ pub fn has_entrapment_proteins(db: &IndexedDatabase) -> bool {
 }
 
 // -----------------------------------------------------------------------------
-// 9) Empirical null tail p-values (used for Nokoi null mapping)
-// -----------------------------------------------------------------------------
-
-fn empirical_p_from_null_ge(null_sorted: &[f64], x: f64) -> f64 {
-    if null_sorted.len() < 10 || !x.is_finite() {
-        return 1.0;
-    }
-    let n = null_sorted.len();
-    let idx = null_sorted.partition_point(|&v| v < x); // first >= x
-    let count_ge = (n - idx) as f64;
-    ((count_ge + 1.0) / ((n as f64) + 1.0))
-        .clamp(0.0, 1.0)
-        .max(1e-300)
-}
-
-// -----------------------------------------------------------------------------
 // 10) Debug / diagnostics helpers
 // -----------------------------------------------------------------------------
 
@@ -969,19 +962,26 @@ fn log_fit_failed_closed(label: &str) {
 // 11B) Final evidence-space helpers
 // -----------------------------------------------------------------------------
 
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum ActiveEvidenceSpace {
+    PValue,
+    Pep,
+}
+
 #[inline]
-fn final_evidence_is_pep_native(settings: &FdrSettings) -> bool {
+fn active_evidence_space(settings: &FdrSettings) -> ActiveEvidenceSpace {
     match settings.final_evidence_space {
-        FinalEvidenceSpace::Pep => true,
-        FinalEvidenceSpace::PValue => false,
-        FinalEvidenceSpace::Auto => matches!(
-            settings.model_fit,
-            ModelFit::Msfdr
-                | ModelFit::Msfdr1Smix
-                | ModelFit::Msfdr2Smix
-                | ModelFit::Nokoi
-                | ModelFit::Ensemble
-        ),
+        FinalEvidenceSpace::PValue => ActiveEvidenceSpace::PValue,
+        FinalEvidenceSpace::Pep => ActiveEvidenceSpace::Pep,
+        FinalEvidenceSpace::Auto => match settings.model_fit {
+            ModelFit::Moments | ModelFit::Mle | ModelFit::LowerOrder => ActiveEvidenceSpace::PValue,
+
+            ModelFit::Msfdr | ModelFit::Msfdr1Smix | ModelFit::Msfdr2Smix | ModelFit::Nokoi => {
+                ActiveEvidenceSpace::PValue
+            }
+
+            ModelFit::Ensemble => ActiveEvidenceSpace::PValue,
+        },
     }
 }
 
@@ -1066,11 +1066,11 @@ fn combine_p_values_for_ensemble(p_values: &[f64], settings: &FdrSettings) -> f6
         return 1.0;
     }
 
-    match settings.peptide_p_combine {
-        PeptidePCombine::Fisher => stats::combine_fisher(p_values).clamp(0.0, 1.0).max(1e-300),
-        PeptidePCombine::Cauchy => combine_cauchy(p_values),
-        PeptidePCombine::SidakMinP => combine_sidak_minp(p_values),
-        PeptidePCombine::Best => p_values
+    match settings.ensemble_p_combiner {
+        EnsemblePCombiner::Fisher => stats::combine_fisher(p_values).clamp(0.0, 1.0).max(1e-300),
+        EnsemblePCombiner::Cauchy => combine_cauchy(p_values),
+        EnsemblePCombiner::SidakMinP => combine_sidak_minp(p_values),
+        EnsemblePCombiner::Best => p_values
             .iter()
             .copied()
             .filter(|p| p.is_finite())
@@ -1245,6 +1245,72 @@ impl GrenanderBlock {
             (self.count as f64) / width
         }
     }
+}
+
+fn recalibrate_companion_pep_from_active_p_values(
+    features: &mut [DfFeature],
+    settings: &FdrSettings,
+    context: &str,
+) {
+    let mut rows: Vec<(usize, f64)> = Vec::new();
+
+    for (idx, f) in features.iter().enumerate() {
+        if f.core.rank != 1 {
+            continue;
+        }
+
+        let Some(p) = f.decoy_free_p_value else {
+            continue;
+        };
+
+        let p = (p as f64).clamp(0.0, 1.0).max(1e-300);
+
+        if p.is_finite() {
+            rows.push((idx, p));
+        }
+    }
+
+    if rows.is_empty() {
+        log::warn!(
+            "DF {}: companion PEP recalibration skipped because no rank-1 active p-values were available.",
+            context
+        );
+        return;
+    }
+
+    let p_values: Vec<f64> = rows.iter().map(|&(_, p)| p).collect();
+
+    let pi0 = estimate_pi0_from_reference_grid(&p_values, settings)
+        .unwrap_or(1.0)
+        .clamp(0.0, 1.0);
+
+    let peps = grenander_pep_from_p(&p_values, pi0);
+
+    if peps.len() != rows.len() {
+        log::warn!(
+            "DF {}: companion PEP recalibration skipped because p/PEP lengths mismatched: p_values={} peps={}.",
+            context,
+            rows.len(),
+            peps.len()
+        );
+        return;
+    }
+
+    for ((idx, p), pep) in rows.into_iter().zip(peps.into_iter()) {
+        set_df_evidence_pair(
+            &mut features[idx],
+            ActiveEvidenceSpace::PValue,
+            p,
+            pep.clamp(0.0, 1.0).max(1e-300),
+        );
+    }
+
+    log::debug!(
+        "DF {}: recalibrated companion PEP stream from {} active p-values using pi0={:.6}.",
+        context,
+        p_values.len(),
+        pi0
+    );
 }
 
 fn grenander_pep_from_p(p_values: &[f64], pi0: f64) -> Vec<f64> {
@@ -1531,6 +1597,7 @@ struct Engines {
     msfdr_2smix: Option<Msfdr2SmixModel>,
 
     nokoi_p_values: Option<Arc<Vec<f64>>>,
+    nokoi_peps: Option<Arc<Vec<f64>>>,
 }
 
 // --- BUILD RANK-NULL POOL ---
@@ -2000,6 +2067,7 @@ fn fit_engines(
 
     // 5) Nokoi
     let mut nokoi_p_values = None;
+    let mut nokoi_peps = None;
 
     if gates.run_nokoi {
         log::info!("Running Nokoi Rescoring ...");
@@ -2045,7 +2113,7 @@ fn fit_engines(
                 l1_lambda_steps: settings.nokoi_l1_lambda_steps,
             };
 
-            if let Some((probs, mut null_scores)) = nokoi::rescore_df_crossfit(
+            if let Some((probs, _null_scores)) = nokoi::rescore_df_crossfit(
                 features,
                 &config,
                 settings.nokoi_min_null_rank,
@@ -2054,19 +2122,35 @@ fn fit_engines(
                 is_positive,
                 &pool.null_indices,
             ) {
-                let prob_arc = Arc::new(probs);
-                null_scores.retain(|x| x.is_finite());
-                null_scores.sort_by(|a, b| a.total_cmp(b));
-                if null_scores.len() < 10 {
-                    log::warn!("Nokoi: pool too small for calibration.");
+                let feature_cores: Vec<_> = features.iter().map(|f| f.core.clone()).collect();
+
+                let nokoi_evidence = nokoi::build_nokoi_evidence(&feature_cores, &probs);
+
+                if nokoi_evidence.p_values.len() != features.len()
+                    || nokoi_evidence.peps.len() != features.len()
+                {
+                    log::warn!(
+						"Nokoi disabled: paired evidence length mismatch p_values={} peps={} features={}",
+						nokoi_evidence.p_values.len(),
+						nokoi_evidence.peps.len(),
+						features.len()
+					);
                 } else {
-                    let mut p_all = vec![1.0; features.len()];
-                    for (i, &pt) in prob_arc.iter().enumerate() {
-                        p_all[i] = empirical_p_from_null_ge(&null_scores, pt)
-                            .clamp(0.0, 1.0)
-                            .max(1e-300);
-                    }
-                    nokoi_p_values = Some(Arc::new(p_all));
+                    nokoi_p_values = Some(Arc::new(
+                        nokoi_evidence
+                            .p_values
+                            .into_iter()
+                            .map(|p| p.clamp(0.0, 1.0).max(1e-300))
+                            .collect(),
+                    ));
+
+                    nokoi_peps = Some(Arc::new(
+                        nokoi_evidence
+                            .peps
+                            .into_iter()
+                            .map(|pep| pep.clamp(0.0, 1.0).max(1e-300))
+                            .collect(),
+                    ));
                 }
             } else {
                 log::warn!("Nokoi disabled: crossfit failed.");
@@ -2083,6 +2167,7 @@ fn fit_engines(
         msfdr_1smix,
         msfdr_2smix,
         nokoi_p_values,
+        nokoi_peps,
     })
 }
 
@@ -2193,6 +2278,7 @@ fn score_base_rank1(
     let msfdr_1smix = engines.msfdr_1smix.clone();
     let msfdr_2smix = engines.msfdr_2smix.clone();
     let nokoi_p_values = engines.nokoi_p_values.clone();
+    let nokoi_peps = engines.nokoi_peps.clone();
 
     let use_mom_expert = gates.run_mom && mom_params.is_some();
     let use_mle_expert = gates.run_mle && mle_params.is_some();
@@ -2200,7 +2286,7 @@ fn score_base_rank1(
     let use_seeded_expert = gates.run_msfdr_seeded && msfdr_seeded.is_some();
     let use_1smix_expert = gates.run_msfdr_1smix && msfdr_1smix.is_some();
     let use_2smix_expert = gates.run_msfdr_2smix && msfdr_2smix.is_some();
-    let use_nokoi_expert = gates.run_nokoi && nokoi_p_values.is_some();
+    let use_nokoi_expert = gates.run_nokoi && nokoi_p_values.is_some() && nokoi_peps.is_some();
 
     let std_gumbel = Gumbel::new(0.0, 1.0).expect("standard gumbel");
 
@@ -2284,18 +2370,30 @@ fn score_base_rank1(
                 (None, None)
             };
 
-            let p_nokoi = if use_nokoi_expert {
+            let (p_nokoi, pep_nokoi) = if use_nokoi_expert {
                 let p_vec = nokoi_p_values.as_ref().unwrap();
-                Some(
-                    p_vec
-                        .get(idx)
-                        .copied()
-                        .unwrap_or(1.0)
-                        .clamp(0.0, 1.0)
-                        .max(1e-300),
+                let pep_vec = nokoi_peps.as_ref().unwrap();
+
+                (
+                    Some(
+                        p_vec
+                            .get(idx)
+                            .copied()
+                            .unwrap_or(1.0)
+                            .clamp(0.0, 1.0)
+                            .max(1e-300),
+                    ),
+                    Some(
+                        pep_vec
+                            .get(idx)
+                            .copied()
+                            .unwrap_or(1.0)
+                            .clamp(0.0, 1.0)
+                            .max(1e-300),
+                    ),
                 )
             } else {
-                None
+                (None, None)
             };
 
             let p_final = if use_ensemble {
@@ -2345,6 +2443,7 @@ fn score_base_rank1(
                 pep_1smix,
                 pep_2smix,
                 p_nokoi,
+                pep_nokoi,
                 p_final,
             })
         })
@@ -2380,11 +2479,6 @@ fn score_base_rank1(
         .map(|r| r.p_2smix.unwrap_or(1.0).clamp(0.0, 1.0).max(1e-300))
         .collect();
 
-    let p_nokoi_all: Vec<f64> = rank1_out
-        .iter()
-        .map(|r| r.p_nokoi.unwrap_or(1.0).clamp(0.0, 1.0).max(1e-300))
-        .collect();
-
     let mut is_ref: Vec<bool> = Vec::with_capacity(rank1_out.len());
     for r in &rank1_out {
         let f = &features[r.idx];
@@ -2402,7 +2496,6 @@ fn score_base_rank1(
     let mut p_msfdr_ref: Vec<f64> = Vec::new();
     let mut p_1smix_ref: Vec<f64> = Vec::new();
     let mut p_2smix_ref: Vec<f64> = Vec::new();
-    let mut p_nokoi_ref: Vec<f64> = Vec::new();
 
     for (k, &ref_ok) in is_ref.iter().enumerate() {
         if !ref_ok {
@@ -2424,9 +2517,6 @@ fn score_base_rank1(
         if r.p_2smix.is_some() {
             p_2smix_ref.push(p_2smix_all[k]);
         }
-        if r.p_nokoi.is_some() {
-            p_nokoi_ref.push(p_nokoi_all[k]);
-        }
     }
 
     let pi0_mom = estimate_pi0_from_reference_grid(&p_mom_ref, settings)
@@ -2436,10 +2526,6 @@ fn score_base_rank1(
         .unwrap_or(1.0)
         .clamp(0.0, 1.0);
     let pi0_lo = estimate_pi0_from_reference_grid(&p_lo_ref, settings)
-        .unwrap_or(1.0)
-        .clamp(0.0, 1.0);
-
-    let pi0_nokoi = estimate_pi0_from_reference_grid(&p_nokoi_ref, settings)
         .unwrap_or(1.0)
         .clamp(0.0, 1.0);
 
@@ -2469,9 +2555,13 @@ fn score_base_rank1(
         .map(|r| r.pep_2smix.unwrap_or(1.0).clamp(0.0, 1.0).max(1e-300))
         .collect();
 
-    // Nokoi: calibrate empirical null-survival p-values from classifier scores,
-    // not raw 1 - P(target).
-    let pep_nokoi_vec = grenander_pep_from_p(&p_nokoi_all, pi0_nokoi);
+    // Nokoi paired evidence:
+    // - p_nokoi   = empirical null-survival p-value from Nokoi score
+    // - pep_nokoi = paired posterior-error / PEP-like stream from Nokoi evidence builder
+    let pep_nokoi_vec: Vec<f64> = rank1_out
+        .iter()
+        .map(|r| r.pep_nokoi.unwrap_or(1.0).clamp(0.0, 1.0).max(1e-300))
+        .collect();
 
     BaseDiscoveryResult {
         workset,
@@ -2597,7 +2687,7 @@ fn write_base_method_outputs(
             None
         };
 
-        let final_pep_native = final_evidence_is_pep_native(settings);
+        let active_space = active_evidence_space(settings);
 
         let p_consensus: f64 = if use_ensemble {
             let mut p_experts: Vec<f64> = Vec::new();
@@ -2638,12 +2728,6 @@ fn write_base_method_outputs(
         }
         .clamp(0.0, 1.0)
         .max(1e-300);
-
-        if final_pep_native {
-            psm.decoy_free_p_value = None;
-        } else {
-            set_df_p_value(psm, p_consensus as f32);
-        }
 
         let pep_consensus: f64 = if use_ensemble {
             let mut pep_experts: Vec<f64> = Vec::new();
@@ -2744,14 +2828,7 @@ fn write_base_method_outputs(
         .clamp(0.0, 1.0)
         .max(1e-300);
 
-        let df_score = if final_pep_native {
-            (-10.0 * pep_consensus.max(1e-15).log10()) as f32
-        } else {
-            (-10.0 * p_consensus.max(1e-15).log10()) as f32
-        };
-
-        psm.decoy_free_pep = Some(pep_consensus as f32);
-        psm.decoy_free_score = Some(df_score);
+        set_df_evidence_pair(psm, active_space, p_consensus, pep_consensus);
     }
 }
 
@@ -2918,46 +2995,60 @@ fn finalize_base_q_values(
         summarize_pvec("rank1_p_ref (targets, non-ENT, non-CONT)", &rank1_p_ref);
     }
 
-    summarize_q(
-        "PREQ rank1 (chosen p-stream/pep)",
-        work.rank1_indices.iter().filter_map(|&i| {
-            if use_ensemble {
-                features[i].decoy_free_pep
-            } else {
-                Some(df_p_value(&features[i]))
+    let active_space = active_evidence_space(settings);
+
+    match active_space {
+        ActiveEvidenceSpace::Pep => {
+            summarize_q(
+                "PREQ rank1 active PEP stream",
+                work.rank1_indices
+                    .iter()
+                    .filter_map(|&i| features[i].decoy_free_pep),
+            );
+
+            let rows: Vec<(f64, usize, f64)> = work
+                .rank1_indices
+                .iter()
+                .filter_map(|&i| {
+                    let f = &features[i];
+                    let pep = f.decoy_free_pep? as f64;
+                    if !pep.is_finite() {
+                        return None;
+                    }
+
+                    let score_key = f
+                        .decoy_free_score
+                        .map(|s| s as f64)
+                        .unwrap_or_else(|| df_score_from_pep(pep) as f64);
+
+                    Some((score_key, i, pep.clamp(0.0, 1.0).max(1e-300)))
+                })
+                .collect();
+
+            for (feat_idx, q) in q_from_pep_cummean(rows) {
+                set_df_q_value(&mut features[feat_idx], q as f32);
             }
-        }),
-    );
-
-    if final_evidence_is_pep_native(settings) {
-        let rows: Vec<(f64, usize, f64)> = work
-            .rank1_indices
-            .iter()
-            .filter_map(|&i| {
-                let f = &features[i];
-                let pep = f.decoy_free_pep? as f64;
-                if !pep.is_finite() {
-                    return None;
-                }
-                let score_key = df_rank_score_base_pep(f);
-                Some((score_key, i, pep.clamp(0.0, 1.0).max(1e-300)))
-            })
-            .collect();
-
-        for (feat_idx, q) in q_from_pep_cummean(rows) {
-            set_df_q_value(&mut features[feat_idx], q as f32);
         }
-    } else {
-        let q_values = q_values_from_p_values_with_method(
-            &rank1_p,
-            &rank1_p_ref,
-            settings,
-            effective_psm_q_method(settings),
-            "PSM",
-        );
 
-        for (&idx, q) in work.rank1_indices.iter().zip(q_values) {
-            set_df_q_value(&mut features[idx], q as f32);
+        ActiveEvidenceSpace::PValue => {
+            summarize_q(
+                "PREQ rank1 active p-value stream",
+                work.rank1_indices
+                    .iter()
+                    .filter_map(|&i| features[i].decoy_free_p_value),
+            );
+
+            let q_values = q_values_from_p_values_with_method(
+                &rank1_p,
+                &rank1_p_ref,
+                settings,
+                effective_psm_q_method(settings),
+                "PSM active p-value",
+            );
+
+            for (&idx, q) in work.rank1_indices.iter().zip(q_values) {
+                set_df_q_value(&mut features[idx], q as f32);
+            }
         }
     }
 
@@ -3971,11 +4062,23 @@ fn apply_physical_update_to_active_stream(
                 fail_closed: false,
                 ..Default::default()
             },
-            PhysicalRescueMode::BoundedAux => {
-                apply_rt_bounded_update_to_active_stream(features, settings, db)
-            }
-            PhysicalRescueMode::DartBayes => {
-                apply_rt_dart_bayes_update_to_active_stream(features, settings, db)
+
+            PhysicalRescueMode::BoundedAux | PhysicalRescueMode::DartBayes => {
+                match active_evidence_space(settings) {
+                    ActiveEvidenceSpace::Pep => match settings.physical_rescue.rt_mode {
+                        PhysicalRescueMode::BoundedAux => {
+                            apply_rt_bounded_update_to_active_stream(features, settings, db)
+                        }
+                        PhysicalRescueMode::DartBayes => {
+                            apply_rt_dart_bayes_update_to_active_stream(features, settings, db)
+                        }
+                        PhysicalRescueMode::Off => unreachable!(),
+                    },
+
+                    ActiveEvidenceSpace::PValue => {
+                        apply_rt_null_pvalue_update_to_active_stream(features, settings, db)
+                    }
+                }
             }
         },
 
@@ -3985,11 +4088,23 @@ fn apply_physical_update_to_active_stream(
                 fail_closed: false,
                 ..Default::default()
             },
-            PhysicalRescueMode::BoundedAux => {
-                apply_ims_bounded_update_to_active_stream(features, settings, db)
-            }
-            PhysicalRescueMode::DartBayes => {
-                apply_ims_dart_bayes_update_to_active_stream(features, settings, db)
+
+            PhysicalRescueMode::BoundedAux | PhysicalRescueMode::DartBayes => {
+                match active_evidence_space(settings) {
+                    ActiveEvidenceSpace::Pep => match settings.physical_rescue.ims_mode {
+                        PhysicalRescueMode::BoundedAux => {
+                            apply_ims_bounded_update_to_active_stream(features, settings, db)
+                        }
+                        PhysicalRescueMode::DartBayes => {
+                            apply_ims_dart_bayes_update_to_active_stream(features, settings, db)
+                        }
+                        PhysicalRescueMode::Off => unreachable!(),
+                    },
+
+                    ActiveEvidenceSpace::PValue => {
+                        apply_ims_null_pvalue_update_to_active_stream(features, settings, db)
+                    }
+                }
             }
         },
     }
@@ -4009,6 +4124,238 @@ fn apply_ims_only_physical_update_to_active_stream(
     db: &IndexedDatabase,
 ) -> PhysicalRescueResult {
     apply_physical_update_to_active_stream(features, settings, db, PhysicalEvidenceStage::ImsOnly)
+}
+
+#[inline]
+fn rt_delta_for_feature(f: &DfFeature) -> Option<f64> {
+    let delta = f.core.delta_rt_model as f64;
+
+    if delta.is_finite() {
+        Some(delta)
+    } else {
+        None
+    }
+}
+
+struct RtAuxNullModel {
+    global: Vec<f64>,
+    by_file: HashMap<usize, Vec<f64>>,
+    by_region: HashMap<i32, Vec<f64>>,
+    by_file_region: HashMap<(usize, i32), Vec<f64>>,
+    rt_sigma_global: Option<f64>,
+    reliability: f64,
+}
+
+#[inline]
+fn rt_region_bin_for_feature(f: &DfFeature, settings: &FdrSettings) -> Option<i32> {
+    let pred = f.core.predicted_rt as f64;
+    if !pred.is_finite() {
+        return None;
+    }
+
+    let bins = settings.physical_rescue.rt_region_bins.max(2) as f64;
+    let b = (pred.clamp(0.0, 1.0) * bins).floor() as i32;
+
+    Some(b.clamp(0, bins as i32 - 1))
+}
+
+#[inline]
+fn aux_null_p_from_sorted_agreements(null_sorted: &[f64], agreement_obs: f64) -> f64 {
+    if null_sorted.is_empty() {
+        return 1.0;
+    }
+
+    let idx = null_sorted.partition_point(|&x| x < agreement_obs);
+    let count_ge = null_sorted.len().saturating_sub(idx);
+
+    ((count_ge as f64 + 1.0) / (null_sorted.len() as f64 + 1.0)).clamp(1e-300, 1.0)
+}
+
+fn aux_sigma_from_agreements(null_agreements: &[f64]) -> Option<f64> {
+    let vals: Vec<f64> = null_agreements
+        .iter()
+        .copied()
+        .filter(|x| x.is_finite())
+        .map(|x| x.abs())
+        .collect();
+
+    median_f64(vals).map(|m| (1.4826 * m).clamp(1e-6, 1.0))
+}
+
+#[inline]
+fn aux_reliability_from_null_count(n: usize, settings: &FdrSettings) -> f64 {
+    let min_n = settings.min_null_size.max(1) as f64;
+    ((n as f64) / (2.0 * min_n)).clamp(0.0, 1.0)
+}
+
+fn build_rt_aux_null_model(
+    features: &[DfFeature],
+    settings: &FdrSettings,
+    _db: &IndexedDatabase,
+) -> Option<RtAuxNullModel> {
+    let mut global: Vec<f64> = Vec::new();
+    let mut by_file: HashMap<usize, Vec<f64>> = HashMap::new();
+    let mut by_region: HashMap<i32, Vec<f64>> = HashMap::new();
+    let mut by_file_region: HashMap<(usize, i32), Vec<f64>> = HashMap::new();
+
+    for f in features.iter() {
+        if f.core.rank < settings.min_null_rank || f.core.rank > settings.max_null_rank {
+            continue;
+        }
+
+        let Some(delta) = rt_delta_for_feature(f) else {
+            continue;
+        };
+
+        let agreement = -delta.abs();
+
+        global.push(agreement);
+        by_file.entry(f.core.file_id).or_default().push(agreement);
+
+        if let Some(region) = rt_region_bin_for_feature(f, settings) {
+            by_region.entry(region).or_default().push(agreement);
+            by_file_region
+                .entry((f.core.file_id, region))
+                .or_default()
+                .push(agreement);
+        }
+    }
+
+    if global.len() < settings.min_null_size {
+        return None;
+    }
+
+    global.sort_by(|a, b| a.total_cmp(b));
+    for vals in by_file.values_mut() {
+        vals.sort_by(|a, b| a.total_cmp(b));
+    }
+    for vals in by_region.values_mut() {
+        vals.sort_by(|a, b| a.total_cmp(b));
+    }
+    for vals in by_file_region.values_mut() {
+        vals.sort_by(|a, b| a.total_cmp(b));
+    }
+
+    let rt_sigma_global = aux_sigma_from_agreements(&global);
+    let reliability = aux_reliability_from_null_count(global.len(), settings);
+
+    Some(RtAuxNullModel {
+        global,
+        by_file,
+        by_region,
+        by_file_region,
+        rt_sigma_global,
+        reliability,
+    })
+}
+
+fn rt_aux_null_p_value(model: &RtAuxNullModel, settings: &FdrSettings, f: &DfFeature) -> f64 {
+    let Some(delta_rt) = rt_delta_for_feature(f) else {
+        return 1.0;
+    };
+
+    let agreement_obs = -delta_rt.abs();
+    let min_n = settings.min_null_size;
+
+    if let Some(region) = rt_region_bin_for_feature(f, settings) {
+        if let Some(vals) = model.by_file_region.get(&(f.core.file_id, region)) {
+            if vals.len() >= min_n {
+                return aux_null_p_from_sorted_agreements(vals, agreement_obs);
+            }
+        }
+    }
+
+    if let Some(vals) = model.by_file.get(&f.core.file_id) {
+        if vals.len() >= min_n {
+            return aux_null_p_from_sorted_agreements(vals, agreement_obs);
+        }
+    }
+
+    if let Some(region) = rt_region_bin_for_feature(f, settings) {
+        if let Some(vals) = model.by_region.get(&region) {
+            if vals.len() >= min_n {
+                return aux_null_p_from_sorted_agreements(vals, agreement_obs);
+            }
+        }
+    }
+
+    aux_null_p_from_sorted_agreements(&model.global, agreement_obs)
+}
+
+fn apply_rt_null_pvalue_update_to_active_stream(
+    features: &mut [DfFeature],
+    settings: &FdrSettings,
+    db: &IndexedDatabase,
+) -> PhysicalRescueResult {
+    let Some(model) = build_rt_aux_null_model(features, settings, db) else {
+        return PhysicalRescueResult {
+            enabled: true,
+            fail_closed: true,
+            ..Default::default()
+        };
+    };
+
+    let is_unreliable = model.rt_sigma_global.is_none()
+        || model.reliability < settings.physical_rescue.reliability_floor
+        || model.global.len() < settings.min_null_size;
+
+    if is_unreliable {
+        log::warn!(
+            "RT p-value rescue failed closed: null_n={} reliability={:.4} floor={:.4} sigma={:?}",
+            model.global.len(),
+            model.reliability,
+            settings.physical_rescue.reliability_floor,
+            model.rt_sigma_global
+        );
+
+        return PhysicalRescueResult {
+            enabled: true,
+            fail_closed: true,
+            anchor_count_total: model.global.len(),
+            anchor_count_after_filters: model.global.len(),
+            rt_reliability: model.reliability,
+            rt_sigma_global: model.rt_sigma_global,
+            ..Default::default()
+        };
+    }
+
+    for f in features.iter_mut().filter(|f| f.core.rank == 1) {
+        let base_p = f.decoy_free_p_value.unwrap_or(1.0) as f64;
+
+        let p_rt = rt_aux_null_p_value(&model, settings, f);
+        let p_new = combine_cauchy(&[base_p, p_rt]).clamp(1e-300, 1.0);
+
+        /*
+         * Placeholder PEP is overwritten immediately below by
+         * recalibrate_companion_pep_from_active_p_values(...).
+         * The score is already correct because active evidence is p-value.
+         */
+        let placeholder_pep = f.decoy_free_pep.unwrap_or(1.0) as f64;
+
+        set_df_evidence_pair(
+            f,
+            ActiveEvidenceSpace::PValue,
+            p_new,
+            placeholder_pep.clamp(1e-300, 1.0),
+        );
+    }
+
+    recalibrate_companion_pep_from_active_p_values(features, settings, "RT p-value rescue");
+    recalculate_active_q_values(features, settings);
+
+    PhysicalRescueResult {
+        enabled: true,
+        fail_closed: false,
+        anchor_count_total: model.global.len(),
+        anchor_count_after_filters: model.global.len(),
+        rt_reliability: model.reliability,
+        ims_reliability: 0.0,
+        joint_reliability: model.reliability,
+        rt_sigma_global: model.rt_sigma_global,
+        ims_sigma_global: None,
+        dropped_runs: Vec::new(),
+        dropped_charge_bins: Vec::new(),
+    }
 }
 
 fn apply_rt_bounded_update_to_active_stream(
@@ -4128,6 +4475,192 @@ fn apply_rt_bounded_update_to_active_stream(
         ims_sigma_global: None,
         dropped_runs,
         dropped_charge_bins,
+    }
+}
+
+#[inline]
+fn ims_delta_for_feature(f: &DfFeature) -> Option<f64> {
+    let obs = f.core.ims as f64;
+    let pred = f.core.predicted_ims as f64;
+
+    if obs.is_finite() && pred.is_finite() {
+        Some(obs - pred)
+    } else {
+        None
+    }
+}
+
+struct ImsAuxNullModel {
+    global: Vec<f64>,
+    by_file: HashMap<usize, Vec<f64>>,
+    by_charge: HashMap<i32, Vec<f64>>,
+    by_file_charge: HashMap<(usize, i32), Vec<f64>>,
+    ims_sigma_global: Option<f64>,
+    reliability: f64,
+}
+
+fn build_ims_aux_null_model(
+    features: &[DfFeature],
+    settings: &FdrSettings,
+    _db: &IndexedDatabase,
+) -> Option<ImsAuxNullModel> {
+    let mut global: Vec<f64> = Vec::new();
+    let mut by_file: HashMap<usize, Vec<f64>> = HashMap::new();
+    let mut by_charge: HashMap<i32, Vec<f64>> = HashMap::new();
+    let mut by_file_charge: HashMap<(usize, i32), Vec<f64>> = HashMap::new();
+
+    for f in features.iter() {
+        if f.core.rank < settings.min_null_rank || f.core.rank > settings.max_null_rank {
+            continue;
+        }
+
+        let Some(delta) = ims_delta_for_feature(f) else {
+            continue;
+        };
+
+        let agreement = -delta.abs();
+        let charge = f.core.charge as i32;
+
+        global.push(agreement);
+        by_file.entry(f.core.file_id).or_default().push(agreement);
+        by_charge.entry(charge).or_default().push(agreement);
+        by_file_charge
+            .entry((f.core.file_id, charge))
+            .or_default()
+            .push(agreement);
+    }
+
+    if global.len() < settings.min_null_size {
+        return None;
+    }
+
+    global.sort_by(|a, b| a.total_cmp(b));
+    for vals in by_file.values_mut() {
+        vals.sort_by(|a, b| a.total_cmp(b));
+    }
+    for vals in by_charge.values_mut() {
+        vals.sort_by(|a, b| a.total_cmp(b));
+    }
+    for vals in by_file_charge.values_mut() {
+        vals.sort_by(|a, b| a.total_cmp(b));
+    }
+
+    let ims_sigma_global = aux_sigma_from_agreements(&global);
+    let reliability = aux_reliability_from_null_count(global.len(), settings);
+
+    Some(ImsAuxNullModel {
+        global,
+        by_file,
+        by_charge,
+        by_file_charge,
+        ims_sigma_global,
+        reliability,
+    })
+}
+
+fn ims_aux_null_p_value(model: &ImsAuxNullModel, settings: &FdrSettings, f: &DfFeature) -> f64 {
+    let Some(delta_ims) = ims_delta_for_feature(f) else {
+        return 1.0;
+    };
+
+    let agreement_obs = -delta_ims.abs();
+    let min_n = settings.min_null_size;
+    let charge = f.core.charge as i32;
+
+    if let Some(vals) = model.by_file_charge.get(&(f.core.file_id, charge)) {
+        if vals.len() >= min_n {
+            return aux_null_p_from_sorted_agreements(vals, agreement_obs);
+        }
+    }
+
+    if let Some(vals) = model.by_file.get(&f.core.file_id) {
+        if vals.len() >= min_n {
+            return aux_null_p_from_sorted_agreements(vals, agreement_obs);
+        }
+    }
+
+    if let Some(vals) = model.by_charge.get(&charge) {
+        if vals.len() >= min_n {
+            return aux_null_p_from_sorted_agreements(vals, agreement_obs);
+        }
+    }
+
+    aux_null_p_from_sorted_agreements(&model.global, agreement_obs)
+}
+
+fn apply_ims_null_pvalue_update_to_active_stream(
+    features: &mut [DfFeature],
+    settings: &FdrSettings,
+    db: &IndexedDatabase,
+) -> PhysicalRescueResult {
+    let Some(model) = build_ims_aux_null_model(features, settings, db) else {
+        return PhysicalRescueResult {
+            enabled: true,
+            fail_closed: true,
+            ..Default::default()
+        };
+    };
+
+    let is_unreliable = model.ims_sigma_global.is_none()
+        || model.reliability < settings.physical_rescue.reliability_floor
+        || model.global.len() < settings.min_null_size;
+
+    if is_unreliable {
+        log::warn!(
+            "IMS p-value rescue failed closed: null_n={} reliability={:.4} floor={:.4} sigma={:?}",
+            model.global.len(),
+            model.reliability,
+            settings.physical_rescue.reliability_floor,
+            model.ims_sigma_global
+        );
+
+        return PhysicalRescueResult {
+            enabled: true,
+            fail_closed: true,
+            anchor_count_total: model.global.len(),
+            anchor_count_after_filters: model.global.len(),
+            ims_reliability: model.reliability,
+            ims_sigma_global: model.ims_sigma_global,
+            ..Default::default()
+        };
+    }
+
+    for f in features.iter_mut().filter(|f| f.core.rank == 1) {
+        let base_p = f.decoy_free_p_value.unwrap_or(1.0) as f64;
+
+        let p_ims = ims_aux_null_p_value(&model, settings, f);
+        let p_new = combine_cauchy(&[base_p, p_ims]).clamp(1e-300, 1.0);
+
+        /*
+         * Placeholder PEP is overwritten immediately below by
+         * recalibrate_companion_pep_from_active_p_values(...).
+         * The score is already correct because active evidence is p-value.
+         */
+        let placeholder_pep = f.decoy_free_pep.unwrap_or(1.0) as f64;
+
+        set_df_evidence_pair(
+            f,
+            ActiveEvidenceSpace::PValue,
+            p_new,
+            placeholder_pep.clamp(1e-300, 1.0),
+        );
+    }
+
+    recalibrate_companion_pep_from_active_p_values(features, settings, "IMS p-value rescue");
+    recalculate_active_q_values(features, settings);
+
+    PhysicalRescueResult {
+        enabled: true,
+        fail_closed: false,
+        anchor_count_total: model.global.len(),
+        anchor_count_after_filters: model.global.len(),
+        rt_reliability: 0.0,
+        ims_reliability: model.reliability,
+        joint_reliability: model.reliability,
+        rt_sigma_global: None,
+        ims_sigma_global: model.ims_sigma_global,
+        dropped_runs: Vec::new(),
+        dropped_charge_bins: Vec::new(),
     }
 }
 
@@ -4588,7 +5121,7 @@ fn apply_ims_dart_bayes_update_to_active_stream(
     }
 
     if !is_unreliable && dart_cfg.dart_recalc_q_from_posterior {
-        recalculate_active_pep_q_values(features);
+        recalculate_active_q_values(features, settings);
     }
 
     PhysicalRescueResult {
@@ -4665,7 +5198,13 @@ fn apply_peptide_reproducibility_update_to_active_stream(
     settings: &FdrSettings,
     db: &IndexedDatabase,
 ) -> ReproducibilityResult {
-    apply_bounded_repro_shift(features, settings, db)
+    match active_evidence_space(settings) {
+        ActiveEvidenceSpace::Pep => apply_bounded_repro_shift(features, settings, db),
+
+        ActiveEvidenceSpace::PValue => {
+            apply_recurrence_null_pvalue_update_to_active_stream(features, settings, db)
+        }
+    }
 }
 
 fn apply_protein_reproducibility_update_to_active_stream(
@@ -4673,7 +5212,13 @@ fn apply_protein_reproducibility_update_to_active_stream(
     settings: &FdrSettings,
     db: &IndexedDatabase,
 ) -> ReproducibilityResult {
-    apply_bounded_repro_shift(features, settings, db)
+    match active_evidence_space(settings) {
+        ActiveEvidenceSpace::Pep => apply_bounded_repro_shift(features, settings, db),
+
+        ActiveEvidenceSpace::PValue => {
+            apply_recurrence_null_pvalue_update_to_active_stream(features, settings, db)
+        }
+    }
 }
 
 fn apply_peptide_reproducibility_rescue(
@@ -5173,7 +5718,7 @@ fn apply_dart_bayes_update(
     }
 
     if dart_cfg.dart_recalc_q_from_posterior {
-        recalculate_active_pep_q_values(features);
+        recalculate_active_q_values(features, settings);
     }
 }
 
@@ -5273,7 +5818,7 @@ fn apply_bounded_physical_shift(
         }
     }
 
-    recalculate_active_pep_q_values(features);
+    recalculate_active_q_values(features, settings);
 }
 
 #[derive(Clone, Debug, Default)]
@@ -5680,6 +6225,125 @@ fn apply_reproducibility_anchor_rescue(
     (post_pep, bounded_shift.abs())
 }
 
+#[inline]
+fn peptide_key_for_feature(f: &DfFeature) -> String {
+    f.core.peptide_idx.0.to_string()
+}
+
+struct RecurrenceNullModel {
+    null_support: Vec<f64>,
+}
+
+fn build_recurrence_null_model(
+    features: &[DfFeature],
+    settings: &FdrSettings,
+    _db: &IndexedDatabase,
+) -> Option<RecurrenceNullModel> {
+    let mut peptide_to_support: FnvHashMap<String, f64> = FnvHashMap::default();
+
+    for f in features.iter() {
+        if f.core.rank < settings.min_null_rank || f.core.rank > settings.max_null_rank {
+            continue;
+        }
+
+        let peptide = peptide_key_for_feature(f);
+        *peptide_to_support.entry(peptide).or_insert(0.0) += 1.0;
+    }
+
+    let mut vals: Vec<f64> = peptide_to_support.into_values().collect();
+
+    if vals.len() < settings.min_null_size {
+        return None;
+    }
+
+    vals.sort_by(|a, b| a.total_cmp(b));
+
+    Some(RecurrenceNullModel { null_support: vals })
+}
+
+fn recurrence_aux_null_p_value(model: &RecurrenceNullModel, support: f64) -> f64 {
+    let n = model.null_support.len();
+    if n == 0 {
+        return 1.0;
+    }
+
+    let idx = model.null_support.partition_point(|&x| x < support);
+    let count_ge = n - idx;
+
+    ((count_ge as f64 + 1.0) / (n as f64 + 1.0)).clamp(1e-300, 1.0)
+}
+
+fn apply_recurrence_null_pvalue_update_to_active_stream(
+    features: &mut [DfFeature],
+    settings: &FdrSettings,
+    db: &IndexedDatabase,
+) -> ReproducibilityResult {
+    let Some(model) = build_recurrence_null_model(features, settings, db) else {
+        return ReproducibilityResult {
+            enabled: true,
+            fail_closed: true,
+            ..Default::default()
+        };
+    };
+
+    let mut peptide_support: FnvHashMap<String, f64> = FnvHashMap::default();
+
+    for f in features.iter().filter(|f| f.core.rank == 1) {
+        let peptide = peptide_key_for_feature(f);
+        *peptide_support.entry(peptide).or_insert(0.0) += 1.0;
+    }
+
+    let n_rescue_eligible_peptides = peptide_support.len();
+    let mut n_rescued_psms = 0usize;
+    let mut max_shift_applied = 0.0f64;
+
+    for f in features.iter_mut().filter(|f| f.core.rank == 1) {
+        let peptide = peptide_key_for_feature(f);
+        let support = peptide_support.get(&peptide).copied().unwrap_or(1.0);
+
+        let p_recur = recurrence_aux_null_p_value(&model, support);
+
+        let base_p = f.decoy_free_p_value.unwrap_or(1.0) as f64;
+
+        let p_new = combine_cauchy(&[base_p, p_recur]).clamp(1e-300, 1.0);
+
+        if p_new < base_p {
+            n_rescued_psms += 1;
+        }
+
+        max_shift_applied = max_shift_applied.max((base_p.log10() - p_new.log10()).abs());
+
+        let placeholder_pep = f.decoy_free_pep.unwrap_or(1.0) as f64;
+
+        set_df_evidence_pair(
+            f,
+            ActiveEvidenceSpace::PValue,
+            p_new,
+            placeholder_pep.clamp(1e-300, 1.0),
+        );
+    }
+
+    recalibrate_companion_pep_from_active_p_values(features, settings, "recurrence p-value rescue");
+    recalculate_active_q_values(features, settings);
+
+    ReproducibilityResult {
+        enabled: true,
+        fail_closed: false,
+        n_rescue_eligible_proteins: 0,
+        n_rescue_eligible_peptides,
+        n_anchor_peptides: model.null_support.len(),
+        n_rescued_psms,
+        n_strong_unchanged_psms: 0,
+        n_too_weak_unrescued_psms: 0,
+        agreement_support_mean: if n_rescue_eligible_peptides > 0 {
+            peptide_support.values().sum::<f64>() / n_rescue_eligible_peptides as f64
+        } else {
+            0.0
+        },
+        max_shift_applied,
+    }
+}
+
 fn apply_bounded_repro_shift(
     features: &mut [DfFeature],
     settings: &FdrSettings,
@@ -5824,7 +6488,7 @@ fn apply_bounded_repro_shift(
         f.decoy_free_score = Some((-10.0 * post_pep.max(1e-15).log10()) as f32);
     }
 
-    recalculate_active_pep_q_values(features);
+    recalculate_active_q_values(features, settings);
 
     ReproducibilityResult {
         enabled: true,
@@ -5867,35 +6531,69 @@ pub enum ActiveDfStream {
 // This function checks the mutable `decoy_free_*` stream, not stage snapshots.
 // Optional-stage failures should already have preserved the last-good active
 // stream before this point.
-fn validate_final_df_stream_contract(features: &[DfFeature], final_stream: ActiveDfStream) {
+fn validate_final_df_stream_contract(
+    features: &[DfFeature],
+    final_stream: ActiveDfStream,
+    settings: &FdrSettings,
+) {
+    let active = active_evidence_space(settings);
+
     let mut n_rank1 = 0usize;
     let mut n_invalid = 0usize;
 
-    for f in features.iter().filter(|f| f.core.rank == 1) {
-        n_rank1 += 1;
+    for f in features.iter() {
+        if f.core.rank == 1 {
+            n_rank1 += 1;
 
-        let has_p = f.decoy_free_p_value.is_some();
-        let has_pep = f.decoy_free_pep.is_some();
-        let has_score = f.decoy_free_score.is_some();
-        let has_q = f.decoy_free_q_value.is_some();
+            let p = f.decoy_free_p_value;
+            let pep = f.decoy_free_pep;
+            let score = f.decoy_free_score;
+            let q = f.decoy_free_q_value;
 
-        if !has_p || !has_pep || !has_score || !has_q {
-            n_invalid += 1;
+            let valid_complete = p.is_some() && pep.is_some() && score.is_some() && q.is_some();
+
+            let valid_score = match (active, p, pep, score) {
+                (ActiveEvidenceSpace::PValue, Some(p), _, Some(s)) => {
+                    let expected = df_score_from_p_value(p as f64);
+                    ((s - expected).abs() as f64) < 1e-3
+                }
+                (ActiveEvidenceSpace::Pep, _, Some(pep), Some(s)) => {
+                    let expected = df_score_from_pep(pep as f64);
+                    ((s - expected).abs() as f64) < 1e-3
+                }
+                _ => false,
+            };
+
+            if !valid_complete || !valid_score {
+                n_invalid += 1;
+            }
+        } else {
+            let leaked = f.decoy_free_p_value.is_some()
+                || f.decoy_free_pep.is_some()
+                || f.decoy_free_score.is_some()
+                || f.decoy_free_q_value.is_some()
+                || f.decoy_free_peptide_q.is_some()
+                || f.decoy_free_protein_q.is_some();
+
+            if leaked {
+                n_invalid += 1;
+            }
         }
     }
 
     if n_invalid > 0 {
         let msg = format!(
-            "DF final stream contract violated: stream={:?} rank1={} invalid_rows={}",
-            final_stream, n_rank1, n_invalid
+            "DF final stream contract violated: stream={:?} active={:?} rank1={} invalid_rows={}",
+            final_stream, active, n_rank1, n_invalid
         );
         log::error!("{}", msg);
         panic!("{}", msg);
     }
 
     log::debug!(
-        "DF final stream contract OK: stream={:?} rank1={}",
+        "DF final stream contract OK: stream={:?} active={:?} rank1={}",
         final_stream,
+        active,
         n_rank1
     );
 }
@@ -5960,26 +6658,60 @@ fn snapshot_current_stream_to_stage(f: &mut DfFeature, stage: DfAdjustmentStage)
 // Recompute q-values for a PEP-native active stream using cumulative mean PEP
 // after best-first sorting. `decoy_free_score` is larger-is-better; do not
 // negate it before calling q_from_pep_cummean.
-fn recalculate_active_pep_q_values(features: &mut [DfFeature]) {
-    let mut rows: Vec<(f64, usize, f64)> = Vec::new();
+fn recalculate_active_q_values(features: &mut [DfFeature], settings: &FdrSettings) {
+    match active_evidence_space(settings) {
+        ActiveEvidenceSpace::Pep => {
+            let mut rows: Vec<(f64, usize, f64)> = Vec::new();
 
-    for (i, f) in features.iter().enumerate() {
-        if f.core.rank != 1 {
-            continue;
+            for (i, f) in features.iter().enumerate() {
+                if f.core.rank != 1 {
+                    continue;
+                }
+
+                let pep = match f.decoy_free_pep {
+                    Some(x) if x.is_finite() => (x as f64).clamp(0.0, 1.0).max(1e-300),
+                    _ => continue,
+                };
+
+                let score_key = f.decoy_free_score.unwrap_or_else(|| df_score_from_pep(pep)) as f64;
+                rows.push((score_key, i, pep));
+            }
+
+            for (feat_idx, q) in q_from_pep_cummean(rows) {
+                features[feat_idx].decoy_free_q_value = Some(q as f32);
+            }
         }
 
-        let pep = match f.decoy_free_pep {
-            Some(x) if x.is_finite() => (x as f64).clamp(0.0, 1.0).max(1e-300),
-            _ => continue,
-        };
+        ActiveEvidenceSpace::PValue => {
+            let mut rows: Vec<(f64, usize, f64)> = Vec::new();
+            let mut p_values: Vec<f64> = Vec::new();
 
-        let score_key = f.decoy_free_score.unwrap_or_else(|| df_score_from_pep(pep)) as f64;
+            for (i, f) in features.iter().enumerate() {
+                if f.core.rank != 1 {
+                    continue;
+                }
 
-        rows.push((score_key, i, pep));
-    }
+                let p = match f.decoy_free_p_value {
+                    Some(x) if x.is_finite() => (x as f64).clamp(0.0, 1.0).max(1e-300),
+                    _ => continue,
+                };
 
-    for (feat_idx, q) in q_from_pep_cummean(rows) {
-        features[feat_idx].decoy_free_q_value = Some(q as f32);
+                rows.push((p, i, p));
+                p_values.push(p);
+            }
+
+            let q_values = q_values_from_p_values_with_method(
+                &p_values,
+                &p_values,
+                settings,
+                effective_psm_q_method(settings),
+                "PSM active p-value",
+            );
+
+            for ((_, feat_idx, _), q) in rows.into_iter().zip(q_values.into_iter()) {
+                features[feat_idx].decoy_free_q_value = Some(q as f32);
+            }
+        }
     }
 }
 
@@ -6203,7 +6935,7 @@ fn finalize_stage_snapshot(
     settings: &FdrSettings,
     stage: DfAdjustmentStage,
 ) {
-    recalculate_active_pep_q_values(features);
+    recalculate_active_q_values(features, settings);
 
     for f in features.iter_mut().filter(|f| f.core.rank == 1) {
         snapshot_current_stream_to_stage(f, stage);
@@ -6440,7 +7172,7 @@ pub fn run_df_layers(
     }
 
     // 4. Validate the active PSM stream from the completed DF layers.
-    validate_final_df_stream_contract(&new_features, active_stream);
+    validate_final_df_stream_contract(&new_features, active_stream, settings);
 
     let stream_kind = match active_stream {
         ActiveDfStream::Base => "base",
@@ -6482,11 +7214,7 @@ pub fn calculate_peptide_q_df(
     // with only bounded support from additional strong observations. Repeated
     // spectra for the same peptide are treated as corroborating evidence, not as a
     // count-based selected-min penalty.
-    let is_pep_native = features
-        .iter()
-        .find(|f| f.core.rank == 1)
-        .map(|f| f.decoy_free_p_value.is_none())
-        .unwrap_or(false);
+    let is_pep_native = matches!(active_evidence_space(settings), ActiveEvidenceSpace::Pep);
 
     #[derive(Default)]
     struct PepEvidence {
@@ -6804,11 +7532,7 @@ pub fn calculate_protein_q_df(
     // Base-only streams may be p-value-native. RT/IMS and reproducibility-adjusted
     // streams are PEP-native unless a valid aligned p-value stream is explicitly
     // introduced.
-    let is_pep_native = features
-        .iter()
-        .find(|f| f.core.rank == 1)
-        .map(|f| f.decoy_free_p_value.is_none())
-        .unwrap_or(false);
+    let is_pep_native = matches!(active_evidence_space(settings), ActiveEvidenceSpace::Pep);
 
     let mut peptide_passing_psm_count = 0usize;
 

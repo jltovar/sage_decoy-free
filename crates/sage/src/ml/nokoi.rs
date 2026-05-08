@@ -18,6 +18,11 @@ use std::cmp::Ordering;
 
 const NOKOI_CROSSFIT_SEED: u64 = 0x5EED_5EED_5EED_5EED;
 
+pub struct NokoiEvidence {
+    pub p_values: Vec<f64>,
+    pub peps: Vec<f64>,
+}
+
 /// Configuration for Nokoi Rescoring
 #[derive(Clone, Serialize, Deserialize, Debug)]
 pub struct NokoiConfig {
@@ -1021,4 +1026,170 @@ pub fn calc_empirical_p_values(features: &[FeatureCore], probs: &[f64]) -> Vec<f
             (count_ge + 1.0) / (n_neg + 1.0)
         })
         .collect()
+}
+
+fn estimate_pi0_for_nokoi_p_values(p_values: &[f64]) -> f64 {
+    let vals: Vec<f64> = p_values
+        .iter()
+        .copied()
+        .filter(|p| p.is_finite())
+        .map(|p| p.clamp(0.0, 1.0))
+        .collect();
+
+    let n = vals.len();
+    if n < 20 {
+        return 1.0;
+    }
+
+    let lambdas = [0.50, 0.60, 0.70, 0.80, 0.90];
+
+    let mut estimates: Vec<f64> = lambdas
+        .iter()
+        .filter_map(|&lambda| {
+            let denom = (n as f64) * (1.0 - lambda);
+            if denom <= 0.0 {
+                return None;
+            }
+
+            let count = vals.iter().filter(|&&p| p >= lambda).count() as f64;
+            Some((count / denom).clamp(0.0, 1.0))
+        })
+        .collect();
+
+    if estimates.is_empty() {
+        return 1.0;
+    }
+
+    estimates.sort_by(|a, b| a.total_cmp(b));
+    estimates[estimates.len() / 2].clamp(0.0, 1.0)
+}
+
+fn nokoi_grenander_pep_from_p_values(p_values: &[f64], pi0: f64) -> Vec<f64> {
+    const EPS: f64 = 1e-300;
+
+    let n = p_values.len();
+    if n == 0 {
+        return Vec::new();
+    }
+
+    let mut pairs: Vec<(f64, usize)> = p_values
+        .iter()
+        .copied()
+        .enumerate()
+        .map(|(i, p)| (p.clamp(EPS, 1.0), i))
+        .collect();
+
+    pairs.sort_by(|a, b| a.0.total_cmp(&b.0));
+
+    #[derive(Clone, Debug)]
+    struct Block {
+        start_p: f64,
+        end_p: f64,
+        count: usize,
+    }
+
+    impl Block {
+        fn width(&self) -> f64 {
+            (self.end_p - self.start_p).max(EPS)
+        }
+
+        fn density(&self, n: usize) -> f64 {
+            (self.count as f64) / ((n as f64) * self.width())
+        }
+    }
+
+    let mut blocks: Vec<Block> = Vec::new();
+    let mut prev = 0.0f64;
+
+    for &(p, _) in pairs.iter() {
+        let end = p.max(prev + EPS).min(1.0);
+
+        blocks.push(Block {
+            start_p: prev,
+            end_p: end,
+            count: 1,
+        });
+
+        prev = end;
+
+        while blocks.len() >= 2 {
+            let m = blocks.len();
+
+            let d_prev = blocks[m - 2].density(n);
+            let d_last = blocks[m - 1].density(n);
+
+            if d_prev >= d_last {
+                break;
+            }
+
+            let last = blocks.pop().unwrap();
+            let prev_block = blocks.pop().unwrap();
+
+            blocks.push(Block {
+                start_p: prev_block.start_p,
+                end_p: last.end_p,
+                count: prev_block.count + last.count,
+            });
+        }
+    }
+
+    if prev < 1.0 {
+        blocks.push(Block {
+            start_p: prev,
+            end_p: 1.0,
+            count: 0,
+        });
+
+        while blocks.len() >= 2 {
+            let m = blocks.len();
+
+            let d_prev = blocks[m - 2].density(n);
+            let d_last = blocks[m - 1].density(n);
+
+            if d_prev >= d_last {
+                break;
+            }
+
+            let last = blocks.pop().unwrap();
+            let prev_block = blocks.pop().unwrap();
+
+            blocks.push(Block {
+                start_p: prev_block.start_p,
+                end_p: last.end_p,
+                count: prev_block.count + last.count,
+            });
+        }
+    }
+
+    let mut out = vec![1.0f64; n];
+
+    let mut block_idx = 0usize;
+    for &(p, original_idx) in pairs.iter() {
+        while block_idx + 1 < blocks.len() && p > blocks[block_idx].end_p {
+            block_idx += 1;
+        }
+
+        let density = blocks[block_idx].density(n).max(EPS);
+        let pep = (pi0 / density).clamp(EPS, 1.0);
+
+        out[original_idx] = pep;
+    }
+
+    out
+}
+
+pub fn build_nokoi_evidence(features: &[FeatureCore], prob_target: &[f64]) -> NokoiEvidence {
+    let p_values: Vec<f64> = calc_empirical_p_values(features, prob_target)
+        .into_iter()
+        .map(|p| p.clamp(0.0, 1.0).max(1e-300))
+        .collect();
+
+    let pi0 = estimate_pi0_for_nokoi_p_values(&p_values);
+
+    let peps: Vec<f64> = nokoi_grenander_pep_from_p_values(&p_values, pi0)
+        .into_iter()
+        .map(|pep| pep.clamp(0.0, 1.0).max(1e-300))
+        .collect();
+
+    NokoiEvidence { p_values, peps }
 }

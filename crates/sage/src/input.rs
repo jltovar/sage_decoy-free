@@ -46,10 +46,20 @@ pub enum PeptidePCombine {
 
 #[derive(Clone, Serialize, Deserialize, Debug, Default, PartialEq, Eq)]
 #[serde(rename_all = "snake_case")]
+pub enum EnsemblePCombiner {
+    Fisher,
+    #[default]
+    Cauchy,
+    SidakMinP,
+    Best,
+}
+
+#[derive(Clone, Serialize, Deserialize, Debug, Default, PartialEq, Eq)]
+#[serde(rename_all = "snake_case")]
 pub enum FinalEvidenceSpace {
-    /// Preserve legacy behavior:
-    /// Moments/MLE/LowerOrder use p-values;
-    /// MSFDR/Nokoi/Ensemble use PEP-native final q-values.
+    /// Explicitly choose the active Decoy-Free evidence stream.
+    /// Auto uses model-specific defaults but must never infer evidence space
+    /// from missing output fields.
     #[default]
     Auto,
     /// Force final selected Decoy-Free evidence to be p-value-native.
@@ -549,6 +559,7 @@ pub struct FdrOptions {
     pub enable_nokoi: Option<bool>,        // default true
 
     // Ensemble combination choices (global controls; used by ModelFit::Ensemble)
+    pub ensemble_p_combiner: Option<EnsemblePCombiner>,
     pub ensemble_pep_combiner: Option<EnsemblePepCombiner>,
 
     // Shared robust-combiner knobs
@@ -730,6 +741,7 @@ pub struct FdrSettings {
     pub enable_msfdr_2smix: bool,
     pub enable_nokoi: bool,
 
+    pub ensemble_p_combiner: EnsemblePCombiner,
     pub ensemble_pep_combiner: EnsemblePepCombiner,
 
     pub ensemble_pep_trim_frac: f64,
@@ -1131,9 +1143,23 @@ impl From<FdrOptions> for FdrSettings {
         // ---------------------------------------------------------------------
         // Ensemble combination choices + weights
         // ---------------------------------------------------------------------
+        let ensemble_p_combiner = options
+            .ensemble_p_combiner
+            .unwrap_or(EnsemblePCombiner::Cauchy);
+
         let ensemble_pep_combiner = options
             .ensemble_pep_combiner
             .unwrap_or(EnsemblePepCombiner::Median);
+
+        if matches!(model_fit, ModelFit::Ensemble)
+            && matches!(final_evidence_space, FinalEvidenceSpace::Auto)
+        {
+            panic!(
+                "Invalid DF configuration: model_fit=ensemble requires explicit \
+				 final_evidence_space='p_value' or final_evidence_space='pep'. \
+				 Ensemble evidence routing must not use auto."
+            );
+        }
 
         let ensemble_pep_trim_frac = options
             .ensemble_pep_trim_frac
@@ -1314,6 +1340,7 @@ impl From<FdrOptions> for FdrSettings {
             enable_msfdr_2smix,
             enable_nokoi,
 
+            ensemble_p_combiner,
             ensemble_pep_combiner,
 
             ensemble_pep_trim_frac,
