@@ -616,10 +616,26 @@ fn madej_lam_scaled_tev_from_e_value(e_value: f64) -> Option<f64> {
 fn build_lo_tev_from_stored_spectrum_evalue(
     features: &[DfFeature],
     settings: &FdrSettings,
+    pool: &RankNullPool,
 ) -> LoTevByKey {
+    use crate::input::LoTailCalibration;
+
     let mut by_key: FnvHashMap<(u32, u8, usize, String), f64> = FnvHashMap::default();
     let mut valid = 0usize;
     let mut invalid = 0usize;
+
+    // Pre-calculate empirical survival mapping if needed
+    let mut sorted_null_scores = Vec::new();
+    if matches!(
+        settings.lo_tail_calibration,
+        LoTailCalibration::Empirical | LoTailCalibration::Hybrid
+    ) {
+        sorted_null_scores = pool.scores_in_window(
+            settings.lower_order_min_null_rank,
+            settings.lower_order_max_null_rank,
+        );
+        sorted_null_scores.sort_by(|a, b| a.total_cmp(b));
+    }
 
     for f in features {
         if f.core.rank < 1 {
@@ -627,14 +643,30 @@ fn build_lo_tev_from_stored_spectrum_evalue(
             continue;
         }
 
-        let Some(e_raw) = lo_spectrum_e_value(f) else {
-            invalid += 1;
-            continue;
+        let e_gumbel = lo_spectrum_e_value(f).unwrap_or(1000.0) * settings.lo_evalue_scale;
+
+        let e_value = match settings.lo_tail_calibration {
+            LoTailCalibration::Gumbel => e_gumbel,
+            LoTailCalibration::Empirical | LoTailCalibration::Hybrid => {
+                let hs = f.core.hyperscore as f64;
+                let idx = sorted_null_scores.partition_point(|&x| x < hs);
+                let count_ge = sorted_null_scores.len() - idx;
+                let p_empirical = (count_ge as f64 + 1.0) / (sorted_null_scores.len() as f64 + 1.0);
+
+                // Convert back to E-value scale (E = p * N_candidates)
+                // We use 1000.0 as the reference N to match Madej/Lam TEV scaling
+                let e_empirical = p_empirical * 1000.0;
+
+                if matches!(settings.lo_tail_calibration, LoTailCalibration::Hybrid) {
+                    let w = settings.lo_tail_empirical_weight.clamp(0.0, 1.0);
+                    (1.0 - w) * e_gumbel + w * e_empirical
+                } else {
+                    e_empirical
+                }
+            }
         };
 
-        let e_value = (e_raw * settings.lo_evalue_scale).clamp(1e-300, 1e300);
-
-        let Some(x_lo) = madej_lam_scaled_tev_from_e_value(e_value) else {
+        let Some(x_lo) = madej_lam_scaled_tev_from_e_value(e_value.clamp(1e-300, 1e300)) else {
             invalid += 1;
             continue;
         };
@@ -648,15 +680,15 @@ fn build_lo_tev_from_stored_spectrum_evalue(
             ),
             x_lo,
         );
-
         valid += 1;
     }
 
     log::info!(
-        "LO stored spectrum-E-value TEV diagnostics: valid={} invalid={} source=core.lo_spectrum_e_value e_scale={:.3}",
+        "LO TEV diagnostics: valid={} invalid={} mode={:?} weight={:.2}",
         valid,
         invalid,
-        settings.lo_evalue_scale
+        settings.lo_tail_calibration,
+        settings.lo_tail_empirical_weight
     );
 
     LoTevByKey {
@@ -1846,7 +1878,7 @@ fn fit_engines(
     let mut lo_tev_by_key: Option<Arc<FnvHashMap<(u32, u8, usize, String), f64>>> = None;
 
     if gates.run_lo {
-        let lo_tev_map = build_lo_tev_from_stored_spectrum_evalue(features, settings);
+        let lo_tev_map = build_lo_tev_from_stored_spectrum_evalue(features, settings, pool);
 
         lo_tev_by_key = Some(Arc::new(lo_tev_map.by_key.clone()));
 
