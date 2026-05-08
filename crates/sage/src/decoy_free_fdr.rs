@@ -129,8 +129,8 @@ use crate::database::IndexedDatabase;
 use crate::input::LoStratify;
 use crate::input::{
     BoundedAuxUpdateSpace, DartNullRtModel, DartTrueRtModel, EnsemblePCombiner,
-    EnsemblePepCombiner, FdrSettings, FinalEvidenceSpace, JointMode, ModelFit, PeptidePCombine,
-    PhysicalAnchorMode, QMethod,
+    EnsemblePepCombiner, FdrSettings, FinalEvidenceSpace, JointMode, LoTevTransform, ModelFit,
+    PeptidePCombine, PhysicalAnchorMode, QMethod,
 };
 use crate::lfq::{Peak, PrecursorId};
 use crate::ml::lower_order::{
@@ -569,10 +569,17 @@ fn set_df_evidence_pair(psm: &mut DfFeature, active: ActiveEvidenceSpace, p_valu
 //   is still available:
 //
 //       local p_tail = P(local spectrum null >= observed hyperscore)
-//       E            = local p_tail * scored_candidate_count_for_spectrum
-//       LO TEV       = 0.02 * ln(1000 / E)
+//       E            = local p_tail
+//                    * scored_candidate_count_for_spectrum.powf(lo_evalue_candidate_count_power)
+//                    * lo_evalue_scale
 //
-//   This is the Tide/Comet-like spectrum-local E-value object LO expects.
+//   The final LO TEV score is selected explicitly by `lo_tev_transform`:
+//
+//       neg_log_e              => TEV = -ln(E)
+//       log_1000_over_e        => TEV = ln(1000 / E)
+//       scaled_log_1000_over_e => TEV = 0.02 * ln(1000 / E)
+//
+//   `neg_log_e` is the default canonical uncompressed LO scale.
 #[inline(always)]
 fn tev(f: &DfFeature) -> Option<f64> {
     let x = f.core.hyperscore as f64;
@@ -601,16 +608,59 @@ struct LoTevByKey {
     invalid: usize,
 }
 
+const LO_TEV_REFERENCE_EVALUE: f64 = 1000.0;
+const LO_HISTORICAL_TEV_SCALE: f64 = 0.02;
+
+/// Historical anchor used only to preserve the old fixed-cutoff calibration point
+/// across all LO TEV transforms.
+///
+/// Previously:
+///   cutoff = 0.18 on TEV = 0.02 * ln(1000 / E)
+///
+/// Therefore:
+///   E_anchor = 1000 * exp(-0.18 / 0.02)
+///
+/// The selected transform maps this same E_anchor into its own score scale.
+const LO_HISTORICAL_TNM_CUTOFF_SCALED_TEV: f64 = 0.18;
+
 #[inline(always)]
-fn madej_lam_scaled_tev_from_e_value(e_value: f64) -> Option<f64> {
+fn lo_tev_from_e_value(e_value: f64, transform: LoTevTransform) -> Option<f64> {
     if !e_value.is_finite() || e_value <= 0.0 {
         return None;
     }
 
     let e = e_value.clamp(1e-300, 1e300);
-    let tev = 0.02 * (1000.0_f64.ln() - e.ln());
+
+    let tev = match transform {
+        LoTevTransform::NegLogE => -e.ln(),
+
+        LoTevTransform::Log1000OverE => LO_TEV_REFERENCE_EVALUE.ln() - e.ln(),
+
+        LoTevTransform::ScaledLog1000OverE => {
+            LO_HISTORICAL_TEV_SCALE * (LO_TEV_REFERENCE_EVALUE.ln() - e.ln())
+        }
+    };
 
     tev.is_finite().then_some(tev)
+}
+
+#[inline(always)]
+fn lo_tnm_fixed_cutoff_calibration(transform: LoTevTransform) -> Option<(f64, f64)> {
+    let anchor_e_value = LO_TEV_REFERENCE_EVALUE
+        * (-LO_HISTORICAL_TNM_CUTOFF_SCALED_TEV / LO_HISTORICAL_TEV_SCALE).exp();
+
+    let cutoff = lo_tev_from_e_value(anchor_e_value, transform)?;
+
+    // Preserve the old calibration target numerically, but derive it from the
+    // explicit anchor E-value instead of hard-coding 1000 * exp(-0.18 / 0.02)
+    // at the LO fitter call site.
+    let target_p_at_cutoff = anchor_e_value.clamp(1e-300, 1.0);
+
+    if cutoff.is_finite() && target_p_at_cutoff.is_finite() && target_p_at_cutoff > 0.0 {
+        Some((cutoff, target_p_at_cutoff))
+    } else {
+        None
+    }
 }
 
 fn build_lo_tev_from_stored_spectrum_evalue(
@@ -653,9 +703,10 @@ fn build_lo_tev_from_stored_spectrum_evalue(
                 let count_ge = sorted_null_scores.len() - idx;
                 let p_empirical = (count_ge as f64 + 1.0) / (sorted_null_scores.len() as f64 + 1.0);
 
-                // Convert back to E-value scale (E = p * N_candidates)
-                // We use 1000.0 as the reference N to match Madej/Lam TEV scaling
-                let e_empirical = p_empirical * 1000.0;
+                // Convert back to E-value scale using the explicit LO reference.
+                // The downstream `lo_tev_transform` determines whether this E-value
+                // is converted to -ln(E), ln(1000/E), or the historical compressed scale.
+                let e_empirical = p_empirical * LO_TEV_REFERENCE_EVALUE;
 
                 if matches!(settings.lo_tail_calibration, LoTailCalibration::Hybrid) {
                     let w = settings.lo_tail_empirical_weight.clamp(0.0, 1.0);
@@ -666,7 +717,9 @@ fn build_lo_tev_from_stored_spectrum_evalue(
             }
         };
 
-        let Some(x_lo) = madej_lam_scaled_tev_from_e_value(e_value.clamp(1e-300, 1e300)) else {
+        let Some(x_lo) =
+            lo_tev_from_e_value(e_value.clamp(1e-300, 1e300), settings.lo_tev_transform)
+        else {
             invalid += 1;
             continue;
         };
@@ -684,11 +737,12 @@ fn build_lo_tev_from_stored_spectrum_evalue(
     }
 
     log::info!(
-        "LO TEV diagnostics: valid={} invalid={} mode={:?} weight={:.2}",
+        "LO TEV diagnostics: valid={} invalid={} tail_calibration={:?} empirical_weight={:.2} tev_transform={:?}",
         valid,
         invalid,
         settings.lo_tail_calibration,
-        settings.lo_tail_empirical_weight
+        settings.lo_tail_empirical_weight,
+        settings.lo_tev_transform
     );
 
     LoTevByKey {
@@ -1883,10 +1937,11 @@ fn fit_engines(
         lo_tev_by_key = Some(Arc::new(lo_tev_map.by_key.clone()));
 
         log::info!(
-            "LO stored spectrum-E-value TEV diagnostics: valid={} invalid={} source=core.lo_spectrum_e_value e_scale={:.3}",
+            "LO stored spectrum-E-value TEV diagnostics: valid={} invalid={} source=core.lo_spectrum_e_value e_scale={:.3} tev_transform={:?}",
             lo_tev_map.valid,
             lo_tev_map.invalid,
-            settings.lo_evalue_scale
+            settings.lo_evalue_scale,
+            settings.lo_tev_transform
         );
 
         let mut rank1_scores_by_charge: Vec<(f64, u8)> =
@@ -1965,13 +2020,31 @@ fn fit_engines(
             // This matches the Tide/Comet-style object expected by the LO order-statistic model.
             let lo_min_count_per_rank = settings.lo_min_count_per_rank;
 
-            lo_model = fit_decoy_free_model(
-                &lo_fit_data,
-                &rank1_scores_by_charge,
-                settings.lower_order_min_null_rank,
-                settings.lower_order_max_null_rank,
-                lo_min_count_per_rank,
-            );
+            if let Some((lo_tnm_cutoff, lo_tnm_target_p_at_cutoff)) =
+                lo_tnm_fixed_cutoff_calibration(settings.lo_tev_transform)
+            {
+                log::info!(
+                    "LO TNM cutoff calibration: tev_transform={:?} cutoff={:.6} target_p_at_cutoff={:.6e}",
+                    settings.lo_tev_transform,
+                    lo_tnm_cutoff,
+                    lo_tnm_target_p_at_cutoff
+                );
+
+                lo_model = fit_decoy_free_model(
+                    &lo_fit_data,
+                    &rank1_scores_by_charge,
+                    settings.lower_order_min_null_rank,
+                    settings.lower_order_max_null_rank,
+                    lo_min_count_per_rank,
+                    lo_tnm_cutoff,
+                    lo_tnm_target_p_at_cutoff,
+                );
+            } else {
+                log::warn!(
+                    "DF fail-closed: LowerOrder could not derive transform-consistent TNM cutoff calibration for {:?}.",
+                    settings.lo_tev_transform
+                );
+            }
         }
     }
 

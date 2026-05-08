@@ -136,6 +136,29 @@ pub enum LoTailCalibration {
     Hybrid,
 }
 
+#[derive(Copy, Clone, Serialize, Deserialize, Debug, Default, PartialEq, Eq)]
+#[serde(rename_all = "snake_case")]
+pub enum LoTevTransform {
+    /// Canonical LowerOrder transformed E-value:
+    ///   TEV = -ln(E)
+    ///
+    /// This is the default publication-facing LO scale.
+    #[default]
+    NegLogE,
+
+    /// Reference-shifted transformed E-value:
+    ///   TEV = ln(1000 / E)
+    ///
+    /// This preserves the historical 1000/E reference without the 0.02 compression.
+    Log1000OverE,
+
+    /// Historical compressed Tide/Comet-style scale:
+    ///   TEV = 0.02 * ln(1000 / E)
+    ///
+    /// Retained only for backward-compatible comparisons.
+    ScaledLog1000OverE,
+}
+
 /// How Nokoi defines the "positive" class in DF mode.
 ///
 /// - or:      top-slice OR provisional p-threshold  (current behavior)
@@ -484,11 +507,19 @@ pub struct FdrOptions {
     pub lo_tail_empirical_weight: Option<f64>,
 
     // LowerOrder TEV e-value calibration.
-    // TEV is computed as:
-    //   e_value = p_tail * observed_candidate_count.powf(lo_evalue_candidate_count_power) * lo_evalue_scale
-    //   TEV     = 0.02 * ln(1000 / e_value)
+    //
+    // First:
+    //   e_value = p_tail
+    //           * observed_candidate_count.powf(lo_evalue_candidate_count_power)
+    //           * lo_evalue_scale
+    //
+    // Then lo_tev_transform selects the score scale:
+    //   neg_log_e              => TEV = -ln(E)
+    //   log_1000_over_e        => TEV = ln(1000 / E)
+    //   scaled_log_1000_over_e => TEV = 0.02 * ln(1000 / E)
     pub lo_evalue_candidate_count_power: Option<f64>,
     pub lo_evalue_scale: Option<f64>,
+    pub lo_tev_transform: Option<LoTevTransform>,
 
     // =========================================================================
     // E) MSFDR specific knobs
@@ -682,6 +713,7 @@ pub struct FdrSettings {
 
     pub lo_evalue_candidate_count_power: f64,
     pub lo_evalue_scale: f64,
+    pub lo_tev_transform: LoTevTransform,
 
     // =========================================================================
     // E) MSFDR specific resolved null window + knobs
@@ -1034,6 +1066,8 @@ impl From<FdrOptions> for FdrSettings {
 
         let lo_evalue_scale = options.lo_evalue_scale.unwrap_or(1.0).clamp(1e-6, 1e6);
 
+        let lo_tev_transform = options.lo_tev_transform.unwrap_or(LoTevTransform::NegLogE);
+
         // ---------------------------------------------------------------------
         // E) MSFDR specific resolved null window + knobs
         // ---------------------------------------------------------------------
@@ -1281,6 +1315,7 @@ impl From<FdrOptions> for FdrSettings {
 
             lo_evalue_candidate_count_power,
             lo_evalue_scale,
+            lo_tev_transform,
 
             // =========================================================================
             // E) MSFDR specific resolved null window + knobs

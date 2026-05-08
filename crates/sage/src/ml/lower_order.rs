@@ -763,6 +763,8 @@ pub fn fit_decoy_free_model(
     min_null_rank: u32,
     max_null_rank: u32,
     lo_min_count_per_rank: usize,
+    tnm_cutoff: f64,
+    tnm_target_p_at_cutoff: f64,
 ) -> Option<LowerOrderModel> {
     // LowerOrder null evidence must come from non-top hits only.
     // Rank 1 is the target-contaminated top-hit mixture and is never a valid
@@ -770,6 +772,19 @@ pub fn fit_decoy_free_model(
     let effective_min_null_rank = min_null_rank.max(2);
 
     if effective_min_null_rank > max_null_rank {
+        return None;
+    }
+
+    if !tnm_cutoff.is_finite()
+        || !tnm_target_p_at_cutoff.is_finite()
+        || tnm_target_p_at_cutoff <= 0.0
+        || tnm_target_p_at_cutoff > 1.0
+    {
+        log::warn!(
+            "LO fail-closed: invalid TNM fixed-cutoff calibration cutoff={:?} target_p_at_cutoff={:?}",
+            tnm_cutoff,
+            tnm_target_p_at_cutoff
+        );
         return None;
     }
 
@@ -955,8 +970,8 @@ pub fn fit_decoy_free_model(
             continue;
         };
 
-        let cutoff = 0.18_f64;
-        let target_cutoff_p = (1000.0_f64 * (-cutoff / 0.02_f64).exp()).clamp(1e-300, 1.0);
+        let cutoff = tnm_cutoff;
+        let target_cutoff_p = tnm_target_p_at_cutoff;
 
         let Some((mu_final, beta_final, cutoff_p, cutoff_error)) =
             scan_mu_for_fixed_cutoff(slope, intercept, cutoff, target_cutoff_p)
