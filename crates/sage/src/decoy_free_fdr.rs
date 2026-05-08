@@ -2114,7 +2114,7 @@ fn fit_engines(
                 l1_lambda_steps: settings.nokoi_l1_lambda_steps,
             };
 
-            if let Some((probs, _null_scores)) = nokoi::rescore_df_crossfit(
+            if let Some((probs, null_scores_oof)) = nokoi::rescore_df_crossfit(
                 features,
                 &config,
                 settings.nokoi_min_null_rank,
@@ -2123,9 +2123,8 @@ fn fit_engines(
                 is_positive,
                 &pool.null_indices,
             ) {
-                let feature_cores: Vec<_> = features.iter().map(|f| f.core.clone()).collect();
-
-                let nokoi_evidence = nokoi::build_nokoi_evidence(&feature_cores, &probs);
+                let nokoi_evidence =
+                    nokoi::build_nokoi_evidence_from_crossfit_null(&probs, &null_scores_oof);
 
                 if nokoi_evidence.p_values.len() != features.len()
                     || nokoi_evidence.peps.len() != features.len()
@@ -2464,6 +2463,38 @@ fn score_base_rank1(
         .iter()
         .map(|r| r.p_lo.clamp(0.0, 1.0).max(1e-300))
         .collect();
+
+    if matches!(settings.model_fit, ModelFit::LowerOrder) {
+        let finite_lo: Vec<f64> = p_lo_all.iter().copied().filter(|p| p.is_finite()).collect();
+
+        if !finite_lo.is_empty() {
+            let n_total = finite_lo.len();
+            let n_one = finite_lo.iter().filter(|&&p| p >= 0.999999).count();
+            let n_floor = finite_lo.iter().filter(|&&p| p <= 1e-250).count();
+
+            let mut sorted = finite_lo.clone();
+            sorted.sort_by(|a, b| a.total_cmp(b));
+
+            let q_at = |frac: f64| -> f64 {
+                let idx = (frac.clamp(0.0, 1.0) * ((sorted.len() - 1) as f64)).round() as usize;
+                sorted[idx.min(sorted.len() - 1)]
+            };
+
+            log::info!(
+                "LO rank1 p-value diagnostics: n={} floor_like={} one_like={} q=[{:.3e},{:.3e},{:.3e},{:.3e},{:.3e},{:.3e},{:.3e}]",
+                n_total,
+                n_floor,
+                n_one,
+                q_at(0.00),
+                q_at(0.01),
+                q_at(0.10),
+                q_at(0.50),
+                q_at(0.90),
+                q_at(0.99),
+                q_at(1.00)
+            );
+        }
+    }
 
     let p_msfdr_all: Vec<f64> = rank1_out
         .iter()

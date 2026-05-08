@@ -1028,6 +1028,53 @@ pub fn calc_empirical_p_values(features: &[FeatureCore], probs: &[f64]) -> Vec<f
         .collect()
 }
 
+/// Convert model scores to upper-tail empirical p-values using an externally
+/// supplied null-score distribution.
+///
+/// For decoy-free Nokoi, this should be the out-of-fold null distribution
+/// produced by `rescore_df_crossfit()`. Using the cross-fitted null avoids
+/// circular in-sample null calibration and respects the caller's configured
+/// Nokoi null-rank window.
+pub fn calc_empirical_p_values_from_null_scores(
+    prob_target_all: &[f64],
+    null_scores_oof: &[f64],
+) -> Vec<f64> {
+    let mut null_scores: Vec<f64> = null_scores_oof
+        .iter()
+        .copied()
+        .filter(|p| p.is_finite())
+        .map(|p| p.clamp(0.0, 1.0))
+        .collect();
+
+    null_scores.sort_by(|a, b| a.total_cmp(b));
+
+    let n_null = null_scores.len();
+
+    if n_null < 10 {
+        log::warn!(
+            "Nokoi DF: too few cross-fitted null scores for empirical calibration ({} < 10); returning p=1.",
+            n_null
+        );
+        return vec![1.0; prob_target_all.len()];
+    }
+
+    prob_target_all
+        .iter()
+        .copied()
+        .map(|p| {
+            let p = p.clamp(0.0, 1.0);
+
+            // Upper-tail null survival: P_null(score >= observed score).
+            let idx = null_scores.partition_point(|&x| x < p);
+            let count_ge = n_null - idx;
+
+            // Conservative +1 smoothing.
+            ((count_ge as f64) + 1.0) / ((n_null as f64) + 1.0)
+        })
+        .map(|p| p.clamp(1e-300, 1.0))
+        .collect()
+}
+
 fn estimate_pi0_for_nokoi_p_values(p_values: &[f64]) -> f64 {
     let vals: Vec<f64> = p_values
         .iter()
@@ -1178,11 +1225,15 @@ fn nokoi_grenander_pep_from_p_values(p_values: &[f64], pi0: f64) -> Vec<f64> {
     out
 }
 
-pub fn build_nokoi_evidence(features: &[FeatureCore], prob_target: &[f64]) -> NokoiEvidence {
-    let p_values: Vec<f64> = calc_empirical_p_values(features, prob_target)
-        .into_iter()
-        .map(|p| p.clamp(0.0, 1.0).max(1e-300))
-        .collect();
+pub fn build_nokoi_evidence_from_crossfit_null(
+    prob_target_all: &[f64],
+    null_scores_oof: &[f64],
+) -> NokoiEvidence {
+    let p_values: Vec<f64> =
+        calc_empirical_p_values_from_null_scores(prob_target_all, null_scores_oof)
+            .into_iter()
+            .map(|p| p.clamp(0.0, 1.0).max(1e-300))
+            .collect();
 
     let pi0 = estimate_pi0_for_nokoi_p_values(&p_values);
 
@@ -1190,6 +1241,41 @@ pub fn build_nokoi_evidence(features: &[FeatureCore], prob_target: &[f64]) -> No
         .into_iter()
         .map(|pep| pep.clamp(0.0, 1.0).max(1e-300))
         .collect();
+
+    let n = p_values.len();
+    if n > 0 {
+        let n_p_one = p_values.iter().filter(|&&p| p >= 0.999999).count();
+        let n_pep_one = peps.iter().filter(|&&p| p >= 0.999999).count();
+
+        let mut ps = p_values.clone();
+        let mut es = peps.clone();
+        ps.sort_by(|a, b| a.total_cmp(b));
+        es.sort_by(|a, b| a.total_cmp(b));
+
+        let q = |xs: &[f64], frac: f64| -> f64 {
+            let idx = (frac.clamp(0.0, 1.0) * ((xs.len() - 1) as f64)).round() as usize;
+            xs[idx.min(xs.len() - 1)]
+        };
+
+        log::info!(
+            "Nokoi DF evidence diagnostics: n={} null_oof={} pi0={:.4} p_one={} pep_one={} p_q=[{:.3e},{:.3e},{:.3e},{:.3e},{:.3e}] pep_q=[{:.3e},{:.3e},{:.3e},{:.3e},{:.3e}]",
+            n,
+            null_scores_oof.len(),
+            pi0,
+            n_p_one,
+            n_pep_one,
+            q(&ps, 0.00),
+            q(&ps, 0.10),
+            q(&ps, 0.50),
+            q(&ps, 0.90),
+            q(&ps, 1.00),
+            q(&es, 0.00),
+            q(&es, 0.10),
+            q(&es, 0.50),
+            q(&es, 0.90),
+            q(&es, 1.00)
+        );
+    }
 
     NokoiEvidence { p_values, peps }
 }
