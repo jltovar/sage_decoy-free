@@ -28,10 +28,12 @@ pub enum ModelFit {
 #[derive(Clone, Serialize, Deserialize, Debug, Default, PartialEq, Eq)]
 #[serde(rename_all = "snake_case")]
 pub enum ProteinPCombine {
-    #[default]
     Fisher,
+    #[default]
     Cauchy,
     SidakMinP,
+    Best,
+    SecondBest,
 }
 
 #[derive(Clone, Serialize, Deserialize, Debug, Default, PartialEq, Eq)]
@@ -42,6 +44,7 @@ pub enum PeptidePCombine {
     Cauchy,
     SidakMinP,
     Best,
+    SecondBest,
 }
 
 #[derive(Clone, Serialize, Deserialize, Debug, Default, PartialEq, Eq)]
@@ -52,6 +55,7 @@ pub enum EnsemblePCombiner {
     Cauchy,
     SidakMinP,
     Best,
+    SecondBest,
 }
 
 #[derive(Clone, Serialize, Deserialize, Debug, Default, PartialEq, Eq)]

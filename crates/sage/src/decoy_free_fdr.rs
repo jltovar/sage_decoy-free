@@ -1075,6 +1075,7 @@ fn combine_p_values_for_ensemble(p_values: &[f64], settings: &FdrSettings) -> f6
             .copied()
             .filter(|p| p.is_finite())
             .fold(1.0_f64, |a, b| a.min(b.clamp(0.0, 1.0).max(1e-300))),
+        EnsemblePCombiner::SecondBest => combine_second_best_p(p_values),
     }
 }
 
@@ -7310,6 +7311,7 @@ pub fn calculate_peptide_q_df(
                     (1.0 - (1.0 - best).powf(n)).clamp(0.0, 1.0).max(1e-300)
                 }
                 PeptidePCombine::Best => best,
+                PeptidePCombine::SecondBest => combine_second_best_p(&ev.vals),
             }
         };
 
@@ -7491,6 +7493,27 @@ pub fn apply_peptide_q_to_psm_reporting_df(features: &mut [DfFeature], settings:
     );
 }
 
+fn combine_second_best_p(p: &[f64]) -> f64 {
+    let mut vals: Vec<f64> = p
+        .iter()
+        .copied()
+        .filter(|x| x.is_finite())
+        .map(|x| x.clamp(0.0, 1.0).max(1e-300))
+        .collect();
+
+    if vals.is_empty() {
+        return 1.0;
+    }
+
+    vals.sort_by(|a, b| a.total_cmp(b));
+
+    if vals.len() == 1 {
+        vals[0]
+    } else {
+        vals[1]
+    }
+}
+
 fn combine_cauchy(p: &[f64]) -> f64 {
     // Cauchy combination (robust under dependence)
     // p_i in (0,1); clamp for numerical stability.
@@ -7608,6 +7631,12 @@ pub fn calculate_protein_q_df(
                 }
                 crate::input::ProteinPCombine::Cauchy => combine_cauchy(&vals),
                 crate::input::ProteinPCombine::SidakMinP => combine_sidak_minp(&vals),
+                crate::input::ProteinPCombine::Best => vals
+                    .iter()
+                    .copied()
+                    .filter(|p| p.is_finite())
+                    .fold(1.0_f64, |a, b| a.min(b.clamp(0.0, 1.0).max(1e-300))),
+                crate::input::ProteinPCombine::SecondBest => combine_second_best_p(&vals),
             }
         };
 
