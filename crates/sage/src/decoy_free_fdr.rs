@@ -1586,9 +1586,190 @@ impl WorkSet {
 }
 
 // -----------------------------------------------------------------------------
-// 16) Debug helper: summarize rank-1 composition (label/entrap/contam)
+// 16) Debug helpers: rank-1 composition and LowerOrder score diagnostics
 // -----------------------------------------------------------------------------
 
+#[inline]
+fn log_f64_distribution(label: &str, values_in: &[f64]) {
+    let mut values: Vec<f64> = values_in
+        .iter()
+        .copied()
+        .filter(|x| x.is_finite())
+        .collect();
+
+    if values.is_empty() {
+        log::info!("{label}: n=0");
+        return;
+    }
+
+    values.sort_by(|a, b| a.total_cmp(b));
+
+    let q_at = |frac: f64| -> f64 {
+        let idx = (frac.clamp(0.0, 1.0) * ((values.len() - 1) as f64)).round() as usize;
+        values[idx.min(values.len() - 1)]
+    };
+
+    let n = values.len();
+    let min = q_at(0.00);
+    let p01 = q_at(0.01);
+    let p05 = q_at(0.05);
+    let p10 = q_at(0.10);
+    let med = q_at(0.50);
+    let p90 = q_at(0.90);
+    let p95 = q_at(0.95);
+    let p99 = q_at(0.99);
+    let max = q_at(1.00);
+
+    log::info!(
+        "{}: n={} q=[min={:.6e},p01={:.6e},p05={:.6e},p10={:.6e},med={:.6e},p90={:.6e},p95={:.6e},p99={:.6e},max={:.6e}]",
+        label,
+        n,
+        min,
+        p01,
+        p05,
+        p10,
+        med,
+        p90,
+        p95,
+        p99,
+        max
+    );
+}
+
+fn log_lower_order_rank1_score_diagnostics(
+    features: &[DfFeature],
+    work: &WorkSet,
+    db: &IndexedDatabase,
+    tev_map: &FnvHashMap<(u32, u8, usize, String), f64>,
+    settings: &FdrSettings,
+) {
+    let mut tev_all = Vec::new();
+    let mut tev_label1 = Vec::new();
+    let mut tev_ref = Vec::new();
+    let mut tev_ent = Vec::new();
+    let mut tev_cont = Vec::new();
+
+    let mut tail_all = Vec::new();
+    let mut tail_ref = Vec::new();
+    let mut tail_ent = Vec::new();
+
+    let mut cand_all = Vec::new();
+    let mut cand_ref = Vec::new();
+    let mut cand_ent = Vec::new();
+
+    let mut eval_all = Vec::new();
+    let mut eval_ref = Vec::new();
+    let mut eval_ent = Vec::new();
+
+    let mut missing_tev = 0usize;
+    let mut missing_components = 0usize;
+
+    for &idx in &work.rank1_indices {
+        let f = &features[idx];
+
+        let prot = db[f.core.peptide_idx].proteins(&db.decoy_tag, db.generate_decoys);
+        let is_ent = is_entrapment_str(&prot);
+        let is_cont = is_contam_str(&prot);
+        let is_ref = f.core.label == 1 && !is_ent && !is_cont;
+
+        match tev_map.get(&(
+            f.core.rank,
+            f.core.charge,
+            f.core.file_id,
+            f.core.spec_id.clone(),
+        )) {
+            Some(&x) if x.is_finite() => {
+                tev_all.push(x);
+
+                if f.core.label == 1 {
+                    tev_label1.push(x);
+                }
+                if is_ref {
+                    tev_ref.push(x);
+                }
+                if is_ent {
+                    tev_ent.push(x);
+                }
+                if is_cont {
+                    tev_cont.push(x);
+                }
+            }
+            _ => {
+                missing_tev += 1;
+            }
+        }
+
+        let tail_p = lo_spectrum_tail_p(f);
+        let cand = lo_spectrum_candidate_count(f);
+        let eval = lo_constructed_e_value(f, settings);
+
+        match (tail_p, cand, eval) {
+            (Some(tp), Some(cc), Some(ev))
+                if tp.is_finite() && cc.is_finite() && ev.is_finite() =>
+            {
+                tail_all.push(tp);
+                cand_all.push(cc);
+                eval_all.push(ev);
+
+                if is_ref {
+                    tail_ref.push(tp);
+                    cand_ref.push(cc);
+                    eval_ref.push(ev);
+                }
+
+                if is_ent {
+                    tail_ent.push(tp);
+                    cand_ent.push(cc);
+                    eval_ent.push(ev);
+                }
+            }
+            _ => {
+                missing_components += 1;
+            }
+        }
+    }
+
+    log::info!(
+        "LO rank1 TEV/component diagnostics: missing_tev={} missing_components={} candidate_count_power={:.3} evalue_scale={:.3} tev_transform={:?}",
+        missing_tev,
+        missing_components,
+        settings.lo_evalue_candidate_count_power,
+        settings.lo_evalue_scale,
+        settings.lo_tev_transform
+    );
+
+    log_f64_distribution("LO rank1 TEV all", &tev_all);
+    log_f64_distribution("LO rank1 TEV label1", &tev_label1);
+    log_f64_distribution(
+        "LO rank1 TEV reference_target_noncontam_nonentrap",
+        &tev_ref,
+    );
+    log_f64_distribution("LO rank1 TEV entrapment", &tev_ent);
+    log_f64_distribution("LO rank1 TEV contaminant", &tev_cont);
+
+    log_f64_distribution("LO rank1 tail_p all", &tail_all);
+    log_f64_distribution(
+        "LO rank1 tail_p reference_target_noncontam_nonentrap",
+        &tail_ref,
+    );
+    log_f64_distribution("LO rank1 tail_p entrapment", &tail_ent);
+
+    log_f64_distribution("LO rank1 candidate_count all", &cand_all);
+    log_f64_distribution(
+        "LO rank1 candidate_count reference_target_noncontam_nonentrap",
+        &cand_ref,
+    );
+    log_f64_distribution("LO rank1 candidate_count entrapment", &cand_ent);
+
+    log_f64_distribution("LO rank1 E_LO all", &eval_all);
+    log_f64_distribution(
+        "LO rank1 E_LO reference_target_noncontam_nonentrap",
+        &eval_ref,
+    );
+    log_f64_distribution("LO rank1 E_LO entrapment", &eval_ent);
+}
+
+// Rank-1 composition summary.
 fn log_rank1_composition(features: &[DfFeature], work: &WorkSet, db: &IndexedDatabase) {
     let mut n_rank1 = 0usize;
     let mut n_label1 = 0usize;
@@ -2022,13 +2203,30 @@ fn fit_engines(
                     .join(" ");
 
                 log::info!(
-            "LO TEV fit-data diagnostics: window=[{}..={}] rank1_rows={} fit_rows={} ranks={}",
-            settings.lower_order_min_null_rank,
-            settings.lower_order_max_null_rank,
-            rank1_scores_by_charge.len(),
-            lo_fit_data.len(),
-            summary
-        );
+					"LO TEV fit-data diagnostics: window=[{}..={}] rank1_rows={} fit_rows={} ranks={}",
+					settings.lower_order_min_null_rank,
+					settings.lower_order_max_null_rank,
+					rank1_scores_by_charge.len(),
+					lo_fit_data.len(),
+					summary
+				);
+
+                let mut by_rank_values: FnvHashMap<u32, Vec<f64>> = FnvHashMap::default();
+
+                for &(k, x, _) in &lo_fit_data {
+                    if x.is_finite() {
+                        by_rank_values.entry(k).or_default().push(x);
+                    }
+                }
+
+                let mut rank_keys: Vec<u32> = by_rank_values.keys().copied().collect();
+                rank_keys.sort_unstable();
+
+                for k in rank_keys {
+                    if let Some(xs) = by_rank_values.get(&k) {
+                        log_f64_distribution(&format!("LO fit-data TEV rank={}", k), xs);
+                    }
+                }
             }
 
             // LowerOrder uses TEV scores derived from Sage spectrum-local E-values.
@@ -2600,18 +2798,24 @@ fn score_base_rank1(
             };
 
             log::info!(
-                "LO rank1 p-value diagnostics: n={} floor_like={} one_like={} q=[{:.3e},{:.3e},{:.3e},{:.3e},{:.3e},{:.3e},{:.3e}]",
-                n_total,
-                n_floor,
-                n_one,
-                q_at(0.00),
-                q_at(0.01),
-                q_at(0.10),
-                q_at(0.50),
-                q_at(0.90),
-                q_at(0.99),
-                q_at(1.00)
-            );
+				"LO rank1 p-value diagnostics: n={} floor_like={} one_like={} q=[{:.3e},{:.3e},{:.3e},{:.3e},{:.3e},{:.3e},{:.3e}]",
+				n_total,
+				n_floor,
+				n_one,
+				q_at(0.00),
+				q_at(0.01),
+				q_at(0.10),
+				q_at(0.50),
+				q_at(0.90),
+				q_at(0.99),
+				q_at(1.00)
+			);
+        }
+
+        if let Some(ref tev_map) = lo_tev_by_key {
+            log_lower_order_rank1_score_diagnostics(features, &workset, db, tev_map, settings);
+        } else {
+            log::warn!("LO rank1 TEV/component diagnostics skipped: no LO TEV map was available.");
         }
     }
 
