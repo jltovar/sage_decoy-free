@@ -129,12 +129,12 @@ use crate::database::IndexedDatabase;
 use crate::input::LoStratify;
 use crate::input::{
     BoundedAuxUpdateSpace, DartNullRtModel, DartTrueRtModel, EnsemblePCombiner,
-    EnsemblePepCombiner, FdrSettings, FinalEvidenceSpace, JointMode, LoTevTransform, LoTnmFit,
-    ModelFit, PeptidePCombine, PhysicalAnchorMode, QMethod,
+    EnsemblePepCombiner, FdrSettings, FinalEvidenceSpace, JointMode, LoTevTransform, ModelFit,
+    PeptidePCombine, PhysicalAnchorMode, QMethod,
 };
 use crate::lfq::{Peak, PrecursorId};
 use crate::ml::lower_order::{
-    fit_decoy_free_model, fit_gumbel_mle, fit_gumbel_moments, LowerOrderModel, LowerOrderTnmFit,
+    fit_decoy_free_model, fit_gumbel_mle, fit_gumbel_moments, LowerOrderModel,
 };
 use crate::ml::msfdr::{Msfdr1SmixModel, Msfdr2SmixModel, MsfdrSeededModel};
 use crate::ml::nokoi;
@@ -519,6 +519,28 @@ fn combine_peps(
     }
 }
 
+#[inline(always)]
+fn clear_lower_order_outputs(psm: &mut DfFeature) {
+    psm.p_lo = None;
+    psm.pep_lo = None;
+    psm.q_lo = None;
+}
+
+#[inline(always)]
+fn clear_selected_df_outputs(psm: &mut DfFeature) {
+    psm.decoy_free_p_value = None;
+    psm.decoy_free_pep = None;
+    psm.decoy_free_score = None;
+    psm.decoy_free_q_value = None;
+    psm.decoy_free_peptide_q = None;
+    psm.decoy_free_protein_q = None;
+
+    psm.decoy_free_p_value_base = None;
+    psm.decoy_free_pep_base = None;
+    psm.decoy_free_score_base = None;
+    psm.decoy_free_q_base = None;
+}
+
 // -----------------------------------------------------------------------------
 // 4) Feature field helpers (tiny setters/getters for DF streams)
 // -----------------------------------------------------------------------------
@@ -668,18 +690,6 @@ struct LoTevByKey {
 const LO_TEV_REFERENCE_EVALUE: f64 = 1000.0;
 const LO_HISTORICAL_TEV_SCALE: f64 = 0.02;
 
-/// Historical anchor used only to preserve the old fixed-cutoff calibration point
-/// across all LO TEV transforms.
-///
-/// Previously:
-///   cutoff = 0.18 on TEV = 0.02 * ln(1000 / E)
-///
-/// Therefore:
-///   E_anchor = 1000 * exp(-0.18 / 0.02)
-///
-/// The selected transform maps this same E_anchor into its own score scale.
-const LO_HISTORICAL_TNM_CUTOFF_SCALED_TEV: f64 = 0.18;
-
 #[inline(always)]
 fn lo_tev_from_e_value(e_value: f64, transform: LoTevTransform) -> Option<f64> {
     if !e_value.is_finite() || e_value <= 0.0 {
@@ -701,56 +711,14 @@ fn lo_tev_from_e_value(e_value: f64, transform: LoTevTransform) -> Option<f64> {
     tev.is_finite().then_some(tev)
 }
 
-#[inline(always)]
-fn lo_tnm_fixed_cutoff_calibration(transform: LoTevTransform) -> Option<(f64, f64)> {
-    let anchor_e_value = LO_TEV_REFERENCE_EVALUE
-        * (-LO_HISTORICAL_TNM_CUTOFF_SCALED_TEV / LO_HISTORICAL_TEV_SCALE).exp();
-
-    let cutoff = lo_tev_from_e_value(anchor_e_value, transform)?;
-
-    // Preserve the old calibration target numerically, but derive it from the
-    // explicit anchor E-value instead of hard-coding 1000 * exp(-0.18 / 0.02)
-    // at the LO fitter call site.
-    let target_p_at_cutoff = anchor_e_value.clamp(1e-300, 1.0);
-
-    if cutoff.is_finite() && target_p_at_cutoff.is_finite() && target_p_at_cutoff > 0.0 {
-        Some((cutoff, target_p_at_cutoff))
-    } else {
-        None
-    }
-}
-
-#[inline(always)]
-fn lower_order_tnm_fit_mode(mode: LoTnmFit) -> LowerOrderTnmFit {
-    match mode {
-        LoTnmFit::FixedCutoff => LowerOrderTnmFit::FixedCutoff,
-        LoTnmFit::JointMle => LowerOrderTnmFit::JointMle,
-    }
-}
-
 fn build_lo_tev_from_spectrum_tail_components(
     features: &[DfFeature],
     settings: &FdrSettings,
-    pool: &RankNullPool,
+    _pool: &RankNullPool,
 ) -> LoTevByKey {
-    use crate::input::LoTailCalibration;
-
     let mut by_key: FnvHashMap<(u32, u8, usize, String), f64> = FnvHashMap::default();
     let mut valid = 0usize;
     let mut invalid = 0usize;
-
-    // Pre-calculate empirical survival mapping if needed
-    let mut sorted_null_scores = Vec::new();
-    if matches!(
-        settings.lo_tail_calibration,
-        LoTailCalibration::Empirical | LoTailCalibration::Hybrid
-    ) {
-        sorted_null_scores = pool.scores_in_window(
-            settings.lower_order_min_null_rank,
-            settings.lower_order_max_null_rank,
-        );
-        sorted_null_scores.sort_by(|a, b| a.total_cmp(b));
-    }
 
     for f in features {
         if f.core.rank < 1 {
@@ -758,41 +726,9 @@ fn build_lo_tev_from_spectrum_tail_components(
             continue;
         }
 
-        let Some(e_gumbel) = lo_constructed_e_value(f, settings) else {
+        let Some(e_value) = lo_constructed_e_value(f, settings) else {
             invalid += 1;
             continue;
-        };
-
-        let e_value = match settings.lo_tail_calibration {
-            LoTailCalibration::Gumbel => e_gumbel,
-            LoTailCalibration::Empirical | LoTailCalibration::Hybrid => {
-                let hs = f.core.hyperscore as f64;
-                let idx = sorted_null_scores.partition_point(|&x| x < hs);
-                let count_ge = sorted_null_scores.len() - idx;
-                let p_empirical = (count_ge as f64 + 1.0) / (sorted_null_scores.len() as f64 + 1.0);
-
-                let Some(candidate_count) = lo_spectrum_candidate_count(f) else {
-                    invalid += 1;
-                    continue;
-                };
-
-                let Some(e_empirical) = lo_e_value_from_tail_and_candidates(
-                    p_empirical,
-                    candidate_count,
-                    settings.lo_evalue_candidate_count_power,
-                    settings.lo_evalue_scale,
-                ) else {
-                    invalid += 1;
-                    continue;
-                };
-
-                if matches!(settings.lo_tail_calibration, LoTailCalibration::Hybrid) {
-                    let w = settings.lo_tail_empirical_weight.clamp(0.0, 1.0);
-                    ((1.0 - w) * e_gumbel + w * e_empirical).clamp(1e-300, 1e300)
-                } else {
-                    e_empirical
-                }
-            }
         };
 
         let Some(x_lo) =
@@ -815,11 +751,11 @@ fn build_lo_tev_from_spectrum_tail_components(
     }
 
     log::info!(
-        "LO TEV diagnostics: valid={} invalid={} tail_calibration={:?} empirical_weight={:.2} tev_transform={:?}",
+        "LO TEV diagnostics: valid={} invalid={} source=spectrum_local_tail_components candidate_count_power={:.3} evalue_scale={:.3} tev_transform={:?}",
         valid,
         invalid,
-        settings.lo_tail_calibration,
-        settings.lo_tail_empirical_weight,
+        settings.lo_evalue_candidate_count_power,
+        settings.lo_evalue_scale,
         settings.lo_tev_transform
     );
 
@@ -2095,37 +2031,33 @@ fn fit_engines(
         );
             }
 
-            // LowerOrder uses Sage spectrum-level p-value-derived E-value TEV.
-            // This matches the Tide/Comet-style object expected by the LO order-statistic model.
+            // LowerOrder uses TEV scores derived from Sage spectrum-local E-values.
+            // The selected LoTevTransform determines the final TEV score scale.
             let lo_min_count_per_rank = settings.lo_min_count_per_rank;
 
-            if let Some((lo_tnm_cutoff, lo_tnm_target_p_at_cutoff)) =
-                lo_tnm_fixed_cutoff_calibration(settings.lo_tev_transform)
-            {
-                log::info!(
-                    "LO TNM cutoff calibration: tev_transform={:?} cutoff={:.6} target_p_at_cutoff={:.6e}",
-                    settings.lo_tev_transform,
-                    lo_tnm_cutoff,
-                    lo_tnm_target_p_at_cutoff
-                );
+            log::info!(
+				"LO TNM fit mode: joint_mle source=supported_lower_order_rank_buckets tev_transform={:?}",
+				settings.lo_tev_transform
+			);
 
-                log::info!("LO TNM fit mode: {:?}", settings.lo_tnm_fit);
+            lo_model = fit_decoy_free_model(
+                &lo_fit_data,
+                &rank1_scores_by_charge,
+                settings.lower_order_min_null_rank,
+                settings.lower_order_max_null_rank,
+                lo_min_count_per_rank,
+            );
 
-                lo_model = fit_decoy_free_model(
-                    &lo_fit_data,
-                    &rank1_scores_by_charge,
-                    settings.lower_order_min_null_rank,
-                    settings.lower_order_max_null_rank,
-                    lo_min_count_per_rank,
-                    lo_tnm_cutoff,
-                    lo_tnm_target_p_at_cutoff,
-                    lower_order_tnm_fit_mode(settings.lo_tnm_fit),
-                );
-            } else {
-                log::warn!(
-                    "DF fail-closed: LowerOrder could not derive transform-consistent TNM cutoff calibration for {:?}.",
-                    settings.lo_tev_transform
-                );
+            if lo_model.is_none() {
+                log::error!(
+					"LO failed closed after joint-MLE fit attempt: requested_window=[{}..={}] effective_min={} fit_rows={} rank1_rows={}. \
+					 LO diagnostic fields and LowerOrder-selected DF fields will be left blank.",
+					settings.lower_order_min_null_rank,
+					settings.lower_order_max_null_rank,
+					settings.lower_order_min_null_rank.max(2),
+					lo_fit_data.len(),
+					rank1_scores_by_charge.len()
+				);
             }
         }
     }
@@ -2826,6 +2758,17 @@ fn write_base_method_outputs(
     let use_mom_expert = gates.run_mom && engines.mom_params.is_some();
     let use_mle_expert = gates.run_mle && engines.mle_params.is_some();
     let use_lo_expert = gates.run_lo && engines.lo_model.is_some();
+
+    let lower_order_selected_but_unfit =
+        matches!(settings.model_fit, ModelFit::LowerOrder) && gates.run_lo && !use_lo_expert;
+
+    if lower_order_selected_but_unfit {
+        log::error!(
+			"LO failed closed while model_fit=LowerOrder. \
+			 Selected decoy_free_* base fields will be left blank instead of being filled with p=1.0/PEP=1.0."
+		);
+    }
+
     let use_seeded_expert = gates.run_msfdr_seeded && engines.msfdr_seeded.is_some();
     let use_1smix_expert = gates.run_msfdr_1smix && engines.msfdr_1smix.is_some();
     let use_2smix_expert = gates.run_msfdr_2smix && engines.msfdr_2smix.is_some();
@@ -2833,6 +2776,12 @@ fn write_base_method_outputs(
 
     for (j, r) in base_res.rank1_out.iter().enumerate() {
         let psm = &mut features[r.idx];
+
+        if lower_order_selected_but_unfit {
+            clear_lower_order_outputs(psm);
+            clear_selected_df_outputs(psm);
+            continue;
+        }
 
         psm.p_mom = if use_mom_expert {
             Some(r.p_mom as f32)

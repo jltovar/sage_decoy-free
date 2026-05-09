@@ -1,26 +1,24 @@
 //! Decoy-free Lower-Order (LO) model fitting utilities.
 //!
-//! The methods in this module are based on the work of Dominik Madej and Henry Lam published here:
+//! This module implements a Sage-specific deterministic LowerOrder estimator
+//! inspired by the lower-order statistics framework of Madej and Lam:
 //!
-//! Modeling Lower-Order Statistics to Enable Decoy-Free FDR Estimation in Proteomics
-//! Dominik Madej and Henry Lam
-//! Journal of Proteome Research 2023 22 (4), 1159-1171
-//! DOI: 10.1021/acs.jproteome.2c00604
-//! https://pubs.acs.org/doi/full/10.1021/acs.jproteome.2c00604
+//!   Modeling Lower-Order Statistics to Enable Decoy-Free FDR Estimation in Proteomics
+//!   Dominik Madej and Henry Lam
+//!   Journal of Proteome Research 2023 22 (4), 1159-1171
+//!   DOI: 10.1021/acs.jproteome.2c00604
 //!
-//! and implemented on GitHub here:
-//! https://github.com/dommad/pylord
+//!   Implemented on GitHub here:
+//!   https://github.com/dommad/pylord
+//!
+//! The production path is not a direct PyLord port. It uses Sage-provided
+//! spectrum-local E-values, a configurable TEV transform, per-rank LOM MLEs,
+//! and one deterministic joint-MLE rank-1 TNM fit over the supported
+//! lower-order rank buckets.
 
 use fnv::FnvHashMap;
 use statrs::consts::EULER_MASCHERONI;
 use statrs::function::gamma::ln_gamma;
-
-#[derive(Copy, Clone, Debug, Default, PartialEq, Eq)]
-pub enum LowerOrderTnmFit {
-    #[default]
-    FixedCutoff,
-    JointMle,
-}
 
 /// Method-of-moments Gumbel fit (mu, beta).
 pub(crate) fn fit_gumbel_moments(scores: &[f64]) -> (f64, f64) {
@@ -45,17 +43,20 @@ pub(crate) fn fit_gumbel_moments(scores: &[f64]) -> (f64, f64) {
     }
 }
 
-/// Gumbel MLE fit (mu, beta) using a Newton–Raphson update for beta
-/// (PyLord-family estimator), then closed-form mu.
+/// Gumbel MLE fit (mu, beta) using a Newton-Raphson update for beta,
+/// followed by the closed-form mu update.
 ///
 /// Solves for beta in:
-///   f(beta) = beta - x̄ + A(beta)/B(beta) = 0
-/// where:
-///   B(beta) = Σ exp(-x/beta)
-///   A(beta) = Σ x exp(-x/beta)
 ///
-/// Newton step:
-///   beta <- beta - f(beta) / f'(beta)
+///   f(beta) = beta - x_bar + A(beta) / B(beta) = 0
+///
+/// where:
+///
+///   B(beta) = Σ exp(-x / beta)
+///   A(beta) = Σ x exp(-x / beta)
+///
+/// The implementation evaluates A/B and the derivative with centered
+/// log-sum-exp weights so shifted scores or small beta values do not overflow.
 pub(crate) fn fit_gumbel_mle(scores: &[f64]) -> Option<(f64, f64)> {
     let finite: Vec<f64> = scores.iter().copied().filter(|x| x.is_finite()).collect();
     if finite.len() < 2 {
@@ -64,6 +65,9 @@ pub(crate) fn fit_gumbel_mle(scores: &[f64]) -> Option<(f64, f64)> {
 
     let n = finite.len() as f64;
     let x_bar = finite.iter().sum::<f64>() / n;
+    if !x_bar.is_finite() {
+        return None;
+    }
 
     // Initialize with moments beta.
     let (_, mut beta) = fit_gumbel_moments(&finite);
@@ -73,57 +77,104 @@ pub(crate) fn fit_gumbel_mle(scores: &[f64]) -> Option<(f64, f64)> {
 
     const MAX_ITERS: usize = 50;
     const TOL_ABS: f64 = 1e-8;
+    const MIN_BETA: f64 = 1e-12;
 
     for _ in 0..MAX_ITERS {
-        // B = Σ e^{-x/beta}
-        // A = Σ x e^{-x/beta}
-        // C = Σ x^2 e^{-x/beta}   (for derivative)
-        let mut b_sum = 0.0f64;
-        let mut a_sum = 0.0f64;
-        let mut c_sum = 0.0f64;
-
-        for &x in &finite {
-            let z = -x / beta;
-            let e = z.exp();
-            if !e.is_finite() {
-                return None;
-            }
-            b_sum += e;
-            a_sum += x * e;
-            c_sum += x * x * e;
-        }
-
-        if !b_sum.is_finite() || b_sum <= 0.0 {
+        if !beta.is_finite() || beta <= MIN_BETA {
             return None;
         }
 
-        let a_over_b = a_sum / b_sum;
+        // Stable evaluation of:
+        //
+        //   B = Σ exp(-x / beta)
+        //   A = Σ x exp(-x / beta)
+        //   C = Σ x² exp(-x / beta)
+        //
+        // Direct exp(-x / beta) can overflow when scores are shifted negative
+        // or beta is small. Use centered weights:
+        //
+        //   z_i = -x_i / beta
+        //   z_max = max_i z_i
+        //   w_i = exp(z_i - z_max)
+        //
+        // The common exp(z_max) factor cancels in A/B, C/B, and d(A/B).
+        let mut z_max = f64::NEG_INFINITY;
+        for &x in &finite {
+            let z = -x / beta;
+            if !z.is_finite() {
+                return None;
+            }
+            z_max = z_max.max(z);
+        }
+
+        if !z_max.is_finite() {
+            return None;
+        }
+
+        let mut w_sum = 0.0f64;
+        let mut x_w_sum = 0.0f64;
+        let mut x2_w_sum = 0.0f64;
+
+        for &x in &finite {
+            let z = -x / beta;
+            let w = (z - z_max).exp();
+
+            if !w.is_finite() {
+                return None;
+            }
+
+            w_sum += w;
+            x_w_sum += x * w;
+            x2_w_sum += x * x * w;
+        }
+
+        if !w_sum.is_finite() || w_sum <= 0.0 {
+            return None;
+        }
+
+        let weighted_mean_x = x_w_sum / w_sum;
+        let weighted_mean_x2 = x2_w_sum / w_sum;
+
+        if !weighted_mean_x.is_finite() || !weighted_mean_x2.is_finite() {
+            return None;
+        }
 
         // f(beta) = beta - x_bar + A/B
-        let f = beta - x_bar + a_over_b;
+        let f = beta - x_bar + weighted_mean_x;
 
-        // dA/dbeta = (1/beta^2) * Σ x^2 e^{-x/beta} = c_sum / beta^2
-        // dB/dbeta = (1/beta^2) * Σ x   e^{-x/beta} = a_sum / beta^2
-        // d(A/B)   = (dA*B - A*dB)/B^2
         let beta2 = beta * beta;
         if !beta2.is_finite() || beta2 <= 0.0 {
             return None;
         }
 
-        let d_a = c_sum / beta2;
-        let d_b = a_sum / beta2;
-        let d_a_over_b = (d_a * b_sum - a_sum * d_b) / (b_sum * b_sum);
+        // d(A/B)/d(beta)
+        //
+        // Original expression:
+        //
+        //   d(A/B) = (dA*B - A*dB) / B²
+        //
+        // with:
+        //
+        //   dA = C / beta²
+        //   dB = A / beta²
+        //
+        // Therefore:
+        //
+        //   d(A/B) = (C/B - (A/B)²) / beta²
+        //
+        // This weighted-moment form is equivalent and avoids overflow.
+        let d_a_over_b = (weighted_mean_x2 - weighted_mean_x * weighted_mean_x) / beta2;
 
         // f'(beta) = 1 + d(A/B)
         let fp = 1.0 + d_a_over_b;
 
-        if !fp.is_finite() || fp.abs() < 1e-12 {
+        if !f.is_finite() || !fp.is_finite() || fp.abs() < 1e-12 {
             return None;
         }
 
         let next_beta = beta - (f / fp);
 
-        if !next_beta.is_finite() || next_beta <= 0.0 {
+        if !next_beta.is_finite() || next_beta <= MIN_BETA {
             return None;
         }
 
@@ -135,12 +186,47 @@ pub(crate) fn fit_gumbel_mle(scores: &[f64]) -> Option<(f64, f64)> {
         beta = next_beta;
     }
 
-    // Closed-form mu: mu = -beta * ln( (1/n) Σ exp(-x/beta) ) = beta * ln(n / Σ exp(-x/beta))
-    let sum_exp = finite.iter().map(|&x| (-x / beta).exp()).sum::<f64>();
-    if !sum_exp.is_finite() || sum_exp <= 0.0 {
+    // Closed-form mu:
+    //
+    //   mu = -beta * ln( (1/n) Σ exp(-x / beta) )
+    //      = beta * (ln(n) - logsumexp(-x / beta))
+    //
+    // Compute logsumexp stably using the same centering trick.
+    let mut z_max = f64::NEG_INFINITY;
+    for &x in &finite {
+        let z = -x / beta;
+        if !z.is_finite() {
+            return None;
+        }
+        z_max = z_max.max(z);
+    }
+
+    if !z_max.is_finite() {
         return None;
     }
-    let mu = beta * (n / sum_exp).ln();
+
+    let mut w_sum = 0.0f64;
+    for &x in &finite {
+        let z = -x / beta;
+        let w = (z - z_max).exp();
+
+        if !w.is_finite() {
+            return None;
+        }
+
+        w_sum += w;
+    }
+
+    if !w_sum.is_finite() || w_sum <= 0.0 {
+        return None;
+    }
+
+    let log_sum_exp = z_max + w_sum.ln();
+    if !log_sum_exp.is_finite() {
+        return None;
+    }
+
+    let mu = beta * (n.ln() - log_sum_exp);
 
     if mu.is_finite() && beta.is_finite() && beta > 0.0 {
         Some((mu, beta))
@@ -159,16 +245,21 @@ fn log_factorial_k_minus_1(k: u32) -> f64 {
 }
 
 // -----------------------------------------------------------------------------
-// Per-k LO estimators (PyLord-inspired / PyLord-consistent)
+// Per-k LO estimators
 // -----------------------------------------------------------------------------
 //
-// Matches PyLord stat.py:
-//   MethodOfMoments().estimate_parameters(scores, hit_rank=k)
+// These helpers implement the asymptotic k-th lower-order Gumbel formulas used
+// by the Madej/Lam lower-order framework. The formulas are compatible with the
+// corresponding PyLord statistical expressions, but the production Sage LO path
+// around them is a deterministic Sage-specific implementation.
 //
-// scale  = sqrt( (E[X^2] - E[X]^2) / psi(k-1) )
-// location = E[X] - scale * (EulerGamma - H_{k-1})
+// Method-of-moments form:
+//
+//   scale    = sqrt((E[X^2] - E[X]^2) / psi(k - 1))
+//   location = E[X] - scale * (EulerGamma - H_{k - 1})
 //
 // where:
+//
 //   psi(m) = pi^2/6 - sum_{i=1..m} 1/i^2
 //   H_m    = sum_{i=1..m} 1/i
 //
@@ -187,8 +278,12 @@ fn harmonic(m: u32) -> f64 {
 
 #[inline]
 fn psi_tail(m: u32) -> f64 {
-    // psi(m) in PyLord = pi^2/6 - sum_{i=1..m} 1/i^2
-    // NOTE: This is NOT digamma; it's the trigamma tail identity used in the paper/PyLord.
+    // psi(m) here is the finite trigamma-tail identity used by the
+    // lower-order Gumbel moment formula:
+    //
+    //   psi(m) = pi^2/6 - sum_{i=1..m} 1/i^2
+    //
+    // It is not the digamma function.
     let mut s = 0.0f64;
     for i in 1..=m {
         let ii = i as f64;
@@ -199,7 +294,7 @@ fn psi_tail(m: u32) -> f64 {
 
 #[inline]
 pub(crate) fn fit_tev_k_moments(scores: &[f64], k: u32) -> Option<(f64, f64)> {
-    // k is hit_rank in PyLord. LO uses k>=2.
+    // k is the selected lower-order rank. Production LO uses k >= 2.
     if k < 2 {
         return None;
     }
@@ -236,14 +331,30 @@ pub(crate) fn fit_tev_k_moments(scores: &[f64], k: u32) -> Option<(f64, f64)> {
 }
 
 #[inline]
+fn log_add_exp(a: f64, b: f64) -> f64 {
+    if !a.is_finite() {
+        return b;
+    }
+    if !b.is_finite() {
+        return a;
+    }
+
+    let m = a.max(b);
+    m + ((a - m).exp() + (b - m).exp()).ln()
+}
+
+#[inline]
 fn nll_tev_k(mu: f64, beta: f64, scores: &[f64], k: u32) -> f64 {
-    // Matches PyLord AsymptoticGumbelMLE.get_log_likelihood:
+    // Negative log-likelihood for the asymptotic k-th lower-order Gumbel model:
     //
-    // likelihood = -n*log(beta*(k-1)!) - k*sum(z) - sum(exp(-z))
-    // returns -likelihood
+    //   NLL = n * ln(beta * (k - 1)!) + k * Σz_i + Σexp(-z_i)
     //
-    // z = (x - mu)/beta
+    // where:
     //
+    //   z_i = (x_i - mu) / beta
+    //
+    // This is the same likelihood family used by the Madej/Lam/PyLord
+    // lower-order formulation.
     if !mu.is_finite() || !beta.is_finite() || beta <= 0.0 || k < 1 {
         return f64::INFINITY;
     }
@@ -294,36 +405,70 @@ fn nll_tev_k(mu: f64, beta: f64, scores: &[f64], k: u32) -> f64 {
 #[inline]
 fn tev_cdf_asymptotic(z: f64, k: u32) -> f64 {
     // Asymptotic TEV CDF consistent with nll_tev_k():
-    // cdf_asymptotic(z, k) = exp(-exp(-z)) * Σ_{m=0..k-1} exp(-m z)/m!
     //
-    // For k = 1 this reduces to the standard Gumbel-max CDF:
-    //   exp(-exp(-z))
+    //   F_k(z) = exp(-exp(-z)) * Σ_{m=0..k-1} exp(-m z) / m!
     //
-    // Implemented via a stable recurrence:
-    // term_0 = 1
-    // term_m = term_{m-1} * exp(-z) / m
+    // Equivalently, with t = exp(-z):
+    //
+    //   F_k(z) = exp(-t) * Σ_{m=0..k-1} t^m / m!
+    //
+    // This is the Poisson CDF P[N <= k-1] for N ~ Poisson(t).
+    //
+    // The direct recurrence can overflow for large t and k:
+    //
+    //   term_m = term_{m-1} * t / m
+    //
+    // Therefore compute in log-space:
+    //
+    //   log F_k(z) = -t + logsumexp_{m=0..k-1}(m log(t) - log(m!)).
     //
     if !z.is_finite() || k < 1 {
         return f64::NAN;
     }
 
-    // t = exp(-z) with exponent clamp to avoid overflow
-    let t = (-z).clamp(-745.0, 745.0).exp();
-    if !t.is_finite() {
+    let log_t = -z;
+
+    // If log_t is so large that t = exp(log_t) would overflow, then
+    // -t dominates the polynomial log-sum and the CDF is numerically zero.
+    if log_t > f64::MAX.ln() {
+        return 0.0;
+    }
+
+    // If log_t is very negative, then t ≈ 0 and F_k(z) ≈ 1 for all k >= 1.
+    if log_t < -745.0 {
+        return 1.0;
+    }
+
+    let t = log_t.exp();
+    if !t.is_finite() || t < 0.0 {
         return f64::NAN;
     }
 
-    // sum_{m=0..k-1} t^m / m!
-    let mut sum = 1.0f64;
-    let mut term = 1.0f64;
-    for m in 1..k {
-        term *= t / (m as f64);
-        sum += term;
+    let mut log_sum = f64::NEG_INFINITY;
+
+    for m in 0..k {
+        let m_f = m as f64;
+
+        let log_term = if m == 0 {
+            0.0
+        } else {
+            m_f * log_t - ln_gamma(m_f + 1.0)
+        };
+
+        log_sum = log_add_exp(log_sum, log_term);
     }
 
-    // exp(-t) * sum
-    let cdf = (-t).clamp(-745.0, 745.0).exp() * sum;
-    cdf.clamp(0.0, 1.0)
+    let log_cdf = -t + log_sum;
+
+    if log_cdf >= 0.0 {
+        return 1.0;
+    }
+
+    if log_cdf < -745.0 {
+        return 0.0;
+    }
+
+    log_cdf.exp().clamp(0.0, 1.0)
 }
 
 #[inline]
@@ -574,13 +719,14 @@ impl LowerOrderModel {
 //   top null model (TNM) per charge.
 //
 // Deterministic LO contract:
-// - LowerOrder is fit only on the scaled Madej/Lam TEV score.
+// - LowerOrder is fit on TEV scores derived from Sage spectrum-local E-values.
+// - The TEV scale is selected upstream by LoTevTransform.
 // - Rank 1 is never used as lower-order null evidence.
 // - Each selected lower-order rank k is modeled with its k-specific TEV likelihood.
-// - Only MLE LOMs are used; MM is not used in the production TNM path.
-// - All supported selected ranks contribute to one β(μ) linear trend.
-// - The TNM is chosen by a fixed-cutoff calibration along that deterministic β(μ)
-//   path.
+// - Only MLE LOMs are used for the production TNM path.
+// - The β(μ) linear trend is reported as a diagnostic across supported LOMs.
+// - The rank-1 TNM is fit by one deterministic joint likelihood over all
+//   supported lower-order rank buckets.
 // - No rank-1 score likelihood is used to fit or select the null.
 // - No PyLord-style autonomous selection is performed:
 //     no best 5-rank LR window,
@@ -640,23 +786,7 @@ fn median_f64(mut xs: Vec<f64>) -> Option<f64> {
     }
 }
 
-#[inline]
-fn mad_f64(xs: &[f64], center: f64) -> Option<f64> {
-    if !center.is_finite() {
-        return None;
-    }
-
-    median_f64(
-        xs.iter()
-            .copied()
-            .filter(|x| x.is_finite())
-            .map(|x| (x - center).abs())
-            .collect(),
-    )
-}
-
 const LO_MIN_LOM_RANKS: usize = 2;
-const LO_TNM_SCAN_GRID: usize = 701;
 const LO_TNM_BETA_REL_FLOOR: f64 = 1e-4;
 const LO_TNM_BETA_ABS_FLOOR: f64 = 1e-8;
 
@@ -711,142 +841,6 @@ fn ols_beta_on_mu_all_supported_ranks(loms: &[(u32, f64, f64)]) -> Option<(f64, 
     };
 
     Some((slope, intercept, r))
-}
-
-#[inline]
-fn rank1_survival_at_cutoff(mu: f64, beta: f64, cutoff: f64) -> Option<f64> {
-    if !mu.is_finite() || !beta.is_finite() || beta <= 0.0 || !cutoff.is_finite() {
-        return None;
-    }
-
-    let z = (cutoff - mu) / beta;
-    if !z.is_finite() {
-        return None;
-    }
-
-    let cdf = tev_cdf_asymptotic(z, 1);
-    if !cdf.is_finite() {
-        return None;
-    }
-
-    Some((1.0 - cdf).clamp(1e-300, 1.0))
-}
-
-#[derive(Copy, Clone, Debug)]
-struct FixedCutoffScanResult {
-    mu: f64,
-    beta: f64,
-    cutoff_p: f64,
-    cutoff_error: f64,
-    mu_center: f64,
-    mu_half_width: f64,
-    beta_floor: f64,
-}
-
-#[inline]
-fn scan_mu_for_fixed_cutoff(
-    slope: f64,
-    intercept: f64,
-    cutoff: f64,
-    target_p_at_cutoff: f64,
-    lom_mle: &[(u32, f64, f64)],
-) -> Option<FixedCutoffScanResult> {
-    if !slope.is_finite()
-        || !intercept.is_finite()
-        || !cutoff.is_finite()
-        || !target_p_at_cutoff.is_finite()
-        || target_p_at_cutoff <= 0.0
-    {
-        return None;
-    }
-
-    let mus: Vec<f64> = lom_mle
-        .iter()
-        .map(|(_, mu, _)| *mu)
-        .filter(|x| x.is_finite())
-        .collect();
-
-    let betas: Vec<f64> = lom_mle
-        .iter()
-        .map(|(_, _, beta)| *beta)
-        .filter(|x| x.is_finite() && *x > 0.0)
-        .collect();
-
-    let mu_center = median_f64(mus.clone())?;
-    let beta_center = median_f64(betas)?;
-
-    if !mu_center.is_finite() || !beta_center.is_finite() || beta_center <= 0.0 {
-        return None;
-    }
-
-    let mu_mad = mad_f64(&mus, mu_center).unwrap_or(0.0);
-
-    // Dynamic, TEV-scale-aware scan width.
-    // No hard-coded compressed-scale clamps.
-    let mu_half_width = (10.0 * mu_mad).max(6.0 * beta_center).max(1.0);
-
-    let mu_lo = mu_center - mu_half_width;
-    let mu_hi = mu_center + mu_half_width;
-
-    if !mu_lo.is_finite() || !mu_hi.is_finite() || mu_hi <= mu_lo {
-        return None;
-    }
-
-    let beta_floor = (beta_center * LO_TNM_BETA_REL_FLOOR).max(LO_TNM_BETA_ABS_FLOOR);
-
-    let step = (mu_hi - mu_lo) / ((LO_TNM_SCAN_GRID - 1) as f64);
-    if !step.is_finite() || step <= 0.0 {
-        return None;
-    }
-
-    let target_log_p = target_p_at_cutoff.ln();
-
-    let mut best: Option<FixedCutoffScanResult> = None;
-
-    for i in 0..LO_TNM_SCAN_GRID {
-        let mu = mu_lo + (i as f64) * step;
-        let beta = slope * mu + intercept;
-
-        if !mu.is_finite() || !beta.is_finite() || beta <= beta_floor {
-            continue;
-        }
-
-        let Some(p_cutoff) = rank1_survival_at_cutoff(mu, beta, cutoff) else {
-            continue;
-        };
-
-        let err = (p_cutoff.ln() - target_log_p).abs();
-        if !err.is_finite() {
-            continue;
-        }
-
-        let candidate = FixedCutoffScanResult {
-            mu,
-            beta,
-            cutoff_p: p_cutoff,
-            cutoff_error: err,
-            mu_center,
-            mu_half_width,
-            beta_floor,
-        };
-
-        match best {
-            None => best = Some(candidate),
-            Some(prev) if err < prev.cutoff_error => best = Some(candidate),
-            _ => {}
-        }
-    }
-
-    let best = best?;
-
-    // Fail closed if the final TNM is wildly outside the fitted LOM parameter cloud.
-    // This catches the prior failure mode where reasonable LOMs produced an absurd
-    // rank-1 TNM.
-    if (best.mu - mu_center).abs() > mu_half_width {
-        return None;
-    }
-
-    Some(best)
 }
 
 #[inline]
@@ -985,11 +979,9 @@ fn fit_joint_tnm_mle_from_loms(
 /// Production LO path:
 /// - Uses every supported selected lower-order rank in the configured window.
 /// - Fits MLE LOM parameters for each supported lower-order rank.
-/// - Fits one deterministic β(μ) trend across those LOMs.
-/// - Default path chooses the rank-1 TNM by transform-consistent fixed-cutoff
-///   calibration along that β(μ) path, using data-driven scan bounds.
-/// - Optional joint_mle path fits the rank-1 TNM by one deterministic joint
-///   likelihood over all supported lower-order rank buckets.
+/// - Fits one deterministic β(μ) trend across those LOMs for diagnostics.
+/// - Fits the rank-1 TNM by one deterministic joint likelihood over all
+///   supported lower-order rank buckets.
 /// - Never uses rank-1 scores to fit or select the null.
 /// - Does not perform PyLord-style autonomous candidate selection.
 /// - Preserves one external null-rank window -> one deterministic LO model.
@@ -1002,9 +994,6 @@ pub fn fit_decoy_free_model(
     min_null_rank: u32,
     max_null_rank: u32,
     lo_min_count_per_rank: usize,
-    tnm_cutoff: f64,
-    tnm_target_p_at_cutoff: f64,
-    tnm_fit: LowerOrderTnmFit,
 ) -> Option<LowerOrderModel> {
     // LowerOrder null evidence must come from non-top hits only.
     // Rank 1 is the target-contaminated top-hit mixture and is never a valid
@@ -1012,19 +1001,24 @@ pub fn fit_decoy_free_model(
     let effective_min_null_rank = min_null_rank.max(2);
 
     if effective_min_null_rank > max_null_rank {
+        log::error!(
+			"LO INVALID WINDOW: requested null-rank window [{}..={}] contains no usable lower-order ranks. \
+			 LowerOrder never uses rank 1 because rank 1 is the target-contaminated top-hit mixture. \
+			 LowerOrder failed closed; no LO model was fit.",
+			min_null_rank,
+			max_null_rank
+		);
         return None;
     }
 
-    if !tnm_cutoff.is_finite()
-        || !tnm_target_p_at_cutoff.is_finite()
-        || tnm_target_p_at_cutoff <= 0.0
-        || tnm_target_p_at_cutoff > 1.0
-    {
-        log::warn!(
-            "LO fail-closed: invalid TNM fixed-cutoff calibration cutoff={:?} target_p_at_cutoff={:?}",
-            tnm_cutoff,
-            tnm_target_p_at_cutoff
-        );
+    if effective_min_null_rank == max_null_rank {
+        log::error!(
+			"LO INVALID WINDOW: effective null-rank window [{}..={}] contains only one usable lower-order rank. \
+			 This implementation requires at least two usable lower-order ranks to estimate the rank-to-rank β(μ) trend. \
+			 LowerOrder failed closed; no LO model was fit.",
+			effective_min_null_rank,
+			max_null_rank
+		);
         return None;
     }
 
@@ -1132,8 +1126,16 @@ pub fn fit_decoy_free_model(
         }
 
         // LowerOrder needs at least two usable selected ranks to estimate the
-        // rank-to-rank trend used by the TNM candidates.
+        // rank-to-rank β(μ) trend used by the TNM candidates.
         if buckets.len() < 2 {
+            log::warn!(
+				"LO charge {} skipped: only {} usable lower-order rank bucket(s) survived filtering in effective window [{}..={}]; need at least 2. \
+				 This charge failed closed.",
+				charge,
+				buckets.len(),
+				effective_min_null_rank,
+				max_null_rank
+			);
             continue;
         }
 
@@ -1158,12 +1160,13 @@ pub fn fit_decoy_free_model(
         }
 
         // ---------------------------------------------------------------------
-        // Deterministic Madej/Lam MLE/LR TNM construction
+        // Deterministic joint-MLE TNM construction
         // ---------------------------------------------------------------------
         //
         // One external null-rank window produces one deterministic LO fit.
-        // Rank-1 scores are not used to fit the null. The final rank-1 TNM is
-        // chosen by fixed-cutoff calibration along the deterministic β(μ) path.
+        // Rank-1 scores are not used to fit or select the null. The final rank-1
+        // TNM is fit by one joint likelihood over all supported lower-order rank
+        // buckets.
 
         let mut lom_mle: Vec<(u32, f64, f64)> = Vec::new();
 
@@ -1195,7 +1198,7 @@ pub fn fit_decoy_free_model(
 
         if lom_mle.len() < LO_MIN_LOM_RANKS {
             log::warn!(
-                "LO deterministic MLE/LR charge {charge}: insufficient supported LOM ranks: have={} need={}",
+                "LO joint-MLE charge {charge}: insufficient supported LOM ranks: have={} need={}",
                 lom_mle.len(),
                 LO_MIN_LOM_RANKS
             );
@@ -1204,7 +1207,7 @@ pub fn fit_decoy_free_model(
 
         let Some((slope, intercept, r)) = ols_beta_on_mu_all_supported_ranks(&lom_mle) else {
             log::warn!(
-                "LO deterministic MLE/LR charge {charge}: failed β(μ) regression across {} LOM ranks",
+                "LO joint-MLE charge {charge}: failed diagnostic β(μ) regression across {} LOM ranks",
                 lom_mle.len()
             );
             continue;
@@ -1216,79 +1219,29 @@ pub fn fit_decoy_free_model(
             .collect::<Vec<_>>()
             .join(",");
 
-        let fit_result: Option<(f64, f64)> = match tnm_fit {
-            LowerOrderTnmFit::FixedCutoff => {
-                let cutoff = tnm_cutoff;
-                let target_cutoff_p = tnm_target_p_at_cutoff;
-
-                let Some(scan) =
-                    scan_mu_for_fixed_cutoff(slope, intercept, cutoff, target_cutoff_p, &lom_mle)
-                else {
-                    log::warn!(
-                        "LO fixed-cutoff charge {charge}: TNM scan failed | slope={:.6} intercept={:.6} r={:.4} lom_ranks={} loms=[{}]",
-                        slope,
-                        intercept,
-                        r,
-                        lom_mle.len(),
-                        rank_summary
-                    );
-                    continue;
-                };
-
-                log::info!(
-                    "LO fixed-cutoff charge={} mu={:.6} beta={:.6} slope={:.6} intercept={:.6} r={:.4} cutoff={:.6} cutoff_p={:.6e} target_cutoff_p={:.6e} cutoff_error={:.6} mu_center={:.6} mu_half_width={:.6} beta_floor={:.6e} lom_ranks={} loms=[{}]",
-                    charge,
-                    scan.mu,
-                    scan.beta,
-                    slope,
-                    intercept,
-                    r,
-                    cutoff,
-                    scan.cutoff_p,
-                    target_cutoff_p,
-                    scan.cutoff_error,
-                    scan.mu_center,
-                    scan.mu_half_width,
-                    scan.beta_floor,
-                    lom_mle.len(),
-                    rank_summary
-                );
-
-                Some((scan.mu, scan.beta))
-            }
-
-            LowerOrderTnmFit::JointMle => {
-                let Some((mu_final, beta_final, joint_nll)) =
-                    fit_joint_tnm_mle_from_loms(&buckets, &lom_mle)
-                else {
-                    log::warn!(
-                        "LO joint-MLE charge {charge}: TNM joint fit failed | lom_ranks={} loms=[{}]",
-                        lom_mle.len(),
-                        rank_summary
-                    );
-                    continue;
-                };
-
-                log::info!(
-                    "LO joint-MLE charge={} mu={:.6} beta={:.6} joint_nll={:.4} beta_mu_slope={:.6} beta_mu_intercept={:.6} beta_mu_r={:.4} lom_ranks={} loms=[{}]",
-                    charge,
-                    mu_final,
-                    beta_final,
-                    joint_nll,
-                    slope,
-                    intercept,
-                    r,
-                    lom_mle.len(),
-                    rank_summary
-                );
-
-                Some((mu_final, beta_final))
-            }
-        };
-
-        let Some((mu_final, beta_final)) = fit_result else {
+        let Some((mu_final, beta_final, joint_nll)) =
+            fit_joint_tnm_mle_from_loms(&buckets, &lom_mle)
+        else {
+            log::warn!(
+                "LO joint-MLE charge {charge}: TNM joint fit failed | lom_ranks={} loms=[{}]",
+                lom_mle.len(),
+                rank_summary
+            );
             continue;
         };
+
+        log::info!(
+			"LO joint-MLE charge={} mu={:.6} beta={:.6} joint_nll={:.4} beta_mu_slope={:.6} beta_mu_intercept={:.6} beta_mu_r={:.4} lom_ranks={} loms=[{}]",
+			charge,
+			mu_final,
+			beta_final,
+			joint_nll,
+			slope,
+			intercept,
+			r,
+			lom_mle.len(),
+			rank_summary
+		);
 
         params_by_charge.insert(charge, (mu_final, beta_final));
     }
@@ -1318,6 +1271,10 @@ pub fn fit_decoy_free_model(
     let max_fitted_charge: u8 = fitted_charges_sorted.last().copied().unwrap_or(0);
 
     if params_by_charge.is_empty() {
+        log::error!(
+            "LO failed closed: no charge state produced a valid LowerOrder model. \
+			 No LO p-values, PEPs, or q-values should be interpreted as valid."
+        );
         return None;
     }
 
@@ -1425,11 +1382,36 @@ mod tests {
         assert!((beta_k_mle / beta_true) > 0.2 && (beta_k_mle / beta_true) < 5.0);
     }
 
+    #[cfg(test)]
+    mod tests {
+        use super::*;
+
+        // existing tests above...
+
+        #[test]
+        fn fit_gumbel_mle_is_stable_for_shifted_scores() {
+            let scores = vec![
+                -10_000.0, -9_999.5, -9_999.0, -9_998.4, -9_997.9, -9_997.2, -9_996.8, -9_996.1,
+                -9_995.5, -9_995.0,
+            ];
+
+            let Some((mu, beta)) = fit_gumbel_mle(&scores) else {
+                panic!("fit_gumbel_mle returned None for finite shifted scores");
+            };
+
+            assert!(mu.is_finite(), "mu is not finite: {mu}");
+            assert!(beta.is_finite(), "beta is not finite: {beta}");
+            assert!(beta > 0.0, "beta must be positive: {beta}");
+        }
+
+        // existing tests below...
+    }
+
     #[test]
     fn pylord_parity_tev_cdf_asymptotic_matches_known_values() {
-        // These expected values are from PyLord's:
-        //   cdf_asymptotic(x, mu=0, beta=1, hit_rank=k)
-        // evaluated at x=z (i.e., z = (x-mu)/beta).
+        // These expected values exercise the asymptotic k-th lower-order Gumbel CDF:
+        //   F_k(z) = exp(-exp(-z)) * Σ_{m=0..k-1} exp(-m z) / m!
+        // evaluated directly on standardized z values.
         //
         // Asymptotic TEV CDF used by this implementation:
         //   cdf = exp(-exp(-z)) * Σ_{m=0..k-1} exp(-m z) / m!
@@ -1458,23 +1440,49 @@ mod tests {
     }
 
     #[test]
+    fn tev_cdf_asymptotic_is_finite_for_extreme_inputs() {
+        let cases: &[(f64, u32)] = &[
+            (-1_000.0, 1),
+            (-1_000.0, 2),
+            (-1_000.0, 10),
+            (-100.0, 50),
+            (100.0, 1),
+            (100.0, 10),
+        ];
+
+        for &(z, k) in cases {
+            let got = tev_cdf_asymptotic(z, k);
+            assert!(
+                got.is_finite(),
+                "tev_cdf_asymptotic produced non-finite value for z={z}, k={k}: {got}"
+            );
+            assert!(
+                (0.0..=1.0).contains(&got),
+                "tev_cdf_asymptotic outside [0,1] for z={z}, k={k}: {got}"
+            );
+        }
+
+        assert_eq!(tev_cdf_asymptotic(-1_000.0, 10), 0.0);
+        assert_eq!(tev_cdf_asymptotic(1_000.0, 10), 1.0);
+    }
+
+    #[test]
     fn pylord_parity_nll_tev_k_matches_asymptotic_gumbel_mle_k1() {
-        // PyLord stat.py:
-        // AsymptoticGumbelMLE.get_log_likelihood(log_params):
+        // Validate the asymptotic k-th lower-order Gumbel NLL for k=1:
         //
-        //   location, scale = exp(log_params) + 1e-10
-        //   z = (scores - location)/scale
-        //   factorial_term = factorial(hit_rank - 1)
-        //   likelihood = -n*log(scale*factorial) - hit_rank*sum(z) - sum(exp(-z))
-        //   return -likelihood     # negative log-likelihood
+        //   NLL = n * ln(beta * (k - 1)!) + k * Σz_i + Σexp(-z_i)
         //
-        // Our nll_tev_k(mu,beta,ts,k) should match for k=1.
+        // with:
+        //
+        //   z_i = (x_i - mu) / beta
+        //
+        // For k=1, (k - 1)! = 1.
         let scores: [f64; 4] = [10.0, 11.0, 12.0, 13.5];
         let mu = 11.2;
         let beta = 2.3;
         let k = 1u32;
 
-        // Expected value computed from the PyLord formula above (k=1 => factorial(0)=1).
+        // Expected value computed from the closed-form NLL above.
         let expected_nll = 7.920672765212197_f64;
 
         let got = nll_tev_k(mu, beta, &scores, k);
@@ -1488,7 +1496,7 @@ mod tests {
             "nll_tev_k mismatch: got={got:.16e}, expected={expected_nll:.16e}, err={err:.3e}",
         );
 
-        // Extra guard: re-compute the PyLord closed-form here and compare again.
+        // Extra guard: re-compute the closed-form NLL here and compare again.
         let n = scores.len() as f64;
         let factorial = 1.0_f64; // factorial(k-1) = factorial(0) = 1
         let mut sum_z = 0.0;
@@ -1498,12 +1506,12 @@ mod tests {
             sum_z += z;
             sum_exp_neg_z += (-z).exp();
         }
-        let pylord_nll = n * (beta * factorial).ln() + (k as f64) * sum_z + sum_exp_neg_z;
+        let closed_form_nll = n * (beta * factorial).ln() + (k as f64) * sum_z + sum_exp_neg_z;
 
-        let err2 = (got - pylord_nll).abs();
+        let err2 = (got - closed_form_nll).abs();
         assert!(
             err2 < 1e-12,
-            "nll_tev_k does not match reconstructed PyLord NLL: got={got:.16e}, pylord={pylord_nll:.16e}, err={err2:.3e}"
+            "nll_tev_k does not match reconstructed closed-form NLL: got={got:.16e}, closed_form={closed_form_nll:.16e}, err={err2:.3e}"
         );
     }
 }

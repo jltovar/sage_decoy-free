@@ -127,15 +127,6 @@ pub enum LoStratify {
     Charge,
 }
 
-#[derive(Clone, Serialize, Deserialize, Debug, Default, PartialEq, Eq)]
-#[serde(rename_all = "snake_case")]
-pub enum LoTailCalibration {
-    #[default]
-    Gumbel,
-    Empirical,
-    Hybrid,
-}
-
 #[derive(Copy, Clone, Serialize, Deserialize, Debug, Default, PartialEq, Eq)]
 #[serde(rename_all = "snake_case")]
 pub enum LoTevTransform {
@@ -157,21 +148,6 @@ pub enum LoTevTransform {
     ///
     /// Retained only for backward-compatible comparisons.
     ScaledLog1000OverE,
-}
-
-#[derive(Copy, Clone, Serialize, Deserialize, Debug, Default, PartialEq, Eq)]
-#[serde(rename_all = "snake_case")]
-pub enum LoTnmFit {
-    /// Production default:
-    /// supported lower-order ranks -> MLE LOMs -> β(μ) trend
-    /// -> transform-consistent fixed-cutoff TNM calibration.
-    #[default]
-    FixedCutoff,
-
-    /// Experimental comparator:
-    /// fit final TNM by one deterministic joint likelihood over all supported
-    /// lower-order rank buckets. Rank-1 scores are still not used.
-    JointMle,
 }
 
 /// How Nokoi defines the "positive" class in DF mode.
@@ -507,49 +483,49 @@ pub struct FdrOptions {
     pub lo_min_count_per_rank: Option<usize>,
 
     // LowerOrder controls.
-    // LO always uses Madej/Lam scaled TEV.
-    // The active TNM path is deterministic MLE/LR:
-    // supported lower-order ranks -> MLE LOMs -> one β(μ) trend -> fixed μ scan.
+    //
+    // LO uses only non-rank-1 lower-order null evidence. Rank 1 is excluded because
+    // it is the target-contaminated top-hit mixture.
+    //
+    // This implementation requires at least two usable lower-order ranks. Each
+    // supported rank contributes a k-specific LOM MLE; those LOMs are also used to
+    // report the diagnostic β(μ) trend. The production rank-1 TNM is fit by one
+    // deterministic joint likelihood over the supported lower-order rank buckets.
+    //
+    // Invalid windows such as 1..1 or 2..2 are allowed through config parsing but
+    // fail closed during LO fitting with explicit logs.
+    //
+    // The TEV transform is configurable through lo_tev_transform.
     pub lo_stratify: Option<LoStratify>,
 
-    // LowerOrder hyperscore-tail calibration used to construct TEV.
-    // gumbel:    fitted Gumbel survival from lower-rank hyperscores.
-    // empirical: empirical survival from sorted lower-rank hyperscores.
-    pub lo_tail_calibration: Option<LoTailCalibration>,
-
-    // Used only when lo_tail_calibration="hybrid".
-    // 0.0 = pure Gumbel tail, 1.0 = pure empirical tail.
-    pub lo_tail_empirical_weight: Option<f64>,
-
-    // LowerOrder TEV e-value calibration.
+    // LowerOrder TEV construction.
     //
-    // Upstream scoring stores the raw spectrum-local components:
+    // Upstream scoring stores spectrum-local tail evidence:
     //
-    //   lo_spectrum_tail_p
-    //   lo_spectrum_candidate_count
+    //   core.lo_spectrum_tail_p
+    //   core.lo_spectrum_candidate_count
     //
-    // Decoy-Free constructs the E-value exactly once:
+    // Decoy-Free constructs the LO E-value once:
     //
-    //   e_value = lo_spectrum_tail_p
-    //           * lo_spectrum_candidate_count.powf(lo_evalue_candidate_count_power)
-    //           * lo_evalue_scale
+    //   E_LO = lo_spectrum_tail_p
+    //        * lo_spectrum_candidate_count.powf(lo_evalue_candidate_count_power)
+    //        * lo_evalue_scale
     //
-    // Then lo_tev_transform selects the score scale:
-    //   neg_log_e              => TEV = -ln(E)
-    //   log_1000_over_e        => TEV = ln(1000 / E)
-    //   scaled_log_1000_over_e => TEV = 0.02 * ln(1000 / E)
+    // Then lo_tev_transform selects the TEV score scale:
+    //
+    //   neg_log_e              => TEV = -ln(E_LO)
+    //   log_1000_over_e        => TEV = ln(1000 / E_LO)
+    //   scaled_log_1000_over_e => TEV = 0.02 * ln(1000 / E_LO)
+    //
     pub lo_evalue_candidate_count_power: Option<f64>,
     pub lo_evalue_scale: Option<f64>,
     pub lo_tev_transform: Option<LoTevTransform>,
 
     // LowerOrder TNM estimator.
     //
-    // fixed_cutoff = repaired production path:
-    //   LOM MLEs -> β(μ) trend -> data-driven fixed-cutoff scan.
-    //
-    // joint_mle = experimental comparator:
-    //   one deterministic joint likelihood over all supported lower-order ranks.
-    pub lo_tnm_fit: Option<LoTnmFit>,
+    // There is no TNM mode knob. The production LO path fits the rank-1 TNM by one
+    // deterministic joint likelihood over all supported lower-order rank buckets.
+    // Rank-1 scores are never used to fit or select the null.
 
     // =========================================================================
     // E) MSFDR specific knobs
@@ -738,13 +714,9 @@ pub struct FdrSettings {
 
     pub lo_stratify: LoStratify,
 
-    pub lo_tail_calibration: LoTailCalibration,
-    pub lo_tail_empirical_weight: f64,
-
     pub lo_evalue_candidate_count_power: f64,
     pub lo_evalue_scale: f64,
     pub lo_tev_transform: LoTevTransform,
-    pub lo_tnm_fit: LoTnmFit,
 
     // =========================================================================
     // E) MSFDR specific resolved null window + knobs
@@ -1081,15 +1053,6 @@ impl From<FdrOptions> for FdrSettings {
         let lo_min_count_per_rank = options.lo_min_count_per_rank.unwrap_or(10).max(1);
         let lo_stratify = options.lo_stratify.unwrap_or(LoStratify::Charge);
 
-        let lo_tail_calibration = options
-            .lo_tail_calibration
-            .unwrap_or(LoTailCalibration::Gumbel);
-
-        let lo_tail_empirical_weight = options
-            .lo_tail_empirical_weight
-            .unwrap_or(0.50)
-            .clamp(0.0, 1.0);
-
         let lo_evalue_candidate_count_power = options
             .lo_evalue_candidate_count_power
             .unwrap_or(0.75)
@@ -1098,7 +1061,6 @@ impl From<FdrOptions> for FdrSettings {
         let lo_evalue_scale = options.lo_evalue_scale.unwrap_or(1.0).clamp(1e-6, 1e6);
 
         let lo_tev_transform = options.lo_tev_transform.unwrap_or(LoTevTransform::NegLogE);
-        let lo_tnm_fit = options.lo_tnm_fit.unwrap_or(LoTnmFit::FixedCutoff);
 
         // ---------------------------------------------------------------------
         // E) MSFDR specific resolved null window + knobs
@@ -1342,13 +1304,9 @@ impl From<FdrOptions> for FdrSettings {
 
             lo_stratify,
 
-            lo_tail_calibration,
-            lo_tail_empirical_weight,
-
             lo_evalue_candidate_count_power,
             lo_evalue_scale,
             lo_tev_transform,
-            lo_tnm_fit,
 
             // =========================================================================
             // E) MSFDR specific resolved null window + knobs
