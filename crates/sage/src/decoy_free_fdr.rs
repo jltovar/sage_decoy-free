@@ -2234,8 +2234,9 @@ fn fit_engines(
             let lo_min_count_per_rank = settings.lo_min_count_per_rank;
 
             log::info!(
-				"LO TNM fit mode: local_lom_extrapolated source=supported_lower_order_lom_mles tev_transform={:?}",
-				settings.lo_tev_transform
+				"LO TNM fit mode: local_lom_extrapolated source=supported_lower_order_lom_mles tev_transform={:?} extrapolation_strength={:.3}",
+				settings.lo_tev_transform,
+				settings.lo_tnm_extrapolation_strength
 			);
 
             lo_model = fit_decoy_free_model(
@@ -2244,6 +2245,7 @@ fn fit_engines(
                 settings.lower_order_min_null_rank,
                 settings.lower_order_max_null_rank,
                 lo_min_count_per_rank,
+                settings.lo_tnm_extrapolation_strength,
             );
 
             if lo_model.is_none() {

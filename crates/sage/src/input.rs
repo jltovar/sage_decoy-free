@@ -521,11 +521,24 @@ pub struct FdrOptions {
     pub lo_evalue_scale: Option<f64>,
     pub lo_tev_transform: Option<LoTevTransform>,
 
+    // LowerOrder rank-1 TNM extrapolation strength.
+    //
+    // The production LO path fits per-rank lower-order LOMs, then infers the
+    // rank-1 TNM by local extrapolation from the nearest supported lower-order
+    // ranks. This scalar controls how far the rank-1 TNM is extrapolated beyond
+    // the nearest lower-order LOMs.
+    //
+    // strength = 1.0 means one local rank step beyond rank 2.
+    // Larger values produce a more aggressive rank-1 null and smaller rank-1
+    // p-values. Entrapment is not used to fit this value; it is an external
+    // validation readout only.
+    pub lo_tnm_extrapolation_strength: Option<f64>,
+
     // LowerOrder TNM estimator.
     //
-    // There is no TNM mode knob. The production LO path fits the rank-1 TNM by one
-    // deterministic joint likelihood over all supported lower-order rank buckets.
-    // Rank-1 scores are never used to fit or select the null.
+    // There is no TNM mode knob. The production LO path infers the rank-1 TNM by
+    // deterministic local extrapolation from supported lower-order LOMs. Rank-1
+    // scores are never used to fit or select the null.
 
     // =========================================================================
     // E) MSFDR specific knobs
@@ -717,6 +730,7 @@ pub struct FdrSettings {
     pub lo_evalue_candidate_count_power: f64,
     pub lo_evalue_scale: f64,
     pub lo_tev_transform: LoTevTransform,
+    pub lo_tnm_extrapolation_strength: f64,
 
     // =========================================================================
     // E) MSFDR specific resolved null window + knobs
@@ -1062,6 +1076,11 @@ impl From<FdrOptions> for FdrSettings {
 
         let lo_tev_transform = options.lo_tev_transform.unwrap_or(LoTevTransform::NegLogE);
 
+        let lo_tnm_extrapolation_strength = options
+            .lo_tnm_extrapolation_strength
+            .unwrap_or(1.0)
+            .clamp(0.25, 5.0);
+
         // ---------------------------------------------------------------------
         // E) MSFDR specific resolved null window + knobs
         // ---------------------------------------------------------------------
@@ -1307,6 +1326,7 @@ impl From<FdrOptions> for FdrSettings {
             lo_evalue_candidate_count_power,
             lo_evalue_scale,
             lo_tev_transform,
+            lo_tnm_extrapolation_strength,
 
             // =========================================================================
             // E) MSFDR specific resolved null window + knobs
