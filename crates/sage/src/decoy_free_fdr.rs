@@ -2234,7 +2234,7 @@ fn fit_engines(
             let lo_min_count_per_rank = settings.lo_min_count_per_rank;
 
             log::info!(
-				"LO TNM fit mode: joint_mle source=supported_lower_order_rank_buckets tev_transform={:?}",
+				"LO TNM fit mode: local_lom_extrapolated source=supported_lower_order_lom_mles tev_transform={:?}",
 				settings.lo_tev_transform
 			);
 
@@ -2248,7 +2248,7 @@ fn fit_engines(
 
             if lo_model.is_none() {
                 log::error!(
-					"LO failed closed after joint-MLE fit attempt: requested_window=[{}..={}] effective_min={} fit_rows={} rank1_rows={}. \
+					"LO failed closed after local-extrapolated TNM fit attempt: requested_window=[{}..={}] effective_min={} fit_rows={} rank1_rows={}. \
 					 LO diagnostic fields and LowerOrder-selected DF fields will be left blank.",
 					settings.lower_order_min_null_rank,
 					settings.lower_order_max_null_rank,

@@ -13,8 +13,8 @@
 //!
 //! The production path is not a direct PyLord port. It uses Sage-provided
 //! spectrum-local E-values, a configurable TEV transform, per-rank LOM MLEs,
-//! and one deterministic joint-MLE rank-1 TNM fit over the supported
-//! lower-order rank buckets.
+//! and a deterministic local extrapolation from supported lower-order LOMs
+//! to the rank-1 TNM.
 
 use fnv::FnvHashMap;
 use statrs::consts::EULER_MASCHERONI;
@@ -725,8 +725,10 @@ impl LowerOrderModel {
 // - Each selected lower-order rank k is modeled with its k-specific TEV likelihood.
 // - Only MLE LOMs are used for the production TNM path.
 // - The β(μ) linear trend is reported as a diagnostic across supported LOMs.
-// - The rank-1 TNM is fit by one deterministic joint likelihood over all
-//   supported lower-order rank buckets.
+// - The rank-1 TNM is inferred by deterministic local extrapolation from the
+//   lowest supported lower-order LOMs, usually ranks 2 and 3.
+// - Joint likelihood over the lower-order buckets is retained only as a
+//   diagnostic; it is not used as the selected rank-1 TNM.
 // - No rank-1 score likelihood is used to fit or select the null.
 // - No PyLord-style autonomous selection is performed:
 //     no best 5-rank LR window,
@@ -789,6 +791,16 @@ fn median_f64(mut xs: Vec<f64>) -> Option<f64> {
 const LO_MIN_LOM_RANKS: usize = 2;
 const LO_TNM_BETA_REL_FLOOR: f64 = 1e-4;
 const LO_TNM_BETA_ABS_FLOOR: f64 = 1e-8;
+
+// Rank-1 TNM extrapolation uses only the nearest lower-order LOMs.
+// This prevents distant ranks from dominating the inferred top-hit null.
+const LO_TNM_EXTRAP_MAX_LOCAL_RANKS: usize = 4;
+
+// Conservative beta bounds for extrapolated rank-1 TNM.
+// These prevent the extrapolated beta from collapsing or exploding relative
+// to the local lower-order LOM beta values.
+const LO_TNM_EXTRAP_BETA_MIN_REL: f64 = 0.50;
+const LO_TNM_EXTRAP_BETA_MAX_REL: f64 = 2.00;
 
 #[inline]
 fn ols_beta_on_mu_all_supported_ranks(loms: &[(u32, f64, f64)]) -> Option<(f64, f64, f64)> {
@@ -972,6 +984,123 @@ fn fit_joint_tnm_mle_from_loms(
     } else {
         None
     }
+}
+
+#[derive(Clone, Debug)]
+struct ExtrapolatedTnmFit {
+    mu: f64,
+    beta: f64,
+    mu_unclamped: f64,
+    beta_unclamped: f64,
+    beta_clamped: bool,
+    mu_slope_per_rank: f64,
+    beta_slope_per_rank: f64,
+    used_ranks: Vec<u32>,
+}
+
+#[inline]
+fn ols_y_on_rank(rows: &[(u32, f64)]) -> Option<(f64, f64)> {
+    if rows.len() < 2 {
+        return None;
+    }
+
+    let n = rows.len() as f64;
+    let mean_x = rows.iter().map(|(k, _)| *k as f64).sum::<f64>() / n;
+    let mean_y = rows.iter().map(|(_, y)| *y).sum::<f64>() / n;
+
+    let mut sxx = 0.0f64;
+    let mut sxy = 0.0f64;
+
+    for &(k, y) in rows {
+        let x = k as f64;
+        let dx = x - mean_x;
+        let dy = y - mean_y;
+
+        sxx += dx * dx;
+        sxy += dx * dy;
+    }
+
+    if !sxx.is_finite() || sxx <= 0.0 {
+        return None;
+    }
+
+    let slope = sxy / sxx;
+    let intercept = mean_y - slope * mean_x;
+
+    if slope.is_finite() && intercept.is_finite() {
+        Some((intercept, slope))
+    } else {
+        None
+    }
+}
+
+fn fit_rank1_tnm_by_local_lom_extrapolation(
+    lom_mle: &[(u32, f64, f64)],
+) -> Option<ExtrapolatedTnmFit> {
+    let mut local: Vec<(u32, f64, f64)> = lom_mle
+        .iter()
+        .copied()
+        .filter(|(k, mu, beta)| *k >= 2 && mu.is_finite() && beta.is_finite() && *beta > 0.0)
+        .collect();
+
+    local.sort_by_key(|(k, _, _)| *k);
+    local.truncate(LO_TNM_EXTRAP_MAX_LOCAL_RANKS);
+
+    if local.len() < LO_MIN_LOM_RANKS {
+        return None;
+    }
+
+    let mu_rows: Vec<(u32, f64)> = local.iter().map(|(k, mu, _)| (*k, *mu)).collect();
+    let beta_rows: Vec<(u32, f64)> = local.iter().map(|(k, _, beta)| (*k, *beta)).collect();
+
+    let (mu_intercept, mu_slope) = ols_y_on_rank(&mu_rows)?;
+    let (beta_intercept, beta_slope) = ols_y_on_rank(&beta_rows)?;
+
+    // Extrapolate to rank 1.
+    let mu_unclamped = mu_intercept + mu_slope * 1.0;
+    let beta_unclamped = beta_intercept + beta_slope * 1.0;
+
+    if !mu_unclamped.is_finite() || !beta_unclamped.is_finite() {
+        return None;
+    }
+
+    let min_beta = local
+        .iter()
+        .map(|(_, _, beta)| *beta)
+        .fold(f64::INFINITY, f64::min);
+
+    let max_beta = local
+        .iter()
+        .map(|(_, _, beta)| *beta)
+        .fold(f64::NEG_INFINITY, f64::max);
+
+    if !min_beta.is_finite() || !max_beta.is_finite() || min_beta <= 0.0 || max_beta <= 0.0 {
+        return None;
+    }
+
+    let beta_floor = (min_beta * LO_TNM_EXTRAP_BETA_MIN_REL)
+        .max(min_beta * LO_TNM_BETA_REL_FLOOR)
+        .max(LO_TNM_BETA_ABS_FLOOR);
+
+    let beta_ceiling = (max_beta * LO_TNM_EXTRAP_BETA_MAX_REL).max(beta_floor);
+
+    let beta = beta_unclamped.clamp(beta_floor, beta_ceiling);
+    let beta_clamped = (beta - beta_unclamped).abs() > 1e-12;
+
+    if !beta.is_finite() || beta <= 0.0 {
+        return None;
+    }
+
+    Some(ExtrapolatedTnmFit {
+        mu: mu_unclamped,
+        beta,
+        mu_unclamped,
+        beta_unclamped,
+        beta_clamped,
+        mu_slope_per_rank: mu_slope,
+        beta_slope_per_rank: beta_slope,
+        used_ranks: local.iter().map(|(k, _, _)| *k).collect(),
+    })
 }
 
 /// Fits a charge-stratified Lower Order Model.
@@ -1160,13 +1289,17 @@ pub fn fit_decoy_free_model(
         }
 
         // ---------------------------------------------------------------------
-        // Deterministic joint-MLE TNM construction
+        // Deterministic local-extrapolated TNM construction
         // ---------------------------------------------------------------------
         //
         // One external null-rank window produces one deterministic LO fit.
-        // Rank-1 scores are not used to fit or select the null. The final rank-1
-        // TNM is fit by one joint likelihood over all supported lower-order rank
-        // buckets.
+        // Rank-1 scores are not used to fit or select the null.
+        //
+        // The final rank-1 TNM is inferred from the nearest supported
+        // lower-order LOMs by local linear extrapolation to rank 1. The previous
+        // joint-MLE TNM is retained only as a diagnostic comparator because it
+        // fits a compromise model over lower-order buckets rather than an
+        // inferred top-hit null.
 
         let mut lom_mle: Vec<(u32, f64, f64)> = Vec::new();
 
@@ -1198,7 +1331,7 @@ pub fn fit_decoy_free_model(
 
         if lom_mle.len() < LO_MIN_LOM_RANKS {
             log::warn!(
-                "LO joint-MLE charge {charge}: insufficient supported LOM ranks: have={} need={}",
+                "LO extrapolated-TNM charge {charge}: insufficient supported LOM ranks: have={} need={}",
                 lom_mle.len(),
                 LO_MIN_LOM_RANKS
             );
@@ -1207,7 +1340,7 @@ pub fn fit_decoy_free_model(
 
         let Some((slope, intercept, r)) = ols_beta_on_mu_all_supported_ranks(&lom_mle) else {
             log::warn!(
-                "LO joint-MLE charge {charge}: failed diagnostic β(μ) regression across {} LOM ranks",
+                "LO extrapolated-TNM charge {charge}: failed diagnostic β(μ) regression across {} LOM ranks",
                 lom_mle.len()
             );
             continue;
@@ -1219,31 +1352,64 @@ pub fn fit_decoy_free_model(
             .collect::<Vec<_>>()
             .join(",");
 
-        let Some((mu_final, beta_final, joint_nll)) =
-            fit_joint_tnm_mle_from_loms(&buckets, &lom_mle)
-        else {
+        let Some(extrap) = fit_rank1_tnm_by_local_lom_extrapolation(&lom_mle) else {
             log::warn!(
-                "LO joint-MLE charge {charge}: TNM joint fit failed | lom_ranks={} loms=[{}]",
+                "LO extrapolated-TNM charge {charge}: rank-1 extrapolation failed | lom_ranks={} loms=[{}]",
                 lom_mle.len(),
                 rank_summary
             );
             continue;
         };
 
-        log::info!(
-			"LO joint-MLE charge={} mu={:.6} beta={:.6} joint_nll={:.4} beta_mu_slope={:.6} beta_mu_intercept={:.6} beta_mu_r={:.4} lom_ranks={} loms=[{}]",
-			charge,
-			mu_final,
-			beta_final,
-			joint_nll,
-			slope,
-			intercept,
-			r,
-			lom_mle.len(),
-			rank_summary
-		);
+        let extrap_nll_on_lower_order_buckets =
+            joint_nll_tev_buckets(extrap.mu, extrap.beta, &buckets);
 
-        params_by_charge.insert(charge, (mu_final, beta_final));
+        let joint_diagnostic = fit_joint_tnm_mle_from_loms(&buckets, &lom_mle);
+
+        if let Some((joint_mu, joint_beta, joint_nll)) = joint_diagnostic {
+            log::info!(
+                "LO TNM diagnostic charge={} selected=local_extrapolated selected_mu={:.6} selected_beta={:.6} selected_lower_order_joint_nll={:.4} comparator_joint_mle_mu={:.6} comparator_joint_mle_beta={:.6} comparator_joint_mle_nll={:.4} extrap_mu_unclamped={:.6} extrap_beta_unclamped={:.6} extrap_beta_clamped={} extrap_mu_slope_per_rank={:.6} extrap_beta_slope_per_rank={:.6} beta_mu_slope={:.6} beta_mu_intercept={:.6} beta_mu_r={:.4} extrap_used_ranks={:?} lom_ranks={} loms=[{}]",
+                charge,
+                extrap.mu,
+                extrap.beta,
+                extrap_nll_on_lower_order_buckets,
+                joint_mu,
+                joint_beta,
+                joint_nll,
+                extrap.mu_unclamped,
+                extrap.beta_unclamped,
+                extrap.beta_clamped,
+                extrap.mu_slope_per_rank,
+                extrap.beta_slope_per_rank,
+                slope,
+                intercept,
+                r,
+                extrap.used_ranks,
+                lom_mle.len(),
+                rank_summary
+            );
+        } else {
+            log::info!(
+                "LO TNM diagnostic charge={} selected=local_extrapolated selected_mu={:.6} selected_beta={:.6} selected_lower_order_joint_nll={:.4} comparator_joint_mle=failed extrap_mu_unclamped={:.6} extrap_beta_unclamped={:.6} extrap_beta_clamped={} extrap_mu_slope_per_rank={:.6} extrap_beta_slope_per_rank={:.6} beta_mu_slope={:.6} beta_mu_intercept={:.6} beta_mu_r={:.4} extrap_used_ranks={:?} lom_ranks={} loms=[{}]",
+                charge,
+                extrap.mu,
+                extrap.beta,
+                extrap_nll_on_lower_order_buckets,
+                extrap.mu_unclamped,
+                extrap.beta_unclamped,
+                extrap.beta_clamped,
+                extrap.mu_slope_per_rank,
+                extrap.beta_slope_per_rank,
+                slope,
+                intercept,
+                r,
+                extrap.used_ranks,
+                lom_mle.len(),
+                rank_summary
+            );
+        }
+
+        params_by_charge.insert(charge, (extrap.mu, extrap.beta));
     }
 
     // -------------------------
