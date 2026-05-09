@@ -710,15 +710,14 @@ fn scan_mu_for_fixed_cutoff(
 
     const N_GRID: usize = 701;
 
-    // DYNAMIC MU GRID (critical fix): old hardcoded [-0.2, 1.0] was incompatible with
-    // Log1000OverE LOM mus (~7-9). Now centers on expected TNM scale via OLS line.
-    let mu_center = if slope.abs() > 1e-6 {
-        ((1.2 - intercept) / slope).clamp(0.0, 15.0)
+    // ROBUST CENTERING: use OLS line to target realistic TNM mu (beta ~1.5-3.0)
+    let mu_center = if slope.abs() > 1e-8 {
+        ((2.5 - intercept) / slope).clamp(5.0, 22.0)
     } else {
-        8.0
+        12.0
     };
-    let mu_lo = (mu_center - 12.0).max(-5.0);
-    let mu_hi = (mu_center + 12.0).min(30.0);
+    let mu_lo = (mu_center - 18.0).max(0.0);
+    let mu_hi = (mu_center + 18.0).min(35.0);
 
     let step = (mu_hi - mu_lo) / ((N_GRID - 1) as f64);
     let target_log_p = target_p_at_cutoff.ln();
@@ -729,7 +728,7 @@ fn scan_mu_for_fixed_cutoff(
         let mu = mu_lo + (i as f64) * step;
         let beta = slope * mu + intercept;
 
-        if !mu.is_finite() || !beta.is_finite() || beta <= 0.01 {
+        if !mu.is_finite() || !beta.is_finite() || beta <= 0.1 {
             continue;
         }
 
