@@ -129,12 +129,12 @@ use crate::database::IndexedDatabase;
 use crate::input::LoStratify;
 use crate::input::{
     BoundedAuxUpdateSpace, DartNullRtModel, DartTrueRtModel, EnsemblePCombiner,
-    EnsemblePepCombiner, FdrSettings, FinalEvidenceSpace, JointMode, LoTevTransform, ModelFit,
-    PeptidePCombine, PhysicalAnchorMode, QMethod,
+    EnsemblePepCombiner, FdrSettings, FinalEvidenceSpace, JointMode, LoTevTransform, LoTnmFit,
+    ModelFit, PeptidePCombine, PhysicalAnchorMode, QMethod,
 };
 use crate::lfq::{Peak, PrecursorId};
 use crate::ml::lower_order::{
-    fit_decoy_free_model, fit_gumbel_mle, fit_gumbel_moments, LowerOrderModel,
+    fit_decoy_free_model, fit_gumbel_mle, fit_gumbel_moments, LowerOrderModel, LowerOrderTnmFit,
 };
 use crate::ml::msfdr::{Msfdr1SmixModel, Msfdr2SmixModel, MsfdrSeededModel};
 use crate::ml::nokoi;
@@ -564,14 +564,18 @@ fn set_df_evidence_pair(psm: &mut DfFeature, active: ActiveEvidenceSpace, p_valu
 // - `tev(...)` remains the raw hyperscore accessor used by existing non-LO DF
 //   code paths.
 // - LowerOrder does not derive TEV from raw hyperscore downstream.
-// - LowerOrder consumes `FeatureCore::lo_spectrum_e_value`, computed upstream
+// - LowerOrder consumes raw spectrum-local components computed upstream
 //   during scoring while the full per-spectrum candidate hyperscore distribution
 //   is still available:
 //
 //       local p_tail = P(local spectrum null >= observed hyperscore)
-//       E            = local p_tail
-//                    * scored_candidate_count_for_spectrum.powf(lo_evalue_candidate_count_power)
-//                    * lo_evalue_scale
+//       n_candidates = number of scored candidates for the spectrum
+//
+//   DF constructs the LO E-value exactly once:
+//
+//       E = local p_tail
+//         * n_candidates.powf(lo_evalue_candidate_count_power)
+//         * lo_evalue_scale
 //
 //   The final LO TEV score is selected explicitly by `lo_tev_transform`:
 //
@@ -591,14 +595,67 @@ fn tev(f: &DfFeature) -> Option<f64> {
 }
 
 #[inline(always)]
-fn lo_spectrum_e_value(f: &DfFeature) -> Option<f64> {
-    let e = f.core.lo_spectrum_e_value;
+fn lo_spectrum_tail_p(f: &DfFeature) -> Option<f64> {
+    let p = f.core.lo_spectrum_tail_p;
+
+    if p.is_finite() && p > 0.0 {
+        Some(p.clamp(1e-300, 1.0))
+    } else {
+        None
+    }
+}
+
+#[inline(always)]
+fn lo_spectrum_candidate_count(f: &DfFeature) -> Option<f64> {
+    let n = f.core.lo_spectrum_candidate_count as f64;
+
+    if n.is_finite() && n >= 1.0 {
+        Some(n)
+    } else {
+        None
+    }
+}
+
+#[inline(always)]
+fn lo_e_value_from_tail_and_candidates(
+    tail_p: f64,
+    candidate_count: f64,
+    candidate_count_power: f64,
+    evalue_scale: f64,
+) -> Option<f64> {
+    if !tail_p.is_finite()
+        || tail_p <= 0.0
+        || !candidate_count.is_finite()
+        || candidate_count < 1.0
+        || !candidate_count_power.is_finite()
+        || !evalue_scale.is_finite()
+        || evalue_scale <= 0.0
+    {
+        return None;
+    }
+
+    let e = tail_p.clamp(1e-300, 1.0)
+        * candidate_count.powf(candidate_count_power.clamp(0.0, 1.0))
+        * evalue_scale.clamp(1e-6, 1e6);
 
     if e.is_finite() && e > 0.0 {
         Some(e.clamp(1e-300, 1e300))
     } else {
         None
     }
+}
+
+#[inline(always)]
+fn lo_constructed_e_value(f: &DfFeature, settings: &FdrSettings) -> Option<f64> {
+    let tail_p = lo_spectrum_tail_p(f)?;
+    let candidate_count = lo_spectrum_candidate_count(f)?;
+
+    lo_e_value_from_tail_and_candidates(
+        tail_p,
+        candidate_count,
+        settings.lo_evalue_candidate_count_power,
+        settings.lo_evalue_scale,
+    )
 }
 
 #[derive(Clone, Debug)]
@@ -663,7 +720,15 @@ fn lo_tnm_fixed_cutoff_calibration(transform: LoTevTransform) -> Option<(f64, f6
     }
 }
 
-fn build_lo_tev_from_stored_spectrum_evalue(
+#[inline(always)]
+fn lower_order_tnm_fit_mode(mode: LoTnmFit) -> LowerOrderTnmFit {
+    match mode {
+        LoTnmFit::FixedCutoff => LowerOrderTnmFit::FixedCutoff,
+        LoTnmFit::JointMle => LowerOrderTnmFit::JointMle,
+    }
+}
+
+fn build_lo_tev_from_spectrum_tail_components(
     features: &[DfFeature],
     settings: &FdrSettings,
     pool: &RankNullPool,
@@ -693,7 +758,10 @@ fn build_lo_tev_from_stored_spectrum_evalue(
             continue;
         }
 
-        let e_gumbel = lo_spectrum_e_value(f).unwrap_or(1000.0) * settings.lo_evalue_scale;
+        let Some(e_gumbel) = lo_constructed_e_value(f, settings) else {
+            invalid += 1;
+            continue;
+        };
 
         let e_value = match settings.lo_tail_calibration {
             LoTailCalibration::Gumbel => e_gumbel,
@@ -703,14 +771,24 @@ fn build_lo_tev_from_stored_spectrum_evalue(
                 let count_ge = sorted_null_scores.len() - idx;
                 let p_empirical = (count_ge as f64 + 1.0) / (sorted_null_scores.len() as f64 + 1.0);
 
-                // Convert back to E-value scale using the explicit LO reference.
-                // The downstream `lo_tev_transform` determines whether this E-value
-                // is converted to -ln(E), ln(1000/E), or the historical compressed scale.
-                let e_empirical = p_empirical * LO_TEV_REFERENCE_EVALUE;
+                let Some(candidate_count) = lo_spectrum_candidate_count(f) else {
+                    invalid += 1;
+                    continue;
+                };
+
+                let Some(e_empirical) = lo_e_value_from_tail_and_candidates(
+                    p_empirical,
+                    candidate_count,
+                    settings.lo_evalue_candidate_count_power,
+                    settings.lo_evalue_scale,
+                ) else {
+                    invalid += 1;
+                    continue;
+                };
 
                 if matches!(settings.lo_tail_calibration, LoTailCalibration::Hybrid) {
                     let w = settings.lo_tail_empirical_weight.clamp(0.0, 1.0);
-                    (1.0 - w) * e_gumbel + w * e_empirical
+                    ((1.0 - w) * e_gumbel + w * e_empirical).clamp(1e-300, 1e300)
                 } else {
                     e_empirical
                 }
@@ -1932,14 +2010,15 @@ fn fit_engines(
     let mut lo_tev_by_key: Option<Arc<FnvHashMap<(u32, u8, usize, String), f64>>> = None;
 
     if gates.run_lo {
-        let lo_tev_map = build_lo_tev_from_stored_spectrum_evalue(features, settings, pool);
+        let lo_tev_map = build_lo_tev_from_spectrum_tail_components(features, settings, pool);
 
         lo_tev_by_key = Some(Arc::new(lo_tev_map.by_key.clone()));
 
         log::info!(
-            "LO stored spectrum-E-value TEV diagnostics: valid={} invalid={} source=core.lo_spectrum_e_value e_scale={:.3} tev_transform={:?}",
+            "LO spectrum-local TEV diagnostics: valid={} invalid={} source=core.lo_spectrum_tail_p+core.lo_spectrum_candidate_count candidate_count_power={:.3} evalue_scale={:.3} tev_transform={:?}",
             lo_tev_map.valid,
             lo_tev_map.invalid,
+            settings.lo_evalue_candidate_count_power,
             settings.lo_evalue_scale,
             settings.lo_tev_transform
         );
@@ -2030,6 +2109,8 @@ fn fit_engines(
                     lo_tnm_target_p_at_cutoff
                 );
 
+                log::info!("LO TNM fit mode: {:?}", settings.lo_tnm_fit);
+
                 lo_model = fit_decoy_free_model(
                     &lo_fit_data,
                     &rank1_scores_by_charge,
@@ -2038,6 +2119,7 @@ fn fit_engines(
                     lo_min_count_per_rank,
                     lo_tnm_cutoff,
                     lo_tnm_target_p_at_cutoff,
+                    lower_order_tnm_fit_mode(settings.lo_tnm_fit),
                 );
             } else {
                 log::warn!(

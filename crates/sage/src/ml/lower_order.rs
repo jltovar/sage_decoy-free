@@ -15,6 +15,13 @@ use fnv::FnvHashMap;
 use statrs::consts::EULER_MASCHERONI;
 use statrs::function::gamma::ln_gamma;
 
+#[derive(Copy, Clone, Debug, Default, PartialEq, Eq)]
+pub enum LowerOrderTnmFit {
+    #[default]
+    FixedCutoff,
+    JointMle,
+}
+
 /// Method-of-moments Gumbel fit (mu, beta).
 pub(crate) fn fit_gumbel_moments(scores: &[f64]) -> (f64, f64) {
     let finite: Vec<f64> = scores.iter().copied().filter(|x| x.is_finite()).collect();
@@ -616,9 +623,42 @@ fn finite_quantiles(xs: &[f64]) -> Option<(f64, f64, f64, f64, f64, f64, f64)> {
     ))
 }
 
+#[inline]
+fn median_f64(mut xs: Vec<f64>) -> Option<f64> {
+    xs.retain(|x| x.is_finite());
+    if xs.is_empty() {
+        return None;
+    }
+
+    xs.sort_by(|a, b| a.total_cmp(b));
+
+    let n = xs.len();
+    if n % 2 == 1 {
+        Some(xs[n / 2])
+    } else {
+        Some(0.5 * (xs[n / 2 - 1] + xs[n / 2]))
+    }
+}
+
+#[inline]
+fn mad_f64(xs: &[f64], center: f64) -> Option<f64> {
+    if !center.is_finite() {
+        return None;
+    }
+
+    median_f64(
+        xs.iter()
+            .copied()
+            .filter(|x| x.is_finite())
+            .map(|x| (x - center).abs())
+            .collect(),
+    )
+}
+
 const LO_MIN_LOM_RANKS: usize = 2;
-const LO_TNM_MU_MIN: f64 = -0.20;
-const LO_TNM_MU_MAX: f64 = 1.00;
+const LO_TNM_SCAN_GRID: usize = 701;
+const LO_TNM_BETA_REL_FLOOR: f64 = 1e-4;
+const LO_TNM_BETA_ABS_FLOOR: f64 = 1e-8;
 
 #[inline]
 fn ols_beta_on_mu_all_supported_ranks(loms: &[(u32, f64, f64)]) -> Option<(f64, f64, f64)> {
@@ -692,13 +732,25 @@ fn rank1_survival_at_cutoff(mu: f64, beta: f64, cutoff: f64) -> Option<f64> {
     Some((1.0 - cdf).clamp(1e-300, 1.0))
 }
 
+#[derive(Copy, Clone, Debug)]
+struct FixedCutoffScanResult {
+    mu: f64,
+    beta: f64,
+    cutoff_p: f64,
+    cutoff_error: f64,
+    mu_center: f64,
+    mu_half_width: f64,
+    beta_floor: f64,
+}
+
 #[inline]
 fn scan_mu_for_fixed_cutoff(
     slope: f64,
     intercept: f64,
     cutoff: f64,
     target_p_at_cutoff: f64,
-) -> Option<(f64, f64, f64, f64)> {
+    lom_mle: &[(u32, f64, f64)],
+) -> Option<FixedCutoffScanResult> {
     if !slope.is_finite()
         || !intercept.is_finite()
         || !cutoff.is_finite()
@@ -708,27 +760,54 @@ fn scan_mu_for_fixed_cutoff(
         return None;
     }
 
-    const N_GRID: usize = 701;
+    let mus: Vec<f64> = lom_mle
+        .iter()
+        .map(|(_, mu, _)| *mu)
+        .filter(|x| x.is_finite())
+        .collect();
 
-    // ROBUST CENTERING: use OLS line to target realistic TNM mu (beta ~1.5-3.0)
-    let mu_center = if slope.abs() > 1e-8 {
-        ((2.5 - intercept) / slope).clamp(5.0, 22.0)
-    } else {
-        12.0
-    };
-    let mu_lo = (mu_center - 18.0).max(0.0);
-    let mu_hi = (mu_center + 18.0).min(35.0);
+    let betas: Vec<f64> = lom_mle
+        .iter()
+        .map(|(_, _, beta)| *beta)
+        .filter(|x| x.is_finite() && *x > 0.0)
+        .collect();
 
-    let step = (mu_hi - mu_lo) / ((N_GRID - 1) as f64);
+    let mu_center = median_f64(mus.clone())?;
+    let beta_center = median_f64(betas)?;
+
+    if !mu_center.is_finite() || !beta_center.is_finite() || beta_center <= 0.0 {
+        return None;
+    }
+
+    let mu_mad = mad_f64(&mus, mu_center).unwrap_or(0.0);
+
+    // Dynamic, TEV-scale-aware scan width.
+    // No hard-coded compressed-scale clamps.
+    let mu_half_width = (10.0 * mu_mad).max(6.0 * beta_center).max(1.0);
+
+    let mu_lo = mu_center - mu_half_width;
+    let mu_hi = mu_center + mu_half_width;
+
+    if !mu_lo.is_finite() || !mu_hi.is_finite() || mu_hi <= mu_lo {
+        return None;
+    }
+
+    let beta_floor = (beta_center * LO_TNM_BETA_REL_FLOOR).max(LO_TNM_BETA_ABS_FLOOR);
+
+    let step = (mu_hi - mu_lo) / ((LO_TNM_SCAN_GRID - 1) as f64);
+    if !step.is_finite() || step <= 0.0 {
+        return None;
+    }
+
     let target_log_p = target_p_at_cutoff.ln();
 
-    let mut best: Option<(f64, f64, f64, f64)> = None;
+    let mut best: Option<FixedCutoffScanResult> = None;
 
-    for i in 0..N_GRID {
+    for i in 0..LO_TNM_SCAN_GRID {
         let mu = mu_lo + (i as f64) * step;
         let beta = slope * mu + intercept;
 
-        if !mu.is_finite() || !beta.is_finite() || beta <= 0.1 {
+        if !mu.is_finite() || !beta.is_finite() || beta <= beta_floor {
             continue;
         }
 
@@ -741,16 +820,164 @@ fn scan_mu_for_fixed_cutoff(
             continue;
         }
 
+        let candidate = FixedCutoffScanResult {
+            mu,
+            beta,
+            cutoff_p: p_cutoff,
+            cutoff_error: err,
+            mu_center,
+            mu_half_width,
+            beta_floor,
+        };
+
         match best {
-            None => best = Some((mu, beta, p_cutoff, err)),
-            Some((_, _, _, best_err)) if err < best_err => {
-                best = Some((mu, beta, p_cutoff, err));
-            }
+            None => best = Some(candidate),
+            Some(prev) if err < prev.cutoff_error => best = Some(candidate),
             _ => {}
         }
     }
 
-    best
+    let best = best?;
+
+    // Fail closed if the final TNM is wildly outside the fitted LOM parameter cloud.
+    // This catches the prior failure mode where reasonable LOMs produced an absurd
+    // rank-1 TNM.
+    if (best.mu - mu_center).abs() > mu_half_width {
+        return None;
+    }
+
+    Some(best)
+}
+
+#[inline]
+fn joint_nll_tev_buckets(mu: f64, beta: f64, buckets: &[RankBucket]) -> f64 {
+    if !mu.is_finite() || !beta.is_finite() || beta <= 0.0 || buckets.is_empty() {
+        return f64::INFINITY;
+    }
+
+    let mut total = 0.0f64;
+
+    for b in buckets {
+        let nll = nll_tev_k(mu, beta, &b.scores, b.k);
+        if !nll.is_finite() {
+            return f64::INFINITY;
+        }
+        total += nll;
+    }
+
+    total
+}
+
+fn fit_joint_tnm_mle_from_loms(
+    buckets: &[RankBucket],
+    lom_mle: &[(u32, f64, f64)],
+) -> Option<(f64, f64, f64)> {
+    if buckets.is_empty() || lom_mle.len() < LO_MIN_LOM_RANKS {
+        return None;
+    }
+
+    let mu0 = median_f64(lom_mle.iter().map(|(_, mu, _)| *mu).collect())?;
+    let beta0 = median_f64(lom_mle.iter().map(|(_, _, beta)| *beta).collect())?;
+
+    if !mu0.is_finite() || !beta0.is_finite() || beta0 <= 0.0 {
+        return None;
+    }
+
+    let beta_floor = (beta0 * LO_TNM_BETA_REL_FLOOR).max(LO_TNM_BETA_ABS_FLOOR);
+    let mu_half_width = (6.0 * beta0).max(1.0);
+
+    let mut best: Option<(f64, f64, f64)> = None;
+
+    for b_step in -12..=12 {
+        let beta = beta0 * 2.0f64.powf((b_step as f64) / 4.0);
+        if !beta.is_finite() || beta <= beta_floor {
+            continue;
+        }
+
+        let mu_lo = mu0 - mu_half_width;
+        let mu_hi = mu0 + mu_half_width;
+
+        const MU_N: usize = 161;
+        let step = (mu_hi - mu_lo) / ((MU_N - 1) as f64);
+
+        if !step.is_finite() || step <= 0.0 {
+            continue;
+        }
+
+        for i in 0..MU_N {
+            let mu = mu_lo + (i as f64) * step;
+            let nll = joint_nll_tev_buckets(mu, beta, buckets);
+
+            if !nll.is_finite() {
+                continue;
+            }
+
+            match best {
+                None => best = Some((mu, beta, nll)),
+                Some((_, _, best_nll)) if nll < best_nll => best = Some((mu, beta, nll)),
+                _ => {}
+            }
+        }
+    }
+
+    let (mut mu_best, mut beta_best, mut nll_best) = best?;
+
+    for round in 0..3 {
+        let mu_half_width = beta_best
+            * match round {
+                0 => 2.0,
+                1 => 0.75,
+                _ => 0.25,
+            };
+
+        let beta_log_half_width = match round {
+            0 => 1.0,
+            1 => 0.5,
+            _ => 0.25,
+        };
+
+        const MU_N_LOCAL: usize = 81;
+        const BETA_N_LOCAL: usize = 41;
+
+        let mu_lo = mu_best - mu_half_width;
+        let mu_hi = mu_best + mu_half_width;
+
+        for bi in 0..BETA_N_LOCAL {
+            let frac_b = (bi as f64) / ((BETA_N_LOCAL - 1) as f64);
+            let log2_delta = -beta_log_half_width + 2.0 * beta_log_half_width * frac_b;
+            let beta = beta_best * 2.0f64.powf(log2_delta);
+
+            if !beta.is_finite() || beta <= beta_floor {
+                continue;
+            }
+
+            for mi in 0..MU_N_LOCAL {
+                let frac_m = (mi as f64) / ((MU_N_LOCAL - 1) as f64);
+                let mu = mu_lo + (mu_hi - mu_lo) * frac_m;
+
+                let nll = joint_nll_tev_buckets(mu, beta, buckets);
+                if !nll.is_finite() {
+                    continue;
+                }
+
+                if nll < nll_best {
+                    mu_best = mu;
+                    beta_best = beta;
+                    nll_best = nll;
+                }
+            }
+        }
+    }
+
+    if mu_best.is_finite()
+        && beta_best.is_finite()
+        && beta_best > beta_floor
+        && nll_best.is_finite()
+    {
+        Some((mu_best, beta_best, nll_best))
+    } else {
+        None
+    }
 }
 
 /// Fits a charge-stratified Lower Order Model.
@@ -759,7 +986,10 @@ fn scan_mu_for_fixed_cutoff(
 /// - Uses every supported selected lower-order rank in the configured window.
 /// - Fits MLE LOM parameters for each supported lower-order rank.
 /// - Fits one deterministic β(μ) trend across those LOMs.
-/// - Chooses the rank-1 TNM by fixed-cutoff calibration along that β(μ) path.
+/// - Default path chooses the rank-1 TNM by transform-consistent fixed-cutoff
+///   calibration along that β(μ) path, using data-driven scan bounds.
+/// - Optional joint_mle path fits the rank-1 TNM by one deterministic joint
+///   likelihood over all supported lower-order rank buckets.
 /// - Never uses rank-1 scores to fit or select the null.
 /// - Does not perform PyLord-style autonomous candidate selection.
 /// - Preserves one external null-rank window -> one deterministic LO model.
@@ -774,6 +1004,7 @@ pub fn fit_decoy_free_model(
     lo_min_count_per_rank: usize,
     tnm_cutoff: f64,
     tnm_target_p_at_cutoff: f64,
+    tnm_fit: LowerOrderTnmFit,
 ) -> Option<LowerOrderModel> {
     // LowerOrder null evidence must come from non-top hits only.
     // Rank 1 is the target-contaminated top-hit mixture and is never a valid
@@ -979,44 +1210,85 @@ pub fn fit_decoy_free_model(
             continue;
         };
 
-        let cutoff = tnm_cutoff;
-        let target_cutoff_p = tnm_target_p_at_cutoff;
-
-        let Some((mu_final, beta_final, cutoff_p, cutoff_error)) =
-            scan_mu_for_fixed_cutoff(slope, intercept, cutoff, target_cutoff_p)
-        else {
-            log::warn!(
-                "LO deterministic MLE/LR charge {charge}: fixed-cutoff TNM scan failed | slope={:.6} intercept={:.6} r={:.4} scan=[{:.4},{:.4}]",
-                slope,
-                intercept,
-                r,
-                LO_TNM_MU_MIN,
-                LO_TNM_MU_MAX
-            );
-            continue;
-        };
-
         let rank_summary = lom_mle
             .iter()
             .map(|(k, mu, beta)| format!("{}:{:.5}/{:.5}", k, mu, beta))
             .collect::<Vec<_>>()
             .join(",");
 
-        log::info!(
-            "LO deterministic MLE/LR charge={} mu={:.6} beta={:.6} slope={:.6} intercept={:.6} r={:.4} cutoff={:.4} cutoff_p={:.6e} target_cutoff_p={:.6e} cutoff_error={:.6} lom_ranks={} loms=[{}]",
-            charge,
-            mu_final,
-            beta_final,
-            slope,
-            intercept,
-            r,
-            cutoff,
-            cutoff_p,
-            target_cutoff_p,
-            cutoff_error,
-            lom_mle.len(),
-            rank_summary
-        );
+        let fit_result: Option<(f64, f64)> = match tnm_fit {
+            LowerOrderTnmFit::FixedCutoff => {
+                let cutoff = tnm_cutoff;
+                let target_cutoff_p = tnm_target_p_at_cutoff;
+
+                let Some(scan) =
+                    scan_mu_for_fixed_cutoff(slope, intercept, cutoff, target_cutoff_p, &lom_mle)
+                else {
+                    log::warn!(
+                        "LO fixed-cutoff charge {charge}: TNM scan failed | slope={:.6} intercept={:.6} r={:.4} lom_ranks={} loms=[{}]",
+                        slope,
+                        intercept,
+                        r,
+                        lom_mle.len(),
+                        rank_summary
+                    );
+                    continue;
+                };
+
+                log::info!(
+                    "LO fixed-cutoff charge={} mu={:.6} beta={:.6} slope={:.6} intercept={:.6} r={:.4} cutoff={:.6} cutoff_p={:.6e} target_cutoff_p={:.6e} cutoff_error={:.6} mu_center={:.6} mu_half_width={:.6} beta_floor={:.6e} lom_ranks={} loms=[{}]",
+                    charge,
+                    scan.mu,
+                    scan.beta,
+                    slope,
+                    intercept,
+                    r,
+                    cutoff,
+                    scan.cutoff_p,
+                    target_cutoff_p,
+                    scan.cutoff_error,
+                    scan.mu_center,
+                    scan.mu_half_width,
+                    scan.beta_floor,
+                    lom_mle.len(),
+                    rank_summary
+                );
+
+                Some((scan.mu, scan.beta))
+            }
+
+            LowerOrderTnmFit::JointMle => {
+                let Some((mu_final, beta_final, joint_nll)) =
+                    fit_joint_tnm_mle_from_loms(&buckets, &lom_mle)
+                else {
+                    log::warn!(
+                        "LO joint-MLE charge {charge}: TNM joint fit failed | lom_ranks={} loms=[{}]",
+                        lom_mle.len(),
+                        rank_summary
+                    );
+                    continue;
+                };
+
+                log::info!(
+                    "LO joint-MLE charge={} mu={:.6} beta={:.6} joint_nll={:.4} beta_mu_slope={:.6} beta_mu_intercept={:.6} beta_mu_r={:.4} lom_ranks={} loms=[{}]",
+                    charge,
+                    mu_final,
+                    beta_final,
+                    joint_nll,
+                    slope,
+                    intercept,
+                    r,
+                    lom_mle.len(),
+                    rank_summary
+                );
+
+                Some((mu_final, beta_final))
+            }
+        };
+
+        let Some((mu_final, beta_final)) = fit_result else {
+            continue;
+        };
 
         params_by_charge.insert(charge, (mu_final, beta_final));
     }

@@ -134,17 +134,26 @@ pub struct FeatureCore {
     pub scored_candidates: u32,
     pub poisson_log10_p_value: f64,
 
-    // Spectrum-local lower-order calibration.
+    // Spectrum-local LowerOrder calibration.
     //
-    // These are computed during scoring, while the full per-spectrum candidate
-    // hyperscore distribution is still available. Decoy-Free LowerOrder consumes
-    // `lo_spectrum_e_value` to construct the Madej/Lam TEV:
+    // These raw components are computed during scoring, while the full
+    // per-spectrum candidate hyperscore distribution is still available.
     //
-    //     TEV = 0.02 * ln(1000 / E)
+    // Important:
+    // - `lo_spectrum_tail_p` is only the local tail probability:
+    //       P(local spectrum null >= observed hyperscore)
     //
-    // Do not derive these downstream from retained rank rows.
-    pub lo_spectrum_p_value: f64,
-    pub lo_spectrum_e_value: f64,
+    // - `lo_spectrum_candidate_count` is the number of scored candidates for
+    //   this spectrum after the same filtering used for output ranking.
+    //
+    // Decoy-Free LowerOrder constructs the E-value exactly once downstream:
+    //
+    //   E = lo_spectrum_tail_p
+    //     * lo_spectrum_candidate_count.powf(lo_evalue_candidate_count_power)
+    //     * lo_evalue_scale
+    //
+    // Do not pre-multiply by candidate count here.
+    pub lo_spectrum_tail_p: f64,
     pub lo_spectrum_candidate_count: u32,
 
     pub ms2_intensity: f32,
@@ -1087,10 +1096,11 @@ fn lo_local_gumbel_survival(score: f64, mu: f64, beta: f64) -> Option<f64> {
     p.is_finite().then_some(p)
 }
 
-fn assign_lo_spectrum_evalues(score_vector: &[(Score, Option<Fragments>)]) -> Vec<(f64, f64, u32)> {
+fn assign_lo_spectrum_tail_components(
+    score_vector: &[(Score, Option<Fragments>)],
+) -> Vec<(f64, u32)> {
     let n_candidates = score_vector.len().max(1);
-    let fail_closed =
-        || vec![(1.0f64, n_candidates as f64, n_candidates as u32); score_vector.len()];
+    let fail_closed = || vec![(1.0f64, n_candidates as u32); score_vector.len()];
 
     if score_vector.len() < LO_LOCAL_MIN_CANDIDATES {
         return fail_closed();
@@ -1123,13 +1133,11 @@ fn assign_lo_spectrum_evalues(score_vector: &[(Score, Option<Fragments>)]) -> Ve
     score_vector
         .iter()
         .map(|(score, _)| {
-            let p = lo_local_gumbel_survival(score.hyperscore, mu, beta)
+            let tail_p = lo_local_gumbel_survival(score.hyperscore, mu, beta)
                 .unwrap_or(1.0)
                 .clamp(1e-300, 1.0);
 
-            let e = (p * n_candidates as f64).clamp(1e-300, 1e300);
-
-            (p, e, n_candidates as u32)
+            (tail_p, n_candidates as u32)
         })
         .collect()
 }
@@ -1362,10 +1370,10 @@ impl<'db> Scorer<'db> {
 
         score_vector.sort_by(|a, b| b.0.hyperscore.total_cmp(&a.0.hyperscore));
 
-        // Compute spectrum-local LO p/E-values before output pruning.
+        // Compute spectrum-local LO tail components before output pruning.
         // This is the only point where the full per-spectrum scored candidate
         // hyperscore distribution is still available.
-        let lo_spectrum_evalues = assign_lo_spectrum_evalues(&score_vector);
+        let lo_spectrum_tail_components = assign_lo_spectrum_tail_components(&score_vector);
 
         let scored_len = score_vector.len().max(1) as f64;
 
@@ -1384,12 +1392,10 @@ impl<'db> Scorer<'db> {
         for idx in 0..report_psms.min(score_vector.len()) {
             let score = score_vector[idx].0;
 
-            let (lo_spectrum_p_value, lo_spectrum_e_value, lo_spectrum_candidate_count) =
-                lo_spectrum_evalues.get(idx).copied().unwrap_or((
-                    1.0,
-                    score_vector.len().max(1) as f64,
-                    score_vector.len().max(1) as u32,
-                ));
+            let (lo_spectrum_tail_p, lo_spectrum_candidate_count) = lo_spectrum_tail_components
+                .get(idx)
+                .copied()
+                .unwrap_or((1.0, score_vector.len().max(1) as u32));
 
             let fragments: Option<Fragments> = score_vector[idx].1.take();
             let psm_id = increment_psm_counter();
@@ -1453,8 +1459,7 @@ impl<'db> Scorer<'db> {
                 longest_y_pct,
                 peptide_len: peptide.sequence.len(),
                 scored_candidates: hits.scored_candidates as u32,
-                lo_spectrum_p_value,
-                lo_spectrum_e_value,
+                lo_spectrum_tail_p,
                 lo_spectrum_candidate_count,
                 missed_cleavages: peptide.missed_cleavages,
                 predicted_rt: 0.0,

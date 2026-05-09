@@ -159,6 +159,21 @@ pub enum LoTevTransform {
     ScaledLog1000OverE,
 }
 
+#[derive(Copy, Clone, Serialize, Deserialize, Debug, Default, PartialEq, Eq)]
+#[serde(rename_all = "snake_case")]
+pub enum LoTnmFit {
+    /// Production default:
+    /// supported lower-order ranks -> MLE LOMs -> β(μ) trend
+    /// -> transform-consistent fixed-cutoff TNM calibration.
+    #[default]
+    FixedCutoff,
+
+    /// Experimental comparator:
+    /// fit final TNM by one deterministic joint likelihood over all supported
+    /// lower-order rank buckets. Rank-1 scores are still not used.
+    JointMle,
+}
+
 /// How Nokoi defines the "positive" class in DF mode.
 ///
 /// - or:      top-slice OR provisional p-threshold  (current behavior)
@@ -508,9 +523,15 @@ pub struct FdrOptions {
 
     // LowerOrder TEV e-value calibration.
     //
-    // First:
-    //   e_value = p_tail
-    //           * observed_candidate_count.powf(lo_evalue_candidate_count_power)
+    // Upstream scoring stores the raw spectrum-local components:
+    //
+    //   lo_spectrum_tail_p
+    //   lo_spectrum_candidate_count
+    //
+    // Decoy-Free constructs the E-value exactly once:
+    //
+    //   e_value = lo_spectrum_tail_p
+    //           * lo_spectrum_candidate_count.powf(lo_evalue_candidate_count_power)
     //           * lo_evalue_scale
     //
     // Then lo_tev_transform selects the score scale:
@@ -520,6 +541,15 @@ pub struct FdrOptions {
     pub lo_evalue_candidate_count_power: Option<f64>,
     pub lo_evalue_scale: Option<f64>,
     pub lo_tev_transform: Option<LoTevTransform>,
+
+    // LowerOrder TNM estimator.
+    //
+    // fixed_cutoff = repaired production path:
+    //   LOM MLEs -> β(μ) trend -> data-driven fixed-cutoff scan.
+    //
+    // joint_mle = experimental comparator:
+    //   one deterministic joint likelihood over all supported lower-order ranks.
+    pub lo_tnm_fit: Option<LoTnmFit>,
 
     // =========================================================================
     // E) MSFDR specific knobs
@@ -714,6 +744,7 @@ pub struct FdrSettings {
     pub lo_evalue_candidate_count_power: f64,
     pub lo_evalue_scale: f64,
     pub lo_tev_transform: LoTevTransform,
+    pub lo_tnm_fit: LoTnmFit,
 
     // =========================================================================
     // E) MSFDR specific resolved null window + knobs
@@ -1067,6 +1098,7 @@ impl From<FdrOptions> for FdrSettings {
         let lo_evalue_scale = options.lo_evalue_scale.unwrap_or(1.0).clamp(1e-6, 1e6);
 
         let lo_tev_transform = options.lo_tev_transform.unwrap_or(LoTevTransform::NegLogE);
+        let lo_tnm_fit = options.lo_tnm_fit.unwrap_or(LoTnmFit::FixedCutoff);
 
         // ---------------------------------------------------------------------
         // E) MSFDR specific resolved null window + knobs
@@ -1316,6 +1348,7 @@ impl From<FdrOptions> for FdrSettings {
             lo_evalue_candidate_count_power,
             lo_evalue_scale,
             lo_tev_transform,
+            lo_tnm_fit,
 
             // =========================================================================
             // E) MSFDR specific resolved null window + knobs
