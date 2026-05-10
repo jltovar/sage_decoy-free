@@ -1109,6 +1109,168 @@ fn effective_protein_q_method(settings: &FdrSettings) -> QMethod {
     }
 }
 
+#[inline]
+fn finite_sorted(values: &[f64]) -> Vec<f64> {
+    let mut out: Vec<f64> = values.iter().copied().filter(|v| v.is_finite()).collect();
+    out.sort_by(|a, b| a.total_cmp(b));
+    out
+}
+
+#[inline]
+fn quantile_from_sorted(sorted: &[f64], q: f64) -> f64 {
+    if sorted.is_empty() {
+        return f64::NAN;
+    }
+
+    let q = q.clamp(0.0, 1.0);
+    let idx = ((sorted.len() - 1) as f64 * q).round() as usize;
+    sorted[idx.min(sorted.len() - 1)]
+}
+
+#[inline]
+fn canonical_f64_bits(x: f64) -> u64 {
+    if x == 0.0 {
+        0.0f64.to_bits()
+    } else {
+        x.to_bits()
+    }
+}
+
+fn n_unique_finite_values(values: &[f64]) -> usize {
+    let mut seen: FnvHashSet<u64> = FnvHashSet::default();
+
+    for &v in values {
+        if v.is_finite() {
+            seen.insert(canonical_f64_bits(v));
+        }
+    }
+
+    seen.len()
+}
+
+fn most_common_finite_values(values: &[f64], n: usize) -> String {
+    let mut counts: HashMap<u64, (f64, usize)> = HashMap::new();
+
+    for &v in values {
+        if !v.is_finite() {
+            continue;
+        }
+
+        let key = canonical_f64_bits(v);
+        counts
+            .entry(key)
+            .and_modify(|(_, c)| *c += 1)
+            .or_insert((v, 1));
+    }
+
+    let mut rows: Vec<(f64, usize)> = counts.into_values().collect();
+
+    rows.sort_by(|a, b| b.1.cmp(&a.1).then_with(|| a.0.total_cmp(&b.0)));
+
+    rows.into_iter()
+        .take(n)
+        .map(|(v, c)| format!("{:.6e}x{}", v, c))
+        .collect::<Vec<_>>()
+        .join(", ")
+}
+
+fn peptide_pi0_for_diagnostics(
+    peptide_ref_vals: &[f64],
+    settings: &FdrSettings,
+    method: QMethod,
+) -> Option<f64> {
+    match method {
+        QMethod::Storey => {
+            if peptide_ref_vals.len() < settings.min_storey_n {
+                None
+            } else {
+                estimate_pi0_from_reference_grid(peptide_ref_vals, settings)
+            }
+        }
+        QMethod::Auto => peptide_pi0_for_diagnostics(
+            peptide_ref_vals,
+            settings,
+            effective_peptide_q_method(settings),
+        ),
+        QMethod::Bh | QMethod::Cummean => None,
+    }
+}
+
+fn log_peptide_q_diagnostics(
+    peptide_combined_vals: &[f64],
+    peptide_ref_vals: &[f64],
+    q_values: &[f64],
+    settings: &FdrSettings,
+    is_pep_native: bool,
+) {
+    let input_sorted = finite_sorted(peptide_combined_vals);
+    let output_sorted = finite_sorted(q_values);
+
+    if input_sorted.is_empty() || output_sorted.is_empty() {
+        log::warn!(
+            "DF peptide q diagnostics: empty input/output; n_input={} n_output={}",
+            peptide_combined_vals.len(),
+            q_values.len()
+        );
+        return;
+    }
+
+    let effective_q_method = if is_pep_native {
+        QMethod::Cummean
+    } else {
+        effective_peptide_q_method(settings)
+    };
+
+    let min_input = input_sorted[0];
+    let min_output_q = output_sorted[0];
+
+    let pi0_peptide = if is_pep_native {
+        None
+    } else {
+        peptide_pi0_for_diagnostics(peptide_ref_vals, settings, effective_q_method)
+    };
+
+    let expected_min_q = pi0_peptide
+        .map(|pi0| (pi0 * min_input * peptide_combined_vals.len() as f64).clamp(0.0, 1.0));
+
+    log::info!(
+        concat!(
+            "DF peptide q diagnostics: ",
+            "model_fit={:?} final_evidence_space={:?} active_space={:?} ",
+            "peptide_q_method_requested={:?} peptide_q_method_effective={:?} ",
+            "peptide_p_combine={:?} ",
+            "n_peptides={} n_reference_peptides={} ",
+            "n_unique_peptide_input_values={} n_unique_output_peptide_q={} ",
+            "min_input_value={:.6e} p001_input_value={:.6e} p01_input_value={:.6e} median_input_value={:.6e} ",
+            "pi0_peptide={} expected_min_q={} min_output_peptide_q={:.6e} ",
+            "most_common_input_values=[{}] most_common_output_q_values=[{}]"
+        ),
+        settings.model_fit,
+        settings.final_evidence_space,
+        active_evidence_space(settings),
+        settings.peptide_q_method,
+        effective_q_method,
+        settings.peptide_p_combine,
+        peptide_combined_vals.len(),
+        peptide_ref_vals.len(),
+        n_unique_finite_values(peptide_combined_vals),
+        n_unique_finite_values(q_values),
+        min_input,
+        quantile_from_sorted(&input_sorted, 0.001),
+        quantile_from_sorted(&input_sorted, 0.01),
+        quantile_from_sorted(&input_sorted, 0.50),
+        pi0_peptide
+            .map(|v| format!("{:.6e}", v))
+            .unwrap_or_else(|| "NA".to_string()),
+        expected_min_q
+            .map(|v| format!("{:.6e}", v))
+            .unwrap_or_else(|| "NA".to_string()),
+        min_output_q,
+        most_common_finite_values(peptide_combined_vals, 10),
+        most_common_finite_values(q_values, 10),
+    );
+}
+
 fn q_values_from_p_values_with_method(
     p_values: &[f64],
     p_ref: &[f64],
@@ -7775,6 +7937,14 @@ pub fn calculate_peptide_q_df(
             "peptide",
         )
     };
+
+    log_peptide_q_diagnostics(
+        &peptide_combined_vals,
+        &peptide_ref_vals,
+        &q_values,
+        settings,
+        is_pep_native,
+    );
 
     let mut best_q: FnvHashMap<String, (f32, bool)> = FnvHashMap::default();
 
