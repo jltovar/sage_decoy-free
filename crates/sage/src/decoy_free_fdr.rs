@@ -1174,43 +1174,21 @@ fn most_common_finite_values(values: &[f64], n: usize) -> String {
         .join(", ")
 }
 
-fn peptide_pi0_for_diagnostics(
-    peptide_ref_vals: &[f64],
-    settings: &FdrSettings,
-    method: QMethod,
-) -> Option<f64> {
-    match method {
-        QMethod::Storey => {
-            if peptide_ref_vals.len() < settings.min_storey_n {
-                None
-            } else {
-                estimate_pi0_from_reference_grid(peptide_ref_vals, settings)
-            }
-        }
-        QMethod::Auto => peptide_pi0_for_diagnostics(
-            peptide_ref_vals,
-            settings,
-            effective_peptide_q_method(settings),
-        ),
-        QMethod::Bh | QMethod::Cummean => None,
-    }
-}
-
 fn log_peptide_q_diagnostics(
     peptide_combined_vals: &[f64],
     peptide_ref_vals: &[f64],
-    q_values: &[f64],
+    q_report: &QValueComputation,
     settings: &FdrSettings,
     is_pep_native: bool,
 ) {
     let input_sorted = finite_sorted(peptide_combined_vals);
-    let output_sorted = finite_sorted(q_values);
+    let output_sorted = finite_sorted(&q_report.q_values);
 
     if input_sorted.is_empty() || output_sorted.is_empty() {
         log::warn!(
             "DF peptide q diagnostics: empty input/output; n_input={} n_output={}",
             peptide_combined_vals.len(),
-            q_values.len()
+            q_report.q_values.len()
         );
         return;
     }
@@ -1218,17 +1196,13 @@ fn log_peptide_q_diagnostics(
     let effective_q_method = if is_pep_native {
         QMethod::Cummean
     } else {
-        effective_peptide_q_method(settings)
+        q_report.effective_method
     };
 
     let min_input = input_sorted[0];
     let min_output_q = output_sorted[0];
 
-    let pi0_peptide = if is_pep_native {
-        None
-    } else {
-        peptide_pi0_for_diagnostics(peptide_ref_vals, settings, effective_q_method)
-    };
+    let pi0_peptide = if is_pep_native { None } else { q_report.pi0 };
 
     let expected_min_q = pi0_peptide
         .map(|pi0| (pi0 * min_input * peptide_combined_vals.len() as f64).clamp(0.0, 1.0));
@@ -1237,7 +1211,7 @@ fn log_peptide_q_diagnostics(
         concat!(
             "DF peptide q diagnostics: ",
             "model_fit={:?} final_evidence_space={:?} active_space={:?} ",
-            "peptide_q_method_requested={:?} peptide_q_method_effective={:?} ",
+            "peptide_q_method_requested={:?} peptide_q_method_effective={:?} peptide_q_method_actual={} fallback_reason={} ",
             "peptide_p_combine={:?} ",
             "n_peptides={} n_reference_peptides={} ",
             "n_unique_peptide_input_values={} n_unique_output_peptide_q={} ",
@@ -1248,13 +1222,15 @@ fn log_peptide_q_diagnostics(
         settings.model_fit,
         settings.final_evidence_space,
         active_evidence_space(settings),
-        settings.peptide_q_method,
-        effective_q_method,
+        q_report.requested_method,
+		effective_q_method,
+		q_report.actual_method,
+		q_report.fallback_reason.unwrap_or("none"),
         settings.peptide_p_combine,
         peptide_combined_vals.len(),
         peptide_ref_vals.len(),
         n_unique_finite_values(peptide_combined_vals),
-        n_unique_finite_values(q_values),
+        n_unique_finite_values(&q_report.q_values),
         min_input,
         quantile_from_sorted(&input_sorted, 0.001),
         quantile_from_sorted(&input_sorted, 0.01),
@@ -1267,19 +1243,41 @@ fn log_peptide_q_diagnostics(
             .unwrap_or_else(|| "NA".to_string()),
         min_output_q,
         most_common_finite_values(peptide_combined_vals, 10),
-        most_common_finite_values(q_values, 10),
+        most_common_finite_values(&q_report.q_values, 10),
     );
 }
 
-fn q_values_from_p_values_with_method(
+#[derive(Debug)]
+struct QValueComputation {
+    q_values: Vec<f64>,
+    requested_method: QMethod,
+    effective_method: QMethod,
+    actual_method: &'static str,
+    pi0: Option<f64>,
+    fallback_reason: Option<&'static str>,
+}
+
+fn q_values_from_p_values_with_method_report(
     p_values: &[f64],
     p_ref: &[f64],
     settings: &FdrSettings,
     method: QMethod,
     level_name: &str,
-) -> Vec<f64> {
-    match method {
-        QMethod::Bh => stats::bh_q_value(p_values),
+) -> QValueComputation {
+    let effective_method = match method {
+        QMethod::Auto => effective_psm_q_method(settings),
+        other => other,
+    };
+
+    match effective_method {
+        QMethod::Bh => QValueComputation {
+            q_values: stats::bh_q_value(p_values),
+            requested_method: method,
+            effective_method,
+            actual_method: "BH",
+            pi0: None,
+            fallback_reason: None,
+        },
 
         QMethod::Storey => {
             if p_ref.len() < settings.min_storey_n {
@@ -1289,37 +1287,77 @@ fn q_values_from_p_values_with_method(
                     p_ref.len(),
                     settings.min_storey_n
                 );
-                stats::bh_q_value(p_values)
+
+                QValueComputation {
+                    q_values: stats::bh_q_value(p_values),
+                    requested_method: method,
+                    effective_method,
+                    actual_method: "BH",
+                    pi0: None,
+                    fallback_reason: Some("storey_reference_count_below_min_storey_n"),
+                }
             } else {
                 match estimate_pi0_from_reference_grid(p_ref, settings) {
-                    Some(pi0) => storey_q_value_with_pi0(p_values, pi0, settings),
+                    Some(pi0) => {
+                        let storey_report = storey_q_value_with_pi0_report(p_values, pi0, settings);
+
+                        QValueComputation {
+                            q_values: storey_report.q_values,
+                            requested_method: method,
+                            effective_method,
+                            actual_method: storey_report.actual_method,
+                            pi0: Some(pi0),
+                            fallback_reason: storey_report.fallback_reason,
+                        }
+                    }
                     None => {
                         log::warn!(
                             "DF {} Storey: failed to estimate pi0; falling back to BH.",
                             level_name
                         );
-                        stats::bh_q_value(p_values)
+
+                        QValueComputation {
+                            q_values: stats::bh_q_value(p_values),
+                            requested_method: method,
+                            effective_method,
+                            actual_method: "BH",
+                            pi0: None,
+                            fallback_reason: Some("storey_pi0_estimation_failed"),
+                        }
                     }
                 }
             }
         }
 
-        QMethod::Auto => q_values_from_p_values_with_method(
-            p_values,
-            p_ref,
-            settings,
-            effective_psm_q_method(settings),
-            level_name,
-        ),
+        QMethod::Auto => unreachable!("QMethod::Auto should have been resolved above."),
 
         QMethod::Cummean => {
             log::warn!(
                 "DF {} q_method=cummean requested on p-value-native evidence; using BH instead.",
                 level_name
             );
-            stats::bh_q_value(p_values)
+
+            QValueComputation {
+                q_values: stats::bh_q_value(p_values),
+                requested_method: method,
+                effective_method,
+                actual_method: "BH",
+                pi0: None,
+                fallback_reason: Some("cummean_requested_on_p_value_native_evidence"),
+            }
         }
     }
+}
+
+fn q_values_from_p_values_with_method(
+    p_values: &[f64],
+    p_ref: &[f64],
+    settings: &FdrSettings,
+    method: QMethod,
+    level_name: &str,
+) -> Vec<f64> {
+    q_values_from_p_values_with_method_report(p_values, p_ref, settings, method, level_name)
+        .q_values
 }
 
 #[inline]
@@ -1404,10 +1442,21 @@ fn estimate_pi0_from_reference_grid(p_ref: &[f64], settings: &FdrSettings) -> Op
     }
 }
 
-fn storey_q_value_with_pi0(p_values: &[f64], pi0: f64, settings: &FdrSettings) -> Vec<f64> {
+fn storey_q_value_with_pi0_report(
+    p_values: &[f64],
+    pi0: f64,
+    settings: &FdrSettings,
+) -> QValueComputation {
     let m = p_values.len();
     if m == 0 {
-        return Vec::new();
+        return QValueComputation {
+            q_values: Vec::new(),
+            requested_method: QMethod::Storey,
+            effective_method: QMethod::Storey,
+            actual_method: "Storey",
+            pi0: Some(pi0),
+            fallback_reason: None,
+        };
     }
 
     let pi0 = pi0.clamp(0.0, 1.0);
@@ -1468,13 +1517,27 @@ fn storey_q_value_with_pi0(p_values: &[f64], pi0: f64, settings: &FdrSettings) -
 
         match settings.storey_degen_fallback {
             crate::input::StoreyDegeneracyFallback::Bh => {
-                return crate::ml::stats::bh_q_value(p_values)
+                return QValueComputation {
+                    q_values: crate::ml::stats::bh_q_value(p_values),
+                    requested_method: QMethod::Storey,
+                    effective_method: QMethod::Storey,
+                    actual_method: "BH",
+                    pi0: Some(pi0),
+                    fallback_reason: Some("storey_degenerate_q_vector"),
+                };
             }
             crate::input::StoreyDegeneracyFallback::None => {}
         }
     }
 
-    out
+    QValueComputation {
+        q_values: out,
+        requested_method: QMethod::Storey,
+        effective_method: QMethod::Storey,
+        actual_method: "Storey",
+        pi0: Some(pi0),
+        fallback_reason: None,
+    }
 }
 
 // -----------------------------------------------------------------------------
@@ -7859,9 +7922,8 @@ pub fn calculate_peptide_q_df(
         is_ent_flags.push(ev.is_entrapment);
     }
 
-    let q_values = if is_pep_native {
-        // PEP-native peptide path: cumulative mean of peptide-level PEP-like values.
-        match settings.peptide_q_method {
+    let q_report = if is_pep_native {
+        let q_values = match settings.peptide_q_method {
             QMethod::Auto | QMethod::Cummean => {
                 let mut rows: Vec<(f64, usize)> = peptide_combined_vals
                     .iter()
@@ -7893,9 +7955,9 @@ pub fn calculate_peptide_q_df(
             }
             QMethod::Bh | QMethod::Storey => {
                 log::warn!(
-                    "DF peptide_q_method={:?} requested on PEP-native peptide evidence; using cumulative-mean PEP q-values.",
-                    settings.peptide_q_method
-                );
+                "DF peptide_q_method={:?} requested on PEP-native peptide evidence; using cumulative-mean PEP q-values.",
+                settings.peptide_q_method
+            );
 
                 let mut rows: Vec<(f64, usize)> = peptide_combined_vals
                     .iter()
@@ -7925,11 +7987,18 @@ pub fn calculate_peptide_q_df(
 
                 out
             }
+        };
+
+        QValueComputation {
+            q_values,
+            requested_method: settings.peptide_q_method,
+            effective_method: QMethod::Cummean,
+            actual_method: "CummeanPEP",
+            pi0: None,
+            fallback_reason: None,
         }
     } else {
-        // P-value-native peptide path: configured p-value method over
-        // peptide-level p-values.
-        q_values_from_p_values_with_method(
+        q_values_from_p_values_with_method_report(
             &peptide_combined_vals,
             &peptide_ref_vals,
             settings,
@@ -7941,10 +8010,12 @@ pub fn calculate_peptide_q_df(
     log_peptide_q_diagnostics(
         &peptide_combined_vals,
         &peptide_ref_vals,
-        &q_values,
+        &q_report,
         settings,
         is_pep_native,
     );
+
+    let q_values = q_report.q_values;
 
     let mut best_q: FnvHashMap<String, (f32, bool)> = FnvHashMap::default();
 
