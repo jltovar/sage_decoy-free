@@ -8708,9 +8708,17 @@ pub fn apply_hierarchical_reporting_df(
 
     if !has_entrapment_proteins {
         log::warn!(
-            "DF Level 4 requested but no entrapment proteins were detected in rank-1 target rows; Level 4 flags were not written."
-        );
+			"DF Level 4 requested but no entrapment proteins were detected in rank-1 target rows; Level 4 flags were not written."
+		);
         return (0, 0);
+    }
+
+    // From this point forward, Level 4 is active for this run.
+    // Mark all rank-1 rows as explicitly evaluated. Later logic upgrades
+    // supported target rows to Some(true). Non-rank-1 rows remain None.
+    for feat in features.iter_mut().filter(|f| f.core.rank == 1) {
+        feat.decoy_free_protein_supported_peptide = Some(false);
+        feat.decoy_free_peptide_supported_psm = Some(false);
     }
 
     let mut accepted_proteins: FnvHashSet<String> = FnvHashSet::default();
