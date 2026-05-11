@@ -8351,19 +8351,20 @@ pub fn calculate_peptide_q_df(
     (passing_total, passing_entrapments)
 }
 
-/// Reporting-only PSM expansion from accepted peptide discoveries.
+/// Optional reporting-only PSM expansion from accepted peptide discoveries.
 ///
 /// This does not alter model-native p-values, PEPs, peptide q-values, or protein
-/// q-values. It only adjusts `decoy_free_q_value` for rank-1 target PSM rows so
-/// the runner can report PSM observations supporting accepted peptides.
+/// q-values. It only adjusts `decoy_free_q_value` when
+/// `report_psms_by_peptide_q=true`.
 ///
-/// Rationale:
-/// - The DF publication/default path remains p-value-native.
-/// - Peptide/protein inference remains unchanged.
-/// - PSM reporting can reflect peptide-level discoveries when the user is using
-///   peptide_fdr as the primary DF reporting threshold.
+/// When `report_psms_by_peptide_q=false`, this function is a strict no-op.
+/// In that default mode, downstream reporting/Level 4 logic must not assume that
+/// PSM q-values were rewritten from peptide q-values.
 pub fn apply_peptide_q_to_psm_reporting_df(features: &mut [DfFeature], settings: &FdrSettings) {
     if !settings.report_psms_by_peptide_q {
+        log::debug!(
+            "DF reporting: peptide-q PSM reporting disabled; leaving decoy_free_q_value unchanged."
+        );
         return;
     }
 
@@ -8658,6 +8659,34 @@ pub fn calculate_protein_q_df(
         .count()
 }
 
+#[inline]
+fn df_strict_psm_reportable(feat: &DfFeature, settings: &FdrSettings) -> bool {
+    if feat.core.rank != 1 || feat.core.label != 1 {
+        return false;
+    }
+
+    if settings.report_psms_by_peptide_q {
+        feat.decoy_free_q_value
+            .map(|q| q <= settings.precursor_fdr)
+            .unwrap_or(false)
+    } else {
+        feat.decoy_free_peptide_q
+            .map(|q| q <= settings.peptide_fdr)
+            .unwrap_or(false)
+    }
+}
+
+#[inline]
+fn df_strict_peptide_reportable(feat: &DfFeature, settings: &FdrSettings) -> bool {
+    if feat.core.rank != 1 || feat.core.label != 1 {
+        return false;
+    }
+
+    feat.decoy_free_peptide_q
+        .map(|q| q <= settings.peptide_fdr)
+        .unwrap_or(false)
+}
+
 /// Level 4 reporting-only flags.
 ///
 /// This layer does not overwrite:
@@ -8746,16 +8775,9 @@ pub fn apply_hierarchical_reporting_df(
                 .iter()
                 .filter(|f| f.core.rank == 1 && f.core.label == 1)
             {
-                let peptide = &db[feat.core.peptide_idx];
-                let peptide_key = peptide.to_string();
-
-                let peptide_passes = feat
-                    .decoy_free_peptide_q
-                    .map(|q| q <= settings.peptide_fdr)
-                    .unwrap_or(false);
-
-                if peptide_passes {
-                    strict_reportable_peptides.insert(peptide_key);
+                if df_strict_peptide_reportable(feat, settings) {
+                    let peptide = &db[feat.core.peptide_idx];
+                    strict_reportable_peptides.insert(peptide.to_string());
                 }
             }
 
@@ -8776,12 +8798,7 @@ pub fn apply_hierarchical_reporting_df(
                 let peptide_key = peptide.to_string();
 
                 let peptide_reportable = strict_reportable_peptides.contains(&peptide_key);
-
-                let psm_reportable = peptide_reportable
-                    && feat
-                        .decoy_free_q_value
-                        .map(|q| q <= settings.precursor_fdr)
-                        .unwrap_or(false);
+                let psm_reportable = df_strict_psm_reportable(feat, settings);
 
                 feat.decoy_free_protein_supported_peptide = Some(peptide_reportable);
                 feat.decoy_free_peptide_supported_psm = Some(psm_reportable);
@@ -8792,10 +8809,11 @@ pub fn apply_hierarchical_reporting_df(
             }
 
             log::info!(
-                "DF Level 4 hierarchical reporting: mode=Strict strict_reportable_peptides={} strict_reportable_psms={}",
-                strict_reportable_peptides.len(),
-                strict_reportable_psm_count
-            );
+				"DF Level 4 hierarchical reporting: mode=Strict strict_reportable_peptides={} strict_reportable_psms={} report_psms_by_peptide_q={}",
+				strict_reportable_peptides.len(),
+				strict_reportable_psm_count,
+				settings.report_psms_by_peptide_q
+			);
 
             (
                 strict_reportable_peptides.len(),
