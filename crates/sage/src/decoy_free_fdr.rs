@@ -2322,6 +2322,33 @@ fn build_rank_null_pool(
     })
 }
 
+fn winsorize_scores_for_fit(scores: &[f64], lower_q: f64, upper_q: f64) -> Vec<f64> {
+    let mut sorted: Vec<f64> = scores.iter().copied().filter(|x| x.is_finite()).collect();
+
+    if sorted.is_empty() {
+        return Vec::new();
+    }
+
+    sorted.sort_by(|a, b| a.total_cmp(b));
+
+    let n = sorted.len();
+    let lower_q = lower_q.clamp(0.0, 1.0);
+    let upper_q = upper_q.clamp(lower_q, 1.0);
+
+    let lo_idx = ((n.saturating_sub(1) as f64) * lower_q).round() as usize;
+    let hi_idx = ((n.saturating_sub(1) as f64) * upper_q).round() as usize;
+
+    let lo = sorted[lo_idx.min(n - 1)];
+    let hi = sorted[hi_idx.min(n - 1)];
+
+    scores
+        .iter()
+        .copied()
+        .filter(|x| x.is_finite())
+        .map(|x| x.clamp(lo, hi))
+        .collect()
+}
+
 #[derive(Clone, Copy, Debug)]
 struct RunGates {
     run_mom: bool,
@@ -2497,13 +2524,34 @@ fn fit_engines(
             settings.moments_min_null_rank,
             settings.moments_max_null_rank,
         );
+
+        let fit_scores = if settings.moments_robust_fit {
+            let x = winsorize_scores_for_fit(
+                &scores,
+                settings.moments_winsor_lower_q,
+                settings.moments_winsor_upper_q,
+            );
+
+            log::info!(
+                "Moments robust fit: enabled=true raw_n={} fit_n={} winsor_q=[{:.3}, {:.3}]",
+                scores.len(),
+                x.len(),
+                settings.moments_winsor_lower_q,
+                settings.moments_winsor_upper_q
+            );
+
+            x
+        } else {
+            scores.clone()
+        };
+
         if window_ok(
             "Moments",
             settings.moments_min_null_rank,
             settings.moments_max_null_rank,
-            scores.len(),
+            fit_scores.len(),
         ) {
-            let (mu, beta) = fit_gumbel_moments(&scores);
+            let (mu, beta) = fit_gumbel_moments(&fit_scores);
             if mu.is_finite() && beta.is_finite() && beta > 0.0 {
                 Some((mu, beta))
             } else {
@@ -2675,13 +2723,34 @@ fn fit_engines(
 
         let scores =
             mle_pool.scores_in_window(settings.mle_min_null_rank, settings.mle_max_null_rank);
+
+        let fit_scores = if settings.mle_robust_fit {
+            let x = winsorize_scores_for_fit(
+                &scores,
+                settings.mle_winsor_lower_q,
+                settings.mle_winsor_upper_q,
+            );
+
+            log::info!(
+                "MLE robust preprocessing: enabled=true raw_n={} fit_n={} winsor_q=[{:.3}, {:.3}]",
+                scores.len(),
+                x.len(),
+                settings.mle_winsor_lower_q,
+                settings.mle_winsor_upper_q
+            );
+
+            x
+        } else {
+            scores.clone()
+        };
+
         if window_ok(
             "MLE",
             settings.mle_min_null_rank,
             settings.mle_max_null_rank,
-            scores.len(),
+            fit_scores.len(),
         ) {
-            match fit_gumbel_mle(&scores) {
+            match fit_gumbel_mle(&fit_scores) {
                 Some((mu, beta)) if mu.is_finite() && beta.is_finite() && beta > 0.0 => {
                     Some((mu, beta))
                 }

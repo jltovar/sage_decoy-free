@@ -465,12 +465,28 @@ pub struct FdrOptions {
     pub moments_max_null_rank: Option<u32>,
     pub moments_purification_factor: Option<f64>,
 
+    /// Robust method-of-moments Gumbel fitting.
+    ///
+    /// If enabled, lower-rank null scores are winsorized before computing the
+    /// mean/variance used by the Gumbel method-of-moments estimator.
+    pub moments_robust_fit: Option<bool>, // default false
+    pub moments_winsor_lower_q: Option<f64>, // default 0.01
+    pub moments_winsor_upper_q: Option<f64>, // default 0.95
+
     // =========================================================================
     // C) MLE specific knobs
     // =========================================================================
     pub mle_min_null_rank: Option<u32>,
     pub mle_max_null_rank: Option<u32>,
     pub mle_purification_factor: Option<f64>,
+
+    /// Optional robust preprocessing for MLE.
+    ///
+    /// Disabled by default because winsorizing before MLE changes the likelihood
+    /// target. Use only as a sensitivity/contamination-control mode.
+    pub mle_robust_fit: Option<bool>, // default false
+    pub mle_winsor_lower_q: Option<f64>, // default 0.01
+    pub mle_winsor_upper_q: Option<f64>, // default 0.975
 
     // =========================================================================
     // D) LowerOrder specific knobs
@@ -724,12 +740,20 @@ pub struct FdrSettings {
     pub moments_max_null_rank: u32,
     pub moments_purification_factor: f64,
 
+    pub moments_robust_fit: bool,
+    pub moments_winsor_lower_q: f64,
+    pub moments_winsor_upper_q: f64,
+
     // =========================================================================
     // C) MLE specific resolved null window
     // =========================================================================
     pub mle_min_null_rank: u32,
     pub mle_max_null_rank: u32,
     pub mle_purification_factor: f64,
+
+    pub mle_robust_fit: bool,
+    pub mle_winsor_lower_q: f64,
+    pub mle_winsor_upper_q: f64,
 
     // =========================================================================
     // D) LowerOrder specific resolved null window + knobs
@@ -973,10 +997,26 @@ impl From<FdrOptions> for FdrSettings {
             .unwrap_or(0.25)
             .clamp(0.0, 0.9);
 
+        let moments_robust_fit = options.moments_robust_fit.unwrap_or(false);
+        let moments_winsor_lower_q = options
+            .moments_winsor_lower_q
+            .unwrap_or(0.01)
+            .clamp(0.0, 1.0);
+        let moments_winsor_upper_q = options
+            .moments_winsor_upper_q
+            .unwrap_or(0.95)
+            .clamp(0.0, 1.0);
+        let moments_winsor_upper_q = moments_winsor_upper_q.max(moments_winsor_lower_q);
+
         let mle_purification_factor = options
             .mle_purification_factor
             .unwrap_or(0.25)
             .clamp(0.0, 0.9);
+
+        let mle_robust_fit = options.mle_robust_fit.unwrap_or(false);
+        let mle_winsor_lower_q = options.mle_winsor_lower_q.unwrap_or(0.01).clamp(0.0, 1.0);
+        let mle_winsor_upper_q = options.mle_winsor_upper_q.unwrap_or(0.975).clamp(0.0, 1.0);
+        let mle_winsor_upper_q = mle_winsor_upper_q.max(mle_winsor_lower_q);
 
         let lower_order_purification_factor = options
             .lower_order_purification_factor
@@ -1356,12 +1396,20 @@ impl From<FdrOptions> for FdrSettings {
             moments_max_null_rank,
             moments_purification_factor,
 
+            moments_robust_fit,
+            moments_winsor_lower_q,
+            moments_winsor_upper_q,
+
             // =========================================================================
             // C) MLE specific resolved null window
             // =========================================================================
             mle_min_null_rank,
             mle_max_null_rank,
             mle_purification_factor,
+
+            mle_robust_fit,
+            mle_winsor_lower_q,
+            mle_winsor_upper_q,
 
             // =========================================================================
             // D) LowerOrder specific resolved null window + knobs
