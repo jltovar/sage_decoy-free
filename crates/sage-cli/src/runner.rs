@@ -1187,6 +1187,12 @@ impl Runner {
         Ok(cp.to_string())
     }
 
+    #[inline]
+    fn df_is_entrapment_protein_key(protein_key: &str) -> bool {
+        // Keep this in sync with decoy_free_fdr.rs::is_entrapment_str().
+        protein_key.contains("|Ent_") || protein_key.contains("Ent_")
+    }
+
     fn active_df_model_suffixes(&self) -> Vec<&'static str> {
         let fdr = &self.parameters.fdr;
 
@@ -1245,8 +1251,14 @@ impl Runner {
             DfDynamicColumn::Final("decoy_free_protein_q"),
         ]);
 
+        let entrapment_reporting_active = fdr.entrapment_report != EntrapmentReportMode::Off;
+
         let level4_reporting_active = fdr.hierarchical_reporting != HierarchicalReportingMode::Off
-            && fdr.entrapment_report != EntrapmentReportMode::Off;
+            && entrapment_reporting_active;
+
+        if entrapment_reporting_active {
+            cols.push(DfDynamicColumn::ReportingFlag("decoy_free_is_entrapment"));
+        }
 
         if level4_reporting_active {
             cols.extend([
@@ -1573,12 +1585,10 @@ impl Runner {
         // Core Columns
         record.push_field(itoa::Buffer::new().format(core.psm_id).as_bytes());
         let peptide = &self.database[core.peptide_idx];
+        let protein_key = peptide.proteins(&self.database.decoy_tag, self.database.generate_decoys);
+
         record.push_field(peptide.to_string().as_bytes());
-        record.push_field(
-            peptide
-                .proteins(&self.database.decoy_tag, self.database.generate_decoys)
-                .as_bytes(),
-        );
+        record.push_field(protein_key.as_bytes());
         record.push_field(
             itoa::Buffer::new()
                 .format(peptide.proteins.len())
@@ -1672,13 +1682,23 @@ impl Runner {
                 },
 
                 DfDynamicColumn::ReportingFlag(name) => match *name {
+                    "decoy_free_is_entrapment" => {
+                        record.push_field(
+                            Self::df_is_entrapment_protein_key(&protein_key)
+                                .to_string()
+                                .as_bytes(),
+                        );
+                    }
+
                     "decoy_free_protein_supported_peptide" => Self::push_opt_bool(
                         &mut record,
                         feature.decoy_free_protein_supported_peptide,
                     ),
+
                     "decoy_free_peptide_supported_psm" => {
                         Self::push_opt_bool(&mut record, feature.decoy_free_peptide_supported_psm)
                     }
+
                     _ => Self::push_opt_bool(&mut record, None),
                 },
 
