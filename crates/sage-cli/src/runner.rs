@@ -8,7 +8,7 @@ use rayon::prelude::*;
 use sage_cloudpath::{CloudPath, FileFormat};
 use sage_core::database::{IndexedDatabase, Parameters, PeptideIx};
 use sage_core::fasta::Fasta;
-use sage_core::input::{FdrMode, ModelFit};
+use sage_core::input::{EntrapmentReportMode, FdrMode, HierarchicalReportingMode, ModelFit};
 use sage_core::ion_series::Kind;
 use sage_core::lfq::{Peak, PrecursorId};
 use sage_core::mass::Tolerance;
@@ -84,6 +84,7 @@ impl FromIterator<RawSpectrum> for RawSpectrumAccumulator {
 #[derive(Clone, Debug)]
 enum DfDynamicColumn {
     Final(&'static str),
+    ReportingFlag(&'static str),
     BaseModel(&'static str),
     RtModel(&'static str),
     ImsModel(&'static str),
@@ -1227,6 +1228,16 @@ impl Runner {
             DfDynamicColumn::Final("decoy_free_protein_q"),
         ]);
 
+        let level4_reporting_active = fdr.hierarchical_reporting != HierarchicalReportingMode::Off
+            && fdr.entrapment_report != EntrapmentReportMode::Off;
+
+        if level4_reporting_active {
+            cols.extend([
+                DfDynamicColumn::ReportingFlag("decoy_free_protein_supported_peptide"),
+                DfDynamicColumn::ReportingFlag("decoy_free_peptide_supported_psm"),
+            ]);
+        }
+
         for suffix in self.active_df_model_suffixes() {
             cols.push(DfDynamicColumn::BaseModel(suffix));
 
@@ -1254,6 +1265,10 @@ impl Runner {
         for col in cols {
             match col {
                 DfDynamicColumn::Final(name) => {
+                    headers.push((*name).to_string());
+                }
+
+                DfDynamicColumn::ReportingFlag(name) => {
                     headers.push((*name).to_string());
                 }
 
@@ -1511,6 +1526,14 @@ impl Runner {
         );
     }
 
+    fn push_opt_bool(record: &mut csv::ByteRecord, val: Option<bool>) {
+        record.push_field(
+            val.map(|v| v.to_string())
+                .unwrap_or_else(|| "NaN".to_string())
+                .as_bytes(),
+        );
+    }
+
     fn push_df_triplet(
         record: &mut csv::ByteRecord,
         vals: (Option<f32>, Option<f32>, Option<f32>),
@@ -1629,6 +1652,17 @@ impl Runner {
                         Self::push_opt_f32(&mut record, feature.decoy_free_protein_q)
                     }
                     _ => Self::push_opt_f32(&mut record, None),
+                },
+
+                DfDynamicColumn::ReportingFlag(name) => match *name {
+                    "decoy_free_protein_supported_peptide" => Self::push_opt_bool(
+                        &mut record,
+                        feature.decoy_free_protein_supported_peptide,
+                    ),
+                    "decoy_free_peptide_supported_psm" => {
+                        Self::push_opt_bool(&mut record, feature.decoy_free_peptide_supported_psm)
+                    }
+                    _ => Self::push_opt_bool(&mut record, None),
                 },
 
                 DfDynamicColumn::BaseModel(suffix) => {
