@@ -20,7 +20,22 @@ use fnv::FnvHashMap;
 use statrs::consts::EULER_MASCHERONI;
 use statrs::function::gamma::ln_gamma;
 
-/// Method-of-moments Gumbel fit (mu, beta).
+/// Method-of-moments fit for the two-parameter Gumbel maximum distribution.
+///
+/// For X ~ Gumbel(mu, beta):
+///
+///   E[X]   = mu + EulerGamma * beta
+///   Var[X] = (pi^2 / 6) * beta^2
+///
+/// Therefore:
+///
+///   beta = sqrt(6 * Var[X]) / pi
+///   mu   = mean(X) - EulerGamma * beta
+///
+/// The empirical variance is computed with denominator n, matching the
+/// population moment equation used by method-of-moments fitting. Invalid,
+/// non-finite, degenerate, or zero-variance inputs return (NaN, NaN), allowing
+/// callers to fail closed.
 pub(crate) fn fit_gumbel_moments(scores: &[f64]) -> (f64, f64) {
     let finite: Vec<f64> = scores.iter().copied().filter(|x| x.is_finite()).collect();
     if finite.len() < 2 {
@@ -1536,6 +1551,34 @@ mod tests {
     }
 
     #[test]
+    fn fit_gumbel_moments_matches_closed_form_moments() {
+        let scores: Vec<f64> = vec![1.0, 2.0, 3.0, 4.0];
+
+        let n = scores.len() as f64;
+        let mean = scores.iter().sum::<f64>() / n;
+        let var = scores.iter().map(|x| (x - mean).powi(2)).sum::<f64>() / n;
+
+        let expected_beta = (6.0 * var / std::f64::consts::PI.powi(2)).sqrt();
+        let expected_mu = mean - EULER_MASCHERONI * expected_beta;
+
+        let (mu, beta) = fit_gumbel_moments(&scores);
+
+        assert!(mu.is_finite());
+        assert!(beta.is_finite());
+        assert!(beta > 0.0);
+
+        assert!(
+            (beta - expected_beta).abs() < 1e-12,
+            "beta mismatch: got={beta:.16e}, expected={expected_beta:.16e}"
+        );
+
+        assert!(
+            (mu - expected_mu).abs() < 1e-12,
+            "mu mismatch: got={mu:.16e}, expected={expected_mu:.16e}"
+        );
+    }
+
+    #[test]
     fn lo_estimators_recover_reasonable_params_and_selection_is_finite() {
         // Synthetic parameters
         let mu_true = 15.0;
@@ -1581,29 +1624,20 @@ mod tests {
         assert!((beta_k_mle / beta_true) > 0.2 && (beta_k_mle / beta_true) < 5.0);
     }
 
-    #[cfg(test)]
-    mod tests {
-        use super::*;
+    #[test]
+    fn fit_gumbel_mle_is_stable_for_shifted_scores() {
+        let scores: Vec<f64> = vec![
+            -10_000.0, -9_999.5, -9_999.0, -9_998.4, -9_997.9, -9_997.2, -9_996.8, -9_996.1,
+            -9_995.5, -9_995.0,
+        ];
 
-        // existing tests above...
+        let Some((mu, beta)) = fit_gumbel_mle(&scores) else {
+            panic!("fit_gumbel_mle returned None for finite shifted scores");
+        };
 
-        #[test]
-        fn fit_gumbel_mle_is_stable_for_shifted_scores() {
-            let scores = vec![
-                -10_000.0, -9_999.5, -9_999.0, -9_998.4, -9_997.9, -9_997.2, -9_996.8, -9_996.1,
-                -9_995.5, -9_995.0,
-            ];
-
-            let Some((mu, beta)) = fit_gumbel_mle(&scores) else {
-                panic!("fit_gumbel_mle returned None for finite shifted scores");
-            };
-
-            assert!(mu.is_finite(), "mu is not finite: {mu}");
-            assert!(beta.is_finite(), "beta is not finite: {beta}");
-            assert!(beta > 0.0, "beta must be positive: {beta}");
-        }
-
-        // existing tests below...
+        assert!(mu.is_finite(), "mu is not finite: {mu}");
+        assert!(beta.is_finite(), "beta is not finite: {beta}");
+        assert!(beta > 0.0, "beta must be positive: {beta}");
     }
 
     #[test]

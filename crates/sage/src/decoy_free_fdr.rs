@@ -519,28 +519,6 @@ fn combine_peps(
     }
 }
 
-#[inline(always)]
-fn clear_lower_order_outputs(psm: &mut DfFeature) {
-    psm.p_lo = None;
-    psm.pep_lo = None;
-    psm.q_lo = None;
-}
-
-#[inline(always)]
-fn clear_selected_df_outputs(psm: &mut DfFeature) {
-    psm.decoy_free_p_value = None;
-    psm.decoy_free_pep = None;
-    psm.decoy_free_score = None;
-    psm.decoy_free_q_value = None;
-    psm.decoy_free_peptide_q = None;
-    psm.decoy_free_protein_q = None;
-
-    psm.decoy_free_p_value_base = None;
-    psm.decoy_free_pep_base = None;
-    psm.decoy_free_score_base = None;
-    psm.decoy_free_q_base = None;
-}
-
 // -----------------------------------------------------------------------------
 // 4) Feature field helpers (tiny setters/getters for DF streams)
 // -----------------------------------------------------------------------------
@@ -1754,6 +1732,107 @@ fn grenander_pep_from_p(p_values: &[f64], pi0: f64) -> Vec<f64> {
     out
 }
 
+fn grenander_pep_from_reference_population(p_all: &[f64], is_ref: &[bool], pi0: f64) -> Vec<f64> {
+    const EPS: f64 = 1e-300;
+
+    if p_all.len() != is_ref.len() {
+        log::warn!(
+            "Grenander reference-population PEP calibration skipped because p/ref lengths differ: p_all={} is_ref={}.",
+            p_all.len(),
+            is_ref.len()
+        );
+        return vec![1.0; p_all.len()];
+    }
+
+    let mut ref_rows: Vec<(usize, f64)> = Vec::new();
+
+    for (idx, (&p, &ref_ok)) in p_all.iter().zip(is_ref.iter()).enumerate() {
+        if ref_ok && p.is_finite() {
+            ref_rows.push((idx, p.clamp(EPS, 1.0)));
+        }
+    }
+
+    if ref_rows.is_empty() {
+        log::warn!(
+            "Grenander reference-population PEP calibration skipped because reference population is empty."
+        );
+        return vec![1.0; p_all.len()];
+    }
+
+    let p_ref: Vec<f64> = ref_rows.iter().map(|&(_, p)| p).collect();
+    let pep_ref = grenander_pep_from_p(&p_ref, pi0);
+
+    if pep_ref.len() != ref_rows.len() {
+        log::warn!(
+            "Grenander reference-population PEP calibration skipped because calibrated length mismatched: ref_rows={} pep_ref={}.",
+            ref_rows.len(),
+            pep_ref.len()
+        );
+        return vec![1.0; p_all.len()];
+    }
+
+    let mut calibration_pairs: Vec<(f64, f64)> = p_ref
+        .into_iter()
+        .zip(pep_ref.into_iter())
+        .filter(|(p, pep)| p.is_finite() && pep.is_finite())
+        .map(|(p, pep)| (p.clamp(EPS, 1.0), pep.clamp(EPS, 1.0)))
+        .collect();
+
+    if calibration_pairs.is_empty() {
+        return vec![1.0; p_all.len()];
+    }
+
+    calibration_pairs.sort_by(|a, b| a.0.total_cmp(&b.0));
+
+    // Collapse duplicate p-values conservatively by keeping the worst PEP.
+    let mut collapsed: Vec<(f64, f64)> = Vec::new();
+    for (p, pep) in calibration_pairs {
+        if let Some(last) = collapsed.last_mut() {
+            if last.0 == p {
+                last.1 = last.1.max(pep);
+                continue;
+            }
+        }
+        collapsed.push((p, pep));
+    }
+
+    // Enforce monotone non-decreasing PEP with worsening p-value.
+    let mut running_max = EPS;
+    for (_, pep) in collapsed.iter_mut() {
+        running_max = running_max.max(*pep);
+        *pep = running_max.clamp(EPS, 1.0);
+    }
+
+    p_all
+        .iter()
+        .map(|&p| {
+            if !p.is_finite() {
+                return 1.0;
+            }
+
+            let p = p.clamp(EPS, 1.0);
+
+            match collapsed.binary_search_by(|(p_ref, _)| p_ref.total_cmp(&p)) {
+                Ok(pos) => collapsed[pos].1,
+                Err(0) => collapsed[0].1,
+                Err(pos) if pos >= collapsed.len() => collapsed[collapsed.len() - 1].1,
+                Err(pos) => {
+                    let (p_lo, pep_lo) = collapsed[pos - 1];
+                    let (p_hi, pep_hi) = collapsed[pos];
+
+                    if p_hi <= p_lo {
+                        pep_hi.max(pep_lo).clamp(EPS, 1.0)
+                    } else {
+                        let w = ((p - p_lo) / (p_hi - p_lo)).clamp(0.0, 1.0);
+                        let pep = pep_lo * (1.0 - w) + pep_hi * w;
+                        pep.clamp(EPS, 1.0)
+                    }
+                }
+            }
+        })
+        .collect()
+}
+
 // -----------------------------------------------------------------------------
 // 14) Q-values from PEP cumulative mean
 // -----------------------------------------------------------------------------
@@ -2112,16 +2191,16 @@ fn build_rank_null_pool(
     features: &[DfFeature],
     work: &WorkSet,
     settings: &FdrSettings,
+    null_purification_factor: f64,
+    label: &str,
 ) -> Option<RankNullPool> {
     let min_null_size = settings.min_null_size;
 
-    // Null-rank window (used throughout this function)
     let min_rank = settings.min_null_rank;
     let max_rank = settings.max_null_rank;
 
-    // --- SOFT PURIFIED NULL (same logic) ---
+    let p_factor = null_purification_factor.clamp(0.0, 0.9);
 
-    // Build rank1_scores as (peptide_idx, hyperscore)
     let mut rank1_scores: Vec<(u32, f64)> = work
         .rank1_indices
         .iter()
@@ -2131,14 +2210,15 @@ fn build_rank_null_pool(
         })
         .collect();
 
-    let purification_threshold = if rank1_scores.len() >= 10 {
+    let purification_threshold = if rank1_scores.len() >= 10 && p_factor > 0.0 {
         rank1_scores.sort_by(|a, b| b.1.total_cmp(&a.1));
-        let p_factor = settings.purification_factor;
+
         let top_k = ((rank1_scores.len() as f64) * p_factor).round() as usize;
         let top_k = top_k.max(5).min(rank1_scores.len());
+
         rank1_scores[top_k - 1].1
     } else {
-        1000.0
+        f64::INFINITY
     };
 
     let purified_peptides: FnvHashSet<u32> = rank1_scores
@@ -2152,16 +2232,20 @@ fn build_rank_null_pool(
 
     for (idx, psm) in features.iter().enumerate() {
         let r: u32 = psm.core.rank as u32;
+
         if r < min_rank || r > max_rank {
             continue;
         }
+
         if purified_peptides.contains(&psm.core.peptide_idx.0) {
             continue;
         }
+
         let s = match tev(psm) {
             Some(v) => v,
             None => continue,
         };
+
         fit_data.push((
             r,
             s,
@@ -2173,19 +2257,26 @@ fn build_rank_null_pool(
     }
 
     if fit_data.len() < min_null_size {
-        log::warn!("Purified null too small, falling back to unpurified null.");
+        log::warn!(
+            "{label}: purified null too small with purification_factor={:.3}; falling back to unpurified null.",
+            p_factor
+        );
+
         fit_data.clear();
         null_indices.clear();
 
         for (idx, psm) in features.iter().enumerate() {
             let r: u32 = psm.core.rank as u32;
+
             if r < min_rank || r > max_rank {
                 continue;
             }
+
             let s = match tev(psm) {
                 Some(v) => v,
                 None => continue,
             };
+
             fit_data.push((
                 r,
                 s,
@@ -2197,7 +2288,6 @@ fn build_rank_null_pool(
         }
     }
 
-    // final safety (keep alignment between fit_data and null_indices)
     let mut fit2: Vec<(u32, f64, u8, usize, String)> = Vec::with_capacity(fit_data.len());
     let mut idx2: Vec<usize> = Vec::with_capacity(null_indices.len());
 
@@ -2207,12 +2297,24 @@ fn build_rank_null_pool(
             idx2.push(null_indices[k]);
         }
     }
+
     let fit_data = fit2;
     let null_indices = idx2;
 
     if fit_data.len() < min_null_size {
+        log::warn!(
+            "{label}: null pool too small after fallback: n={} < min_null_size={}",
+            fit_data.len(),
+            min_null_size
+        );
         return None;
     }
+
+    log::info!(
+        "{label}: rank-null pool built with purification_factor={:.3}; rows={}",
+        p_factor,
+        fit_data.len()
+    );
 
     Some(RankNullPool {
         fit_data,
@@ -2306,15 +2408,78 @@ fn fit_msfdr_2smix(
 fn fit_engines(
     features: &[DfFeature],
     work: &WorkSet,
-    pool: &RankNullPool,
     settings: &FdrSettings,
     gates: RunGates,
 ) -> Option<Engines> {
     let min_null_size = settings.min_null_size;
 
+    let moments_pool = if gates.run_mom {
+        build_rank_null_pool(
+            features,
+            work,
+            settings,
+            settings.moments_purification_factor,
+            "Moments",
+        )
+    } else {
+        None
+    };
+
+    let mle_pool = if gates.run_mle {
+        build_rank_null_pool(
+            features,
+            work,
+            settings,
+            settings.mle_purification_factor,
+            "MLE",
+        )
+    } else {
+        None
+    };
+
+    let lower_order_pool = if gates.run_lo {
+        build_rank_null_pool(
+            features,
+            work,
+            settings,
+            settings.lower_order_purification_factor,
+            "LowerOrder",
+        )
+    } else {
+        None
+    };
+
+    let msfdr_seeded_pool = if gates.run_msfdr_seeded {
+        build_rank_null_pool(
+            features,
+            work,
+            settings,
+            settings.msfdr_seeded_purification_factor,
+            "MSFDR seeded",
+        )
+    } else {
+        None
+    };
+
+    let nokoi_pool = if gates.run_nokoi {
+        build_rank_null_pool(
+            features,
+            work,
+            settings,
+            settings.nokoi_null_purification_factor,
+            "Nokoi",
+        )
+    } else {
+        None
+    };
+
     let window_ok = |method: &str, window_min: u32, window_max: u32, count: usize| -> bool {
         if count < min_null_size {
-            log::warn!("DF fail-closed: {method}: null window [{window_min}..={window_max}] too small (n={count} < min_null_size={min_null_size}). Skipping.");
+            log::warn!(
+                "{method}: null window [{window_min}..={window_max}] too small \
+				 (n={count} < min_null_size={min_null_size}); expert will be unavailable. \
+				 If this is the selected non-ensemble model, the selected-model guard will fail closed."
+            );
             false
         } else {
             true
@@ -2323,7 +2488,12 @@ fn fit_engines(
 
     // 1) Moments
     let mom_params = if gates.run_mom {
-        let scores = pool.scores_in_window(
+        let Some(moments_pool) = moments_pool.as_ref() else {
+            log::warn!("Moments unavailable: method-specific null pool could not be built.");
+            return None;
+        };
+
+        let scores = moments_pool.scores_in_window(
             settings.moments_min_null_rank,
             settings.moments_max_null_rank,
         );
@@ -2337,7 +2507,10 @@ fn fit_engines(
             if mu.is_finite() && beta.is_finite() && beta > 0.0 {
                 Some((mu, beta))
             } else {
-                log::warn!("DF fail-closed: Moments produced invalid params.");
+                log::warn!(
+                    "Moments fit produced invalid parameters; Moments expert will be unavailable. \
+					 If model_fit=Moments, the selected-model guard will fail closed."
+                );
                 None
             }
         } else {
@@ -2352,7 +2525,13 @@ fn fit_engines(
     let mut lo_tev_by_key: Option<Arc<FnvHashMap<(u32, u8, usize, String), f64>>> = None;
 
     if gates.run_lo {
-        let lo_tev_map = build_lo_tev_from_spectrum_tail_components(features, settings, pool);
+        let Some(lower_order_pool) = lower_order_pool.as_ref() else {
+            log::warn!("LowerOrder unavailable: method-specific null pool could not be built.");
+            return None;
+        };
+
+        let lo_tev_map =
+            build_lo_tev_from_spectrum_tail_components(features, settings, lower_order_pool);
 
         lo_tev_by_key = Some(Arc::new(lo_tev_map.by_key.clone()));
 
@@ -2381,7 +2560,7 @@ fn fit_engines(
             }
         }
 
-        let lo_raw = pool.fit_data_in_window(
+        let lo_raw = lower_order_pool.fit_data_in_window(
             settings.lower_order_min_null_rank,
             settings.lower_order_max_null_rank,
         );
@@ -2489,7 +2668,13 @@ fn fit_engines(
 
     // 3) MLE
     let mle_params = if gates.run_mle {
-        let scores = pool.scores_in_window(settings.mle_min_null_rank, settings.mle_max_null_rank);
+        let Some(mle_pool) = mle_pool.as_ref() else {
+            log::warn!("MLE unavailable: method-specific null pool could not be built.");
+            return None;
+        };
+
+        let scores =
+            mle_pool.scores_in_window(settings.mle_min_null_rank, settings.mle_max_null_rank);
         if window_ok(
             "MLE",
             settings.mle_min_null_rank,
@@ -2501,7 +2686,10 @@ fn fit_engines(
                     Some((mu, beta))
                 }
                 _ => {
-                    log::warn!("DF fail-closed: MLE fit invalid.");
+                    log::warn!(
+                        "MLE fit produced invalid parameters; MLE expert will be unavailable. \
+						 If model_fit=Mle, the selected-model guard will fail closed."
+                    );
                     None
                 }
             }
@@ -2520,8 +2708,13 @@ fn fit_engines(
         .collect();
 
     let msfdr_seeded = if gates.run_msfdr_seeded {
-        let seed_pool =
-            pool.scores_in_window(settings.msfdr_min_null_rank, settings.msfdr_max_null_rank);
+        let Some(msfdr_seeded_pool) = msfdr_seeded_pool.as_ref() else {
+            log::warn!("MSFDR seeded unavailable: method-specific null pool could not be built.");
+            return None;
+        };
+
+        let seed_pool = msfdr_seeded_pool
+            .scores_in_window(settings.msfdr_min_null_rank, settings.msfdr_max_null_rank);
         if window_ok(
             "MSFDR seeded",
             settings.msfdr_min_null_rank,
@@ -2616,8 +2809,14 @@ fn fit_engines(
 
     if gates.run_nokoi {
         log::info!("Running Nokoi Rescoring ...");
-        let nokoi_data =
-            pool.fit_data_in_window(settings.nokoi_min_null_rank, settings.nokoi_max_null_rank);
+
+        let Some(nokoi_pool) = nokoi_pool.as_ref() else {
+            log::warn!("Nokoi unavailable: method-specific null pool could not be built.");
+            return None;
+        };
+
+        let nokoi_data = nokoi_pool
+            .fit_data_in_window(settings.nokoi_min_null_rank, settings.nokoi_max_null_rank);
 
         if window_ok(
             "Nokoi",
@@ -2632,12 +2831,19 @@ fn fit_engines(
                 .collect();
             let threshold = if rank1_hs.len() >= 10 {
                 rank1_hs.sort_by(|a, b| b.total_cmp(a));
-                let top_k =
-                    ((rank1_hs.len() as f64) * settings.purification_factor).round() as usize;
+                let top_k = ((rank1_hs.len() as f64) * settings.nokoi_positive_top_fraction).round()
+                    as usize;
                 rank1_hs[top_k.max(5).min(rank1_hs.len()) - 1]
             } else {
                 f64::INFINITY
             };
+
+            log::info!(
+                "Nokoi training split: null_purification_factor={:.3} positive_top_fraction={:.3} positive_threshold={:.6e}",
+                settings.nokoi_null_purification_factor,
+                settings.nokoi_positive_top_fraction,
+                threshold
+            );
 
             let is_positive = |f: &DfFeature| -> bool {
                 if f.core.rank != 1 {
@@ -2665,7 +2871,7 @@ fn fit_engines(
                 settings.nokoi_max_null_rank,
                 settings.nokoi_k_folds,
                 is_positive,
-                &pool.null_indices,
+                &nokoi_pool.null_indices,
             ) {
                 let nokoi_evidence =
                     nokoi::build_nokoi_evidence_from_crossfit_null(&probs, &null_scores_oof);
@@ -2699,6 +2905,37 @@ fn fit_engines(
             } else {
                 log::warn!("Nokoi disabled: crossfit failed.");
             }
+        }
+    }
+
+    // Fail closed when a non-ensemble selected base model was requested but did not fit.
+    //
+    // In single-model mode, the selected model is the mandatory base DF stream.
+    // Returning Some(Engines { selected_model: None, ... }) would allow
+    // score_base_rank1() to silently substitute p=1.0 / PEP=1.0 for every PSM,
+    // producing a superficially valid but uninformative DF run.
+    //
+    // Ensemble mode is different: unavailable experts are simply excluded from
+    // the ensemble, so missing optional expert fits are allowed there.
+    if !matches!(settings.model_fit, ModelFit::Ensemble) {
+        let selected_fit_ok = match settings.model_fit {
+            ModelFit::Moments => mom_params.is_some(),
+            ModelFit::Mle => mle_params.is_some(),
+            ModelFit::LowerOrder => lo_model.is_some(),
+            ModelFit::Msfdr => msfdr_seeded.is_some(),
+            ModelFit::Msfdr1Smix => msfdr_1smix.is_some(),
+            ModelFit::Msfdr2Smix => msfdr_2smix.is_some(),
+            ModelFit::Nokoi => nokoi_p_values.is_some() && nokoi_peps.is_some(),
+            ModelFit::Ensemble => true,
+        };
+
+        if !selected_fit_ok {
+            log::error!(
+                "DF fail-closed: selected model_fit={:?} did not produce a valid fitted engine. \
+                 Clearing selected DF outputs instead of substituting p=1.0/PEP=1.0.",
+                settings.model_fit
+            );
+            return None;
         }
     }
 
@@ -2782,22 +3019,13 @@ fn build_base_workset(features: &[DfFeature]) -> WorkSet {
     WorkSet::build(features)
 }
 
-fn build_base_null_pool(
-    features: &[DfFeature],
-    work: &WorkSet,
-    settings: &FdrSettings,
-) -> Option<RankNullPool> {
-    build_rank_null_pool(features, work, settings)
-}
-
 fn fit_base_experts(
     features: &[DfFeature],
     work: &WorkSet,
-    pool: &RankNullPool,
     settings: &FdrSettings,
     gates: RunGates,
 ) -> Option<Engines> {
-    fit_engines(features, work, pool, settings, gates)
+    fit_engines(features, work, settings, gates)
 }
 
 fn score_base_rank1(
@@ -3111,9 +3339,19 @@ fn score_base_rank1(
         .unwrap_or(1.0)
         .clamp(0.0, 1.0);
 
-    let pep_mom_vec = grenander_pep_from_p(&p_mom_all, pi0_mom);
-    let pep_mle_vec = grenander_pep_from_p(&p_mle_all, pi0_mle);
-    let pep_lo_vec = grenander_pep_from_p(&p_lo_all, pi0_lo);
+    // Companion PEP-like streams for p-native experts are calibrated on the same
+    // reference population used to estimate pi0, then mapped back to all rank-1
+    // rows by monotone interpolation on the p-value scale.
+    //
+    // This avoids mixing populations between:
+    //   numerator: pi0 estimated from reference target/non-contam/non-entrapment PSMs
+    //   denominator: Grenander density fitted on all rank-1 PSMs
+    //
+    // The resulting pep_* streams remain empirical PEP-like calibration aids, not
+    // formally validated posterior probabilities.
+    let pep_mom_vec = grenander_pep_from_reference_population(&p_mom_all, &is_ref, pi0_mom);
+    let pep_mle_vec = grenander_pep_from_reference_population(&p_mle_all, &is_ref, pi0_mle);
+    let pep_lo_vec = grenander_pep_from_reference_population(&p_lo_all, &is_ref, pi0_lo);
 
     // MSFDR-family models expose both streams:
     // - p_*     = native p-like null/incorrect tail probability
@@ -3190,16 +3428,6 @@ fn write_base_method_outputs(
     let use_mle_expert = gates.run_mle && engines.mle_params.is_some();
     let use_lo_expert = gates.run_lo && engines.lo_model.is_some();
 
-    let lower_order_selected_but_unfit =
-        matches!(settings.model_fit, ModelFit::LowerOrder) && gates.run_lo && !use_lo_expert;
-
-    if lower_order_selected_but_unfit {
-        log::error!(
-			"LO failed closed while model_fit=LowerOrder. \
-			 Selected decoy_free_* base fields will be left blank instead of being filled with p=1.0/PEP=1.0."
-		);
-    }
-
     let use_seeded_expert = gates.run_msfdr_seeded && engines.msfdr_seeded.is_some();
     let use_1smix_expert = gates.run_msfdr_1smix && engines.msfdr_1smix.is_some();
     let use_2smix_expert = gates.run_msfdr_2smix && engines.msfdr_2smix.is_some();
@@ -3207,12 +3435,6 @@ fn write_base_method_outputs(
 
     for (j, r) in base_res.rank1_out.iter().enumerate() {
         let psm = &mut features[r.idx];
-
-        if lower_order_selected_but_unfit {
-            clear_lower_order_outputs(psm);
-            clear_selected_df_outputs(psm);
-            continue;
-        }
 
         psm.p_mom = if use_mom_expert {
             Some(r.p_mom as f32)
@@ -7607,22 +7829,11 @@ pub fn run_df_layers(
         use_ensemble
     );
 
-    // 1B. Null Pool
-    let pool = match build_base_null_pool(&new_features, &work, settings) {
-        Some(p) => p,
-        None => {
-            log::error!("Null distribution too small. Aborting FDR.");
-            new_features.par_iter_mut().for_each(|psm| {
-                clear_all_df_outputs(psm, true);
-            });
-            return new_features;
-        }
-    };
-
-    log::info!("DF: pool_size={}", pool.fit_data.len());
-
-    // 1C. Experts
-    let engines = match fit_base_experts(&new_features, &work, &pool, settings, gates) {
+    // 1B. Experts
+    //
+    // Each expert now builds its own method-specific rank-null pool using its own
+    // purification factor. There is intentionally no shared/global null pool here.
+    let engines = match fit_base_experts(&new_features, &work, settings, gates) {
         Some(e) => e,
         None => {
             log::error!("Invalid null fit. FDR will fail closed.");

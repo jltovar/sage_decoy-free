@@ -429,9 +429,8 @@ pub struct FdrOptions {
     pub max_null_rank: Option<u32>,
 
     // Rank-null pool construction controls
-    pub min_null_size: Option<usize>,     // default 300
-    pub min_rank_count: Option<usize>,    // default 10
-    pub purification_factor: Option<f64>, // default 0.20; clamp 0..0.9
+    pub min_null_size: Option<usize>,  // default 300
+    pub min_rank_count: Option<usize>, // default 10
 
     // Explicit post-base Decoy-Free stage gates.
     // These control whether stage-specific TSV snapshots are produced and whether
@@ -464,18 +463,21 @@ pub struct FdrOptions {
     // =========================================================================
     pub moments_min_null_rank: Option<u32>,
     pub moments_max_null_rank: Option<u32>,
+    pub moments_purification_factor: Option<f64>,
 
     // =========================================================================
     // C) MLE specific knobs
     // =========================================================================
     pub mle_min_null_rank: Option<u32>,
     pub mle_max_null_rank: Option<u32>,
+    pub mle_purification_factor: Option<f64>,
 
     // =========================================================================
     // D) LowerOrder specific knobs
     // =========================================================================
     pub lower_order_min_null_rank: Option<u32>,
     pub lower_order_max_null_rank: Option<u32>,
+    pub lower_order_purification_factor: Option<f64>,
 
     // LowerOrder support threshold.
     // This is not a rank-window selector. The selected LO ranks are controlled
@@ -545,6 +547,7 @@ pub struct FdrOptions {
     // =========================================================================
     pub msfdr_min_null_rank: Option<u32>,
     pub msfdr_max_null_rank: Option<u32>,
+    pub msfdr_seeded_purification_factor: Option<f64>,
 
     // MSFDR init/drift knobs (needed by real models)
     pub msfdr_seeded_top_frac_init: Option<f64>, // default 0.2
@@ -591,6 +594,16 @@ pub struct FdrOptions {
     // =========================================================================
     pub nokoi_min_null_rank: Option<u32>,
     pub nokoi_max_null_rank: Option<u32>,
+
+    /// Nokoi-specific controls.
+    ///
+    /// `nokoi_null_purification_factor` controls lower-rank null-pool
+    /// construction.
+    ///
+    /// `nokoi_positive_top_fraction` controls the high-scoring rank-1 fraction
+    /// used to define Nokoi's positive training class.
+    pub nokoi_null_purification_factor: Option<f64>, // default 0.20; clamp 0..0.9
+    pub nokoi_positive_top_fraction: Option<f64>, // default 0.10; clamp 0..0.9
 
     // Nokoi DF cross-fit calibration
     pub nokoi_k_folds: Option<usize>,
@@ -679,7 +692,6 @@ pub struct FdrSettings {
     // Rank-null pool construction controls
     pub min_null_size: usize,
     pub min_rank_count: usize,
-    pub purification_factor: f64,
 
     // Explicit post-base Decoy-Free stage gates.
     pub enable_rt_confidence_adjustment: bool,
@@ -710,18 +722,21 @@ pub struct FdrSettings {
     // =========================================================================
     pub moments_min_null_rank: u32,
     pub moments_max_null_rank: u32,
+    pub moments_purification_factor: f64,
 
     // =========================================================================
     // C) MLE specific resolved null window
     // =========================================================================
     pub mle_min_null_rank: u32,
     pub mle_max_null_rank: u32,
+    pub mle_purification_factor: f64,
 
     // =========================================================================
     // D) LowerOrder specific resolved null window + knobs
     // =========================================================================
     pub lower_order_min_null_rank: u32,
     pub lower_order_max_null_rank: u32,
+    pub lower_order_purification_factor: f64,
 
     pub lo_min_count_per_rank: usize,
 
@@ -737,6 +752,7 @@ pub struct FdrSettings {
     // =========================================================================
     pub msfdr_min_null_rank: u32,
     pub msfdr_max_null_rank: u32,
+    pub msfdr_seeded_purification_factor: f64,
 
     pub msfdr_seeded_top_frac_init: f64,
     pub msfdr_multistart: usize,
@@ -776,6 +792,10 @@ pub struct FdrSettings {
     // =========================================================================
     pub nokoi_min_null_rank: u32,
     pub nokoi_max_null_rank: u32,
+
+    /// Resolved Nokoi-specific controls.
+    pub nokoi_null_purification_factor: f64,
+    pub nokoi_positive_top_fraction: f64,
 
     pub nokoi_k_folds: usize,
 
@@ -948,7 +968,36 @@ impl From<FdrOptions> for FdrSettings {
         let min_storey_n = options.min_storey_n.unwrap_or(300);
         let min_null_size = options.min_null_size.unwrap_or(300);
 
-        let purification_factor = options.purification_factor.unwrap_or(0.50).clamp(0.0, 0.9);
+        let moments_purification_factor = options
+            .moments_purification_factor
+            .unwrap_or(0.25)
+            .clamp(0.0, 0.9);
+
+        let mle_purification_factor = options
+            .mle_purification_factor
+            .unwrap_or(0.25)
+            .clamp(0.0, 0.9);
+
+        let lower_order_purification_factor = options
+            .lower_order_purification_factor
+            .unwrap_or(0.15)
+            .clamp(0.0, 0.9);
+
+        let msfdr_seeded_purification_factor = options
+            .msfdr_seeded_purification_factor
+            .unwrap_or(0.25)
+            .clamp(0.0, 0.9);
+
+        let nokoi_null_purification_factor = options
+            .nokoi_null_purification_factor
+            .unwrap_or(0.20)
+            .clamp(0.0, 0.9);
+
+        let nokoi_positive_top_fraction = options
+            .nokoi_positive_top_fraction
+            .unwrap_or(0.10)
+            .clamp(0.0, 0.9);
+
         let min_rank_count = options.min_rank_count.unwrap_or(10);
 
         // ---------------------------------------------------------------------
@@ -1275,7 +1324,6 @@ impl From<FdrOptions> for FdrSettings {
             // Rank-null pool construction controls
             min_null_size,
             min_rank_count,
-            purification_factor,
 
             // Explicit post-base Decoy-Free stage gates
             enable_rt_confidence_adjustment,
@@ -1306,18 +1354,21 @@ impl From<FdrOptions> for FdrSettings {
             // =========================================================================
             moments_min_null_rank,
             moments_max_null_rank,
+            moments_purification_factor,
 
             // =========================================================================
             // C) MLE specific resolved null window
             // =========================================================================
             mle_min_null_rank,
             mle_max_null_rank,
+            mle_purification_factor,
 
             // =========================================================================
             // D) LowerOrder specific resolved null window + knobs
             // =========================================================================
             lower_order_min_null_rank,
             lower_order_max_null_rank,
+            lower_order_purification_factor,
 
             lo_min_count_per_rank,
 
@@ -1333,6 +1384,7 @@ impl From<FdrOptions> for FdrSettings {
             // =========================================================================
             msfdr_min_null_rank,
             msfdr_max_null_rank,
+            msfdr_seeded_purification_factor,
 
             msfdr_seeded_top_frac_init,
             msfdr_multistart,
@@ -1372,6 +1424,9 @@ impl From<FdrOptions> for FdrSettings {
             // =========================================================================
             nokoi_min_null_rank,
             nokoi_max_null_rank,
+
+            nokoi_null_purification_factor,
+            nokoi_positive_top_fraction,
 
             nokoi_k_folds,
 

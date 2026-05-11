@@ -410,7 +410,6 @@ impl Input {
                 min_null_size: None,
 
                 // Additional inference controls.
-                purification_factor: None,
                 min_rank_count: None,
 
                 ..Default::default()
