@@ -8658,9 +8658,9 @@ pub fn calculate_protein_q_df(
         .count()
 }
 
-/// Level 4 protein-primary / strict hierarchical reporting.
+/// Level 4 reporting-only flags.
 ///
-/// This is a reporting-only layer. It does not overwrite:
+/// This layer does not overwrite:
 /// - decoy_free_q_value
 /// - decoy_free_peptide_q
 /// - decoy_free_protein_q
@@ -8670,13 +8670,27 @@ pub fn calculate_protein_q_df(
 /// - decoy_free_peptide_supported_psm
 ///
 /// Semantics:
-/// - Off: clear Level 4 flags.
-/// - Strict: protein, peptide, and PSM must each independently pass their thresholds.
-/// - ProteinPrimary: accepted protein is primary; peptide/PSM flags mean
-///   protein-supported observations, not independent peptide/PSM discoveries.
 ///
-/// This layer is gated by entrapment reporting because the intended use is
-/// entrapment-aware validation/reporting.
+/// Off:
+///   no Level 4 columns/flags are written.
+///
+/// Strict:
+///   reportable peptide/PSM flags are derived from the same independent
+///   thresholds used for strict DF reporting:
+///
+///     peptide q <= peptide_fdr
+///     PSM q     <= precursor_fdr
+///
+///   Entrapment status is not filtered here. The TSV column
+///   decoy_free_is_entrapment is used downstream to split target vs
+///   entrapment counts. Therefore, when entrapment counts are zero,
+///   Level 4 strict peptide/PSM counts should match the raw strict
+///   target peptide/PSM counts.
+///
+/// ProteinPrimary:
+///   accepted proteins are inferred first, then peptides/PSMs are restricted
+///   to observations supporting the accepted protein set. These are
+///   protein-supported observations, not independent peptide/PSM discoveries.
 pub fn apply_hierarchical_reporting_df(
     features: &mut [DfFeature],
     db: &IndexedDatabase,
@@ -8708,143 +8722,186 @@ pub fn apply_hierarchical_reporting_df(
 
     if !has_entrapment_proteins {
         log::warn!(
-			"DF Level 4 requested but no entrapment proteins were detected in rank-1 target rows; Level 4 flags were not written."
-		);
+            "DF Level 4 requested but no entrapment proteins were detected in rank-1 target rows; Level 4 flags were not written."
+        );
         return (0, 0);
     }
 
     // From this point forward, Level 4 is active for this run.
     // Mark all rank-1 rows as explicitly evaluated. Later logic upgrades
-    // supported target rows to Some(true). Non-rank-1 rows remain None.
+    // reportable rows to Some(true). Non-rank-1 rows remain None.
     for feat in features.iter_mut().filter(|f| f.core.rank == 1) {
         feat.decoy_free_protein_supported_peptide = Some(false);
         feat.decoy_free_peptide_supported_psm = Some(false);
     }
 
-    let mut accepted_proteins: FnvHashSet<String> = FnvHashSet::default();
+    match settings.hierarchical_reporting {
+        HierarchicalReportingMode::Off => (0, 0),
 
-    for feat in features
-        .iter()
-        .filter(|f| f.core.rank == 1 && f.core.label == 1)
-    {
-        let protein_q = feat.decoy_free_protein_q.unwrap_or(1.0);
-        if protein_q > settings.protein_fdr {
-            continue;
-        }
+        HierarchicalReportingMode::Strict => {
+            let mut strict_reportable_peptides: FnvHashSet<String> = FnvHashSet::default();
+            let mut strict_reportable_psm_count = 0usize;
 
-        let peptide = &db[feat.core.peptide_idx];
+            for feat in features
+                .iter()
+                .filter(|f| f.core.rank == 1 && f.core.label == 1)
+            {
+                let peptide = &db[feat.core.peptide_idx];
+                let peptide_key = peptide.to_string();
 
-        // Keep Level 4 aligned with protein inference:
-        // protein inference is unique-peptide-only.
-        if peptide.proteins.len() != 1 {
-            continue;
-        }
+                let peptide_passes = feat
+                    .decoy_free_peptide_q
+                    .map(|q| q <= settings.peptide_fdr)
+                    .unwrap_or(false);
 
-        let protein_key = peptide.proteins(&db.decoy_tag, db.generate_decoys);
-        accepted_proteins.insert(protein_key);
-    }
+                if peptide_passes {
+                    strict_reportable_peptides.insert(peptide_key);
+                }
+            }
 
-    if accepted_proteins.is_empty() {
-        for feat in features.iter_mut().filter(|f| f.core.rank == 1) {
-            feat.decoy_free_protein_supported_peptide = Some(false);
-            feat.decoy_free_peptide_supported_psm = Some(false);
-        }
+            for feat in features.iter_mut() {
+                if feat.core.rank != 1 {
+                    feat.decoy_free_protein_supported_peptide = None;
+                    feat.decoy_free_peptide_supported_psm = None;
+                    continue;
+                }
 
-        log::info!(
-            "DF Level 4 hierarchical reporting: mode={:?} accepted_proteins=0 protein_supported_peptides=0 peptide_supported_psms=0",
-            settings.hierarchical_reporting
-        );
+                if feat.core.label != 1 {
+                    feat.decoy_free_protein_supported_peptide = Some(false);
+                    feat.decoy_free_peptide_supported_psm = Some(false);
+                    continue;
+                }
 
-        return (0, 0);
-    }
+                let peptide = &db[feat.core.peptide_idx];
+                let peptide_key = peptide.to_string();
 
-    let mut protein_supported_peptides: FnvHashSet<String> = FnvHashSet::default();
+                let peptide_reportable = strict_reportable_peptides.contains(&peptide_key);
 
-    for feat in features
-        .iter()
-        .filter(|f| f.core.rank == 1 && f.core.label == 1)
-    {
-        let peptide = &db[feat.core.peptide_idx];
-
-        if peptide.proteins.len() != 1 {
-            continue;
-        }
-
-        let protein_key = peptide.proteins(&db.decoy_tag, db.generate_decoys);
-        if !accepted_proteins.contains(&protein_key) {
-            continue;
-        }
-
-        let peptide_passes = match settings.hierarchical_reporting {
-            HierarchicalReportingMode::Off => false,
-
-            HierarchicalReportingMode::Strict => feat
-                .decoy_free_peptide_q
-                .map(|q| q <= settings.peptide_fdr)
-                .unwrap_or(false),
-
-            HierarchicalReportingMode::ProteinPrimary => true,
-        };
-
-        if peptide_passes {
-            protein_supported_peptides.insert(peptide.to_string());
-        }
-    }
-
-    let mut peptide_supported_psm_count = 0usize;
-
-    for feat in features.iter_mut() {
-        if feat.core.rank != 1 {
-            feat.decoy_free_protein_supported_peptide = None;
-            feat.decoy_free_peptide_supported_psm = None;
-            continue;
-        }
-
-        if feat.core.label != 1 {
-            feat.decoy_free_protein_supported_peptide = Some(false);
-            feat.decoy_free_peptide_supported_psm = Some(false);
-            continue;
-        }
-
-        let peptide = &db[feat.core.peptide_idx];
-        let peptide_key = peptide.to_string();
-
-        let protein_supported_peptide = protein_supported_peptides.contains(&peptide_key);
-
-        let psm_passes = match settings.hierarchical_reporting {
-            HierarchicalReportingMode::Off => false,
-
-            HierarchicalReportingMode::Strict => {
-                protein_supported_peptide
+                let psm_reportable = peptide_reportable
                     && feat
                         .decoy_free_q_value
                         .map(|q| q <= settings.precursor_fdr)
-                        .unwrap_or(false)
+                        .unwrap_or(false);
+
+                feat.decoy_free_protein_supported_peptide = Some(peptide_reportable);
+                feat.decoy_free_peptide_supported_psm = Some(psm_reportable);
+
+                if psm_reportable {
+                    strict_reportable_psm_count += 1;
+                }
             }
 
-            HierarchicalReportingMode::ProteinPrimary => protein_supported_peptide,
-        };
+            log::info!(
+                "DF Level 4 hierarchical reporting: mode=Strict strict_reportable_peptides={} strict_reportable_psms={}",
+                strict_reportable_peptides.len(),
+                strict_reportable_psm_count
+            );
 
-        feat.decoy_free_protein_supported_peptide = Some(protein_supported_peptide);
-        feat.decoy_free_peptide_supported_psm = Some(psm_passes);
+            (
+                strict_reportable_peptides.len(),
+                strict_reportable_psm_count,
+            )
+        }
 
-        if psm_passes {
-            peptide_supported_psm_count += 1;
+        HierarchicalReportingMode::ProteinPrimary => {
+            let mut accepted_proteins: FnvHashSet<String> = FnvHashSet::default();
+
+            for feat in features
+                .iter()
+                .filter(|f| f.core.rank == 1 && f.core.label == 1)
+            {
+                let protein_q = feat.decoy_free_protein_q.unwrap_or(1.0);
+                if protein_q > settings.protein_fdr {
+                    continue;
+                }
+
+                let peptide = &db[feat.core.peptide_idx];
+
+                // Keep protein-primary reporting aligned with protein inference:
+                // protein inference is unique-peptide-only.
+                if peptide.proteins.len() != 1 {
+                    continue;
+                }
+
+                let protein_key = peptide.proteins(&db.decoy_tag, db.generate_decoys);
+                accepted_proteins.insert(protein_key);
+            }
+
+            if accepted_proteins.is_empty() {
+                for feat in features.iter_mut().filter(|f| f.core.rank == 1) {
+                    feat.decoy_free_protein_supported_peptide = Some(false);
+                    feat.decoy_free_peptide_supported_psm = Some(false);
+                }
+
+                log::info!(
+                    "DF Level 4 hierarchical reporting: mode=ProteinPrimary accepted_proteins=0 protein_supported_peptides=0 peptide_supported_psms=0"
+                );
+
+                return (0, 0);
+            }
+
+            let mut protein_supported_peptides: FnvHashSet<String> = FnvHashSet::default();
+
+            for feat in features
+                .iter()
+                .filter(|f| f.core.rank == 1 && f.core.label == 1)
+            {
+                let peptide = &db[feat.core.peptide_idx];
+
+                if peptide.proteins.len() != 1 {
+                    continue;
+                }
+
+                let protein_key = peptide.proteins(&db.decoy_tag, db.generate_decoys);
+                if !accepted_proteins.contains(&protein_key) {
+                    continue;
+                }
+
+                protein_supported_peptides.insert(peptide.to_string());
+            }
+
+            let mut peptide_supported_psm_count = 0usize;
+
+            for feat in features.iter_mut() {
+                if feat.core.rank != 1 {
+                    feat.decoy_free_protein_supported_peptide = None;
+                    feat.decoy_free_peptide_supported_psm = None;
+                    continue;
+                }
+
+                if feat.core.label != 1 {
+                    feat.decoy_free_protein_supported_peptide = Some(false);
+                    feat.decoy_free_peptide_supported_psm = Some(false);
+                    continue;
+                }
+
+                let peptide = &db[feat.core.peptide_idx];
+                let peptide_key = peptide.to_string();
+
+                let protein_supported_peptide = protein_supported_peptides.contains(&peptide_key);
+                let psm_passes = protein_supported_peptide;
+
+                feat.decoy_free_protein_supported_peptide = Some(protein_supported_peptide);
+                feat.decoy_free_peptide_supported_psm = Some(psm_passes);
+
+                if psm_passes {
+                    peptide_supported_psm_count += 1;
+                }
+            }
+
+            log::info!(
+                "DF Level 4 hierarchical reporting: mode=ProteinPrimary accepted_proteins={} protein_supported_peptides={} peptide_supported_psms={}",
+                accepted_proteins.len(),
+                protein_supported_peptides.len(),
+                peptide_supported_psm_count
+            );
+
+            (
+                protein_supported_peptides.len(),
+                peptide_supported_psm_count,
+            )
         }
     }
-
-    log::info!(
-        "DF Level 4 hierarchical reporting: mode={:?} accepted_proteins={} protein_supported_peptides={} peptide_supported_psms={}",
-        settings.hierarchical_reporting,
-        accepted_proteins.len(),
-        protein_supported_peptides.len(),
-        peptide_supported_psm_count
-    );
-
-    (
-        protein_supported_peptides.len(),
-        peptide_supported_psm_count,
-    )
 }
 
 pub fn decoy_free_precursor(
