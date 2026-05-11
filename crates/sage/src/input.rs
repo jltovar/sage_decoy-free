@@ -95,6 +95,21 @@ pub enum EntrapmentReportMode {
     On,
 }
 
+#[derive(Clone, Copy, Serialize, Deserialize, Debug, Default, PartialEq, Eq)]
+#[serde(rename_all = "snake_case")]
+pub enum HierarchicalReportingMode {
+    #[default]
+    Off,
+
+    /// Requires independent PSM, peptide, and protein thresholds.
+    /// Produces protein-supported peptide and peptide-supported PSM reporting flags.
+    Strict,
+
+    /// Protein is primary. Peptides/PSMs are reportable if they support accepted proteins.
+    /// These are protein-supported observations, not independent peptide/PSM discoveries.
+    ProteinPrimary,
+}
+
 impl Default for EntrapmentReportMode {
     fn default() -> Self {
         Self::Auto
@@ -399,6 +414,23 @@ pub struct FdrOptions {
     pub mode: Option<FdrMode>,
     pub entrapment_report: Option<EntrapmentReportMode>,
 
+    /// Level 4 reporting-only hierarchical inference.
+    ///
+    /// off:
+    ///   current behavior.
+    ///
+    /// strict:
+    ///   reportable peptide/PSM rows must independently pass their own q-value
+    ///   threshold and support an accepted protein.
+    ///
+    /// protein_primary:
+    ///   accepted proteins are primary; downstream peptide/PSM flags indicate
+    ///   protein-supported observations, not independent peptide/PSM discoveries.
+    ///
+    /// This is reporting-only. It must not overwrite decoy_free_q_value,
+    /// decoy_free_peptide_q, or decoy_free_protein_q.
+    pub hierarchical_reporting: Option<HierarchicalReportingMode>,
+
     // Model selection
     pub model_fit: Option<ModelFit>,
 
@@ -675,6 +707,7 @@ pub struct FdrSettings {
     // =========================================================================
     pub mode: FdrMode,
     pub entrapment_report: EntrapmentReportMode,
+    pub hierarchical_reporting: HierarchicalReportingMode,
 
     // Model selection
     pub model_fit: ModelFit,
@@ -977,6 +1010,22 @@ impl From<FdrOptions> for FdrSettings {
         let entrapment_report = options
             .entrapment_report
             .unwrap_or(EntrapmentReportMode::Auto);
+
+        let hierarchical_reporting = options
+            .hierarchical_reporting
+            .unwrap_or(HierarchicalReportingMode::Off);
+
+        let hierarchical_reporting = if hierarchical_reporting != HierarchicalReportingMode::Off
+            && entrapment_report == EntrapmentReportMode::Off
+        {
+            log::warn!(
+                "DF Level 4 hierarchical_reporting={:?} requested, but entrapment_report=off; disabling Level 4 reporting flags.",
+                hierarchical_reporting
+            );
+            HierarchicalReportingMode::Off
+        } else {
+            hierarchical_reporting
+        };
 
         let model_fit = options.model_fit.unwrap_or(ModelFit::Ensemble);
         let protein_p_combine = options.protein_p_combine.unwrap_or(ProteinPCombine::Cauchy);
@@ -1335,6 +1384,7 @@ impl From<FdrOptions> for FdrSettings {
             // =========================================================================
             mode,
             entrapment_report,
+            hierarchical_reporting,
 
             // Model selection
             model_fit,

@@ -195,6 +195,24 @@ pub struct DfFeature {
     #[serde(skip_serializing_if = "Option::is_none")]
     pub decoy_free_protein_q: Option<f32>,
 
+    /// Level 4 reporting-only flag.
+    ///
+    /// True means this rank-1 target PSM's peptide supports at least one accepted
+    /// protein under the configured hierarchical reporting mode.
+    ///
+    /// This is not an independent peptide-level FDR claim.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub decoy_free_protein_supported_peptide: Option<bool>,
+
+    /// Level 4 reporting-only flag.
+    ///
+    /// True means this rank-1 target PSM is reportable because it supports a
+    /// Level-4 protein-supported peptide.
+    ///
+    /// This is not an independent PSM-level FDR claim.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub decoy_free_peptide_supported_psm: Option<bool>,
+
     // =========================================================================
     // Decoy-Free explicit stage snapshots
     // =========================================================================
@@ -635,6 +653,8 @@ impl FeatureCore {
             decoy_free_q_value: None,
             decoy_free_peptide_q: None,
             decoy_free_protein_q: None,
+            decoy_free_protein_supported_peptide: None,
+            decoy_free_peptide_supported_psm: None,
 
             p_mom: None,
             q_mom: None,
