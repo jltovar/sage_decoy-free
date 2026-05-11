@@ -673,12 +673,29 @@ impl Runner {
                 &fdr_settings,
             );
 
+            let (level4_peptides, level4_psms) =
+                sage_core::decoy_free_fdr::apply_hierarchical_reporting_df(
+                    &mut features,
+                    &self.database,
+                    &fdr_settings,
+                );
+
             log::info!(
                 "discovered {} target peptides at {}% FDR (Decoy-Free)",
                 q_peptide,
                 fdr_settings.peptide_fdr * 100.0
             );
             log::info!("discovered {} target proteins (Decoy-Free)", q_protein);
+
+            if fdr_settings.hierarchical_reporting
+                != sage_core::input::HierarchicalReportingMode::Off
+            {
+                log::info!(
+                    "DF Level 4 reporting: protein_supported_peptides={} peptide_supported_psms={}",
+                    level4_peptides,
+                    level4_psms
+                );
+            }
 
             let emit_entrapment_counts = match fdr_settings.entrapment_report {
                 sage_core::input::EntrapmentReportMode::Off => false,
