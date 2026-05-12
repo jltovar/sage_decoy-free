@@ -1251,10 +1251,10 @@ impl Runner {
             DfDynamicColumn::Final("decoy_free_protein_q"),
         ]);
 
-        let entrapment_reporting_active = fdr.entrapment_report != EntrapmentReportMode::Off;
+        let entrapment_reporting_active = fdr.entrapment_report != EntrapmentReportMode::Off
+            || fdr.hierarchical_entrapment_validation;
 
-        let level4_reporting_active = fdr.hierarchical_reporting != HierarchicalReportingMode::Off
-            && entrapment_reporting_active;
+        let level4_reporting_active = fdr.hierarchical_reporting != HierarchicalReportingMode::Off;
 
         if entrapment_reporting_active {
             cols.push(DfDynamicColumn::ReportingFlag("decoy_free_is_entrapment"));

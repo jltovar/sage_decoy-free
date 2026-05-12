@@ -406,6 +406,44 @@ pub struct ReproducibilityConfig {
     pub rescue_band: RescueBandConfig,
 }
 
+#[derive(Clone, Copy, Serialize, Deserialize, Debug, Default, PartialEq, Eq)]
+#[serde(rename_all = "snake_case")]
+pub enum HierarchicalInferenceMode {
+    #[default]
+    Off,
+
+    /// Protein-anchored Level 4 reporting:
+    /// accepted proteins -> protein-supported peptides -> protein-supported PSMs.
+    ProteinAnchored,
+}
+
+#[derive(Clone, Serialize, Deserialize, Debug, PartialEq)]
+pub struct HierarchicalInferenceConfig {
+    /// Enables Level 4 protein-anchored reporting.
+    pub enabled: bool,
+
+    /// Enables entrapment validation output columns/counting support.
+    ///
+    /// This must not affect Level 4 acceptance logic. It only controls whether
+    /// validation labels are emitted for downstream optimization/auditing.
+    #[serde(default)]
+    pub entrapment_validation: bool,
+
+    /// Level 4 mode.
+    #[serde(default)]
+    pub mode: HierarchicalInferenceMode,
+}
+
+impl Default for HierarchicalInferenceConfig {
+    fn default() -> Self {
+        Self {
+            enabled: false,
+            entrapment_validation: false,
+            mode: HierarchicalInferenceMode::Off,
+        }
+    }
+}
+
 #[derive(Clone, Serialize, Deserialize, Debug, Default)]
 pub struct FdrOptions {
     // =========================================================================
@@ -413,23 +451,6 @@ pub struct FdrOptions {
     // =========================================================================
     pub mode: Option<FdrMode>,
     pub entrapment_report: Option<EntrapmentReportMode>,
-
-    /// Level 4 reporting-only hierarchical inference.
-    ///
-    /// off:
-    ///   current behavior.
-    ///
-    /// strict:
-    ///   reportable peptide/PSM rows must independently pass their own q-value
-    ///   threshold and support an accepted protein.
-    ///
-    /// protein_primary:
-    ///   accepted proteins are primary; downstream peptide/PSM flags indicate
-    ///   protein-supported observations, not independent peptide/PSM discoveries.
-    ///
-    /// This is reporting-only. It must not overwrite decoy_free_q_value,
-    /// decoy_free_peptide_q, or decoy_free_protein_q.
-    pub hierarchical_reporting: Option<HierarchicalReportingMode>,
 
     // Model selection
     pub model_fit: Option<ModelFit>,
@@ -695,9 +716,26 @@ pub struct FdrOptions {
     // =========================================================================
     // J) Layer 2: Physical confidence adjustment: RT and IMS Knobs
     //    Layer 3: Reproducibility rescue: peptide and protein
+    //    Level 4: protein-anchored hierarchical inference/reporting
+    /// Level 4 reporting-only hierarchical inference.
+    ///
+    /// off:
+    ///   current behavior.
+    ///
+    /// strict:
+    ///   reportable peptide/PSM rows must independently pass their own q-value
+    ///   threshold and support an accepted protein.
+    ///
+    /// protein_primary:
+    ///   accepted proteins are primary; downstream peptide/PSM flags indicate
+    ///   protein-supported observations, not independent peptide/PSM discoveries.
+    ///
+    /// This is reporting-only. It must not overwrite decoy_free_q_value,
+    /// decoy_free_peptide_q, or decoy_free_protein_q.
     // =========================================================================
     pub physical_rescue: Option<PhysicalRescueConfig>,
     pub reproducibility: Option<ReproducibilityConfig>,
+    pub hierarchical_inference: Option<HierarchicalInferenceConfig>,
 }
 
 #[derive(Clone, Serialize, Debug)]
@@ -707,7 +745,6 @@ pub struct FdrSettings {
     // =========================================================================
     pub mode: FdrMode,
     pub entrapment_report: EntrapmentReportMode,
-    pub hierarchical_reporting: HierarchicalReportingMode,
 
     // Model selection
     pub model_fit: ModelFit,
@@ -890,9 +927,12 @@ pub struct FdrSettings {
     // =========================================================================
     // J) Layer 2: Physical confidence adjustment: RT and IMS Knobs
     //    Layer 3: Reproducibility rescue: peptide and protein
+    //    Level 4: protein-anchored hierarchical inference/reporting
     // =========================================================================
     pub physical_rescue: PhysicalRescueConfig,
     pub reproducibility: ReproducibilityConfig,
+    pub hierarchical_reporting: HierarchicalReportingMode,
+    pub hierarchical_entrapment_validation: bool,
 }
 
 impl From<FdrOptions> for FdrSettings {
@@ -1011,21 +1051,19 @@ impl From<FdrOptions> for FdrSettings {
             .entrapment_report
             .unwrap_or(EntrapmentReportMode::Auto);
 
-        let hierarchical_reporting = options
-            .hierarchical_reporting
-            .unwrap_or(HierarchicalReportingMode::Off);
+        let hierarchical_inference = options.hierarchical_inference.unwrap_or_default();
 
-        let hierarchical_reporting = if hierarchical_reporting != HierarchicalReportingMode::Off
-            && entrapment_report == EntrapmentReportMode::Off
-        {
-            log::warn!(
-                "DF Level 4 hierarchical_reporting={:?} requested, but entrapment_report=off; disabling Level 4 reporting flags.",
-                hierarchical_reporting
-            );
-            HierarchicalReportingMode::Off
+        let hierarchical_reporting = if hierarchical_inference.enabled {
+            match hierarchical_inference.mode {
+                HierarchicalInferenceMode::Off => HierarchicalReportingMode::Off,
+                HierarchicalInferenceMode::ProteinAnchored => HierarchicalReportingMode::Strict,
+            }
         } else {
-            hierarchical_reporting
+            HierarchicalReportingMode::Off
         };
+
+        let hierarchical_entrapment_validation =
+            hierarchical_inference.enabled && hierarchical_inference.entrapment_validation;
 
         let model_fit = options.model_fit.unwrap_or(ModelFit::Ensemble);
         let protein_p_combine = options.protein_p_combine.unwrap_or(ProteinPCombine::Cauchy);
@@ -1384,7 +1422,6 @@ impl From<FdrOptions> for FdrSettings {
             // =========================================================================
             mode,
             entrapment_report,
-            hierarchical_reporting,
 
             // Model selection
             model_fit,
@@ -1562,9 +1599,12 @@ impl From<FdrOptions> for FdrSettings {
             // =========================================================================
             // J) Layer 2: Physical confidence adjustment: RT and IMS Knobs
             //    Layer 3: Reproducibility rescue: peptide and protein
+            //    Level 4: protein-anchored hierarchical inference/reporting
             // =========================================================================
             physical_rescue,
             reproducibility,
+            hierarchical_reporting,
+            hierarchical_entrapment_validation,
         }
     }
 }

@@ -8719,13 +8719,6 @@ pub fn apply_hierarchical_reporting_df(
         return (0, 0);
     }
 
-    if settings.entrapment_report == crate::input::EntrapmentReportMode::Off {
-        log::warn!(
-            "DF Level 4 requested but entrapment_report=off; Level 4 flags were not written."
-        );
-        return (0, 0);
-    }
-
     // From this point forward, Level 4 is active for this run.
     // Mark all rank-1 rows as evaluated. Non-rank-1 rows remain None.
     for feat in features.iter_mut().filter(|f| f.core.rank == 1) {
