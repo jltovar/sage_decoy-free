@@ -336,54 +336,161 @@ pub struct Msfdr1SmixModel {
 }
 
 impl Msfdr1SmixModel {
-    pub fn fit_rank1(
-        rank1_scores: &[f64],
+    #[inline]
+    fn skew_normal_mean(sn: &SkewNormal) -> f64 {
+        let delta = sn.shape / (1.0 + sn.shape * sn.shape).sqrt();
+        sn.location + sn.scale * delta * (2.0 / std::f64::consts::PI).sqrt()
+    }
+
+    #[inline]
+    fn component_strength(sn: &SkewNormal, q90: f64, q95: f64) -> f64 {
+        let mean = Self::skew_normal_mean(sn);
+        let sf90 = sn.sf(q90).max(TINY);
+        let sf95 = sn.sf(q95).max(TINY);
+
+        // Higher-is-better score orientation: prefer the component with the
+        // stronger upper tail, not merely the larger location parameter.
+        mean + 0.5 * (-sf90.log10()) + 0.5 * (-sf95.log10())
+    }
+
+    fn avg_log_likelihood_for(
+        xs: &[f64],
+        correct: &SkewNormal,
+        incorrect1: &SkewNormal,
+        a: f64,
+    ) -> f64 {
+        if xs.is_empty() {
+            return f64::NEG_INFINITY;
+        }
+
+        let a = a.clamp(1e-6, 1.0 - 1e-6);
+        let log_a = a.ln();
+        let log_1ma = (1.0 - a).ln();
+
+        let mut ll = 0.0;
+        for &x in xs {
+            let fc = correct.pdf(x).max(TINY);
+            let f1 = incorrect1.pdf(x).max(TINY);
+
+            ll += log_add_exp(log_a + fc.ln(), log_1ma + f1.ln());
+        }
+
+        ll / xs.len() as f64
+    }
+
+    fn orient_by_upper_tail(mut self, xs: &[f64]) -> Self {
+        if xs.len() < 5 {
+            return self;
+        }
+
+        let q90 = xs[((xs.len() as f64 * 0.90).floor() as usize).min(xs.len() - 1)];
+        let q95 = xs[((xs.len() as f64 * 0.95).floor() as usize).min(xs.len() - 1)];
+
+        let c_strength = Self::component_strength(&self.correct, q90, q95);
+        let i_strength = Self::component_strength(&self.incorrect1, q90, q95);
+
+        if i_strength > c_strength {
+            std::mem::swap(&mut self.correct, &mut self.incorrect1);
+            self.a = (1.0 - self.a).clamp(1e-6, 1.0 - 1e-6);
+        }
+
+        self
+    }
+
+    fn tail_sanity_penalty(&self, xs: &[f64]) -> f64 {
+        if xs.len() < 5 {
+            return 0.0;
+        }
+
+        let q90 = xs[((xs.len() as f64 * 0.90).floor() as usize).min(xs.len() - 1)];
+        let q95 = xs[((xs.len() as f64 * 0.95).floor() as usize).min(xs.len() - 1)];
+
+        let c_mean = Self::skew_normal_mean(&self.correct);
+        let i_mean = Self::skew_normal_mean(&self.incorrect1);
+
+        let c_sf90 = self.correct.sf(q90).max(TINY);
+        let i_sf90 = self.incorrect1.sf(q90).max(TINY);
+        let c_sf95 = self.correct.sf(q95).max(TINY);
+        let i_sf95 = self.incorrect1.sf(q95).max(TINY);
+
+        let mut penalty = 0.0;
+
+        if c_mean <= i_mean {
+            penalty += 10.0;
+        }
+        if c_sf90 <= i_sf90 {
+            penalty += 5.0;
+        }
+        if c_sf95 <= i_sf95 {
+            penalty += 5.0;
+        }
+
+        penalty
+    }
+
+    fn fit_rank1_once(
+        xs: &[f64],
         iters: usize,
         em_tol: f64,
         pi_clamp: (f64, f64),
         bottom_frac_init: f64,
         top_frac_init: f64,
-    ) -> Option<Self> {
-        let mut xs: Vec<f64> = rank1_scores
-            .iter()
-            .copied()
-            .filter(|x| x.is_finite())
-            .collect();
-
-        if xs.len() < 20 {
+        bottom_skew_seed: f64,
+        top_skew_seed: f64,
+    ) -> Option<(Self, f64)> {
+        let n = xs.len();
+        if n < 20 {
             return None;
         }
 
-        xs.sort_by(|a, b| a.total_cmp(b));
-        let n = xs.len();
+        let min_seed_n = if n < 100 {
+            10usize
+        } else if n < 1000 {
+            25usize
+        } else {
+            50usize
+        };
 
         // Incorrect I1 initialization from the lower part of S1.
         let bottom_frac = bottom_frac_init.clamp(0.10, 0.90);
         let bottom_n = ((n as f64) * bottom_frac).round() as usize;
-        let bottom_n = bottom_n.max(10).min(n);
+        let bottom_n = bottom_n.max(min_seed_n).min(n);
         let bottom = &xs[..bottom_n];
-
-        let b_mean = bottom.iter().sum::<f64>() / bottom.len() as f64;
-        let b_var = bottom.iter().map(|v| (v - b_mean).powi(2)).sum::<f64>() / bottom.len() as f64;
-        let b_skew = sample_skewness(bottom, b_mean, b_var);
-
-        let mut incorrect1 = SkewNormal::from_moments(b_mean, b_var.max(1e-12), b_skew)
-            .unwrap_or_else(|| SkewNormal::new(b_mean, b_var.sqrt().max(1e-6), 0.0));
 
         // Correct C initialization from the upper part of S1.
         let top_frac = top_frac_init.clamp(0.05, 0.50);
         let top_n = ((n as f64) * top_frac).round() as usize;
-        let top_n = top_n.max(10).min(n);
+        let top_n = top_n.max(min_seed_n).min(n);
         let top = &xs[(n - top_n)..];
+
+        if bottom.len() < 10 || top.len() < 10 {
+            return None;
+        }
+
+        let b_mean = bottom.iter().sum::<f64>() / bottom.len() as f64;
+        let b_var = bottom.iter().map(|v| (v - b_mean).powi(2)).sum::<f64>() / bottom.len() as f64;
+        let b_skew_emp = sample_skewness(bottom, b_mean, b_var);
+        let b_skew = if bottom_skew_seed == 0.0 {
+            0.0
+        } else {
+            (bottom_skew_seed * b_skew_emp).clamp(-0.99, 0.99)
+        };
+
+        let mut incorrect1 = SkewNormal::from_moments(b_mean, b_var.max(1e-12), b_skew)
+            .unwrap_or_else(|| SkewNormal::new(b_mean, b_var.sqrt().max(1e-6), 0.0));
 
         let t_mean = top.iter().sum::<f64>() / top.len() as f64;
         let t_var = top.iter().map(|v| (v - t_mean).powi(2)).sum::<f64>() / top.len() as f64;
-        let t_skew = sample_skewness(top, t_mean, t_var);
+        let t_skew_emp = sample_skewness(top, t_mean, t_var);
+        let t_skew = if top_skew_seed == 0.0 {
+            0.0
+        } else {
+            (top_skew_seed * t_skew_emp).clamp(-0.99, 0.99)
+        };
 
         let mut correct = SkewNormal::from_moments(t_mean, t_var.max(1e-12), t_skew)
             .unwrap_or_else(|| SkewNormal::new(t_mean, t_var.sqrt().max(1e-6), 0.0));
 
-        // Paper initializes a at 0.5. Keep clamp to preserve your safety controls.
         let mut a_mix = 0.5f64.clamp(pi_clamp.0, pi_clamp.1);
 
         let iters = iters.max(10).min(500);
@@ -391,7 +498,6 @@ impl Msfdr1SmixModel {
 
         for _ in 0..iters {
             let a0 = a_mix.clamp(1e-6, 1.0 - 1e-6);
-
             let log_a = a0.ln();
             let log_1ma = (1.0 - a0).ln();
 
@@ -399,7 +505,7 @@ impl Msfdr1SmixModel {
             let mut p1 = Vec::with_capacity(n);
             let mut ll = 0.0;
 
-            for &x in &xs {
+            for &x in xs {
                 let fc = correct.pdf(x).max(TINY);
                 let f1 = incorrect1.pdf(x).max(TINY);
 
@@ -429,24 +535,127 @@ impl Msfdr1SmixModel {
 
             a_mix = (sum_pc / n as f64).clamp(pi_clamp.0, pi_clamp.1);
 
-            if let Some((m, v, s)) = weighted_moments(&xs, &pc) {
-                if let Some(sn) = SkewNormal::from_moments(m, v.max(1e-12), s) {
+            if let Some((m, v, s)) = weighted_moments(xs, &pc) {
+                if let Some(sn) = SkewNormal::from_moments(m, v.max(1e-12), s.clamp(-0.99, 0.99)) {
                     correct = sn;
                 }
             }
 
-            if let Some((m, v, s)) = weighted_moments(&xs, &p1) {
-                if let Some(sn) = SkewNormal::from_moments(m, v.max(1e-12), s) {
+            if let Some((m, v, s)) = weighted_moments(xs, &p1) {
+                if let Some(sn) = SkewNormal::from_moments(m, v.max(1e-12), s.clamp(-0.99, 0.99)) {
                     incorrect1 = sn;
                 }
             }
         }
 
-        Some(Self {
+        let model = Self {
             correct,
             incorrect1,
             a: a_mix,
-        })
+        }
+        .orient_by_upper_tail(xs);
+
+        let ll = Self::avg_log_likelihood_for(xs, &model.correct, &model.incorrect1, model.a);
+        let penalty = model.tail_sanity_penalty(xs);
+
+        Some((model, ll - penalty))
+    }
+
+    pub fn fit_rank1(
+        rank1_scores: &[f64],
+        iters: usize,
+        em_tol: f64,
+        pi_clamp: (f64, f64),
+        bottom_frac_init: f64,
+        top_frac_init: f64,
+    ) -> Option<Self> {
+        let mut xs: Vec<f64> = rank1_scores
+            .iter()
+            .copied()
+            .filter(|x| x.is_finite())
+            .collect();
+
+        if xs.len() < 20 {
+            return None;
+        }
+
+        xs.sort_by(|a, b| a.total_cmp(b));
+        let n = xs.len();
+
+        let mut bottom_fracs = vec![
+            bottom_frac_init.clamp(0.10, 0.90),
+            0.30,
+            0.40,
+            0.50,
+            0.60,
+            0.70,
+        ];
+        bottom_fracs.sort_by(|a, b| a.total_cmp(b));
+        bottom_fracs.dedup_by(|a, b| (*a - *b).abs() < 1e-12);
+
+        let mut top_fracs = vec![top_frac_init.clamp(0.05, 0.50), 0.10, 0.20, 0.30, 0.40];
+        top_fracs.sort_by(|a, b| a.total_cmp(b));
+        top_fracs.dedup_by(|a, b| (*a - *b).abs() < 1e-12);
+
+        // Small-dataset fallback: keep the search compact and close to the
+        // user-provided/paper-like initialization so seeds are not too sparse.
+        if n < 100 {
+            bottom_fracs = vec![bottom_frac_init.clamp(0.10, 0.90), 0.50];
+            top_fracs = vec![top_frac_init.clamp(0.05, 0.50), 0.20];
+            bottom_fracs.sort_by(|a, b| a.total_cmp(b));
+            bottom_fracs.dedup_by(|a, b| (*a - *b).abs() < 1e-12);
+            top_fracs.sort_by(|a, b| a.total_cmp(b));
+            top_fracs.dedup_by(|a, b| (*a - *b).abs() < 1e-12);
+        }
+
+        let skew_signs = [1.0, -1.0, 0.0];
+
+        let mut best: Option<(Self, f64, f64, f64)> = None;
+
+        for &bottom_frac in &bottom_fracs {
+            for &top_frac in &top_fracs {
+                for &bottom_skew_seed in &skew_signs {
+                    for &top_skew_seed in &skew_signs {
+                        let Some((model, score)) = Self::fit_rank1_once(
+                            &xs,
+                            iters,
+                            em_tol,
+                            pi_clamp,
+                            bottom_frac,
+                            top_frac,
+                            bottom_skew_seed,
+                            top_skew_seed,
+                        ) else {
+                            continue;
+                        };
+
+                        let replace = best
+                            .as_ref()
+                            .map(|(_, best_score, _, _)| score > *best_score)
+                            .unwrap_or(true);
+
+                        if replace {
+                            best = Some((model, score, bottom_frac, top_frac));
+                        }
+                    }
+                }
+            }
+        }
+
+        let Some((model, score, bottom_frac, top_frac)) = best else {
+            return None;
+        };
+
+        log::info!(
+            "DF MSFDR 1smix selected init: bottom_frac={:.3} top_frac={:.3} score={:.6e} correct_mean={:.6e} incorrect_mean={:.6e}",
+            bottom_frac,
+            top_frac,
+            score,
+            Self::skew_normal_mean(&model.correct),
+            Self::skew_normal_mean(&model.incorrect1),
+        );
+
+        Some(model)
     }
 
     /// Local posterior error probability: P(I1 | x).

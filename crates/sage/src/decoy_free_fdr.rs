@@ -7221,12 +7221,13 @@ fn apply_recurrence_null_pvalue_update_to_active_stream(
         let base_score = -base_p.log10();
         let combined_score = -combined_p.log10();
 
-        let max_shift = settings.reproducibility.max_total_shift.max(0.0);
-        let bounded_score = if combined_score > base_score {
-            base_score + (combined_score - base_score).min(max_shift)
-        } else {
-            combined_score
-        };
+        let max_total_shift = settings.reproducibility.max_total_shift.max(0.0);
+        let max_recurrence_shift = settings.reproducibility.max_recurrence_shift.max(0.0);
+        let max_shift = max_total_shift.min(max_recurrence_shift);
+
+        let raw_delta = combined_score - base_score;
+        let bounded_delta = raw_delta.clamp(-max_shift, max_shift);
+        let bounded_score = (base_score + bounded_delta).max(0.0);
 
         let p_new = finite_df_p_value(10.0_f64.powf(-bounded_score));
 
@@ -7246,6 +7247,20 @@ fn apply_recurrence_null_pvalue_update_to_active_stream(
 
     recalibrate_companion_pep_from_active_p_values(features, settings, "recurrence p-value rescue");
     recalculate_active_q_values(features, settings);
+
+    let configured_shift_cap = settings
+        .reproducibility
+        .max_total_shift
+        .max(0.0)
+        .min(settings.reproducibility.max_recurrence_shift.max(0.0));
+
+    if max_shift_applied > configured_shift_cap + 1e-9 {
+        log::warn!(
+            "DF recurrence p-value rescue exceeded configured cap: observed={:.6e} cap={:.6e}",
+            max_shift_applied,
+            configured_shift_cap
+        );
+    }
 
     ReproducibilityResult {
         enabled: true,
@@ -7360,7 +7375,7 @@ fn apply_bounded_repro_shift(
 
         cnt += 1;
 
-        let prior_pep = f.decoy_free_pep.unwrap_or(1.0) as f64;
+        let prior_pep = f.decoy_free_pep.unwrap_or(1.0);
         let pep_id = f.core.peptide_idx.0;
 
         let expert_s = compute_expert_agreement_support(f, settings)
