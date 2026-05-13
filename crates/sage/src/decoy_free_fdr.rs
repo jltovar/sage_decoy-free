@@ -520,26 +520,60 @@ fn combine_peps(
 }
 
 // -----------------------------------------------------------------------------
+// 3B) DF numeric boundary helpers
+// -----------------------------------------------------------------------------
+//
+// Storage policy:
+//   - DF p-values are stored as f64 so MSFDR values down to 1e-300 survive.
+//   - Do not globally floor p-values at 1e-15.
+//
+// Transform policy:
+//   - p-value log-space transforms may use values down to 1e-300.
+//   - PEP/logit transforms must not see 0.0 or 1.0.
+
+const DF_PVALUE_FLOOR: f64 = 1.0e-300;
+const DF_PEP_FLOOR: f64 = 1.0e-15;
+const DF_PEP_CEIL: f64 = 1.0 - 1.0e-15;
+
+#[inline(always)]
+fn finite_df_p_value(x: f64) -> f64 {
+    if x.is_finite() {
+        x.clamp(DF_PVALUE_FLOOR, 1.0)
+    } else {
+        1.0
+    }
+}
+
+#[inline(always)]
+fn finite_df_probability_for_logit(x: f64) -> f64 {
+    if x.is_finite() {
+        x.clamp(DF_PEP_FLOOR, DF_PEP_CEIL)
+    } else {
+        1.0
+    }
+}
+
+// -----------------------------------------------------------------------------
 // 4) Feature field helpers (tiny setters/getters for DF streams)
 // -----------------------------------------------------------------------------
 
 #[inline(always)]
-fn set_df_q_value(psm: &mut DfFeature, q: f32) {
-    psm.decoy_free_q_value = Some(q);
+fn set_df_q_value(psm: &mut DfFeature, q: f64) {
+    psm.decoy_free_q_value = Some(finite_df_p_value(q));
 }
 
 #[inline(always)]
-fn df_q_value(psm: &DfFeature) -> f32 {
+fn df_q_value(psm: &DfFeature) -> f64 {
     psm.decoy_free_q_value.unwrap_or(1.0)
 }
 
 #[inline(always)]
-fn df_score_from_p_value(p: f64) -> f32 {
-    (-10.0 * p.clamp(1e-300, 1.0).log10()) as f32
+fn df_score_from_p_value(p: f64) -> f64 {
+    -10.0 * finite_df_p_value(p).log10()
 }
 
 #[inline(always)]
-fn df_score_from_active(active: ActiveEvidenceSpace, p_value: f64, pep: f64) -> f32 {
+fn df_score_from_active(active: ActiveEvidenceSpace, p_value: f64, pep: f64) -> f64 {
     match active {
         ActiveEvidenceSpace::PValue => df_score_from_p_value(p_value),
         ActiveEvidenceSpace::Pep => df_score_from_pep(pep),
@@ -548,11 +582,11 @@ fn df_score_from_active(active: ActiveEvidenceSpace, p_value: f64, pep: f64) -> 
 
 #[inline(always)]
 fn set_df_evidence_pair(psm: &mut DfFeature, active: ActiveEvidenceSpace, p_value: f64, pep: f64) {
-    let p_value = p_value.clamp(1e-300, 1.0);
-    let pep = pep.clamp(1e-300, 1.0);
+    let p_value = finite_df_p_value(p_value);
+    let pep = finite_df_probability_for_logit(pep);
 
-    psm.decoy_free_p_value = Some(p_value as f32);
-    psm.decoy_free_pep = Some(pep as f32);
+    psm.decoy_free_p_value = Some(p_value);
+    psm.decoy_free_pep = Some(pep);
     psm.decoy_free_score = Some(df_score_from_active(active, p_value, pep));
 }
 
@@ -853,6 +887,8 @@ pub fn calculate_entrapment_counts_df(
     peptide_fdr: f32,
     protein_fdr: f32,
 ) -> EntrapmentCounts {
+    let peptide_fdr = peptide_fdr as f64;
+    let protein_fdr = protein_fdr as f64;
     let mut counts = EntrapmentCounts::default();
     let mut peptide_set: FnvHashSet<String> = FnvHashSet::default();
     let mut protein_set: FnvHashSet<String> = FnvHashSet::default();
@@ -985,8 +1021,8 @@ fn summarize_pvec(name: &str, p: &[f64]) {
     );
 }
 
-fn summarize_q(label: &str, qs_in: impl Iterator<Item = f32>) {
-    let mut qs: Vec<f32> = qs_in.filter(|q| q.is_finite()).collect();
+fn summarize_q(label: &str, qs_in: impl Iterator<Item = f64>) {
+    let mut qs: Vec<f64> = qs_in.filter(|q| q.is_finite()).collect();
 
     if qs.is_empty() {
         log::info!("DF DEBUG {}: n=0 (no finite q)", label);
@@ -3510,73 +3546,73 @@ fn write_base_method_outputs(
         let psm = &mut features[r.idx];
 
         psm.p_mom = if use_mom_expert {
-            Some(r.p_mom as f32)
+            Some(finite_df_p_value(r.p_mom))
         } else {
             None
         };
         psm.p_mle = if use_mle_expert {
-            Some(r.p_mle as f32)
+            Some(finite_df_p_value(r.p_mle))
         } else {
             None
         };
         psm.p_lo = if use_lo_expert {
-            Some(r.p_lo as f32)
+            Some(finite_df_p_value(r.p_lo))
         } else {
             None
         };
         psm.p_msfdr = if use_seeded_expert {
-            r.p_msfdr.map(|v| v as f32)
+            r.p_msfdr.map(finite_df_p_value)
         } else {
             None
         };
         psm.p_1smix = if use_1smix_expert {
-            r.p_1smix.map(|v| v as f32)
+            r.p_1smix.map(finite_df_p_value)
         } else {
             None
         };
         psm.p_2smix = if use_2smix_expert {
-            r.p_2smix.map(|v| v as f32)
+            r.p_2smix.map(finite_df_p_value)
         } else {
             None
         };
         psm.p_nokoi = if use_nokoi_expert {
-            r.p_nokoi.map(|v| v as f32)
+            r.p_nokoi.map(finite_df_p_value)
         } else {
             None
         };
 
         psm.pep_mom = if use_mom_expert {
-            Some(base_res.pep_mom_vec[j] as f32)
+            Some(finite_df_probability_for_logit(base_res.pep_mom_vec[j]))
         } else {
             None
         };
         psm.pep_mle = if use_mle_expert {
-            Some(base_res.pep_mle_vec[j] as f32)
+            Some(finite_df_probability_for_logit(base_res.pep_mle_vec[j]))
         } else {
             None
         };
         psm.pep_lo = if use_lo_expert {
-            Some(base_res.pep_lo_vec[j] as f32)
+            Some(finite_df_probability_for_logit(base_res.pep_lo_vec[j]))
         } else {
             None
         };
         psm.pep_msfdr = if use_seeded_expert {
-            Some(base_res.pep_msfdr_vec[j] as f32)
+            Some(finite_df_probability_for_logit(base_res.pep_msfdr_vec[j]))
         } else {
             None
         };
         psm.pep_1smix = if use_1smix_expert {
-            Some(base_res.pep_1smix_vec[j] as f32)
+            Some(finite_df_probability_for_logit(base_res.pep_1smix_vec[j]))
         } else {
             None
         };
         psm.pep_2smix = if use_2smix_expert {
-            Some(base_res.pep_2smix_vec[j] as f32)
+            Some(finite_df_probability_for_logit(base_res.pep_2smix_vec[j]))
         } else {
             None
         };
         psm.pep_nokoi = if use_nokoi_expert {
-            Some(base_res.pep_nokoi_vec[j] as f32)
+            Some(finite_df_probability_for_logit(base_res.pep_nokoi_vec[j]))
         } else {
             None
         };
@@ -3818,11 +3854,7 @@ fn finalize_base_q_values(
     let rank1_p: Vec<f64> = work
         .rank1_indices
         .iter()
-        .filter_map(|&i| {
-            features[i]
-                .decoy_free_p_value
-                .map(|p| (p as f64).clamp(0.0, 1.0).max(1e-300))
-        })
+        .filter_map(|&i| features[i].decoy_free_p_value.map(finite_df_p_value))
         .collect();
 
     log_rank1_composition(features, work, db);
@@ -3835,7 +3867,7 @@ fn finalize_base_q_values(
             .filter_map(|&i| {
                 features[i]
                     .decoy_free_pep
-                    .map(|p| (p as f64).clamp(0.0, 1.0).max(1e-300))
+                    .map(finite_df_probability_for_logit)
             })
             .collect();
         summarize_pvec("rank1_pep (chosen stream, pre-q)", &rank1_pep);
@@ -3907,7 +3939,7 @@ fn finalize_base_q_values(
                 .iter()
                 .filter_map(|&i| {
                     let f = &features[i];
-                    let pep = f.decoy_free_pep? as f64;
+                    let pep = f.decoy_free_pep?;
                     if !pep.is_finite() {
                         return None;
                     }
@@ -3922,7 +3954,7 @@ fn finalize_base_q_values(
                 .collect();
 
             for (feat_idx, q) in q_from_pep_cummean(rows) {
-                set_df_q_value(&mut features[feat_idx], q as f32);
+                set_df_q_value(&mut features[feat_idx], q);
             }
         }
 
@@ -3943,7 +3975,7 @@ fn finalize_base_q_values(
             );
 
             for (&idx, q) in work.rank1_indices.iter().zip(q_values) {
-                set_df_q_value(&mut features[idx], q as f32);
+                set_df_q_value(&mut features[idx], q);
             }
         }
     }
@@ -4109,19 +4141,19 @@ fn finalize_base_q_values(
     let q_nokoi_present = compute_q_present(&p_nokoi_present, &p_nokoi_ref);
 
     for (j, &k) in mom_pos.iter().enumerate() {
-        features[work.rank1_indices[k]].q_mom = Some(q_mom_present[j] as f32);
+        features[work.rank1_indices[k]].q_mom = Some(finite_df_p_value(q_mom_present[j]));
     }
     for (j, &k) in mle_pos.iter().enumerate() {
-        features[work.rank1_indices[k]].q_mle = Some(q_mle_present[j] as f32);
+        features[work.rank1_indices[k]].q_mle = Some(finite_df_p_value(q_mle_present[j]));
     }
     for (j, &k) in lo_pos.iter().enumerate() {
-        features[work.rank1_indices[k]].q_lo = Some(q_lo_present[j] as f32);
+        features[work.rank1_indices[k]].q_lo = Some(finite_df_p_value(q_lo_present[j]));
     }
     for (j, &k) in msfdr_pos.iter().enumerate() {
-        features[work.rank1_indices[k]].q_msfdr = Some(q_msfdr_present[j] as f32);
+        features[work.rank1_indices[k]].q_msfdr = Some(finite_df_p_value(q_msfdr_present[j]));
     }
     for (j, &k) in nokoi_pos.iter().enumerate() {
-        features[work.rank1_indices[k]].q_nokoi = Some(q_nokoi_present[j] as f32);
+        features[work.rank1_indices[k]].q_nokoi = Some(finite_df_p_value(q_nokoi_present[j]));
     }
 
     {
@@ -4139,7 +4171,7 @@ fn finalize_base_q_values(
             .collect();
         for (i, q) in q_from_pep_cummean(rows_1smix) {
             if features[i].core.rank == 1 && features[i].pep_1smix.is_some() {
-                features[i].q_1smix = Some(q as f32);
+                features[i].q_1smix = Some(finite_df_p_value(q));
             }
         }
 
@@ -4157,7 +4189,7 @@ fn finalize_base_q_values(
             .collect();
         for (i, q) in q_from_pep_cummean(rows_2smix) {
             if features[i].core.rank == 1 && features[i].pep_2smix.is_some() {
-                features[i].q_2smix = Some(q as f32);
+                features[i].q_2smix = Some(finite_df_p_value(q));
             }
         }
     }
@@ -4172,8 +4204,8 @@ fn build_physical_anchor_set(
     settings: &FdrSettings,
     _db: &crate::database::IndexedDatabase,
 ) -> Vec<usize> {
-    let max_pep = settings.physical_rescue.anchor_max_pep as f32;
-    let max_q = settings.physical_rescue.anchor_max_q;
+    let max_pep = settings.physical_rescue.anchor_max_pep as f64;
+    let max_q = settings.physical_rescue.anchor_max_q as f64;
 
     features
         .iter()
@@ -4194,7 +4226,7 @@ fn build_physical_anchor_set(
             // The q-value threshold enforces global base-stream confidence before a PSM can
             // contribute to RT/IMS reliability estimation.
             let q = f.decoy_free_q_base.unwrap_or(1.0);
-            if q > max_q as f32 {
+            if q > max_q {
                 return false;
             }
 
@@ -4344,8 +4376,8 @@ fn summarize_anchor_coverage(
 ) {
     use std::collections::{HashMap, HashSet};
 
-    let max_pep = settings.physical_rescue.anchor_max_pep as f32;
-    let max_q = settings.physical_rescue.anchor_max_q;
+    let max_pep = settings.physical_rescue.anchor_max_pep as f64;
+    let max_q = settings.physical_rescue.anchor_max_q as f64;
     let min_per_run = settings.physical_rescue.min_anchor_count_per_run;
     let min_per_charge = settings.physical_rescue.min_anchor_count_per_charge;
     let anchor_mode = &settings.physical_rescue.anchor_mode;
@@ -4376,7 +4408,7 @@ fn summarize_anchor_coverage(
             let pep = f.decoy_free_pep_base.unwrap_or(1.0);
             let q = f.decoy_free_q_base.unwrap_or(1.0);
 
-            pep.is_finite() && pep <= max_pep && q <= max_q as f32
+            pep.is_finite() && pep <= max_pep && q <= max_q
         })
         .map(|(i, _)| i)
         .collect();
@@ -5216,24 +5248,19 @@ fn apply_rt_null_pvalue_update_to_active_stream(
     }
 
     for f in features.iter_mut().filter(|f| f.core.rank == 1) {
-        let base_p = f.decoy_free_p_value.unwrap_or(1.0) as f64;
+        let base_p = finite_df_p_value(f.decoy_free_p_value.unwrap_or(1.0));
 
         let p_rt = rt_aux_null_p_value(&model, settings, f);
-        let p_new = combine_cauchy(&[base_p, p_rt]).clamp(1e-300, 1.0);
+        let p_new = finite_df_p_value(combine_cauchy(&[base_p, p_rt]));
 
         /*
          * Placeholder PEP is overwritten immediately below by
          * recalibrate_companion_pep_from_active_p_values(...).
          * The score is already correct because active evidence is p-value.
          */
-        let placeholder_pep = f.decoy_free_pep.unwrap_or(1.0) as f64;
+        let placeholder_pep = finite_df_probability_for_logit(f.decoy_free_pep.unwrap_or(1.0));
 
-        set_df_evidence_pair(
-            f,
-            ActiveEvidenceSpace::PValue,
-            p_new,
-            placeholder_pep.clamp(1e-300, 1.0),
-        );
+        set_df_evidence_pair(f, ActiveEvidenceSpace::PValue, p_new, placeholder_pep);
     }
 
     recalibrate_companion_pep_from_active_p_values(features, settings, "RT p-value rescue");
@@ -5341,21 +5368,17 @@ fn apply_rt_bounded_update_to_active_stream(
             }
         };
 
-        f.decoy_free_pep = Some(posterior_pep as f32);
+        f.decoy_free_pep = Some(finite_df_probability_for_logit(posterior_pep));
 
-        let df_score = (-10.0 * posterior_pep.max(1e-15).log10()) as f32;
+        let df_score = df_score_from_pep(posterior_pep);
         f.decoy_free_score = Some(df_score);
 
-        rows_for_q.push((
-            df_score as f64,
-            i,
-            posterior_pep.clamp(0.0, 1.0).max(1e-300),
-        ));
+        rows_for_q.push((df_score, i, posterior_pep.clamp(0.0, 1.0).max(1e-300)));
     }
 
     if !is_unreliable {
         for (feat_idx, q) in q_from_pep_cummean(rows_for_q) {
-            features[feat_idx].decoy_free_q_value = Some(q as f32);
+            features[feat_idx].decoy_free_q_value = Some(finite_df_p_value(q));
         }
     }
 
@@ -5534,12 +5557,7 @@ fn apply_ims_null_pvalue_update_to_active_stream(
          */
         let placeholder_pep = f.decoy_free_pep.unwrap_or(1.0) as f64;
 
-        set_df_evidence_pair(
-            f,
-            ActiveEvidenceSpace::PValue,
-            p_new,
-            placeholder_pep.clamp(1e-300, 1.0),
-        );
+        set_df_evidence_pair(f, ActiveEvidenceSpace::PValue, p_new, placeholder_pep);
     }
 
     recalibrate_companion_pep_from_active_p_values(features, settings, "IMS p-value rescue");
@@ -5670,21 +5688,17 @@ fn apply_ims_bounded_update_to_active_stream(
             }
         };
 
-        f.decoy_free_pep = Some(posterior_pep as f32);
+        f.decoy_free_pep = Some(finite_df_probability_for_logit(posterior_pep));
 
-        let df_score = (-10.0 * posterior_pep.max(1e-15).log10()) as f32;
+        let df_score = df_score_from_pep(posterior_pep);
         f.decoy_free_score = Some(df_score);
 
-        rows_for_q.push((
-            df_score as f64,
-            i,
-            posterior_pep.clamp(0.0, 1.0).max(1e-300),
-        ));
+        rows_for_q.push((df_score, i, posterior_pep.clamp(0.0, 1.0).max(1e-300)));
     }
 
     if !is_unreliable {
         for (feat_idx, q) in q_from_pep_cummean(rows_for_q) {
-            features[feat_idx].decoy_free_q_value = Some(q as f32);
+            features[feat_idx].decoy_free_q_value = Some(finite_df_p_value(q));
         }
     }
 
@@ -6005,8 +6019,8 @@ fn apply_ims_dart_bayes_update_to_active_stream(
             .clamp(0.0, 1.0)
             .max(1e-300);
 
-        f.decoy_free_pep = Some(posterior_pep as f32);
-        f.decoy_free_score = Some((-10.0 * posterior_pep.max(1e-15).log10()) as f32);
+        f.decoy_free_pep = Some(finite_df_probability_for_logit(posterior_pep));
+        f.decoy_free_score = Some(df_score_from_pep(posterior_pep));
 
         f.dart_posterior_used = Some(true);
 
@@ -6605,8 +6619,8 @@ fn apply_dart_bayes_update(
 
         let posterior_pep = compute_dart_posterior_pep(prior_pep, log_lik_true, log_lik_null);
 
-        f.decoy_free_pep = Some(posterior_pep as f32);
-        f.decoy_free_score = Some((-10.0 * posterior_pep.max(1e-15).log10()) as f32);
+        f.decoy_free_pep = Some(finite_df_probability_for_logit(posterior_pep));
+        f.decoy_free_score = Some(df_score_from_pep(posterior_pep));
 
         f.dart_posterior_used = Some(true);
         f.dart_rt_lik_correct = Some(log_lik_true as f32);
@@ -6701,8 +6715,8 @@ fn apply_bounded_physical_shift(
             }
         };
 
-        f.decoy_free_pep = Some(posterior_pep as f32);
-        let df_score = (-10.0 * posterior_pep.max(1e-15).log10()) as f32;
+        f.decoy_free_pep = Some(finite_df_probability_for_logit(posterior_pep));
+        let df_score = df_score_from_pep(posterior_pep);
         f.decoy_free_score = Some(df_score);
 
         f.physical_shift_total = Some(bounded_shift as f32);
@@ -6841,7 +6855,7 @@ fn build_protein_support_map(
             .insert(peptide_seq.clone());
 
         if f.decoy_free_q_value
-            .map(|q| q <= cfg.q_threshold_physical as f32)
+            .map(|q| q <= cfg.q_threshold_physical)
             .unwrap_or(false)
         {
             passing.entry(protein_key).or_default().insert(peptide_seq);
@@ -6923,11 +6937,11 @@ fn build_peptide_eligibility_map(
 
         let q_ok = f
             .decoy_free_q_value
-            .map(|q| q <= cfg.strong_reference_q_threshold_physical as f32)
+            .map(|q| q <= cfg.strong_reference_q_threshold_physical as f64)
             .unwrap_or(false);
 
         let pep_ok = match cfg.strong_reference_pep_threshold_physical {
-            Some(thr) => f.decoy_free_pep.map(|p| p <= thr as f32).unwrap_or(false),
+            Some(thr) => f.decoy_free_pep.map(|p| p <= thr).unwrap_or(false),
             None => true,
         };
 
@@ -7002,11 +7016,11 @@ fn build_reproducibility_anchor_map(
 
         let q_ok = f
             .decoy_free_q_value
-            .map(|q| q <= pep_cfg.strong_reference_q_threshold_physical as f32)
+            .map(|q| q <= pep_cfg.strong_reference_q_threshold_physical as f64)
             .unwrap_or(false);
 
         let pep_ok = match pep_cfg.strong_reference_pep_threshold_physical {
-            Some(thr) => f.decoy_free_pep.map(|p| p <= thr as f32).unwrap_or(false),
+            Some(thr) => f.decoy_free_pep.map(|p| p <= thr).unwrap_or(false),
             None => true,
         };
 
@@ -7015,7 +7029,7 @@ fn build_reproducibility_anchor_map(
         }
 
         if let Some(pep) = f.decoy_free_pep {
-            let pep = (pep as f64).clamp(0.0, 1.0).max(1e-300);
+            let pep = finite_df_probability_for_logit(pep);
             strong_peps.entry(pep_id).or_default().push(pep);
         }
     }
@@ -7044,7 +7058,7 @@ fn build_reproducibility_anchor_map(
             out.insert(
                 pep_id,
                 ReproducibilityAnchorSummary {
-                    anchor_value: anchor_value.clamp(0.0, 1.0).max(1e-300),
+                    anchor_value: finite_df_probability_for_logit(anchor_value),
                     n_anchor_observations: vals.len(),
                 },
             );
@@ -7088,17 +7102,15 @@ fn apply_reproducibility_anchor_rescue(
     let band = &settings.reproducibility.rescue_band;
     let max_frac = band.max_rescue_fraction.clamp(0.0, 1.0);
 
-    let prior = prior_pep.clamp(0.0, 1.0).max(1e-300);
-    let anchor = anchor_pep.clamp(0.0, 1.0).max(1e-300);
+    let prior = finite_df_probability_for_logit(prior_pep);
+    let anchor = finite_df_probability_for_logit(anchor_pep);
 
     let improved_target = anchor.min(prior);
 
-    let rescued_pep = match band.rescue_mode {
+    let rescued_pep = finite_df_probability_for_logit(match band.rescue_mode {
         RescueMode::Replace => improved_target,
         RescueMode::BoundedShrinkage => prior + max_frac * (improved_target - prior),
-    }
-    .clamp(0.0, 1.0)
-    .max(1e-300);
+    });
 
     let prior_logit = crate::ml::stats::safe_logit_confidence(prior);
     let rescue_logit = crate::ml::stats::safe_logit_confidence(rescued_pep);
@@ -7115,8 +7127,9 @@ fn apply_reproducibility_anchor_rescue(
         settings.reproducibility.max_total_shift,
     );
 
-    let post_pep =
-        crate::ml::stats::safe_inv_logit_confidence(prior_logit + bounded_shift).clamp(0.0, 1.0);
+    let post_pep = finite_df_probability_for_logit(crate::ml::stats::safe_inv_logit_confidence(
+        prior_logit + bounded_shift,
+    ));
 
     (post_pep, bounded_shift.abs())
 }
@@ -7197,26 +7210,38 @@ fn apply_recurrence_null_pvalue_update_to_active_stream(
         let peptide = peptide_key_for_feature(f);
         let support = peptide_support.get(&peptide).copied().unwrap_or(1.0);
 
-        let p_recur = recurrence_aux_null_p_value(&model, support);
+        let p_recur = finite_df_p_value(recurrence_aux_null_p_value(&model, support));
+        let base_p = finite_df_p_value(f.decoy_free_p_value.unwrap_or(1.0));
 
-        let base_p = f.decoy_free_p_value.unwrap_or(1.0) as f64;
+        let combined_p = finite_df_p_value(combine_cauchy(&[base_p, p_recur]));
 
-        let p_new = combine_cauchy(&[base_p, p_recur]).clamp(1e-300, 1.0);
+        // Bound p-value-active recurrence rescue on the -log10(p) scale.
+        // This preserves MSFDR dynamic range but prevents unbounded auxiliary
+        // evidence stacking.
+        let base_score = -base_p.log10();
+        let combined_score = -combined_p.log10();
+
+        let max_shift = settings.reproducibility.max_total_shift.max(0.0);
+        let bounded_score = if combined_score > base_score {
+            base_score + (combined_score - base_score).min(max_shift)
+        } else {
+            combined_score
+        };
+
+        let p_new = finite_df_p_value(10.0_f64.powf(-bounded_score));
 
         if p_new < base_p {
             n_rescued_psms += 1;
         }
 
-        max_shift_applied = max_shift_applied.max((base_p.log10() - p_new.log10()).abs());
+        let shift_abs = (bounded_score - base_score).abs();
+        if shift_abs.is_finite() {
+            max_shift_applied = max_shift_applied.max(shift_abs);
+        }
 
-        let placeholder_pep = f.decoy_free_pep.unwrap_or(1.0) as f64;
+        let placeholder_pep = finite_df_probability_for_logit(f.decoy_free_pep.unwrap_or(1.0));
 
-        set_df_evidence_pair(
-            f,
-            ActiveEvidenceSpace::PValue,
-            p_new,
-            placeholder_pep.clamp(1e-300, 1.0),
-        );
+        set_df_evidence_pair(f, ActiveEvidenceSpace::PValue, p_new, placeholder_pep);
     }
 
     recalibrate_companion_pep_from_active_p_values(features, settings, "recurrence p-value rescue");
@@ -7380,8 +7405,8 @@ fn apply_bounded_repro_shift(
 
         max_shift_applied = max_shift_applied.max(shift_abs);
 
-        f.decoy_free_pep = Some(post_pep as f32);
-        f.decoy_free_score = Some((-10.0 * post_pep.max(1e-15).log10()) as f32);
+        f.decoy_free_pep = Some(post_pep);
+        f.decoy_free_score = Some(df_score_from_pep(post_pep));
     }
 
     recalculate_active_q_values(features, settings);
@@ -7511,8 +7536,8 @@ enum PhysicalEvidenceStage {
 }
 
 #[inline]
-fn df_score_from_pep(pep: f64) -> f32 {
-    (-10.0 * pep.clamp(1e-15, 1.0).log10()) as f32
+fn df_score_from_pep(pep: f64) -> f64 {
+    -10.0 * finite_df_probability_for_logit(pep).log10()
 }
 
 // Copy the current active stream into the audit columns for a successfully
@@ -7576,7 +7601,7 @@ fn recalculate_active_q_values(features: &mut [DfFeature], settings: &FdrSetting
             }
 
             for (feat_idx, q) in q_from_pep_cummean(rows) {
-                features[feat_idx].decoy_free_q_value = Some(q as f32);
+                features[feat_idx].decoy_free_q_value = Some(finite_df_p_value(q));
             }
         }
 
@@ -7607,7 +7632,7 @@ fn recalculate_active_q_values(features: &mut [DfFeature], settings: &FdrSetting
             );
 
             for ((_, feat_idx, _), q) in rows.into_iter().zip(q_values.into_iter()) {
-                features[feat_idx].decoy_free_q_value = Some(q as f32);
+                features[feat_idx].decoy_free_q_value = Some(finite_df_p_value(q));
             }
         }
     }
@@ -8097,6 +8122,7 @@ pub fn calculate_peptide_q_df(
     settings: &FdrSettings,
     threshold: f32,
 ) -> (usize, usize) {
+    let threshold = threshold as f64;
     // Peptide inference consumes the finalized active DF PSM stream.
     // PEP-native final streams use decoy_free_pep; p-value-native streams use
     // decoy_free_p_value. Peptide-level aggregation uses the best supporting PSM,
@@ -8307,12 +8333,12 @@ pub fn calculate_peptide_q_df(
 
     let q_values = q_report.q_values;
 
-    let mut best_q: FnvHashMap<String, (f32, bool)> = FnvHashMap::default();
+    let mut best_q: FnvHashMap<String, (f64, bool)> = FnvHashMap::default();
 
     for i in 0..peptide_keys.len() {
         best_q.insert(
             peptide_keys[i].clone(),
-            (q_values[i] as f32, is_ent_flags[i]),
+            (finite_df_p_value(q_values[i]), is_ent_flags[i]),
         );
     }
 
@@ -8333,7 +8359,7 @@ pub fn calculate_peptide_q_df(
 
         let peptide = db[feat.core.peptide_idx].to_string();
         let q = best_q.get(&peptide).map(|v| v.0).unwrap_or(1.0);
-        feat.decoy_free_peptide_q = Some(q);
+        feat.decoy_free_peptide_q = Some(finite_df_p_value(q));
     }
 
     let mut passing_total = 0usize;
@@ -8379,7 +8405,7 @@ pub fn apply_peptide_q_to_psm_reporting_df(features: &mut [DfFeature], settings:
             continue;
         };
 
-        if peptide_q > settings.peptide_fdr {
+        if peptide_q > settings.peptide_fdr as f64 {
             continue;
         }
 
@@ -8472,7 +8498,7 @@ pub fn calculate_protein_q_df(
         f.core.rank == 1
             && f.core.label == 1
             && f.decoy_free_peptide_q
-                .map(|q| q <= settings.peptide_fdr)
+                .map(|q| q <= settings.peptide_fdr as f64)
                 .unwrap_or(false)
     }) {
         peptide_passing_psm_count += 1;
@@ -8623,9 +8649,9 @@ pub fn calculate_protein_q_df(
     };
 
     // Map back: protein_key -> q
-    let mut best_q: FnvHashMap<String, f32> = FnvHashMap::default();
+    let mut best_q: FnvHashMap<String, f64> = FnvHashMap::default();
     for (key, q) in protein_keys.into_iter().zip(protein_q_values) {
-        best_q.insert(key, q as f32);
+        best_q.insert(key, finite_df_p_value(q));
     }
 
     // Write ONLY DF protein q (rank1-only by contract; scrub others)
@@ -8650,12 +8676,12 @@ pub fn calculate_protein_q_df(
 
         let protein_key = db[feat.core.peptide_idx].proteins(&db.decoy_tag, db.generate_decoys);
         let q = *best_q.get(&protein_key).unwrap_or(&1.0);
-        feat.decoy_free_protein_q = Some(q);
+        feat.decoy_free_protein_q = Some(finite_df_p_value(q));
     }
 
     best_q
         .values()
-        .filter(|&&q| q <= settings.protein_fdr)
+        .filter(|&&q| q <= settings.protein_fdr as f64)
         .count()
 }
 
@@ -8679,7 +8705,7 @@ fn df_row_passes_strict_psm_threshold(feat: &DfFeature, settings: &FdrSettings) 
     }
 
     feat.decoy_free_q_value
-        .map(|q| q <= settings.precursor_fdr)
+        .map(|q| q <= settings.precursor_fdr as f64)
         .unwrap_or(false)
 }
 
@@ -8738,7 +8764,7 @@ pub fn apply_hierarchical_reporting_df(
         .filter(|f| f.core.rank == 1 && f.core.label == 1)
     {
         let protein_q = feat.decoy_free_protein_q.unwrap_or(1.0);
-        if protein_q > settings.protein_fdr {
+        if protein_q > settings.protein_fdr as f64 {
             continue;
         }
 
@@ -8777,7 +8803,7 @@ pub fn apply_hierarchical_reporting_df(
         .filter(|f| f.core.rank == 1 && f.core.label == 1)
     {
         let peptide_q = feat.decoy_free_peptide_q.unwrap_or(1.0);
-        if peptide_q > settings.peptide_fdr {
+        if peptide_q > settings.peptide_fdr as f64 {
             continue;
         }
 

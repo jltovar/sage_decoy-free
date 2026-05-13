@@ -183,17 +183,17 @@ pub struct DfFeature {
 
     // --- DECOY-FREE: Core Columns ---
     #[serde(skip_serializing_if = "Option::is_none")]
-    pub decoy_free_p_value: Option<f32>,
+    pub decoy_free_p_value: Option<f64>,
     #[serde(skip_serializing_if = "Option::is_none")]
-    pub decoy_free_pep: Option<f32>,
+    pub decoy_free_pep: Option<f64>,
     #[serde(skip_serializing_if = "Option::is_none")]
-    pub decoy_free_score: Option<f32>,
+    pub decoy_free_score: Option<f64>,
     #[serde(skip_serializing_if = "Option::is_none")]
-    pub decoy_free_q_value: Option<f32>,
+    pub decoy_free_q_value: Option<f64>,
     #[serde(skip_serializing_if = "Option::is_none")]
-    pub decoy_free_peptide_q: Option<f32>,
+    pub decoy_free_peptide_q: Option<f64>,
     #[serde(skip_serializing_if = "Option::is_none")]
-    pub decoy_free_protein_q: Option<f32>,
+    pub decoy_free_protein_q: Option<f64>,
 
     /// Level 4 reporting-only flag.
     ///
@@ -230,72 +230,72 @@ pub struct DfFeature {
 
     // Base Sage Decoy-Free post-model-fit snapshot.
     #[serde(skip_serializing_if = "Option::is_none")]
-    pub decoy_free_p_value_base: Option<f32>,
+    pub decoy_free_p_value_base: Option<f64>,
     #[serde(skip_serializing_if = "Option::is_none")]
-    pub decoy_free_pep_base: Option<f32>,
+    pub decoy_free_pep_base: Option<f64>,
     #[serde(skip_serializing_if = "Option::is_none")]
-    pub decoy_free_score_base: Option<f32>,
+    pub decoy_free_score_base: Option<f64>,
     #[serde(skip_serializing_if = "Option::is_none")]
-    pub decoy_free_q_base: Option<f32>,
+    pub decoy_free_q_base: Option<f64>,
 
     // RT confidence adjustment snapshot.
     #[serde(skip_serializing_if = "Option::is_none")]
-    pub decoy_free_p_value_rt: Option<f32>,
+    pub decoy_free_p_value_rt: Option<f64>,
     #[serde(skip_serializing_if = "Option::is_none")]
-    pub decoy_free_pep_rt: Option<f32>,
+    pub decoy_free_pep_rt: Option<f64>,
     #[serde(skip_serializing_if = "Option::is_none")]
-    pub decoy_free_score_rt: Option<f32>,
+    pub decoy_free_score_rt: Option<f64>,
     #[serde(skip_serializing_if = "Option::is_none")]
-    pub decoy_free_q_rt: Option<f32>,
+    pub decoy_free_q_rt: Option<f64>,
 
     // IMS confidence adjustment snapshot.
     #[serde(skip_serializing_if = "Option::is_none")]
-    pub decoy_free_p_value_ims: Option<f32>,
+    pub decoy_free_p_value_ims: Option<f64>,
     #[serde(skip_serializing_if = "Option::is_none")]
-    pub decoy_free_pep_ims: Option<f32>,
+    pub decoy_free_pep_ims: Option<f64>,
     #[serde(skip_serializing_if = "Option::is_none")]
-    pub decoy_free_score_ims: Option<f32>,
+    pub decoy_free_score_ims: Option<f64>,
     #[serde(skip_serializing_if = "Option::is_none")]
-    pub decoy_free_q_ims: Option<f32>,
+    pub decoy_free_q_ims: Option<f64>,
 
     // Peptide reproducibility rescue snapshot.
     #[serde(skip_serializing_if = "Option::is_none")]
-    pub decoy_free_p_value_peptide_rescue: Option<f32>,
+    pub decoy_free_p_value_peptide_rescue: Option<f64>,
     #[serde(skip_serializing_if = "Option::is_none")]
-    pub decoy_free_pep_peptide_rescue: Option<f32>,
+    pub decoy_free_pep_peptide_rescue: Option<f64>,
     #[serde(skip_serializing_if = "Option::is_none")]
-    pub decoy_free_score_peptide_rescue: Option<f32>,
+    pub decoy_free_score_peptide_rescue: Option<f64>,
     #[serde(skip_serializing_if = "Option::is_none")]
-    pub decoy_free_q_peptide_rescue: Option<f32>,
+    pub decoy_free_q_peptide_rescue: Option<f64>,
 
     // Protein reproducibility rescue snapshot.
     #[serde(skip_serializing_if = "Option::is_none")]
-    pub decoy_free_p_value_protein_rescue: Option<f32>,
+    pub decoy_free_p_value_protein_rescue: Option<f64>,
     #[serde(skip_serializing_if = "Option::is_none")]
-    pub decoy_free_pep_protein_rescue: Option<f32>,
+    pub decoy_free_pep_protein_rescue: Option<f64>,
     #[serde(skip_serializing_if = "Option::is_none")]
-    pub decoy_free_score_protein_rescue: Option<f32>,
+    pub decoy_free_score_protein_rescue: Option<f64>,
     #[serde(skip_serializing_if = "Option::is_none")]
-    pub decoy_free_q_protein_rescue: Option<f32>,
+    pub decoy_free_q_protein_rescue: Option<f64>,
 
     // Transitional internal fields.
     // TODO: remove after apply_physical_rescue/apply_bounded_repro_shift are rewritten
     // to operate directly on the active decoy_free_* stream.
     #[serde(skip_serializing_if = "Option::is_none")]
-    pub decoy_free_p_value_l2: Option<f32>,
+    pub decoy_free_p_value_l2: Option<f64>,
     #[serde(skip_serializing_if = "Option::is_none")]
-    pub decoy_free_pep_l2: Option<f32>,
+    pub decoy_free_pep_l2: Option<f64>,
     #[serde(skip_serializing_if = "Option::is_none")]
-    pub decoy_free_score_l2: Option<f32>,
+    pub decoy_free_score_l2: Option<f64>,
     #[serde(skip_serializing_if = "Option::is_none")]
-    pub decoy_free_q_l2: Option<f32>,
+    pub decoy_free_q_l2: Option<f64>,
 
     #[serde(skip_serializing_if = "Option::is_none")]
-    pub decoy_free_pep_l3: Option<f32>,
+    pub decoy_free_pep_l3: Option<f64>,
     #[serde(skip_serializing_if = "Option::is_none")]
-    pub decoy_free_score_l3: Option<f32>,
+    pub decoy_free_score_l3: Option<f64>,
     #[serde(skip_serializing_if = "Option::is_none")]
-    pub decoy_free_q_l3: Option<f32>,
+    pub decoy_free_q_l3: Option<f64>,
 
     // 5D. Layer 2 diagnostics
     #[serde(skip_serializing_if = "Option::is_none")]
@@ -342,293 +342,293 @@ pub struct DfFeature {
     // --- DECOY-FREE: Per-method outputs (p / q / pep) ---
     // Moments
     #[serde(skip_serializing_if = "Option::is_none")]
-    pub p_mom: Option<f32>,
+    pub p_mom: Option<f64>,
     #[serde(skip_serializing_if = "Option::is_none")]
-    pub q_mom: Option<f32>,
+    pub q_mom: Option<f64>,
     #[serde(skip_serializing_if = "Option::is_none")]
-    pub pep_mom: Option<f32>,
+    pub pep_mom: Option<f64>,
 
     #[serde(skip_serializing_if = "Option::is_none")]
-    pub rt_adjust_p_mom: Option<f32>,
+    pub rt_adjust_p_mom: Option<f64>,
     #[serde(skip_serializing_if = "Option::is_none")]
-    pub rt_adjust_q_mom: Option<f32>,
+    pub rt_adjust_q_mom: Option<f64>,
     #[serde(skip_serializing_if = "Option::is_none")]
-    pub rt_adjust_pep_mom: Option<f32>,
+    pub rt_adjust_pep_mom: Option<f64>,
 
     #[serde(skip_serializing_if = "Option::is_none")]
-    pub ims_adjust_p_mom: Option<f32>,
+    pub ims_adjust_p_mom: Option<f64>,
     #[serde(skip_serializing_if = "Option::is_none")]
-    pub ims_adjust_q_mom: Option<f32>,
+    pub ims_adjust_q_mom: Option<f64>,
     #[serde(skip_serializing_if = "Option::is_none")]
-    pub ims_adjust_pep_mom: Option<f32>,
+    pub ims_adjust_pep_mom: Option<f64>,
 
     #[serde(skip_serializing_if = "Option::is_none")]
-    pub peptide_rescue_p_mom: Option<f32>,
+    pub peptide_rescue_p_mom: Option<f64>,
     #[serde(skip_serializing_if = "Option::is_none")]
-    pub peptide_rescue_q_mom: Option<f32>,
+    pub peptide_rescue_q_mom: Option<f64>,
     #[serde(skip_serializing_if = "Option::is_none")]
-    pub peptide_rescue_pep_mom: Option<f32>,
+    pub peptide_rescue_pep_mom: Option<f64>,
 
     #[serde(skip_serializing_if = "Option::is_none")]
-    pub protein_rescue_p_mom: Option<f32>,
+    pub protein_rescue_p_mom: Option<f64>,
     #[serde(skip_serializing_if = "Option::is_none")]
-    pub protein_rescue_q_mom: Option<f32>,
+    pub protein_rescue_q_mom: Option<f64>,
     #[serde(skip_serializing_if = "Option::is_none")]
-    pub protein_rescue_pep_mom: Option<f32>,
+    pub protein_rescue_pep_mom: Option<f64>,
 
     // MLE
     #[serde(skip_serializing_if = "Option::is_none")]
-    pub p_mle: Option<f32>,
+    pub p_mle: Option<f64>,
     #[serde(skip_serializing_if = "Option::is_none")]
-    pub q_mle: Option<f32>,
+    pub q_mle: Option<f64>,
     #[serde(skip_serializing_if = "Option::is_none")]
-    pub pep_mle: Option<f32>,
+    pub pep_mle: Option<f64>,
 
     #[serde(skip_serializing_if = "Option::is_none")]
-    pub rt_adjust_p_mle: Option<f32>,
+    pub rt_adjust_p_mle: Option<f64>,
     #[serde(skip_serializing_if = "Option::is_none")]
-    pub rt_adjust_q_mle: Option<f32>,
+    pub rt_adjust_q_mle: Option<f64>,
     #[serde(skip_serializing_if = "Option::is_none")]
-    pub rt_adjust_pep_mle: Option<f32>,
+    pub rt_adjust_pep_mle: Option<f64>,
 
     #[serde(skip_serializing_if = "Option::is_none")]
-    pub ims_adjust_p_mle: Option<f32>,
+    pub ims_adjust_p_mle: Option<f64>,
     #[serde(skip_serializing_if = "Option::is_none")]
-    pub ims_adjust_q_mle: Option<f32>,
+    pub ims_adjust_q_mle: Option<f64>,
     #[serde(skip_serializing_if = "Option::is_none")]
-    pub ims_adjust_pep_mle: Option<f32>,
+    pub ims_adjust_pep_mle: Option<f64>,
 
     #[serde(skip_serializing_if = "Option::is_none")]
-    pub peptide_rescue_p_mle: Option<f32>,
+    pub peptide_rescue_p_mle: Option<f64>,
     #[serde(skip_serializing_if = "Option::is_none")]
-    pub peptide_rescue_q_mle: Option<f32>,
+    pub peptide_rescue_q_mle: Option<f64>,
     #[serde(skip_serializing_if = "Option::is_none")]
-    pub peptide_rescue_pep_mle: Option<f32>,
+    pub peptide_rescue_pep_mle: Option<f64>,
 
     #[serde(skip_serializing_if = "Option::is_none")]
-    pub protein_rescue_p_mle: Option<f32>,
+    pub protein_rescue_p_mle: Option<f64>,
     #[serde(skip_serializing_if = "Option::is_none")]
-    pub protein_rescue_q_mle: Option<f32>,
+    pub protein_rescue_q_mle: Option<f64>,
     #[serde(skip_serializing_if = "Option::is_none")]
-    pub protein_rescue_pep_mle: Option<f32>,
+    pub protein_rescue_pep_mle: Option<f64>,
 
     // Lower Order
     #[serde(skip_serializing_if = "Option::is_none")]
-    pub p_lo: Option<f32>,
+    pub p_lo: Option<f64>,
     #[serde(skip_serializing_if = "Option::is_none")]
-    pub q_lo: Option<f32>,
+    pub q_lo: Option<f64>,
     #[serde(skip_serializing_if = "Option::is_none")]
-    pub pep_lo: Option<f32>,
+    pub pep_lo: Option<f64>,
 
     #[serde(skip_serializing_if = "Option::is_none")]
-    pub rt_adjust_p_lo: Option<f32>,
+    pub rt_adjust_p_lo: Option<f64>,
     #[serde(skip_serializing_if = "Option::is_none")]
-    pub rt_adjust_q_lo: Option<f32>,
+    pub rt_adjust_q_lo: Option<f64>,
     #[serde(skip_serializing_if = "Option::is_none")]
-    pub rt_adjust_pep_lo: Option<f32>,
+    pub rt_adjust_pep_lo: Option<f64>,
 
     #[serde(skip_serializing_if = "Option::is_none")]
-    pub ims_adjust_p_lo: Option<f32>,
+    pub ims_adjust_p_lo: Option<f64>,
     #[serde(skip_serializing_if = "Option::is_none")]
-    pub ims_adjust_q_lo: Option<f32>,
+    pub ims_adjust_q_lo: Option<f64>,
     #[serde(skip_serializing_if = "Option::is_none")]
-    pub ims_adjust_pep_lo: Option<f32>,
+    pub ims_adjust_pep_lo: Option<f64>,
 
     #[serde(skip_serializing_if = "Option::is_none")]
-    pub peptide_rescue_p_lo: Option<f32>,
+    pub peptide_rescue_p_lo: Option<f64>,
     #[serde(skip_serializing_if = "Option::is_none")]
-    pub peptide_rescue_q_lo: Option<f32>,
+    pub peptide_rescue_q_lo: Option<f64>,
     #[serde(skip_serializing_if = "Option::is_none")]
-    pub peptide_rescue_pep_lo: Option<f32>,
+    pub peptide_rescue_pep_lo: Option<f64>,
 
     #[serde(skip_serializing_if = "Option::is_none")]
-    pub protein_rescue_p_lo: Option<f32>,
+    pub protein_rescue_p_lo: Option<f64>,
     #[serde(skip_serializing_if = "Option::is_none")]
-    pub protein_rescue_q_lo: Option<f32>,
+    pub protein_rescue_q_lo: Option<f64>,
     #[serde(skip_serializing_if = "Option::is_none")]
-    pub protein_rescue_pep_lo: Option<f32>,
+    pub protein_rescue_pep_lo: Option<f64>,
 
     // MSFDR (seeded / legacy)
     #[serde(skip_serializing_if = "Option::is_none")]
-    pub p_msfdr: Option<f32>,
+    pub p_msfdr: Option<f64>,
     #[serde(skip_serializing_if = "Option::is_none")]
-    pub q_msfdr: Option<f32>,
+    pub q_msfdr: Option<f64>,
     #[serde(skip_serializing_if = "Option::is_none")]
-    pub pep_msfdr: Option<f32>,
+    pub pep_msfdr: Option<f64>,
 
     #[serde(skip_serializing_if = "Option::is_none")]
-    pub rt_adjust_p_msfdr: Option<f32>,
+    pub rt_adjust_p_msfdr: Option<f64>,
     #[serde(skip_serializing_if = "Option::is_none")]
-    pub rt_adjust_q_msfdr: Option<f32>,
+    pub rt_adjust_q_msfdr: Option<f64>,
     #[serde(skip_serializing_if = "Option::is_none")]
-    pub rt_adjust_pep_msfdr: Option<f32>,
+    pub rt_adjust_pep_msfdr: Option<f64>,
 
     #[serde(skip_serializing_if = "Option::is_none")]
-    pub ims_adjust_p_msfdr: Option<f32>,
+    pub ims_adjust_p_msfdr: Option<f64>,
     #[serde(skip_serializing_if = "Option::is_none")]
-    pub ims_adjust_q_msfdr: Option<f32>,
+    pub ims_adjust_q_msfdr: Option<f64>,
     #[serde(skip_serializing_if = "Option::is_none")]
-    pub ims_adjust_pep_msfdr: Option<f32>,
+    pub ims_adjust_pep_msfdr: Option<f64>,
 
     #[serde(skip_serializing_if = "Option::is_none")]
-    pub peptide_rescue_p_msfdr: Option<f32>,
+    pub peptide_rescue_p_msfdr: Option<f64>,
     #[serde(skip_serializing_if = "Option::is_none")]
-    pub peptide_rescue_q_msfdr: Option<f32>,
+    pub peptide_rescue_q_msfdr: Option<f64>,
     #[serde(skip_serializing_if = "Option::is_none")]
-    pub peptide_rescue_pep_msfdr: Option<f32>,
+    pub peptide_rescue_pep_msfdr: Option<f64>,
 
     #[serde(skip_serializing_if = "Option::is_none")]
-    pub protein_rescue_p_msfdr: Option<f32>,
+    pub protein_rescue_p_msfdr: Option<f64>,
     #[serde(skip_serializing_if = "Option::is_none")]
-    pub protein_rescue_q_msfdr: Option<f32>,
+    pub protein_rescue_q_msfdr: Option<f64>,
     #[serde(skip_serializing_if = "Option::is_none")]
-    pub protein_rescue_pep_msfdr: Option<f32>,
+    pub protein_rescue_pep_msfdr: Option<f64>,
 
     // MSFDR (1-state mixture)
     #[serde(skip_serializing_if = "Option::is_none")]
-    pub p_1smix: Option<f32>,
+    pub p_1smix: Option<f64>,
     #[serde(skip_serializing_if = "Option::is_none")]
-    pub q_1smix: Option<f32>,
+    pub q_1smix: Option<f64>,
     #[serde(skip_serializing_if = "Option::is_none")]
-    pub pep_1smix: Option<f32>,
+    pub pep_1smix: Option<f64>,
 
     #[serde(skip_serializing_if = "Option::is_none")]
-    pub rt_adjust_p_1smix: Option<f32>,
+    pub rt_adjust_p_1smix: Option<f64>,
     #[serde(skip_serializing_if = "Option::is_none")]
-    pub rt_adjust_q_1smix: Option<f32>,
+    pub rt_adjust_q_1smix: Option<f64>,
     #[serde(skip_serializing_if = "Option::is_none")]
-    pub rt_adjust_pep_1smix: Option<f32>,
+    pub rt_adjust_pep_1smix: Option<f64>,
 
     #[serde(skip_serializing_if = "Option::is_none")]
-    pub ims_adjust_p_1smix: Option<f32>,
+    pub ims_adjust_p_1smix: Option<f64>,
     #[serde(skip_serializing_if = "Option::is_none")]
-    pub ims_adjust_q_1smix: Option<f32>,
+    pub ims_adjust_q_1smix: Option<f64>,
     #[serde(skip_serializing_if = "Option::is_none")]
-    pub ims_adjust_pep_1smix: Option<f32>,
+    pub ims_adjust_pep_1smix: Option<f64>,
 
     #[serde(skip_serializing_if = "Option::is_none")]
-    pub peptide_rescue_p_1smix: Option<f32>,
+    pub peptide_rescue_p_1smix: Option<f64>,
     #[serde(skip_serializing_if = "Option::is_none")]
-    pub peptide_rescue_q_1smix: Option<f32>,
+    pub peptide_rescue_q_1smix: Option<f64>,
     #[serde(skip_serializing_if = "Option::is_none")]
-    pub peptide_rescue_pep_1smix: Option<f32>,
+    pub peptide_rescue_pep_1smix: Option<f64>,
 
     #[serde(skip_serializing_if = "Option::is_none")]
-    pub protein_rescue_p_1smix: Option<f32>,
+    pub protein_rescue_p_1smix: Option<f64>,
     #[serde(skip_serializing_if = "Option::is_none")]
-    pub protein_rescue_q_1smix: Option<f32>,
+    pub protein_rescue_q_1smix: Option<f64>,
     #[serde(skip_serializing_if = "Option::is_none")]
-    pub protein_rescue_pep_1smix: Option<f32>,
+    pub protein_rescue_pep_1smix: Option<f64>,
 
     // MSFDR (2-state mixture)
     #[serde(skip_serializing_if = "Option::is_none")]
-    pub p_2smix: Option<f32>,
+    pub p_2smix: Option<f64>,
     #[serde(skip_serializing_if = "Option::is_none")]
-    pub q_2smix: Option<f32>,
+    pub q_2smix: Option<f64>,
     #[serde(skip_serializing_if = "Option::is_none")]
-    pub pep_2smix: Option<f32>,
+    pub pep_2smix: Option<f64>,
 
     #[serde(skip_serializing_if = "Option::is_none")]
-    pub rt_adjust_p_2smix: Option<f32>,
+    pub rt_adjust_p_2smix: Option<f64>,
     #[serde(skip_serializing_if = "Option::is_none")]
-    pub rt_adjust_q_2smix: Option<f32>,
+    pub rt_adjust_q_2smix: Option<f64>,
     #[serde(skip_serializing_if = "Option::is_none")]
-    pub rt_adjust_pep_2smix: Option<f32>,
+    pub rt_adjust_pep_2smix: Option<f64>,
 
     #[serde(skip_serializing_if = "Option::is_none")]
-    pub ims_adjust_p_2smix: Option<f32>,
+    pub ims_adjust_p_2smix: Option<f64>,
     #[serde(skip_serializing_if = "Option::is_none")]
-    pub ims_adjust_q_2smix: Option<f32>,
+    pub ims_adjust_q_2smix: Option<f64>,
     #[serde(skip_serializing_if = "Option::is_none")]
-    pub ims_adjust_pep_2smix: Option<f32>,
+    pub ims_adjust_pep_2smix: Option<f64>,
 
     #[serde(skip_serializing_if = "Option::is_none")]
-    pub peptide_rescue_p_2smix: Option<f32>,
+    pub peptide_rescue_p_2smix: Option<f64>,
     #[serde(skip_serializing_if = "Option::is_none")]
-    pub peptide_rescue_q_2smix: Option<f32>,
+    pub peptide_rescue_q_2smix: Option<f64>,
     #[serde(skip_serializing_if = "Option::is_none")]
-    pub peptide_rescue_pep_2smix: Option<f32>,
+    pub peptide_rescue_pep_2smix: Option<f64>,
 
     #[serde(skip_serializing_if = "Option::is_none")]
-    pub protein_rescue_p_2smix: Option<f32>,
+    pub protein_rescue_p_2smix: Option<f64>,
     #[serde(skip_serializing_if = "Option::is_none")]
-    pub protein_rescue_q_2smix: Option<f32>,
+    pub protein_rescue_q_2smix: Option<f64>,
     #[serde(skip_serializing_if = "Option::is_none")]
-    pub protein_rescue_pep_2smix: Option<f32>,
+    pub protein_rescue_pep_2smix: Option<f64>,
 
     // Nokoi
     #[serde(skip_serializing_if = "Option::is_none")]
-    pub p_nokoi: Option<f32>,
+    pub p_nokoi: Option<f64>,
     #[serde(skip_serializing_if = "Option::is_none")]
-    pub q_nokoi: Option<f32>,
+    pub q_nokoi: Option<f64>,
     #[serde(skip_serializing_if = "Option::is_none")]
-    pub pep_nokoi: Option<f32>,
+    pub pep_nokoi: Option<f64>,
 
     #[serde(skip_serializing_if = "Option::is_none")]
-    pub rt_adjust_p_nokoi: Option<f32>,
+    pub rt_adjust_p_nokoi: Option<f64>,
     #[serde(skip_serializing_if = "Option::is_none")]
-    pub rt_adjust_q_nokoi: Option<f32>,
+    pub rt_adjust_q_nokoi: Option<f64>,
     #[serde(skip_serializing_if = "Option::is_none")]
-    pub rt_adjust_pep_nokoi: Option<f32>,
+    pub rt_adjust_pep_nokoi: Option<f64>,
 
     #[serde(skip_serializing_if = "Option::is_none")]
-    pub ims_adjust_p_nokoi: Option<f32>,
+    pub ims_adjust_p_nokoi: Option<f64>,
     #[serde(skip_serializing_if = "Option::is_none")]
-    pub ims_adjust_q_nokoi: Option<f32>,
+    pub ims_adjust_q_nokoi: Option<f64>,
     #[serde(skip_serializing_if = "Option::is_none")]
-    pub ims_adjust_pep_nokoi: Option<f32>,
+    pub ims_adjust_pep_nokoi: Option<f64>,
 
     #[serde(skip_serializing_if = "Option::is_none")]
-    pub peptide_rescue_p_nokoi: Option<f32>,
+    pub peptide_rescue_p_nokoi: Option<f64>,
     #[serde(skip_serializing_if = "Option::is_none")]
-    pub peptide_rescue_q_nokoi: Option<f32>,
+    pub peptide_rescue_q_nokoi: Option<f64>,
     #[serde(skip_serializing_if = "Option::is_none")]
-    pub peptide_rescue_pep_nokoi: Option<f32>,
+    pub peptide_rescue_pep_nokoi: Option<f64>,
 
     #[serde(skip_serializing_if = "Option::is_none")]
-    pub protein_rescue_p_nokoi: Option<f32>,
+    pub protein_rescue_p_nokoi: Option<f64>,
     #[serde(skip_serializing_if = "Option::is_none")]
-    pub protein_rescue_q_nokoi: Option<f32>,
+    pub protein_rescue_q_nokoi: Option<f64>,
     #[serde(skip_serializing_if = "Option::is_none")]
-    pub protein_rescue_pep_nokoi: Option<f32>,
+    pub protein_rescue_pep_nokoi: Option<f64>,
 
     // Ensemble consensus stream
     #[serde(skip_serializing_if = "Option::is_none")]
-    pub p_ensemble: Option<f32>,
+    pub p_ensemble: Option<f64>,
     #[serde(skip_serializing_if = "Option::is_none")]
-    pub q_ensemble: Option<f32>,
+    pub q_ensemble: Option<f64>,
     #[serde(skip_serializing_if = "Option::is_none")]
-    pub pep_ensemble: Option<f32>,
+    pub pep_ensemble: Option<f64>,
     #[serde(skip_serializing_if = "Option::is_none")]
-    pub score_ensemble: Option<f32>,
+    pub score_ensemble: Option<f64>,
 
     #[serde(skip_serializing_if = "Option::is_none")]
-    pub rt_adjust_p_ensemble: Option<f32>,
+    pub rt_adjust_p_ensemble: Option<f64>,
     #[serde(skip_serializing_if = "Option::is_none")]
-    pub rt_adjust_q_ensemble: Option<f32>,
+    pub rt_adjust_q_ensemble: Option<f64>,
     #[serde(skip_serializing_if = "Option::is_none")]
-    pub rt_adjust_pep_ensemble: Option<f32>,
+    pub rt_adjust_pep_ensemble: Option<f64>,
 
     #[serde(skip_serializing_if = "Option::is_none")]
-    pub ims_adjust_p_ensemble: Option<f32>,
+    pub ims_adjust_p_ensemble: Option<f64>,
     #[serde(skip_serializing_if = "Option::is_none")]
-    pub ims_adjust_q_ensemble: Option<f32>,
+    pub ims_adjust_q_ensemble: Option<f64>,
     #[serde(skip_serializing_if = "Option::is_none")]
-    pub ims_adjust_pep_ensemble: Option<f32>,
+    pub ims_adjust_pep_ensemble: Option<f64>,
 
     #[serde(skip_serializing_if = "Option::is_none")]
-    pub peptide_rescue_p_ensemble: Option<f32>,
+    pub peptide_rescue_p_ensemble: Option<f64>,
     #[serde(skip_serializing_if = "Option::is_none")]
-    pub peptide_rescue_q_ensemble: Option<f32>,
+    pub peptide_rescue_q_ensemble: Option<f64>,
     #[serde(skip_serializing_if = "Option::is_none")]
-    pub peptide_rescue_pep_ensemble: Option<f32>,
+    pub peptide_rescue_pep_ensemble: Option<f64>,
 
     #[serde(skip_serializing_if = "Option::is_none")]
-    pub protein_rescue_p_ensemble: Option<f32>,
+    pub protein_rescue_p_ensemble: Option<f64>,
     #[serde(skip_serializing_if = "Option::is_none")]
-    pub protein_rescue_q_ensemble: Option<f32>,
+    pub protein_rescue_q_ensemble: Option<f64>,
     #[serde(skip_serializing_if = "Option::is_none")]
-    pub protein_rescue_pep_ensemble: Option<f32>,
+    pub protein_rescue_pep_ensemble: Option<f64>,
 }
 
 // Conversion helpers

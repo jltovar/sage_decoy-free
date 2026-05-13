@@ -657,7 +657,7 @@ impl Runner {
                 .iter()
                 .filter(|f| {
                     f.core.label == 1
-                        && f.decoy_free_q_value.unwrap_or(1.0) <= fdr_settings.peptide_fdr
+                        && f.decoy_free_q_value.unwrap_or(1.0) <= fdr_settings.peptide_fdr as f64
                 })
                 .count();
 
@@ -758,8 +758,8 @@ impl Runner {
             if !parquet {
                 features.par_sort_unstable_by(|a, b| {
                     a.decoy_free_q_value
-                        .unwrap_or(f32::INFINITY)
-                        .total_cmp(&b.decoy_free_q_value.unwrap_or(f32::INFINITY))
+                        .unwrap_or(f64::INFINITY)
+                        .total_cmp(&b.decoy_free_q_value.unwrap_or(f64::INFINITY))
                         .then_with(|| b.core.hyperscore.total_cmp(&a.core.hyperscore))
                         .then_with(|| {
                             a.core
@@ -1337,7 +1337,7 @@ impl Runner {
     fn df_base_model_values(
         feature: &DfFeature,
         suffix: &str,
-    ) -> (Option<f32>, Option<f32>, Option<f32>) {
+    ) -> (Option<f64>, Option<f64>, Option<f64>) {
         match suffix {
             "mom" => (feature.p_mom, feature.q_mom, feature.pep_mom),
             "mle" => (feature.p_mle, feature.q_mle, feature.pep_mle),
@@ -1354,7 +1354,7 @@ impl Runner {
     fn df_rt_model_values(
         feature: &DfFeature,
         suffix: &str,
-    ) -> (Option<f32>, Option<f32>, Option<f32>) {
+    ) -> (Option<f64>, Option<f64>, Option<f64>) {
         match suffix {
             "mom" => (
                 feature.rt_adjust_p_mom,
@@ -1403,7 +1403,7 @@ impl Runner {
     fn df_ims_model_values(
         feature: &DfFeature,
         suffix: &str,
-    ) -> (Option<f32>, Option<f32>, Option<f32>) {
+    ) -> (Option<f64>, Option<f64>, Option<f64>) {
         match suffix {
             "mom" => (
                 feature.ims_adjust_p_mom,
@@ -1452,7 +1452,7 @@ impl Runner {
     fn df_peptide_rescue_model_values(
         feature: &DfFeature,
         suffix: &str,
-    ) -> (Option<f32>, Option<f32>, Option<f32>) {
+    ) -> (Option<f64>, Option<f64>, Option<f64>) {
         match suffix {
             "mom" => (
                 feature.peptide_rescue_p_mom,
@@ -1501,7 +1501,7 @@ impl Runner {
     fn df_protein_rescue_model_values(
         feature: &DfFeature,
         suffix: &str,
-    ) -> (Option<f32>, Option<f32>, Option<f32>) {
+    ) -> (Option<f64>, Option<f64>, Option<f64>) {
         match suffix {
             "mom" => (
                 feature.protein_rescue_p_mom,
@@ -1547,7 +1547,7 @@ impl Runner {
         }
     }
 
-    fn push_opt_f32(record: &mut csv::ByteRecord, val: Option<f32>) {
+    fn push_opt_f64(record: &mut csv::ByteRecord, val: Option<f64>) {
         record.push_field(
             val.map(|v| v.to_string())
                 .unwrap_or_else(|| "NaN".to_string())
@@ -1565,11 +1565,11 @@ impl Runner {
 
     fn push_df_triplet(
         record: &mut csv::ByteRecord,
-        vals: (Option<f32>, Option<f32>, Option<f32>),
+        vals: (Option<f64>, Option<f64>, Option<f64>),
     ) {
-        Self::push_opt_f32(record, vals.0);
-        Self::push_opt_f32(record, vals.1);
-        Self::push_opt_f32(record, vals.2);
+        Self::push_opt_f64(record, vals.0);
+        Self::push_opt_f64(record, vals.1);
+        Self::push_opt_f64(record, vals.2);
     }
 
     // --- DF WRITERS (Decoy-Free) ---
@@ -1665,20 +1665,20 @@ impl Runner {
             match col {
                 DfDynamicColumn::Final(name) => match *name {
                     "decoy_free_p_value" => {
-                        Self::push_opt_f32(&mut record, feature.decoy_free_p_value)
+                        Self::push_opt_f64(&mut record, feature.decoy_free_p_value)
                     }
-                    "decoy_free_pep" => Self::push_opt_f32(&mut record, feature.decoy_free_pep),
-                    "decoy_free_score" => Self::push_opt_f32(&mut record, feature.decoy_free_score),
+                    "decoy_free_pep" => Self::push_opt_f64(&mut record, feature.decoy_free_pep),
+                    "decoy_free_score" => Self::push_opt_f64(&mut record, feature.decoy_free_score),
                     "decoy_free_q_value" => {
-                        Self::push_opt_f32(&mut record, feature.decoy_free_q_value)
+                        Self::push_opt_f64(&mut record, feature.decoy_free_q_value)
                     }
                     "decoy_free_peptide_q" => {
-                        Self::push_opt_f32(&mut record, feature.decoy_free_peptide_q)
+                        Self::push_opt_f64(&mut record, feature.decoy_free_peptide_q)
                     }
                     "decoy_free_protein_q" => {
-                        Self::push_opt_f32(&mut record, feature.decoy_free_protein_q)
+                        Self::push_opt_f64(&mut record, feature.decoy_free_protein_q)
                     }
-                    _ => Self::push_opt_f32(&mut record, None),
+                    _ => Self::push_opt_f64(&mut record, None),
                 },
 
                 DfDynamicColumn::ReportingFlag(name) => match *name {
