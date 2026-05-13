@@ -5339,7 +5339,7 @@ fn apply_rt_bounded_update_to_active_stream(
             continue;
         }
 
-        let prior_pep = f.decoy_free_pep.unwrap_or(1.0) as f64;
+        let prior_pep = f.decoy_free_pep.unwrap_or(1.0);
 
         let missing_rt = !f.core.aligned_rt.is_finite()
             || !f.core.predicted_rt.is_finite()
