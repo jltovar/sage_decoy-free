@@ -698,6 +698,11 @@ pub struct FdrOptions {
     pub ensemble_p_combiner: Option<EnsemblePCombiner>,
     pub ensemble_pep_combiner: Option<EnsemblePepCombiner>,
 
+    // Cauchy p-value combiner conservativeness.
+    // Applied only when ensemble_p_combiner == cauchy.
+    // 1.0 = no penalty. >1.0 makes Cauchy more conservative.
+    pub ensemble_cauchy_penalty: Option<f64>, // default 1.0, clamp [1.0, 100.0]
+
     // Shared robust-combiner knobs
     pub ensemble_pep_trim_frac: Option<f64>, // default 0.20, clamp [0.0, 0.49]
     pub ensemble_pep_quantile: Option<f64>,  // default 0.50, clamp [0.0, 1.0]
@@ -910,6 +915,10 @@ pub struct FdrSettings {
 
     pub ensemble_p_combiner: EnsemblePCombiner,
     pub ensemble_pep_combiner: EnsemblePepCombiner,
+
+    /// Multiplicative penalty applied to ensemble Cauchy-combined p-values.
+    /// 1.0 preserves the original Cauchy result; values >1.0 are more conservative.
+    pub ensemble_cauchy_penalty: f64,
 
     pub ensemble_pep_trim_frac: f64,
     pub ensemble_pep_quantile: f64,
@@ -1378,6 +1387,14 @@ impl From<FdrOptions> for FdrSettings {
             .ensemble_pep_combiner
             .unwrap_or(EnsemblePepCombiner::Median);
 
+        let ensemble_cauchy_penalty = options.ensemble_cauchy_penalty.unwrap_or(1.0);
+
+        let ensemble_cauchy_penalty = if ensemble_cauchy_penalty.is_finite() {
+            ensemble_cauchy_penalty.clamp(1.0, 100.0)
+        } else {
+            1.0
+        };
+
         if matches!(model_fit, ModelFit::Ensemble)
             && matches!(final_evidence_space, FinalEvidenceSpace::Auto)
         {
@@ -1582,6 +1599,8 @@ impl From<FdrOptions> for FdrSettings {
 
             ensemble_p_combiner,
             ensemble_pep_combiner,
+
+            ensemble_cauchy_penalty,
 
             ensemble_pep_trim_frac,
             ensemble_pep_quantile,

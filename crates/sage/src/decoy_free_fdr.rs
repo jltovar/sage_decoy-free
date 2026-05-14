@@ -1386,13 +1386,21 @@ fn combine_p_values_for_ensemble(p_values: &[f64], settings: &FdrSettings) -> f6
 
     match settings.ensemble_p_combiner {
         EnsemblePCombiner::Fisher => stats::combine_fisher(p_values).clamp(0.0, 1.0).max(1e-300),
-        EnsemblePCombiner::Cauchy => combine_cauchy(p_values),
+
+        EnsemblePCombiner::Cauchy => {
+            let p = combine_cauchy(p_values);
+            let penalty = settings.ensemble_cauchy_penalty;
+            (p * penalty).clamp(0.0, 1.0).max(1e-300)
+        }
+
         EnsemblePCombiner::SidakMinP => combine_sidak_minp(p_values),
+
         EnsemblePCombiner::Best => p_values
             .iter()
             .copied()
             .filter(|p| p.is_finite())
             .fold(1.0_f64, |a, b| a.min(b.clamp(0.0, 1.0).max(1e-300))),
+
         EnsemblePCombiner::SecondBest => combine_second_best_p(p_values),
     }
 }
