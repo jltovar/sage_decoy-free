@@ -634,6 +634,13 @@ impl Runner {
 
             let fdr_settings = self.parameters.fdr.clone();
 
+			if self.parameters.write_pin {
+				log::warn!(
+					"write_pin=true was requested, but PIN output is not supported in decoy-free mode; \
+					 PIN is a target-decoy rescoring format and will be skipped."
+				);
+			}
+
             // Compute Decoy-Free PSM statistics, then enforce the rank-1 contract
             // for downstream reporting, aggregation, quantification, and output.
             features =
@@ -791,8 +798,12 @@ impl Runner {
                         .push(self.write_lfq(areas, &filenames)?);
                 }
             } else {
-                log::warn!("Parquet not supported for Decoy-Free mode yet.");
-            }
+				anyhow::bail!(
+					"Parquet output is not supported for decoy-free mode yet. \
+					 Re-run without --parquet to write decoy-free results.sage.tsv, matched_fragments.sage.tsv, \
+					 tmt.tsv, and lfq.tsv."
+				);
+			}
         } else {
             // In TDC mode, keep vanilla Sage RT/IMS training behavior.
             // Do not run the full LDA/TDC spectrum_fdr() path here. That path belongs to

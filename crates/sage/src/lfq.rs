@@ -135,8 +135,14 @@ impl Quantifiable for DfFeature {
     fn core(&self) -> &FeatureCore {
         &self.core
     }
-    fn passes_filter(&self, _settings: &LfqSettings) -> bool {
+
+    fn passes_filter(&self, settings: &LfqSettings) -> bool {
         self.core.rank == 1
+            && self.core.label == 1
+            && self
+                .decoy_free_peptide_q
+                .map(|q| q <= settings.peptide_q_value as f64)
+                .unwrap_or(false)
     }
 }
 
