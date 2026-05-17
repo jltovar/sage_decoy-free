@@ -19,22 +19,12 @@ pub struct Kde<'a> {
 
 impl<'a> Kde<'a> {
     pub fn new(sample: &'a [f64], bw_adjust: impl Fn(f64) -> f64) -> Self {
-        let n = sample.len();
-        assert!(n > 0, "Kde::new requires a non-empty sample");
-
         let factor = 4.0 / 3.0;
         let exponent = 1.0 / 5.0;
         let sigma = std(sample);
 
-        let raw_bandwidth = sigma * (factor / n as f64).powf(exponent);
-        let bandwidth = bw_adjust(raw_bandwidth);
-
-        assert!(
-            bandwidth.is_finite() && bandwidth > 0.0,
-            "Kde::new requires a positive finite bandwidth"
-        );
-
-        let constant = (2.0 * std::f64::consts::PI).sqrt() * bandwidth * n as f64;
+        let bandwidth = bw_adjust(sigma * (factor / sample.len() as f64).powf(exponent));
+        let constant = (2.0 * std::f64::consts::PI).sqrt() * bandwidth * sample.len() as f64;
 
         Self {
             sample,
@@ -93,16 +83,19 @@ impl Builder {
     }
 
     pub fn build(self, scores: &[f64], decoys: &[bool]) -> Estimator {
-        assert_eq!(
+        debug_assert_eq!(
             scores.len(),
             decoys.len(),
             "scores and decoys must have the same length"
         );
-        assert!(
-            !scores.is_empty(),
-            "KDE builder requires at least one score"
-        );
-        assert!(self.bins >= 2, "KDE builder requires at least two bins");
+
+        if scores.is_empty() || decoys.is_empty() || scores.len() != decoys.len() || self.bins < 2 {
+            return Estimator {
+                bins: vec![1.0; self.bins.max(2)],
+                min_score: 0.0,
+                score_step: 1.0,
+            };
+        }
 
         let d = scores
             .par_iter()
@@ -118,42 +111,50 @@ impl Builder {
             .map(|(s, _)| *s)
             .collect::<Vec<_>>();
 
-        assert!(
-            !d.is_empty(),
-            "KDE builder requires at least one decoy score"
-        );
-        assert!(
-            !t.is_empty(),
-            "KDE builder requires at least one target score"
-        );
+        // Match vanilla Sage behavior: do not panic here.
+        // If one class is absent at the KDE stage, return a conservative finite
+        // estimator instead of aborting an otherwise valid TDC run.
+        if d.is_empty() || t.is_empty() {
+            return Estimator {
+                bins: vec![1.0; self.bins],
+                min_score: scores
+                    .iter()
+                    .copied()
+                    .filter(|x| x.is_finite())
+                    .fold(f64::INFINITY, f64::min)
+                    .min(0.0),
+                score_step: 1.0,
+            };
+        }
 
         // P(decoy)
         let pi = d.len() as f64 / scores.len() as f64;
         let decoy = Kde::new(&d, &self.bw_adjust);
         let target = Kde::new(&t, &self.bw_adjust);
 
-        let mut min_score = f64::INFINITY;
-        let mut max_score = f64::NEG_INFINITY;
+        // Essentially, np.linspace(scores.min(), scores.max(), 1000)
+        let mut min_score = f64::MAX;
+        let mut max_score = f64::MIN;
         for s in scores {
             min_score = min_score.min(*s);
             max_score = max_score.max(*s);
         }
 
-        if !min_score.is_finite() || !max_score.is_finite() {
-            panic!("KDE builder requires finite scores");
-        }
-
-        if min_score == max_score {
-            let pep = pi.clamp(0.0, 1.0);
+        if !min_score.is_finite() || !max_score.is_finite() || min_score == max_score {
             return Estimator {
-                bins: vec![pep; self.bins],
-                min_score,
+                bins: vec![pi.clamp(0.0, 1.0); self.bins],
+                min_score: if min_score.is_finite() {
+                    min_score
+                } else {
+                    0.0
+                },
                 score_step: 1.0,
             };
         }
 
         let score_step = (max_score - min_score) / (self.bins - 1) as f64;
 
+        // Calculate PEP for evenly spaced scores
         let mut bins = (0..self.bins)
             .map(|bin| {
                 let score = (bin as f64 * score_step) + min_score;
@@ -161,7 +162,7 @@ impl Builder {
                 let target_density = target.pdf(score) * (1.0 - pi);
                 let denom = target_density + decoy_density;
 
-                if denom > 0.0 && denom.is_finite() {
+                if denom.is_finite() && denom > 0.0 {
                     (decoy_density / denom).clamp(0.0, 1.0)
                 } else {
                     pi.clamp(0.0, 1.0)
@@ -170,7 +171,7 @@ impl Builder {
             .collect::<Vec<_>>();
 
         if self.monotonic {
-            // Enforce non-increasing PEP as score increases.
+            // Make PEP monotonically increasing as score decreases.
             let init = *bins.last().unwrap();
             bins.iter_mut().rev().fold(init, |acc, x| {
                 *x = acc.max(*x);
