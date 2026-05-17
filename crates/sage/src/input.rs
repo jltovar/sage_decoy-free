@@ -967,7 +967,7 @@ impl From<FdrOptions> for FdrSettings {
         // ---------------------------------------------------------------------
         // A) Global knobs
         // ---------------------------------------------------------------------
-        let mode = options.mode.unwrap_or(FdrMode::DecoyFree);
+        let mode = options.mode.unwrap_or(FdrMode::Tdc);
 
         let physical_rescue = options
             .physical_rescue
@@ -1074,7 +1074,11 @@ impl From<FdrOptions> for FdrSettings {
         let hierarchical_entrapment_validation =
             hierarchical_inference.enabled && hierarchical_inference.entrapment_validation;
 
-        let model_fit = options.model_fit.unwrap_or(ModelFit::Ensemble);
+        let model_fit = match mode {
+            FdrMode::DecoyFree => options.model_fit.unwrap_or(ModelFit::Ensemble),
+            FdrMode::Tdc => options.model_fit.unwrap_or(ModelFit::Moments),
+        };
+
         let protein_p_combine = options.protein_p_combine.unwrap_or(ProteinPCombine::Cauchy);
         let peptide_p_combine = options.peptide_p_combine.unwrap_or(PeptidePCombine::Cauchy);
         let final_evidence_space = options
@@ -1395,7 +1399,8 @@ impl From<FdrOptions> for FdrSettings {
             1.0
         };
 
-        if matches!(model_fit, ModelFit::Ensemble)
+        if matches!(mode, FdrMode::DecoyFree)
+            && matches!(model_fit, ModelFit::Ensemble)
             && matches!(final_evidence_space, FinalEvidenceSpace::Auto)
         {
             panic!(
