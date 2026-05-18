@@ -5253,7 +5253,13 @@ fn annotate_physical_residual_columns(
 #[derive(Default, Clone, Copy)]
 struct SigmaBinCounts {
     n: usize,
+
+    le025: usize,
+    le050: usize,
+    le075: usize,
     le1: usize,
+
+    le150: usize,
     le2: usize,
     le3: usize,
     gt3: usize,
@@ -5270,8 +5276,22 @@ impl SigmaBinCounts {
         }
 
         self.n += 1;
+
+        if z <= 0.25 {
+            self.le025 += 1;
+        }
+        if z <= 0.50 {
+            self.le050 += 1;
+        }
+        if z <= 0.75 {
+            self.le075 += 1;
+        }
         if z <= 1.0 {
             self.le1 += 1;
+        }
+
+        if z <= 1.50 {
+            self.le150 += 1;
         }
         if z <= 2.0 {
             self.le2 += 1;
@@ -5287,15 +5307,44 @@ impl SigmaBinCounts {
 #[inline]
 fn fmt_sigma_bins(c: SigmaBinCounts) -> String {
     if c.n == 0 {
-        return "n=0 <=1σ=0(0.0%) <=2σ=0(0.0%) <=3σ=0(0.0%) >3σ=0(0.0%)".to_string();
+        return concat!(
+            "n=0 ",
+            "<=0.25σ=0(0.0%) ",
+            "<=0.50σ=0(0.0%) ",
+            "<=0.75σ=0(0.0%) ",
+            "<=1σ=0(0.0%) ",
+            "<=1.5σ=0(0.0%) ",
+            "<=2σ=0(0.0%) ",
+            "<=3σ=0(0.0%) ",
+            ">3σ=0(0.0%)"
+        )
+        .to_string();
     }
 
     let n = c.n as f64;
     format!(
-        "n={} <=1σ={}({:.1}%) <=2σ={}({:.1}%) <=3σ={}({:.1}%) >3σ={}({:.1}%)",
+        concat!(
+            "n={} ",
+            "<=0.25σ={}({:.1}%) ",
+            "<=0.50σ={}({:.1}%) ",
+            "<=0.75σ={}({:.1}%) ",
+            "<=1σ={}({:.1}%) ",
+            "<=1.5σ={}({:.1}%) ",
+            "<=2σ={}({:.1}%) ",
+            "<=3σ={}({:.1}%) ",
+            ">3σ={}({:.1}%)"
+        ),
         c.n,
+        c.le025,
+        100.0 * c.le025 as f64 / n,
+        c.le050,
+        100.0 * c.le050 as f64 / n,
+        c.le075,
+        100.0 * c.le075 as f64 / n,
         c.le1,
         100.0 * c.le1 as f64 / n,
+        c.le150,
+        100.0 * c.le150 as f64 / n,
         c.le2,
         100.0 * c.le2 as f64 / n,
         c.le3,
@@ -5303,6 +5352,42 @@ fn fmt_sigma_bins(c: SigmaBinCounts) -> String {
         c.gt3,
         100.0 * c.gt3 as f64 / n
     )
+}
+
+#[inline]
+fn sigma_rate_le025(c: SigmaBinCounts) -> f64 {
+    if c.n == 0 {
+        0.0
+    } else {
+        c.le025 as f64 / c.n as f64
+    }
+}
+
+#[inline]
+fn sigma_rate_le050(c: SigmaBinCounts) -> f64 {
+    if c.n == 0 {
+        0.0
+    } else {
+        c.le050 as f64 / c.n as f64
+    }
+}
+
+#[inline]
+fn sigma_rate_le075(c: SigmaBinCounts) -> f64 {
+    if c.n == 0 {
+        0.0
+    } else {
+        c.le075 as f64 / c.n as f64
+    }
+}
+
+#[inline]
+fn sigma_rate_le150(c: SigmaBinCounts) -> f64 {
+    if c.n == 0 {
+        0.0
+    } else {
+        c.le150 as f64 / c.n as f64
+    }
 }
 
 #[inline]
@@ -5586,33 +5671,69 @@ fn log_physical_sigma_diagnostics(features: &[DfFeature], db: &IndexedDatabase) 
         fmt_sigma_bins(rescued_by_recurrence.ims)
     );
 
+    let rt_d025 = sigma_rate_le025(target_ref.rt) - sigma_rate_le025(entrapment.rt);
+    let rt_d050 = sigma_rate_le050(target_ref.rt) - sigma_rate_le050(entrapment.rt);
+    let rt_d075 = sigma_rate_le075(target_ref.rt) - sigma_rate_le075(entrapment.rt);
     let rt_d1 = sigma_rate_le1(target_ref.rt) - sigma_rate_le1(entrapment.rt);
+    let rt_d150 = sigma_rate_le150(target_ref.rt) - sigma_rate_le150(entrapment.rt);
     let rt_d2 = sigma_rate_le2(target_ref.rt) - sigma_rate_le2(entrapment.rt);
     let rt_d3 = sigma_rate_le3(target_ref.rt) - sigma_rate_le3(entrapment.rt);
 
+    let ims_d025 = sigma_rate_le025(target_ref.ims) - sigma_rate_le025(entrapment.ims);
+    let ims_d050 = sigma_rate_le050(target_ref.ims) - sigma_rate_le050(entrapment.ims);
+    let ims_d075 = sigma_rate_le075(target_ref.ims) - sigma_rate_le075(entrapment.ims);
     let ims_d1 = sigma_rate_le1(target_ref.ims) - sigma_rate_le1(entrapment.ims);
+    let ims_d150 = sigma_rate_le150(target_ref.ims) - sigma_rate_le150(entrapment.ims);
     let ims_d2 = sigma_rate_le2(target_ref.ims) - sigma_rate_le2(entrapment.ims);
     let ims_d3 = sigma_rate_le3(target_ref.ims) - sigma_rate_le3(entrapment.ims);
 
     log::info!(
-        "DF physical target-entrapment separation: rt_delta_le1σ={:.4} rt_delta_le2σ={:.4} rt_delta_le3σ={:.4} ims_delta_le1σ={:.4} ims_delta_le2σ={:.4} ims_delta_le3σ={:.4}",
+        concat!(
+            "DF physical target-entrapment separation: ",
+            "rt_delta_le0.25σ={:.4} ",
+            "rt_delta_le0.50σ={:.4} ",
+            "rt_delta_le0.75σ={:.4} ",
+            "rt_delta_le1σ={:.4} ",
+            "rt_delta_le1.5σ={:.4} ",
+            "rt_delta_le2σ={:.4} ",
+            "rt_delta_le3σ={:.4} ",
+            "ims_delta_le0.25σ={:.4} ",
+            "ims_delta_le0.50σ={:.4} ",
+            "ims_delta_le0.75σ={:.4} ",
+            "ims_delta_le1σ={:.4} ",
+            "ims_delta_le1.5σ={:.4} ",
+            "ims_delta_le2σ={:.4} ",
+            "ims_delta_le3σ={:.4}"
+        ),
+        rt_d025,
+        rt_d050,
+        rt_d075,
         rt_d1,
+        rt_d150,
         rt_d2,
         rt_d3,
+        ims_d025,
+        ims_d050,
+        ims_d075,
         ims_d1,
+        ims_d150,
         ims_d2,
         ims_d3
     );
 
-    if rt_d1.abs() < 0.02 && rt_d2.abs() < 0.02 {
+    if rt_d025.abs() < 0.02 && rt_d050.abs() < 0.02 && rt_d075.abs() < 0.02 && rt_d1.abs() < 0.02 {
         log::warn!(
-            "DF RT separation warning: target_ref and entrapment RT residual distributions are very similar; rt_reliability reflects internal anchor/sigma stability, not target-entrapment discrimination."
+            "DF RT separation warning: target_ref and entrapment RT residual distributions are very similar from <=0.25σ through <=1σ; rt_reliability reflects internal anchor/sigma stability, not target-entrapment discrimination."
         );
     }
 
-    if ims_d1.abs() < 0.02 && ims_d2.abs() < 0.02 {
+    if ims_d025.abs() < 0.02
+        && ims_d050.abs() < 0.02
+        && ims_d075.abs() < 0.02
+        && ims_d1.abs() < 0.02
+    {
         log::warn!(
-            "DF IMS separation warning: target_ref and entrapment IMS residual distributions are very similar; ims_reliability reflects internal anchor/sigma stability, not target-entrapment discrimination."
+            "DF IMS separation warning: target_ref and entrapment IMS residual distributions are very similar from <=0.25σ through <=1σ; ims_reliability reflects internal anchor/sigma stability, not target-entrapment discrimination."
         );
     }
 }
