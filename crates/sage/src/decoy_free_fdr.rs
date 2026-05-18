@@ -5556,6 +5556,420 @@ fn log_physical_rescue_enrichment_diagnostics(features: &[DfFeature], db: &Index
     }
 }
 
+fn log_df_pvalue_bin_diagnostics(features: &[DfFeature], db: &IndexedDatabase) {
+    const THRESHOLDS: [f64; 6] = [1e-6, 1e-5, 1e-4, 1e-3, 1e-2, 5e-2];
+
+    for thr in THRESHOLDS {
+        let mut counts = RescueCompositionCounts::default();
+
+        for f in features.iter().filter(|f| f.core.rank == 1) {
+            let Some(p) = f.decoy_free_p_value else {
+                continue;
+            };
+
+            if p.is_finite() && (p as f64) <= thr {
+                counts.observe(f, db);
+            }
+        }
+
+        log::info!(
+            "DF evidence separation: decoy_free_p_value<={:.0e} {}",
+            thr,
+            fmt_rescue_composition(counts)
+        );
+    }
+}
+
+type DfMetricFn = fn(&DfFeature) -> Option<f64>;
+
+#[derive(Clone, Copy)]
+struct DfMetricSpec {
+    name: &'static str,
+    higher_is_better: bool,
+    value: DfMetricFn,
+}
+
+#[inline]
+fn metric_hyperscore(f: &DfFeature) -> Option<f64> {
+    f.core.hyperscore.is_finite().then_some(f.core.hyperscore)
+}
+
+#[inline]
+fn metric_delta_next(f: &DfFeature) -> Option<f64> {
+    f.core.delta_next.is_finite().then_some(f.core.delta_next)
+}
+
+#[inline]
+fn metric_delta_best(f: &DfFeature) -> Option<f64> {
+    f.core.delta_best.is_finite().then_some(f.core.delta_best)
+}
+
+#[inline]
+fn metric_matched_peaks(f: &DfFeature) -> Option<f64> {
+    Some(f.core.matched_peaks as f64)
+}
+
+#[inline]
+fn metric_longest_b(f: &DfFeature) -> Option<f64> {
+    Some(f.core.longest_b as f64)
+}
+
+#[inline]
+fn metric_longest_y(f: &DfFeature) -> Option<f64> {
+    Some(f.core.longest_y as f64)
+}
+
+#[inline]
+fn metric_matched_intensity_pct(f: &DfFeature) -> Option<f64> {
+    let x = f.core.matched_intensity_pct as f64;
+    x.is_finite().then_some(x)
+}
+
+#[inline]
+fn metric_ms2_intensity(f: &DfFeature) -> Option<f64> {
+    let x = f.core.ms2_intensity as f64;
+    x.is_finite().then_some(x)
+}
+
+#[inline]
+fn metric_scored_candidates(f: &DfFeature) -> Option<f64> {
+    Some(f.core.scored_candidates as f64)
+}
+
+fn quantile_sorted(vals: &[f64], q: f64) -> Option<f64> {
+    if vals.is_empty() {
+        return None;
+    }
+
+    let q = q.clamp(0.0, 1.0);
+    let pos = q * (vals.len().saturating_sub(1) as f64);
+    let lo = pos.floor() as usize;
+    let hi = pos.ceil() as usize;
+
+    if lo == hi {
+        Some(vals[lo])
+    } else {
+        let w = pos - lo as f64;
+        Some(vals[lo] * (1.0 - w) + vals[hi] * w)
+    }
+}
+
+fn count_metric_subset(
+    features: &[DfFeature],
+    db: &IndexedDatabase,
+    metric: DfMetricFn,
+    higher_is_better: bool,
+    threshold: f64,
+) -> RescueCompositionCounts {
+    let mut counts = RescueCompositionCounts::default();
+
+    for f in features.iter().filter(|f| f.core.rank == 1) {
+        let Some(v) = metric(f) else {
+            continue;
+        };
+
+        if !v.is_finite() {
+            continue;
+        }
+
+        let pass = if higher_is_better {
+            v >= threshold
+        } else {
+            v <= threshold
+        };
+
+        if pass {
+            counts.observe(f, db);
+        }
+    }
+
+    counts
+}
+
+fn log_spectral_feature_separation_diagnostics(features: &[DfFeature], db: &IndexedDatabase) {
+    let metrics: [DfMetricSpec; 9] = [
+        DfMetricSpec {
+            name: "hyperscore",
+            higher_is_better: true,
+            value: metric_hyperscore,
+        },
+        DfMetricSpec {
+            name: "delta_next",
+            higher_is_better: true,
+            value: metric_delta_next,
+        },
+        DfMetricSpec {
+            name: "delta_best",
+            higher_is_better: true,
+            value: metric_delta_best,
+        },
+        DfMetricSpec {
+            name: "matched_peaks",
+            higher_is_better: true,
+            value: metric_matched_peaks,
+        },
+        DfMetricSpec {
+            name: "longest_b",
+            higher_is_better: true,
+            value: metric_longest_b,
+        },
+        DfMetricSpec {
+            name: "longest_y",
+            higher_is_better: true,
+            value: metric_longest_y,
+        },
+        DfMetricSpec {
+            name: "matched_intensity_pct",
+            higher_is_better: true,
+            value: metric_matched_intensity_pct,
+        },
+        DfMetricSpec {
+            name: "ms2_intensity",
+            higher_is_better: true,
+            value: metric_ms2_intensity,
+        },
+        DfMetricSpec {
+            name: "scored_candidates",
+            higher_is_better: false,
+            value: metric_scored_candidates,
+        },
+    ];
+
+    for spec in metrics {
+        let mut vals: Vec<f64> = features
+            .iter()
+            .filter(|f| f.core.rank == 1)
+            .filter_map(|f| (spec.value)(f))
+            .filter(|x| x.is_finite())
+            .collect();
+
+        if vals.len() < 100 {
+            log::warn!(
+                "DF spectral feature separation: metric={} skipped; finite_n={}",
+                spec.name,
+                vals.len()
+            );
+            continue;
+        }
+
+        vals.sort_by(|a, b| a.total_cmp(b));
+
+        let quantiles: [(f64, &'static str); 3] = if spec.higher_is_better {
+            [(0.90, "top10pct"), (0.95, "top5pct"), (0.99, "top1pct")]
+        } else {
+            [
+                (0.10, "bottom10pct"),
+                (0.05, "bottom5pct"),
+                (0.01, "bottom1pct"),
+            ]
+        };
+
+        for (q, label) in quantiles {
+            let Some(thr) = quantile_sorted(&vals, q) else {
+                continue;
+            };
+
+            let counts = count_metric_subset(features, db, spec.value, spec.higher_is_better, thr);
+
+            log::info!(
+                "DF spectral feature separation: metric={} subset={} threshold={:.6e} direction={} {}",
+                spec.name,
+                label,
+                thr,
+                if spec.higher_is_better { "higher" } else { "lower" },
+                fmt_rescue_composition(counts)
+            );
+        }
+    }
+}
+
+fn log_delta_next_focused_diagnostics(features: &[DfFeature], db: &IndexedDatabase) {
+    const THRESHOLDS: [f64; 7] = [0.0, 0.01, 0.05, 0.10, 0.25, 0.50, 1.00];
+
+    for thr in THRESHOLDS {
+        let counts = count_metric_subset(features, db, metric_delta_next, true, thr);
+
+        log::info!(
+            "DF delta_next separation: delta_next>={:.2} {}",
+            thr,
+            fmt_rescue_composition(counts)
+        );
+    }
+}
+
+#[derive(Default)]
+struct PeptideRunEvidence {
+    runs: FnvHashSet<usize>,
+    is_entrapment: bool,
+    is_contaminant: bool,
+    is_reference: bool,
+}
+
+fn fmt_run_count_bins(label: &str, bins: &[usize; 6]) -> String {
+    let total: usize = bins.iter().sum();
+
+    format!(
+        "{} n={} runs1={}({:.1}%) runs2={}({:.1}%) runs3={}({:.1}%) runs4={}({:.1}%) runs5plus={}({:.1}%)",
+        label,
+        total,
+        bins[1],
+        pct_part(bins[1], total),
+        bins[2],
+        pct_part(bins[2], total),
+        bins[3],
+        pct_part(bins[3], total),
+        bins[4],
+        pct_part(bins[4], total),
+        bins[5],
+        pct_part(bins[5], total)
+    )
+}
+
+fn log_peptide_recurrence_separation_diagnostics(features: &[DfFeature], db: &IndexedDatabase) {
+    let mut peptide_runs: FnvHashMap<u32, PeptideRunEvidence> = FnvHashMap::default();
+
+    for f in features.iter().filter(|f| f.core.rank == 1) {
+        let proteins = db[f.core.peptide_idx].proteins(&db.decoy_tag, db.generate_decoys);
+        let is_ent = is_entrapment_str(&proteins);
+        let is_cont = is_contam_str(&proteins);
+        let is_ref = f.core.label == 1 && !is_ent && !is_cont;
+
+        let entry = peptide_runs.entry(f.core.peptide_idx.0).or_default();
+        entry.runs.insert(f.core.file_id);
+        entry.is_entrapment |= is_ent;
+        entry.is_contaminant |= is_cont;
+        entry.is_reference |= is_ref;
+    }
+
+    let mut target_bins = [0usize; 6];
+    let mut ent_bins = [0usize; 6];
+    let mut cont_bins = [0usize; 6];
+
+    for ev in peptide_runs.values() {
+        let n_runs = ev.runs.len().clamp(1, 5);
+
+        if ev.is_reference && !ev.is_entrapment && !ev.is_contaminant {
+            target_bins[n_runs] += 1;
+        }
+
+        if ev.is_entrapment {
+            ent_bins[n_runs] += 1;
+        }
+
+        if ev.is_contaminant {
+            cont_bins[n_runs] += 1;
+        }
+    }
+
+    log::info!(
+        "DF peptide recurrence separation: {}",
+        fmt_run_count_bins("target_ref", &target_bins)
+    );
+    log::info!(
+        "DF peptide recurrence separation: {}",
+        fmt_run_count_bins("entrapment", &ent_bins)
+    );
+    log::info!(
+        "DF peptide recurrence separation: {}",
+        fmt_run_count_bins("contaminant", &cont_bins)
+    );
+
+    for min_runs in 2..=5 {
+        let mut counts = RescueCompositionCounts::default();
+
+        for f in features.iter().filter(|f| f.core.rank == 1) {
+            let n = peptide_runs
+                .get(&f.core.peptide_idx.0)
+                .map(|ev| ev.runs.len())
+                .unwrap_or(1);
+
+            if n >= min_runs {
+                counts.observe(f, db);
+            }
+        }
+
+        log::info!(
+            "DF peptide recurrence PSM enrichment: peptide_observed_in_{}plus_runs {}",
+            min_runs,
+            fmt_rescue_composition(counts)
+        );
+    }
+}
+
+fn log_mass_error_separation_diagnostics(features: &[DfFeature], db: &IndexedDatabase) {
+    const PPM_THRESHOLDS: [f64; 6] = [1.0, 2.0, 5.0, 10.0, 20.0, 50.0];
+
+    for thr in PPM_THRESHOLDS {
+        let mut precursor_counts = RescueCompositionCounts::default();
+        let mut fragment_counts = RescueCompositionCounts::default();
+
+        for f in features.iter().filter(|f| f.core.rank == 1) {
+            let precursor_ppm_like = f.core.delta_mass as f64;
+            if precursor_ppm_like.is_finite() && precursor_ppm_like.abs() <= thr {
+                precursor_counts.observe(f, db);
+            }
+
+            let fragment_ppm_like = f.core.average_ppm as f64;
+            if fragment_ppm_like.is_finite() && fragment_ppm_like.abs() <= thr {
+                fragment_counts.observe(f, db);
+            }
+        }
+
+        log::info!(
+            "DF mass-error separation: abs_precursor_error<={:.1} {}",
+            thr,
+            fmt_rescue_composition(precursor_counts)
+        );
+        log::info!(
+            "DF mass-error separation: abs_fragment_ppm<={:.1} {}",
+            thr,
+            fmt_rescue_composition(fragment_counts)
+        );
+    }
+}
+
+fn log_support_layer_separation_diagnostics(features: &[DfFeature], db: &IndexedDatabase) {
+    let mut peptide_supported = RescueCompositionCounts::default();
+    let mut protein_supported = RescueCompositionCounts::default();
+    let mut peptide_q_1pct = RescueCompositionCounts::default();
+    let mut protein_q_1pct = RescueCompositionCounts::default();
+
+    for f in features.iter().filter(|f| f.core.rank == 1) {
+        if f.decoy_free_peptide_supported_psm.unwrap_or(false) {
+            peptide_supported.observe(f, db);
+        }
+
+        if f.decoy_free_protein_supported_peptide.unwrap_or(false) {
+            protein_supported.observe(f, db);
+        }
+
+        if f.decoy_free_peptide_q.unwrap_or(1.0) <= 0.01 {
+            peptide_q_1pct.observe(f, db);
+        }
+
+        if f.decoy_free_protein_q.unwrap_or(1.0) <= 0.01 {
+            protein_q_1pct.observe(f, db);
+        }
+    }
+
+    log::info!(
+        "DF support-layer separation: peptide_supported_psm {}",
+        fmt_rescue_composition(peptide_supported)
+    );
+    log::info!(
+        "DF support-layer separation: protein_supported_peptide {}",
+        fmt_rescue_composition(protein_supported)
+    );
+    log::info!(
+        "DF support-layer separation: peptide_q<=0.01 {}",
+        fmt_rescue_composition(peptide_q_1pct)
+    );
+    log::info!(
+        "DF support-layer separation: protein_q<=0.01 {}",
+        fmt_rescue_composition(protein_q_1pct)
+    );
+}
+
 fn log_physical_sigma_diagnostics(features: &[DfFeature], db: &IndexedDatabase) {
     #[derive(Default)]
     struct Row {
@@ -8977,6 +9391,12 @@ pub fn run_df_layers(
     log_physical_sigma_diagnostics(&new_features, db);
     log_physical_rescue_enrichment_diagnostics(&new_features, db);
 
+    log_df_pvalue_bin_diagnostics(&new_features, db);
+    log_spectral_feature_separation_diagnostics(&new_features, db);
+    log_delta_next_focused_diagnostics(&new_features, db);
+    log_peptide_recurrence_separation_diagnostics(&new_features, db);
+    log_mass_error_separation_diagnostics(&new_features, db);
+
     new_features
 }
 
@@ -8994,6 +9414,8 @@ pub fn calculate_q_values(
     let _ = calculate_protein_q_df(&mut features, db, settings);
 
     let _ = apply_hierarchical_reporting_df(&mut features, db, settings);
+
+    log_support_layer_separation_diagnostics(&features, db);
 
     features
 }
