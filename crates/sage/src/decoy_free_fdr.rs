@@ -793,6 +793,28 @@ fn clear_all_df_outputs(psm: &mut DfFeature, fail_closed_rank1: bool) {
     psm.decoy_free_protein_q = None;
     psm.decoy_free_protein_supported_peptide = None;
     psm.decoy_free_peptide_supported_psm = None;
+    psm.rt_residual = None;
+    psm.abs_rt_residual = None;
+    psm.rt_z = None;
+    psm.rt_within_1sigma = None;
+    psm.rt_within_2sigma = None;
+    psm.rt_within_3sigma = None;
+
+    psm.ims_residual = None;
+    psm.abs_ims_residual = None;
+    psm.ims_z = None;
+    psm.ims_within_1sigma = None;
+    psm.ims_within_2sigma = None;
+    psm.ims_within_3sigma = None;
+
+    psm.physical_rescue_source = None;
+    psm.rescued_by_rt = None;
+    psm.rescued_by_ims = None;
+    psm.rescued_by_recurrence = None;
+
+    psm.rt_local_z = None;
+    psm.rt_local_outlier = None;
+    psm.rt_training_eligible = None;
 
     // Clear the frozen base-stage audit snapshot.
     psm.decoy_free_p_value_base = None;
@@ -3781,6 +3803,28 @@ fn scrub_non_rank1_df_outputs(features: &mut [DfFeature]) {
             psm.decoy_free_protein_q = None;
             psm.decoy_free_protein_supported_peptide = None;
             psm.decoy_free_peptide_supported_psm = None;
+            psm.rt_residual = None;
+            psm.abs_rt_residual = None;
+            psm.rt_z = None;
+            psm.rt_within_1sigma = None;
+            psm.rt_within_2sigma = None;
+            psm.rt_within_3sigma = None;
+
+            psm.ims_residual = None;
+            psm.abs_ims_residual = None;
+            psm.ims_z = None;
+            psm.ims_within_1sigma = None;
+            psm.ims_within_2sigma = None;
+            psm.ims_within_3sigma = None;
+
+            psm.physical_rescue_source = None;
+            psm.rescued_by_rt = None;
+            psm.rescued_by_ims = None;
+            psm.rescued_by_recurrence = None;
+
+            psm.rt_local_z = None;
+            psm.rt_local_outlier = None;
+            psm.rt_training_eligible = None;
             psm.decoy_free_p_value_base = None;
             psm.decoy_free_pep_base = None;
             psm.decoy_free_score_base = None;
@@ -5107,6 +5151,390 @@ fn aux_null_p_from_sorted_agreements(null_sorted: &[f64], agreement_obs: f64) ->
     ((count_ge as f64 + 1.0) / (null_sorted.len() as f64 + 1.0)).clamp(1e-300, 1.0)
 }
 
+const DF_RT_LOCAL_OUTLIER_Z: f64 = 5.0;
+
+#[inline]
+fn robust_sigma_from_abs_residuals(mut vals: Vec<f64>, lo: f64, hi: f64) -> Option<f64> {
+    vals.retain(|x| x.is_finite() && *x >= 0.0);
+    if vals.is_empty() {
+        return None;
+    }
+
+    vals.sort_by(|a, b| a.total_cmp(b));
+    let med = vals[vals.len() / 2];
+
+    Some((1.4826 * med).clamp(lo, hi))
+}
+
+#[inline]
+fn rt_residual_for_feature(f: &DfFeature) -> Option<f64> {
+    let aligned = f.core.aligned_rt as f64;
+    let predicted = f.core.predicted_rt as f64;
+
+    if aligned.is_finite() && predicted.is_finite() {
+        Some(aligned - predicted)
+    } else {
+        None
+    }
+}
+
+#[inline]
+fn ims_residual_for_feature(f: &DfFeature) -> Option<f64> {
+    let observed = f.core.ims as f64;
+    let predicted = f.core.predicted_ims as f64;
+
+    if observed.is_finite() && predicted.is_finite() {
+        Some(observed - predicted)
+    } else {
+        None
+    }
+}
+
+fn annotate_physical_residual_columns(
+    features: &mut [DfFeature],
+    settings: &FdrSettings,
+    rt_sigma: Option<f64>,
+    ims_sigma: Option<f64>,
+) {
+    for f in features.iter_mut().filter(|f| f.core.rank == 1) {
+        if let (Some(delta), Some(sig)) = (rt_residual_for_feature(f), rt_sigma) {
+            if sig.is_finite() && sig > 0.0 {
+                let abs_delta = delta.abs();
+                let z = abs_delta / sig;
+
+                f.rt_residual = Some(delta as f32);
+                f.abs_rt_residual = Some(abs_delta as f32);
+                f.rt_z = Some(z as f32);
+                f.rt_within_1sigma = Some(z <= 1.0);
+                f.rt_within_2sigma = Some(z <= 2.0);
+                f.rt_within_3sigma = Some(z <= 3.0);
+            }
+        }
+
+        if let (Some(delta), Some(sig)) = (ims_residual_for_feature(f), ims_sigma) {
+            if sig.is_finite() && sig > 0.0 {
+                let abs_delta = delta.abs();
+                let z = abs_delta / sig;
+
+                f.ims_residual = Some(delta as f32);
+                f.abs_ims_residual = Some(abs_delta as f32);
+                f.ims_z = Some(z as f32);
+                f.ims_within_1sigma = Some(z <= 1.0);
+                f.ims_within_2sigma = Some(z <= 2.0);
+                f.ims_within_3sigma = Some(z <= 3.0);
+            }
+        }
+
+        if f.rescued_by_rt.is_none() {
+            f.rescued_by_rt = Some(false);
+        }
+        if f.rescued_by_ims.is_none() {
+            f.rescued_by_ims = Some(false);
+        }
+        if f.rescued_by_recurrence.is_none() {
+            f.rescued_by_recurrence = Some(false);
+        }
+
+        if f.physical_rescue_source.is_none() {
+            f.physical_rescue_source = Some("none".to_string());
+        }
+
+        // Default to eligible unless local diagnostics prove otherwise.
+        if f.rt_training_eligible.is_none() {
+            f.rt_training_eligible = Some(true);
+        }
+
+        // Avoid warning for currently unused settings argument if future cfg wiring
+        // is added later.
+        let _ = settings;
+    }
+}
+
+#[derive(Default, Clone, Copy)]
+struct SigmaBinCounts {
+    n: usize,
+    le1: usize,
+    le2: usize,
+    le3: usize,
+    gt3: usize,
+}
+
+impl SigmaBinCounts {
+    fn observe(&mut self, z: Option<f32>) {
+        let Some(z) = z else {
+            return;
+        };
+        let z = z as f64;
+        if !z.is_finite() {
+            return;
+        }
+
+        self.n += 1;
+        if z <= 1.0 {
+            self.le1 += 1;
+        }
+        if z <= 2.0 {
+            self.le2 += 1;
+        }
+        if z <= 3.0 {
+            self.le3 += 1;
+        } else {
+            self.gt3 += 1;
+        }
+    }
+}
+
+#[inline]
+fn fmt_sigma_bins(c: SigmaBinCounts) -> String {
+    if c.n == 0 {
+        return "n=0 <=1σ=0(0.0%) <=2σ=0(0.0%) <=3σ=0(0.0%) >3σ=0(0.0%)".to_string();
+    }
+
+    let n = c.n as f64;
+    format!(
+        "n={} <=1σ={}({:.1}%) <=2σ={}({:.1}%) <=3σ={}({:.1}%) >3σ={}({:.1}%)",
+        c.n,
+        c.le1,
+        100.0 * c.le1 as f64 / n,
+        c.le2,
+        100.0 * c.le2 as f64 / n,
+        c.le3,
+        100.0 * c.le3 as f64 / n,
+        c.gt3,
+        100.0 * c.gt3 as f64 / n
+    )
+}
+
+fn log_physical_sigma_diagnostics(features: &[DfFeature], db: &IndexedDatabase) {
+    #[derive(Default)]
+    struct Row {
+        rt: SigmaBinCounts,
+        ims: SigmaBinCounts,
+    }
+
+    let mut all_rank1 = Row::default();
+    let mut target_ref = Row::default();
+    let mut entrapment = Row::default();
+    let mut accepted_psm_q_1pct = Row::default();
+    let mut rescued_by_rt = Row::default();
+    let mut rescued_by_ims = Row::default();
+    let mut rescued_by_recurrence = Row::default();
+
+    for f in features.iter().filter(|f| f.core.rank == 1) {
+        let proteins = db[f.core.peptide_idx].proteins(&db.decoy_tag, db.generate_decoys);
+        let is_ent = is_entrapment_str(&proteins);
+        let is_cont = is_contam_str(&proteins);
+        let is_ref = f.core.label == 1 && !is_ent && !is_cont;
+
+        all_rank1.rt.observe(f.rt_z);
+        all_rank1.ims.observe(f.ims_z);
+
+        if is_ref {
+            target_ref.rt.observe(f.rt_z);
+            target_ref.ims.observe(f.ims_z);
+        }
+
+        if is_ent {
+            entrapment.rt.observe(f.rt_z);
+            entrapment.ims.observe(f.ims_z);
+        }
+
+        if f.decoy_free_q_value.unwrap_or(1.0) <= 0.01 {
+            accepted_psm_q_1pct.rt.observe(f.rt_z);
+            accepted_psm_q_1pct.ims.observe(f.ims_z);
+        }
+
+        if f.rescued_by_rt.unwrap_or(false) {
+            rescued_by_rt.rt.observe(f.rt_z);
+            rescued_by_rt.ims.observe(f.ims_z);
+        }
+
+        if f.rescued_by_ims.unwrap_or(false) {
+            rescued_by_ims.rt.observe(f.rt_z);
+            rescued_by_ims.ims.observe(f.ims_z);
+        }
+
+        if f.rescued_by_recurrence.unwrap_or(false) {
+            rescued_by_recurrence.rt.observe(f.rt_z);
+            rescued_by_recurrence.ims.observe(f.ims_z);
+        }
+    }
+
+    log::info!("DF RT residual diagnostics:");
+    log::info!(
+        "DF RT residual diagnostics: all_rank1 {}",
+        fmt_sigma_bins(all_rank1.rt)
+    );
+    log::info!(
+        "DF RT residual diagnostics: target_ref {}",
+        fmt_sigma_bins(target_ref.rt)
+    );
+    log::info!(
+        "DF RT residual diagnostics: entrapment {}",
+        fmt_sigma_bins(entrapment.rt)
+    );
+    log::info!(
+        "DF RT residual diagnostics: accepted_psm_q_1pct {}",
+        fmt_sigma_bins(accepted_psm_q_1pct.rt)
+    );
+    log::info!(
+        "DF RT residual diagnostics: rescued_by_rt {}",
+        fmt_sigma_bins(rescued_by_rt.rt)
+    );
+    log::info!(
+        "DF RT residual diagnostics: rescued_by_ims {}",
+        fmt_sigma_bins(rescued_by_ims.rt)
+    );
+    log::info!(
+        "DF RT residual diagnostics: rescued_by_recurrence {}",
+        fmt_sigma_bins(rescued_by_recurrence.rt)
+    );
+
+    log::info!("DF IMS residual diagnostics:");
+    log::info!(
+        "DF IMS residual diagnostics: all_rank1 {}",
+        fmt_sigma_bins(all_rank1.ims)
+    );
+    log::info!(
+        "DF IMS residual diagnostics: target_ref {}",
+        fmt_sigma_bins(target_ref.ims)
+    );
+    log::info!(
+        "DF IMS residual diagnostics: entrapment {}",
+        fmt_sigma_bins(entrapment.ims)
+    );
+    log::info!(
+        "DF IMS residual diagnostics: accepted_psm_q_1pct {}",
+        fmt_sigma_bins(accepted_psm_q_1pct.ims)
+    );
+    log::info!(
+        "DF IMS residual diagnostics: rescued_by_rt {}",
+        fmt_sigma_bins(rescued_by_rt.ims)
+    );
+    log::info!(
+        "DF IMS residual diagnostics: rescued_by_ims {}",
+        fmt_sigma_bins(rescued_by_ims.ims)
+    );
+    log::info!(
+        "DF IMS residual diagnostics: rescued_by_recurrence {}",
+        fmt_sigma_bins(rescued_by_recurrence.ims)
+    );
+}
+
+fn annotate_local_rt_training_guardrail(
+    features: &mut [DfFeature],
+    settings: &FdrSettings,
+) -> usize {
+    let min_n = settings
+        .physical_rescue
+        .min_anchor_count_per_run
+        .max(settings.min_null_size)
+        .max(10);
+
+    let mut by_file_region: HashMap<(usize, i32), Vec<f64>> = HashMap::new();
+    let mut by_file: HashMap<usize, Vec<f64>> = HashMap::new();
+
+    for f in features.iter().filter(|f| f.core.rank == 1) {
+        let Some(delta) = rt_residual_for_feature(f) else {
+            continue;
+        };
+
+        let abs_delta = delta.abs();
+        by_file.entry(f.core.file_id).or_default().push(abs_delta);
+
+        if let Some(region) = rt_region_bin_for_feature(f, settings) {
+            by_file_region
+                .entry((f.core.file_id, region))
+                .or_default()
+                .push(abs_delta);
+        }
+    }
+
+    let mut sigma_by_file_region: HashMap<(usize, i32), f64> = HashMap::new();
+    for (key, vals) in by_file_region {
+        if vals.len() >= min_n {
+            if let Some(sig) = robust_sigma_from_abs_residuals(vals, 0.05, 0.25) {
+                sigma_by_file_region.insert(key, sig);
+            }
+        }
+    }
+
+    let mut sigma_by_file: HashMap<usize, f64> = HashMap::new();
+    for (key, vals) in by_file {
+        if vals.len() >= min_n {
+            if let Some(sig) = robust_sigma_from_abs_residuals(vals, 0.05, 0.25) {
+                sigma_by_file.insert(key, sig);
+            }
+        }
+    }
+
+    let mut excluded = 0usize;
+    let mut excluded_by_file_region: HashMap<(usize, i32), usize> = HashMap::new();
+
+    for f in features.iter_mut().filter(|f| f.core.rank == 1) {
+        let Some(delta) = rt_residual_for_feature(f) else {
+            f.rt_training_eligible = Some(false);
+            f.rt_local_outlier = Some(true);
+            excluded += 1;
+            continue;
+        };
+
+        let region = rt_region_bin_for_feature(f, settings);
+        let sigma = region
+            .and_then(|r| sigma_by_file_region.get(&(f.core.file_id, r)).copied())
+            .or_else(|| sigma_by_file.get(&f.core.file_id).copied());
+
+        let Some(sigma) = sigma else {
+            // Fail open for sparse local bins: keep the PSM, but mark that no local
+            // outlier decision was possible.
+            f.rt_training_eligible = Some(true);
+            f.rt_local_outlier = Some(false);
+            continue;
+        };
+
+        let z = delta.abs() / sigma;
+        let outlier = z > DF_RT_LOCAL_OUTLIER_Z;
+
+        f.rt_local_z = Some(z as f32);
+        f.rt_local_outlier = Some(outlier);
+        f.rt_training_eligible = Some(!outlier);
+
+        if outlier {
+            excluded += 1;
+            if let Some(r) = region {
+                *excluded_by_file_region
+                    .entry((f.core.file_id, r))
+                    .or_default() += 1;
+            }
+        }
+    }
+
+    log::info!(
+        "DF RT local guardrail: threshold_z={:.1} min_local_n={} excluded_psms={}",
+        DF_RT_LOCAL_OUTLIER_Z,
+        min_n,
+        excluded
+    );
+
+    let mut rows: Vec<_> = excluded_by_file_region.into_iter().collect();
+    rows.sort_by_key(|((file_id, region), _)| (*file_id, *region));
+    for ((file_id, region), n) in rows {
+        log::debug!(
+            "DF RT local guardrail: file_id={} rt_region_bin={} excluded_psms={}",
+            file_id,
+            region,
+            n
+        );
+    }
+
+    excluded
+}
+
+#[inline]
+fn rt_training_eligible(f: &DfFeature) -> bool {
+    f.rt_training_eligible.unwrap_or(true) && !f.rt_local_outlier.unwrap_or(false)
+}
+
 fn aux_sigma_from_agreements(null_agreements: &[f64]) -> Option<f64> {
     let vals: Vec<f64> = null_agreements
         .iter()
@@ -5136,6 +5564,10 @@ fn build_rt_aux_null_model(
 
     for f in features.iter() {
         if f.core.rank < settings.min_null_rank || f.core.rank > settings.max_null_rank {
+            continue;
+        }
+
+        if !rt_training_eligible(f) {
             continue;
         }
 
@@ -5258,7 +5690,12 @@ fn apply_rt_null_pvalue_update_to_active_stream(
     for f in features.iter_mut().filter(|f| f.core.rank == 1) {
         let base_p = finite_df_p_value(f.decoy_free_p_value.unwrap_or(1.0));
 
-        let p_rt = rt_aux_null_p_value(&model, settings, f);
+        let p_rt = if rt_training_eligible(f) {
+            rt_aux_null_p_value(&model, settings, f)
+        } else {
+            1.0
+        };
+
         let p_new = finite_df_p_value(combine_cauchy(&[base_p, p_rt]));
 
         /*
@@ -5269,6 +5706,12 @@ fn apply_rt_null_pvalue_update_to_active_stream(
         let placeholder_pep = finite_df_probability_for_logit(f.decoy_free_pep.unwrap_or(1.0));
 
         set_df_evidence_pair(f, ActiveEvidenceSpace::PValue, p_new, placeholder_pep);
+
+        let rescued = p_new < base_p;
+        f.rescued_by_rt = Some(rescued);
+        if rescued {
+            f.physical_rescue_source = Some("rt".to_string());
+        }
     }
 
     recalibrate_companion_pep_from_active_p_values(features, settings, "RT p-value rescue");
@@ -5359,7 +5802,7 @@ fn apply_rt_bounded_update_to_active_stream(
             0.0
         };
 
-        let raw_shift = if missing_rt {
+        let raw_shift = if missing_rt || !rt_training_eligible(f) {
             0.0
         } else {
             compute_physical_shift(f, rt_sigma)
@@ -5377,6 +5820,13 @@ fn apply_rt_bounded_update_to_active_stream(
         };
 
         f.decoy_free_pep = Some(finite_df_probability_for_logit(posterior_pep));
+
+        let rescued = posterior_pep < prior_pep;
+        f.rescued_by_rt = Some(rescued);
+        if rescued {
+            f.physical_rescue_source = Some("rt".to_string());
+        }
+        f.rt_rescue_delta = Some(bounded_shift as f32);
 
         let df_score = df_score_from_pep(posterior_pep);
         f.decoy_free_score = Some(df_score);
@@ -5566,6 +6016,12 @@ fn apply_ims_null_pvalue_update_to_active_stream(
         let placeholder_pep = f.decoy_free_pep.unwrap_or(1.0) as f64;
 
         set_df_evidence_pair(f, ActiveEvidenceSpace::PValue, p_new, placeholder_pep);
+
+        let rescued = p_new < base_p;
+        f.rescued_by_ims = Some(rescued);
+        if rescued {
+            f.physical_rescue_source = Some("ims".to_string());
+        }
     }
 
     recalibrate_companion_pep_from_active_p_values(features, settings, "IMS p-value rescue");
@@ -5697,6 +6153,13 @@ fn apply_ims_bounded_update_to_active_stream(
         };
 
         f.decoy_free_pep = Some(finite_df_probability_for_logit(posterior_pep));
+
+        let rescued = posterior_pep < prior_pep;
+        f.rescued_by_ims = Some(rescued);
+        if rescued {
+            f.physical_rescue_source = Some("ims".to_string());
+        }
+        f.ims_rescue_delta = Some(bounded_shift as f32);
 
         let df_score = df_score_from_pep(posterior_pep);
         f.decoy_free_score = Some(df_score);
@@ -7239,8 +7702,11 @@ fn apply_recurrence_null_pvalue_update_to_active_stream(
 
         let p_new = finite_df_p_value(10.0_f64.powf(-bounded_score));
 
-        if p_new < base_p {
+        let rescued = p_new < base_p;
+        f.rescued_by_recurrence = Some(rescued);
+        if rescued {
             n_rescued_psms += 1;
+            f.physical_rescue_source = Some("recurrence".to_string());
         }
 
         let shift_abs = (bounded_score - base_score).abs();
@@ -7427,6 +7893,12 @@ fn apply_bounded_repro_shift(
         };
 
         max_shift_applied = max_shift_applied.max(shift_abs);
+
+        let rescued = post_pep + 1e-12 < prior_pep;
+        f.rescued_by_recurrence = Some(rescued);
+        if rescued {
+            f.physical_rescue_source = Some("recurrence".to_string());
+        }
 
         f.decoy_free_pep = Some(post_pep);
         f.decoy_free_score = Some(df_score_from_pep(post_pep));
@@ -8018,6 +8490,30 @@ pub fn run_df_layers(
     // populated immediately after base q-values are computed.
     snapshot_base_stream_once(&mut new_features);
 
+    // 1I. Physical residual diagnostics and conservative local RT guardrail.
+    //
+    // This does not delete any PSMs. It only:
+    //   - writes RT/IMS residual diagnostics to the TSV,
+    //   - marks extreme local RT outliers,
+    //   - prevents those outliers from positive RT rescue / RT physical training.
+    //
+    // The sigma values used here are intentionally derived from the current DF
+    // physical context, not from final peptide/protein inference.
+    let rt_diag_anchors = build_physical_anchor_set(&new_features, settings, db);
+    let (rt_diag_safe_anchors, _) =
+        exclude_non_rescue_safe_anchors(&new_features, rt_diag_anchors, settings, db);
+    let rt_diag_rel = compute_rt_reliability(&new_features, &rt_diag_safe_anchors, settings);
+    let ims_diag_rel = compute_ims_reliability(&new_features, &rt_diag_safe_anchors, settings);
+
+    annotate_physical_residual_columns(
+        &mut new_features,
+        settings,
+        rt_diag_rel.rt_sigma_global,
+        ims_diag_rel.ims_sigma_global,
+    );
+
+    let _rt_local_excluded = annotate_local_rt_training_guardrail(&mut new_features, settings);
+
     let base_snapshot_missing = new_features
         .iter()
         .filter(|f| f.core.rank == 1)
@@ -8117,6 +8613,8 @@ pub fn run_df_layers(
         ActiveDfStream::ProteinRescue => "protein_reproducibility_rescue",
     };
     log::info!("DF final active stream: {}", stream_kind);
+
+    log_physical_sigma_diagnostics(&new_features, db);
 
     new_features
 }

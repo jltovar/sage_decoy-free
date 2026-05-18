@@ -300,6 +300,63 @@ pub struct DfFeature {
     // 5D. Layer 2 diagnostics
     #[serde(skip_serializing_if = "Option::is_none")]
     pub physical_mode_used: Option<String>,
+
+    // PSM-level RT/IMS residual diagnostics.
+    //
+    // Existing core columns already include:
+    //   aligned_rt
+    //   predicted_rt
+    //   ims
+    //   predicted_ims
+    //
+    // These normalized columns are written by the DF physical-diagnostics layer.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub rt_residual: Option<f32>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub abs_rt_residual: Option<f32>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub rt_z: Option<f32>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub rt_within_1sigma: Option<bool>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub rt_within_2sigma: Option<bool>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub rt_within_3sigma: Option<bool>,
+
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub ims_residual: Option<f32>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub abs_ims_residual: Option<f32>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub ims_z: Option<f32>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub ims_within_1sigma: Option<bool>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub ims_within_2sigma: Option<bool>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub ims_within_3sigma: Option<bool>,
+
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub physical_rescue_source: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub rescued_by_rt: Option<bool>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub rescued_by_ims: Option<bool>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub rescued_by_recurrence: Option<bool>,
+
+    // Local RT guardrail diagnostics.
+    //
+    // rt_local_z is computed against a local file+RT-bin robust sigma when possible.
+    // rt_training_eligible=false means the row is retained in output, but excluded
+    // from RT physical training/positive RT rescue.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub rt_local_z: Option<f32>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub rt_local_outlier: Option<bool>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub rt_training_eligible: Option<bool>,
+
     #[serde(skip_serializing_if = "Option::is_none")]
     pub rt_rescue_delta: Option<f32>,
     #[serde(skip_serializing_if = "Option::is_none")]
@@ -853,6 +910,30 @@ impl FeatureCore {
             decoy_free_q_l3: None,
 
             physical_mode_used: None,
+
+            rt_residual: None,
+            abs_rt_residual: None,
+            rt_z: None,
+            rt_within_1sigma: None,
+            rt_within_2sigma: None,
+            rt_within_3sigma: None,
+
+            ims_residual: None,
+            abs_ims_residual: None,
+            ims_z: None,
+            ims_within_1sigma: None,
+            ims_within_2sigma: None,
+            ims_within_3sigma: None,
+
+            physical_rescue_source: None,
+            rescued_by_rt: None,
+            rescued_by_ims: None,
+            rescued_by_recurrence: None,
+
+            rt_local_z: None,
+            rt_local_outlier: None,
+            rt_training_eligible: None,
+
             rt_rescue_delta: None,
             ims_rescue_delta: None,
             physical_shift_total: None,
