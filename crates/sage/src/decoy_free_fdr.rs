@@ -5305,6 +5305,172 @@ fn fmt_sigma_bins(c: SigmaBinCounts) -> String {
     )
 }
 
+#[inline]
+fn sigma_rate_le1(c: SigmaBinCounts) -> f64 {
+    if c.n == 0 {
+        0.0
+    } else {
+        c.le1 as f64 / c.n as f64
+    }
+}
+
+#[inline]
+fn sigma_rate_le2(c: SigmaBinCounts) -> f64 {
+    if c.n == 0 {
+        0.0
+    } else {
+        c.le2 as f64 / c.n as f64
+    }
+}
+
+#[inline]
+fn sigma_rate_le3(c: SigmaBinCounts) -> f64 {
+    if c.n == 0 {
+        0.0
+    } else {
+        c.le3 as f64 / c.n as f64
+    }
+}
+
+#[derive(Default, Clone, Copy)]
+struct RescueCompositionCounts {
+    total: usize,
+    target_ref: usize,
+    entrapment: usize,
+    contaminant: usize,
+    accepted_psm_q_1pct: usize,
+}
+
+impl RescueCompositionCounts {
+    fn observe(&mut self, f: &DfFeature, db: &IndexedDatabase) {
+        let proteins = db[f.core.peptide_idx].proteins(&db.decoy_tag, db.generate_decoys);
+        let is_ent = is_entrapment_str(&proteins);
+        let is_cont = is_contam_str(&proteins);
+        let is_ref = f.core.label == 1 && !is_ent && !is_cont;
+
+        self.total += 1;
+
+        if is_ref {
+            self.target_ref += 1;
+        }
+        if is_ent {
+            self.entrapment += 1;
+        }
+        if is_cont {
+            self.contaminant += 1;
+        }
+        if f.decoy_free_q_value.unwrap_or(1.0) <= 0.01 {
+            self.accepted_psm_q_1pct += 1;
+        }
+    }
+}
+
+#[inline]
+fn pct_part(num: usize, den: usize) -> f64 {
+    if den == 0 {
+        0.0
+    } else {
+        100.0 * num as f64 / den as f64
+    }
+}
+
+fn fmt_rescue_composition(c: RescueCompositionCounts) -> String {
+    format!(
+        "total={} target_ref={}({:.2}%) entrapment={}({:.2}%) contaminant={}({:.2}%) accepted_psm_q_1pct={}({:.2}%)",
+        c.total,
+        c.target_ref,
+        pct_part(c.target_ref, c.total),
+        c.entrapment,
+        pct_part(c.entrapment, c.total),
+        c.contaminant,
+        pct_part(c.contaminant, c.total),
+        c.accepted_psm_q_1pct,
+        pct_part(c.accepted_psm_q_1pct, c.total)
+    )
+}
+
+fn log_physical_rescue_enrichment_diagnostics(features: &[DfFeature], db: &IndexedDatabase) {
+    let mut all_rank1 = RescueCompositionCounts::default();
+    let mut accepted_psm_q_1pct = RescueCompositionCounts::default();
+    let mut rescued_by_rt = RescueCompositionCounts::default();
+    let mut rescued_by_ims = RescueCompositionCounts::default();
+    let mut rescued_by_recurrence = RescueCompositionCounts::default();
+
+    for f in features.iter().filter(|f| f.core.rank == 1) {
+        all_rank1.observe(f, db);
+
+        if f.decoy_free_q_value.unwrap_or(1.0) <= 0.01 {
+            accepted_psm_q_1pct.observe(f, db);
+        }
+
+        if f.rescued_by_rt.unwrap_or(false) {
+            rescued_by_rt.observe(f, db);
+        }
+
+        if f.rescued_by_ims.unwrap_or(false) {
+            rescued_by_ims.observe(f, db);
+        }
+
+        if f.rescued_by_recurrence.unwrap_or(false) {
+            rescued_by_recurrence.observe(f, db);
+        }
+    }
+
+    log::info!(
+        "DF physical rescue enrichment: all_rank1 {}",
+        fmt_rescue_composition(all_rank1)
+    );
+    log::info!(
+        "DF physical rescue enrichment: accepted_psm_q_1pct {}",
+        fmt_rescue_composition(accepted_psm_q_1pct)
+    );
+    log::info!(
+        "DF physical rescue enrichment: rescued_by_rt {}",
+        fmt_rescue_composition(rescued_by_rt)
+    );
+    log::info!(
+        "DF physical rescue enrichment: rescued_by_ims {}",
+        fmt_rescue_composition(rescued_by_ims)
+    );
+    log::info!(
+        "DF physical rescue enrichment: rescued_by_recurrence {}",
+        fmt_rescue_composition(rescued_by_recurrence)
+    );
+
+    if all_rank1.total > 0 {
+        let baseline_ent_rate = all_rank1.entrapment as f64 / all_rank1.total as f64;
+
+        for (name, c) in [
+            ("rescued_by_rt", rescued_by_rt),
+            ("rescued_by_ims", rescued_by_ims),
+            ("rescued_by_recurrence", rescued_by_recurrence),
+        ] {
+            if c.total == 0 {
+                continue;
+            }
+
+            let rescued_ent_rate = c.entrapment as f64 / c.total as f64;
+            let delta = rescued_ent_rate - baseline_ent_rate;
+
+            log::info!(
+                "DF physical rescue enrichment: {} entrapment_rate_delta_vs_all_rank1={:.4} baseline={:.4} rescued={:.4}",
+                name,
+                delta,
+                baseline_ent_rate,
+                rescued_ent_rate
+            );
+
+            if delta > 0.01 {
+                log::warn!(
+                    "DF physical rescue enrichment warning: {} is entrapment-enriched versus all_rank1 by {:.2} percentage points.",
+                    name,
+                    100.0 * delta
+                );
+            }
+        }
+    }
+}
+
 fn log_physical_sigma_diagnostics(features: &[DfFeature], db: &IndexedDatabase) {
     #[derive(Default)]
     struct Row {
@@ -5419,6 +5585,36 @@ fn log_physical_sigma_diagnostics(features: &[DfFeature], db: &IndexedDatabase) 
         "DF IMS residual diagnostics: rescued_by_recurrence {}",
         fmt_sigma_bins(rescued_by_recurrence.ims)
     );
+
+    let rt_d1 = sigma_rate_le1(target_ref.rt) - sigma_rate_le1(entrapment.rt);
+    let rt_d2 = sigma_rate_le2(target_ref.rt) - sigma_rate_le2(entrapment.rt);
+    let rt_d3 = sigma_rate_le3(target_ref.rt) - sigma_rate_le3(entrapment.rt);
+
+    let ims_d1 = sigma_rate_le1(target_ref.ims) - sigma_rate_le1(entrapment.ims);
+    let ims_d2 = sigma_rate_le2(target_ref.ims) - sigma_rate_le2(entrapment.ims);
+    let ims_d3 = sigma_rate_le3(target_ref.ims) - sigma_rate_le3(entrapment.ims);
+
+    log::info!(
+        "DF physical target-entrapment separation: rt_delta_le1σ={:.4} rt_delta_le2σ={:.4} rt_delta_le3σ={:.4} ims_delta_le1σ={:.4} ims_delta_le2σ={:.4} ims_delta_le3σ={:.4}",
+        rt_d1,
+        rt_d2,
+        rt_d3,
+        ims_d1,
+        ims_d2,
+        ims_d3
+    );
+
+    if rt_d1.abs() < 0.02 && rt_d2.abs() < 0.02 {
+        log::warn!(
+            "DF RT separation warning: target_ref and entrapment RT residual distributions are very similar; rt_reliability reflects internal anchor/sigma stability, not target-entrapment discrimination."
+        );
+    }
+
+    if ims_d1.abs() < 0.02 && ims_d2.abs() < 0.02 {
+        log::warn!(
+            "DF IMS separation warning: target_ref and entrapment IMS residual distributions are very similar; ims_reliability reflects internal anchor/sigma stability, not target-entrapment discrimination."
+        );
+    }
 }
 
 fn annotate_local_rt_training_guardrail(
@@ -6574,6 +6770,49 @@ fn apply_ims_confidence_adjustment(
     (res, outcome)
 }
 
+fn apply_protein_recurrence_null_pvalue_update_to_active_stream(
+    features: &mut [DfFeature],
+    settings: &FdrSettings,
+    db: &IndexedDatabase,
+) -> ReproducibilityResult {
+    let protein_support_map = build_protein_support_map(features, db, settings);
+
+    let n_rescue_eligible_proteins = protein_support_map
+        .values()
+        .filter(|s| s.is_rescue_eligible)
+        .count();
+
+    if n_rescue_eligible_proteins == 0 {
+        log::warn!(
+            "DF protein reproducibility rescue skipped in p-value mode: eligible_proteins=0; leaving active stream unchanged."
+        );
+    } else {
+        log::warn!(
+            "DF protein reproducibility rescue skipped in p-value mode: eligible_proteins={} but protein-specific p-value recurrence rescue is not implemented; leaving active stream unchanged.",
+            n_rescue_eligible_proteins
+        );
+    }
+
+    for f in features.iter_mut().filter(|f| f.core.rank == 1) {
+        if f.rescued_by_recurrence.is_none() {
+            f.rescued_by_recurrence = Some(false);
+        }
+    }
+
+    ReproducibilityResult {
+        enabled: true,
+        fail_closed: false,
+        n_rescue_eligible_proteins,
+        n_rescue_eligible_peptides: 0,
+        n_anchor_peptides: 0,
+        n_rescued_psms: 0,
+        n_strong_unchanged_psms: 0,
+        n_too_weak_unrescued_psms: 0,
+        agreement_support_mean: 0.0,
+        max_shift_applied: 0.0,
+    }
+}
+
 fn apply_peptide_reproducibility_update_to_active_stream(
     features: &mut [DfFeature],
     settings: &FdrSettings,
@@ -6597,7 +6836,7 @@ fn apply_protein_reproducibility_update_to_active_stream(
         ActiveEvidenceSpace::Pep => apply_bounded_repro_shift(features, settings, db),
 
         ActiveEvidenceSpace::PValue => {
-            apply_recurrence_null_pvalue_update_to_active_stream(features, settings, db)
+            apply_protein_recurrence_null_pvalue_update_to_active_stream(features, settings, db)
         }
     }
 }
@@ -8615,6 +8854,7 @@ pub fn run_df_layers(
     log::info!("DF final active stream: {}", stream_kind);
 
     log_physical_sigma_diagnostics(&new_features, db);
+    log_physical_rescue_enrichment_diagnostics(&new_features, db);
 
     new_features
 }
