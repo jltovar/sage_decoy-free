@@ -78,13 +78,74 @@ pub enum QMethod {
     /// Use the level-appropriate default.
     #[default]
     Auto,
+
     /// Benjamini-Hochberg over p-values.
     Bh,
+
     /// Storey q-values over p-values.
     Storey,
+
+    /// Benjamini-Yekutieli over p-values.
+    By,
+
+    /// Benjamini-Krieger-Yekutieli two-stage adaptive BH.
+    Bky,
+
+    /// Structural/scaled FDR sensitivity mode.
+    Sfdr,
+
+    /// Covariate-weighted BH.
+    /// Uses level-specific covariates:
+    /// psm_q_covariate, peptide_q_covariate, protein_q_covariate.
+    CovariateWeightedBh,
+
     /// Cumulative mean over PEP-like values.
     /// Only valid for PEP-native evidence.
     Cummean,
+}
+
+#[derive(Clone, Copy, Serialize, Deserialize, Debug, Default, PartialEq, Eq)]
+#[serde(rename_all = "snake_case")]
+pub enum QCovariate {
+    #[default]
+    None,
+
+    // PSM-level
+    Hyperscore,
+    DeltaNext,
+    DeltaBest,
+    MatchedPeaks,
+    LongestB,
+    LongestY,
+    LongestYPct,
+    MatchedIntensityPct,
+    ScoredCandidates,
+    Ms2Intensity,
+    PeptideLen,
+    Charge,
+    MissedCleavages,
+
+    // Peptide-level
+    BestMatchedPeaks,
+    BestLongestYPct,
+    BestDeltaRtModel,
+    BestHyperscore,
+    PsmCount,
+    PeptideObservedRunCount,
+
+    // Protein-level
+    ObservedUniquePeptides,
+    ObservedPeptideSupport,
+
+    /// Requires FASTA-derived protein metadata not exposed in the attached files.
+    ProteinLength,
+
+    /// Requires FASTA digestion/observability metadata not exposed in the attached files.
+    ObservableProteinPeptides,
+
+    /// Intended future NSAF-like denominator:
+    /// observed_unique_peptides / observable_protein_peptides.
+    NsafObservableLength,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
@@ -466,6 +527,23 @@ pub struct FdrOptions {
     pub peptide_q_method: Option<QMethod>,
     pub protein_q_method: Option<QMethod>,
 
+    // Adaptive q-value controls.
+    pub bky_alpha: Option<f64>,
+    pub sfdr_gamma: Option<f64>,
+
+    // Level-specific covariate-weighted BH controls.
+    pub psm_q_covariate: Option<QCovariate>,
+    pub peptide_q_covariate: Option<QCovariate>,
+    pub protein_q_covariate: Option<QCovariate>,
+
+    pub psm_q_covariate_bins: Option<usize>,
+    pub peptide_q_covariate_bins: Option<usize>,
+    pub protein_q_covariate_bins: Option<usize>,
+
+    pub psm_q_covariate_weight_strength: Option<f64>,
+    pub peptide_q_covariate_weight_strength: Option<f64>,
+    pub protein_q_covariate_weight_strength: Option<f64>,
+
     pub peptide_fdr: Option<f32>,
     pub protein_fdr: Option<f32>,
     pub precursor_fdr: Option<f32>,
@@ -765,6 +843,23 @@ pub struct FdrSettings {
     pub psm_q_method: QMethod,
     pub peptide_q_method: QMethod,
     pub protein_q_method: QMethod,
+
+    // Adaptive q-value controls.
+    pub bky_alpha: f64,
+    pub sfdr_gamma: f64,
+
+    // Level-specific covariate-weighted BH controls.
+    pub psm_q_covariate: QCovariate,
+    pub peptide_q_covariate: QCovariate,
+    pub protein_q_covariate: QCovariate,
+
+    pub psm_q_covariate_bins: usize,
+    pub peptide_q_covariate_bins: usize,
+    pub protein_q_covariate_bins: usize,
+
+    pub psm_q_covariate_weight_strength: f64,
+    pub peptide_q_covariate_weight_strength: f64,
+    pub protein_q_covariate_weight_strength: f64,
 
     pub peptide_fdr: f32,
     pub protein_fdr: f32,
@@ -1088,6 +1183,32 @@ impl From<FdrOptions> for FdrSettings {
         let psm_q_method = options.psm_q_method.unwrap_or(QMethod::Storey);
         let peptide_q_method = options.peptide_q_method.unwrap_or(QMethod::Auto);
         let protein_q_method = options.protein_q_method.unwrap_or(QMethod::Auto);
+
+        let bky_alpha = options.bky_alpha.unwrap_or(0.01).clamp(1e-6, 0.50);
+        let sfdr_gamma = options.sfdr_gamma.unwrap_or(1.0).clamp(0.10, 3.0);
+
+        let psm_q_covariate = options.psm_q_covariate.unwrap_or(QCovariate::None);
+        let peptide_q_covariate = options.peptide_q_covariate.unwrap_or(QCovariate::None);
+        let protein_q_covariate = options.protein_q_covariate.unwrap_or(QCovariate::None);
+
+        let psm_q_covariate_bins = options.psm_q_covariate_bins.unwrap_or(5).clamp(2, 20);
+        let peptide_q_covariate_bins = options.peptide_q_covariate_bins.unwrap_or(5).clamp(2, 20);
+        let protein_q_covariate_bins = options.protein_q_covariate_bins.unwrap_or(5).clamp(2, 20);
+
+        let psm_q_covariate_weight_strength = options
+            .psm_q_covariate_weight_strength
+            .unwrap_or(1.0)
+            .clamp(0.0, 5.0);
+
+        let peptide_q_covariate_weight_strength = options
+            .peptide_q_covariate_weight_strength
+            .unwrap_or(0.75)
+            .clamp(0.0, 5.0);
+
+        let protein_q_covariate_weight_strength = options
+            .protein_q_covariate_weight_strength
+            .unwrap_or(0.75)
+            .clamp(0.0, 5.0);
 
         let min_storey_n = options.min_storey_n.unwrap_or(300);
         let min_null_size = options.min_null_size.unwrap_or(300);
@@ -1459,6 +1580,21 @@ impl From<FdrOptions> for FdrSettings {
             psm_q_method,
             peptide_q_method,
             protein_q_method,
+
+            bky_alpha,
+            sfdr_gamma,
+
+            psm_q_covariate,
+            peptide_q_covariate,
+            protein_q_covariate,
+
+            psm_q_covariate_bins,
+            peptide_q_covariate_bins,
+            protein_q_covariate_bins,
+
+            psm_q_covariate_weight_strength,
+            peptide_q_covariate_weight_strength,
+            protein_q_covariate_weight_strength,
 
             peptide_fdr,
             protein_fdr,

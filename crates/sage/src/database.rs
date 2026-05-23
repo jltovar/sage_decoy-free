@@ -9,7 +9,7 @@ use fnv::FnvBuildHasher;
 use rayon::prelude::*;
 use serde::{Deserialize, Serialize};
 use std::cmp::Ordering;
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
 use std::hash::Hash;
 
 #[derive(Deserialize, Serialize, Clone, Debug)]
@@ -259,10 +259,84 @@ impl Parameters {
 
     pub fn build(self, fasta: Fasta) -> IndexedDatabase {
         let target_decoys = self.digest(&fasta);
-        self.build_from_peptides(target_decoys)
+
+        let protein_metadata = Self::build_protein_metadata(
+            &fasta,
+            &target_decoys,
+            &self.decoy_tag,
+            self.generate_decoys,
+        );
+
+        self.build_from_peptides_with_metadata(target_decoys, protein_metadata)
+    }
+
+    fn build_protein_metadata(
+        fasta: &Fasta,
+        peptides: &[Peptide],
+        decoy_tag: &str,
+        generate_decoys: bool,
+    ) -> HashMap<String, ProteinMetadata> {
+        let mut protein_metadata: HashMap<String, ProteinMetadata> = HashMap::new();
+
+        // Pass 1: sequence length from the active parsed FASTA.
+        for (acc, seq) in &fasta.targets {
+            protein_metadata.insert(
+                acc.to_string(),
+                ProteinMetadata {
+                    length: seq.len(),
+                    observable_peptides: 0,
+                },
+            );
+        }
+
+        // Pass 2: count unique observable peptide sequences per target protein
+        // from the actual indexed peptide search space.
+        //
+        // Use the same protein-key convention as downstream DF protein inference:
+        // peptide.proteins(decoy_tag, generate_decoys).
+        let mut seen: HashSet<(String, Vec<u8>)> = HashSet::new();
+
+        for peptide in peptides.iter().filter(|p| !p.decoy) {
+            if peptide.proteins.len() != 1 {
+                continue;
+            }
+
+            let protein_key = peptide.proteins(decoy_tag, generate_decoys);
+
+            if !protein_metadata.contains_key(&protein_key) {
+                continue;
+            }
+
+            let peptide_key = peptide.sequence.to_vec();
+
+            if seen.insert((protein_key.clone(), peptide_key)) {
+                if let Some(meta) = protein_metadata.get_mut(&protein_key) {
+                    meta.observable_peptides += 1;
+                }
+            }
+        }
+
+        log::debug!(
+            "built protein metadata: proteins={} proteins_with_observable_peptides={}",
+            protein_metadata.len(),
+            protein_metadata
+                .values()
+                .filter(|m| m.observable_peptides > 0)
+                .count()
+        );
+
+        protein_metadata
     }
 
     pub fn build_from_peptides(self, target_decoys: Vec<Peptide>) -> IndexedDatabase {
+        self.build_from_peptides_with_metadata(target_decoys, HashMap::default())
+    }
+
+    fn build_from_peptides_with_metadata(
+        self,
+        target_decoys: Vec<Peptide>,
+        protein_metadata: HashMap<String, ProteinMetadata>,
+    ) -> IndexedDatabase {
         log::trace!("generating fragments");
 
         // Finally, perform in silico digest for our target sequences
@@ -360,6 +434,7 @@ impl Parameters {
             generate_decoys: self.generate_decoys,
             potential_mods,
             decoy_tag: self.decoy_tag,
+            protein_metadata,
         }
     }
 }
@@ -381,6 +456,18 @@ pub struct Theoretical {
     pub fragment_mz: f32,
 }
 
+#[derive(Clone, Debug, Default)]
+pub struct ProteinMetadata {
+    pub length: usize,
+
+    /// Number of unique theoretical observable peptide sequences assigned to this
+    /// protein in the active indexed search space.
+    ///
+    /// This is derived from the same FASTA, enzyme, missed-cleavage, peptide-length,
+    /// mass-filter, and decoy settings used to build the search database.
+    pub observable_peptides: usize,
+}
+
 #[derive(Default)]
 pub struct IndexedDatabase {
     pub peptides: Vec<Peptide>,
@@ -392,6 +479,9 @@ pub struct IndexedDatabase {
     pub bucket_size: usize,
     pub generate_decoys: bool,
     pub decoy_tag: String,
+
+    /// FASTA-derived protein metadata for protein-level covariates.
+    pub protein_metadata: HashMap<String, ProteinMetadata>,
 }
 
 impl IndexedDatabase {

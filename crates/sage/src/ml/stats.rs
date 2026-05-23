@@ -125,6 +125,161 @@ pub fn bh_q_value(p_values: &[f64]) -> Vec<f64> {
     q_values
 }
 
+pub fn by_q_value(p_values: &[f64]) -> Vec<f64> {
+    let m = p_values.len();
+    if m == 0 {
+        return Vec::new();
+    }
+
+    let harmonic: f64 = (1..=m).map(|i| 1.0 / i as f64).sum();
+
+    let adjusted: Vec<f64> = p_values
+        .iter()
+        .map(|&p| {
+            if p.is_finite() {
+                (p.clamp(0.0, 1.0) * harmonic).clamp(0.0, 1.0)
+            } else {
+                1.0
+            }
+        })
+        .collect();
+
+    bh_q_value(&adjusted)
+}
+
+pub fn bky_q_value(p_values: &[f64], alpha: f64) -> Vec<f64> {
+    let m = p_values.len();
+    if m == 0 {
+        return Vec::new();
+    }
+
+    let alpha = alpha.clamp(1e-12, 0.999999);
+    let alpha1 = alpha / (1.0 + alpha);
+
+    let mut sorted: Vec<f64> = p_values
+        .iter()
+        .copied()
+        .map(|p| {
+            if p.is_finite() {
+                p.clamp(0.0, 1.0)
+            } else {
+                1.0
+            }
+        })
+        .collect();
+
+    sorted.sort_by(|a, b| a.total_cmp(b));
+
+    let mut r1 = 0usize;
+
+    for (i, &p) in sorted.iter().enumerate() {
+        let rank = (i + 1) as f64;
+        let threshold = rank * alpha1 / m as f64;
+        if p <= threshold {
+            r1 = i + 1;
+        }
+    }
+
+    if r1 == 0 {
+        return bh_q_value(p_values);
+    }
+
+    let m0_hat = (m - r1).max(1) as f64;
+    let scale = (m0_hat / m as f64).clamp(1e-12, 1.0);
+
+    bh_q_value(p_values)
+        .into_iter()
+        .map(|q| (q * scale).clamp(0.0, 1.0))
+        .collect()
+}
+
+pub fn sfdr_q_value(p_values: &[f64], gamma: f64) -> Vec<f64> {
+    let m = p_values.len();
+    if m == 0 {
+        return Vec::new();
+    }
+
+    let gamma = gamma.clamp(0.10, 3.0);
+
+    let mut indices: Vec<usize> = (0..m).collect();
+    indices.sort_by(|&a, &b| {
+        let pa = if p_values[a].is_finite() {
+            p_values[a].clamp(0.0, 1.0)
+        } else {
+            1.0
+        };
+        let pb = if p_values[b].is_finite() {
+            p_values[b].clamp(0.0, 1.0)
+        } else {
+            1.0
+        };
+        pa.total_cmp(&pb)
+    });
+
+    let mut q_values = vec![1.0_f64; m];
+    let mut min_q: f64 = 1.0;
+
+    for (i, &idx) in indices.iter().enumerate().rev() {
+        let p = if p_values[idx].is_finite() {
+            p_values[idx].clamp(0.0, 1.0)
+        } else {
+            1.0
+        };
+
+        let rank = (i + 1) as f64;
+        let denom = rank.powf(gamma).max(1.0);
+        let q = (p * m as f64 / denom).clamp(0.0, 1.0);
+
+        min_q = min_q.min(q);
+        q_values[idx] = min_q;
+    }
+
+    q_values
+}
+
+pub fn weighted_bh_q_value(p_values: &[f64], weights: &[f64]) -> Vec<f64> {
+    let m = p_values.len();
+    if m == 0 {
+        return Vec::new();
+    }
+
+    if weights.len() != m {
+        return bh_q_value(p_values);
+    }
+
+    let mut w: Vec<f64> = weights
+        .iter()
+        .copied()
+        .map(|x| if x.is_finite() && x > 0.0 { x } else { 1.0 })
+        .collect();
+
+    let sum_w: f64 = w.iter().sum();
+
+    if !sum_w.is_finite() || sum_w <= 0.0 {
+        return bh_q_value(p_values);
+    }
+
+    for x in &mut w {
+        *x = (*x * m as f64 / sum_w).clamp(1e-6, 1e6);
+    }
+
+    let weighted_p: Vec<f64> = p_values
+        .iter()
+        .copied()
+        .zip(w.iter().copied())
+        .map(|(p, wt)| {
+            let p = if p.is_finite() {
+                p.clamp(0.0, 1.0)
+            } else {
+                1.0
+            };
+            (p / wt).clamp(0.0, 1.0)
+        })
+        .collect();
+
+    bh_q_value(&weighted_p)
+}
+
 /// Storey-Tibshirani Adaptive FDR Control
 ///
 /// More powerful than BH when a significant fraction of hypotheses are true targets.

@@ -130,7 +130,7 @@ use crate::input::LoStratify;
 use crate::input::{
     BoundedAuxUpdateSpace, DartNullRtModel, DartTrueRtModel, EnsemblePCombiner,
     EnsemblePepCombiner, FdrSettings, FinalEvidenceSpace, HierarchicalReportingMode, JointMode,
-    LoTevTransform, ModelFit, PeptidePCombine, PhysicalAnchorMode, QMethod,
+    LoTevTransform, ModelFit, PeptidePCombine, PhysicalAnchorMode, QCovariate, QMethod,
 };
 use crate::lfq::{Peak, PrecursorId};
 use crate::ml::lower_order::{
@@ -1319,6 +1319,50 @@ fn q_values_from_p_values_with_method_report(
             fallback_reason: None,
         },
 
+        QMethod::By => QValueComputation {
+            q_values: stats::by_q_value(p_values),
+            requested_method: method,
+            effective_method,
+            actual_method: "BY",
+            pi0: None,
+            fallback_reason: None,
+        },
+
+        QMethod::Bky => QValueComputation {
+            q_values: stats::bky_q_value(p_values, settings.bky_alpha),
+            requested_method: method,
+            effective_method,
+            actual_method: "BKY",
+            pi0: None,
+            fallback_reason: None,
+        },
+
+        QMethod::Sfdr => QValueComputation {
+            q_values: stats::sfdr_q_value(p_values, settings.sfdr_gamma),
+            requested_method: method,
+            effective_method,
+            actual_method: "sFDR",
+            pi0: None,
+            fallback_reason: None,
+        },
+
+        QMethod::CovariateWeightedBh => {
+            log::warn!(
+                "DF {} q_method=covariate_weighted_bh reached generic p-value path; using BH. \
+                 Level-specific covariate paths should intercept this first.",
+                level_name
+            );
+
+            QValueComputation {
+                q_values: stats::bh_q_value(p_values),
+                requested_method: method,
+                effective_method,
+                actual_method: "BH",
+                pi0: None,
+                fallback_reason: Some("covariate_weighted_bh_without_level_covariates"),
+            }
+        }
+
         QMethod::Storey => {
             if p_ref.len() < settings.min_storey_n {
                 log::warn!(
@@ -1387,6 +1431,192 @@ fn q_values_from_p_values_with_method_report(
             }
         }
     }
+}
+
+#[derive(Clone, Copy)]
+enum QLevel {
+    Psm,
+    Peptide,
+    Protein,
+}
+
+fn covariate_higher_is_better(cov: QCovariate) -> bool {
+    !matches!(
+        cov,
+        QCovariate::DeltaBest
+            | QCovariate::BestDeltaRtModel
+            | QCovariate::ScoredCandidates
+            | QCovariate::MissedCleavages
+            | QCovariate::ProteinLength
+            | QCovariate::ObservableProteinPeptides
+    )
+}
+
+fn weights_from_covariates(
+    values: &[Option<f64>],
+    cov: QCovariate,
+    bins: usize,
+    strength: f64,
+    level_name: &str,
+) -> Option<Vec<f64>> {
+    if matches!(cov, QCovariate::None) || values.is_empty() {
+        return None;
+    }
+
+    let bins = bins.clamp(2, 20);
+    let strength = strength.clamp(0.0, 5.0);
+
+    if strength == 0.0 {
+        return Some(vec![1.0; values.len()]);
+    }
+
+    let higher_is_better = covariate_higher_is_better(cov);
+
+    let mut usable: Vec<(usize, f64)> = values
+        .iter()
+        .enumerate()
+        .filter_map(|(i, v)| {
+            let x = (*v)?;
+            x.is_finite().then_some((i, x))
+        })
+        .collect();
+
+    if usable.len() < bins * 5 {
+        log::warn!(
+            "DF {} covariate q: covariate={:?} usable_values={} too small for bins={}; using BH.",
+            level_name,
+            cov,
+            usable.len(),
+            bins
+        );
+        return None;
+    }
+
+    usable.sort_by(|a, b| a.1.total_cmp(&b.1));
+
+    let n = usable.len();
+    let mut weights = vec![1.0f64; values.len()];
+
+    for (rank0, &(idx, _)) in usable.iter().enumerate() {
+        // Assign one shared weight per covariate bin.
+        // This avoids hypothesis-specific continuous weights from tiny covariate
+        // fluctuations and makes this closer to an IHW-style stratified mode.
+        let bin_idx = ((rank0 * bins) / n).min(bins - 1);
+        let frac = (bin_idx as f64 + 0.5) / bins as f64;
+
+        let oriented = if higher_is_better { frac } else { 1.0 - frac };
+        let centered = oriented - 0.5;
+
+        weights[idx] = (strength * centered).exp();
+    }
+
+    log::info!(
+        "DF {} covariate q: covariate={:?} higher_is_better={} usable={} bins={} strength={:.3} weighting=binned_exponential",
+        level_name,
+        cov,
+        higher_is_better,
+        usable.len(),
+        bins,
+        strength
+    );
+
+    Some(weights)
+}
+
+fn q_values_from_level_covariates(
+    p_values: &[f64],
+    p_ref: &[f64],
+    cov_values: &[Option<f64>],
+    settings: &FdrSettings,
+    method: QMethod,
+    level: QLevel,
+    level_name: &str,
+) -> QValueComputation {
+    let effective_method = match method {
+        QMethod::Auto => match level {
+            QLevel::Psm => effective_psm_q_method(settings),
+            QLevel::Peptide => effective_peptide_q_method(settings),
+            QLevel::Protein => effective_protein_q_method(settings),
+        },
+        other => other,
+    };
+
+    if !matches!(effective_method, QMethod::CovariateWeightedBh) {
+        return q_values_from_p_values_with_method_report(
+            p_values, p_ref, settings, method, level_name,
+        );
+    }
+
+    let (cov, bins, strength) = match level {
+        QLevel::Psm => (
+            settings.psm_q_covariate,
+            settings.psm_q_covariate_bins,
+            settings.psm_q_covariate_weight_strength,
+        ),
+        QLevel::Peptide => (
+            settings.peptide_q_covariate,
+            settings.peptide_q_covariate_bins,
+            settings.peptide_q_covariate_weight_strength,
+        ),
+        QLevel::Protein => (
+            settings.protein_q_covariate,
+            settings.protein_q_covariate_bins,
+            settings.protein_q_covariate_weight_strength,
+        ),
+    };
+
+    let Some(weights) = weights_from_covariates(cov_values, cov, bins, strength, level_name) else {
+        return QValueComputation {
+            q_values: stats::bh_q_value(p_values),
+            requested_method: method,
+            effective_method,
+            actual_method: "BH",
+            pi0: None,
+            fallback_reason: Some("covariate_weighting_unavailable"),
+        };
+    };
+
+    QValueComputation {
+        q_values: stats::weighted_bh_q_value(p_values, &weights),
+        requested_method: method,
+        effective_method,
+        actual_method: "WeightedBH",
+        pi0: None,
+        fallback_reason: None,
+    }
+}
+
+fn psm_covariate_value(f: &DfFeature, cov: QCovariate) -> Option<f64> {
+    let v = match cov {
+        QCovariate::None => return None,
+        QCovariate::Hyperscore => f.core.hyperscore as f64,
+        QCovariate::DeltaNext => f.core.delta_next as f64,
+        QCovariate::DeltaBest => f.core.delta_best as f64,
+        QCovariate::MatchedPeaks => f.core.matched_peaks as f64,
+        QCovariate::LongestB => f.core.longest_b as f64,
+        QCovariate::LongestY => f.core.longest_y as f64,
+        QCovariate::LongestYPct => {
+            let denom = (f.core.peptide_len as f64 - 1.0).max(1.0);
+            f.core.longest_y as f64 / denom
+        }
+        QCovariate::MatchedIntensityPct => f.core.matched_intensity_pct as f64,
+        QCovariate::ScoredCandidates => f.core.scored_candidates as f64,
+        QCovariate::Ms2Intensity => {
+            let x = f.core.ms2_intensity as f64;
+            if x > 0.0 {
+                x.ln_1p()
+            } else {
+                x
+            }
+        }
+        QCovariate::PeptideLen => f.core.peptide_len as f64,
+        QCovariate::Charge => f.core.charge as f64,
+        QCovariate::MissedCleavages => f.core.missed_cleavages as f64,
+
+        _ => return None,
+    };
+
+    v.is_finite().then_some(v)
 }
 
 fn q_values_from_p_values_with_method(
@@ -4018,13 +4248,23 @@ fn finalize_base_q_values(
                     .filter_map(|&i| features[i].decoy_free_p_value),
             );
 
-            let q_values = q_values_from_p_values_with_method(
+            let psm_cov_values: Vec<Option<f64>> = work
+                .rank1_indices
+                .iter()
+                .map(|&idx| psm_covariate_value(&features[idx], settings.psm_q_covariate))
+                .collect();
+
+            let q_report = q_values_from_level_covariates(
                 &rank1_p,
                 &rank1_p_ref,
+                &psm_cov_values,
                 settings,
                 effective_psm_q_method(settings),
+                QLevel::Psm,
                 "PSM active p-value",
             );
+
+            let q_values = q_report.q_values;
 
             for (&idx, q) in work.rank1_indices.iter().zip(q_values) {
                 set_df_q_value(&mut features[idx], q);
@@ -8892,13 +9132,24 @@ fn recalculate_active_q_values(features: &mut [DfFeature], settings: &FdrSetting
                 p_values.push(p);
             }
 
-            let q_values = q_values_from_p_values_with_method(
+            let feature_indices: Vec<usize> = rows.iter().map(|(_, idx, _)| *idx).collect();
+
+            let psm_cov_values: Vec<Option<f64>> = feature_indices
+                .iter()
+                .map(|&idx| psm_covariate_value(&features[idx], settings.psm_q_covariate))
+                .collect();
+
+            let q_report = q_values_from_level_covariates(
                 &p_values,
                 &p_values,
+                &psm_cov_values,
                 settings,
                 effective_psm_q_method(settings),
+                QLevel::Psm,
                 "PSM active p-value",
             );
+
+            let q_values = q_report.q_values;
 
             for ((_, feat_idx, _), q) in rows.into_iter().zip(q_values.into_iter()) {
                 features[feat_idx].decoy_free_q_value = Some(finite_df_p_value(q));
@@ -9440,6 +9691,13 @@ pub fn calculate_peptide_q_df(
         vals: Vec<f64>,
         is_entrapment: bool,
         is_reference: bool,
+
+        best_matched_peaks: f64,
+        best_longest_y_pct: f64,
+        best_delta_rt_model: f64,
+        best_hyperscore: f64,
+        psm_count: usize,
+        peptide_len: Option<f64>,
     }
 
     let mut peptide_evidence_map: FnvHashMap<String, PepEvidence> = FnvHashMap::default();
@@ -9472,6 +9730,33 @@ pub fn calculate_peptide_q_df(
         entry.vals.push(v);
         entry.is_entrapment |= is_ent;
         entry.is_reference |= is_ref;
+
+        entry.psm_count += 1;
+        entry
+            .peptide_len
+            .get_or_insert(feat.core.peptide_len as f64);
+
+        entry.best_matched_peaks = entry.best_matched_peaks.max(feat.core.matched_peaks as f64);
+
+        let denom = (feat.core.peptide_len as f64 - 1.0).max(1.0);
+        let longest_y_pct = feat.core.longest_y as f64 / denom;
+        if longest_y_pct.is_finite() {
+            entry.best_longest_y_pct = entry.best_longest_y_pct.max(longest_y_pct);
+        }
+
+        let x = feat.core.delta_rt_model as f64;
+        if x.is_finite() {
+            if entry.best_delta_rt_model == 0.0 {
+                entry.best_delta_rt_model = x.abs();
+            } else {
+                entry.best_delta_rt_model = entry.best_delta_rt_model.min(x.abs());
+            }
+        }
+
+        let hs = feat.core.hyperscore as f64;
+        if hs.is_finite() {
+            entry.best_hyperscore = entry.best_hyperscore.max(hs);
+        }
     }
 
     log::debug!(
@@ -9484,6 +9769,8 @@ pub fn calculate_peptide_q_df(
     let mut peptide_combined_vals = Vec::with_capacity(peptide_evidence_map.len());
     let mut peptide_ref_vals = Vec::new();
     let mut is_ent_flags = Vec::with_capacity(peptide_evidence_map.len());
+
+    let mut peptide_cov_values = Vec::with_capacity(peptide_evidence_map.len());
 
     for (peptide, mut ev) in peptide_evidence_map {
         ev.vals.retain(|v| v.is_finite());
@@ -9537,6 +9824,18 @@ pub fn calculate_peptide_q_df(
             peptide_ref_vals.push(combined);
         }
 
+        let peptide_cov = match settings.peptide_q_covariate {
+            QCovariate::PeptideLen => ev.peptide_len,
+            QCovariate::BestMatchedPeaks => Some(ev.best_matched_peaks),
+            QCovariate::BestLongestYPct => Some(ev.best_longest_y_pct),
+            QCovariate::BestDeltaRtModel => Some(ev.best_delta_rt_model),
+            QCovariate::BestHyperscore => Some(ev.best_hyperscore),
+            QCovariate::PsmCount => Some(ev.psm_count as f64),
+            _ => None,
+        };
+
+        peptide_cov_values.push(peptide_cov);
+
         peptide_keys.push(peptide);
         peptide_combined_vals.push(combined);
         is_ent_flags.push(ev.is_entrapment);
@@ -9573,7 +9872,12 @@ pub fn calculate_peptide_q_df(
 
                 out
             }
-            QMethod::Bh | QMethod::Storey => {
+            QMethod::Bh
+            | QMethod::Storey
+            | QMethod::By
+            | QMethod::Bky
+            | QMethod::Sfdr
+            | QMethod::CovariateWeightedBh => {
                 log::warn!(
                 "DF peptide_q_method={:?} requested on PEP-native peptide evidence; using cumulative-mean PEP q-values.",
                 settings.peptide_q_method
@@ -9618,11 +9922,13 @@ pub fn calculate_peptide_q_df(
             fallback_reason: None,
         }
     } else {
-        q_values_from_p_values_with_method_report(
+        q_values_from_level_covariates(
             &peptide_combined_vals,
             &peptide_ref_vals,
+            &peptide_cov_values,
             settings,
             effective_peptide_q_method(settings),
+            QLevel::Peptide,
             "peptide",
         )
     };
@@ -9845,6 +10151,7 @@ pub fn calculate_protein_q_df(
     // evidence value from the finalized DF stream.
     let mut protein_keys: Vec<String> = Vec::new();
     let mut protein_combined_vals: Vec<f64> = Vec::new();
+    let mut protein_cov_values: Vec<Option<f64>> = Vec::new();
 
     for (key, peptide_map) in protein_peptide_map {
         let mut vals: Vec<f64> = peptide_map.values().copied().collect();
@@ -9875,8 +10182,44 @@ pub fn calculate_protein_q_df(
             }
         };
 
+        let observed_unique_peptides = vals.len() as f64;
+
+        let protein_cov = match settings.protein_q_covariate {
+            QCovariate::ObservedUniquePeptides => Some(observed_unique_peptides),
+            QCovariate::ObservedPeptideSupport => Some(observed_unique_peptides),
+
+            QCovariate::ProteinLength => db
+                .protein_metadata
+                .get(&key)
+                .map(|meta| meta.length as f64)
+                .filter(|x| x.is_finite() && *x > 0.0),
+
+            QCovariate::ObservableProteinPeptides => db
+                .protein_metadata
+                .get(&key)
+                .map(|meta| meta.observable_peptides as f64)
+                .filter(|x| x.is_finite() && *x > 0.0),
+
+            QCovariate::NsafObservableLength => {
+                let theoretical = db
+                    .protein_metadata
+                    .get(&key)
+                    .map(|meta| meta.observable_peptides as f64)
+                    .unwrap_or(0.0);
+
+                if theoretical.is_finite() && theoretical > 0.0 {
+                    Some(observed_unique_peptides / theoretical)
+                } else {
+                    None
+                }
+            }
+
+            _ => None,
+        };
+
         protein_keys.push(key);
         protein_combined_vals.push(combined);
+        protein_cov_values.push(protein_cov);
     }
 
     // If no proteins, write fail-closed (rank1-only by contract) and return 0.
@@ -9943,13 +10286,16 @@ pub fn calculate_protein_q_df(
             }
         }
 
-        q_values_from_p_values_with_method(
+        q_values_from_level_covariates(
             &protein_combined_vals,
             &protein_p_ref,
+            &protein_cov_values,
             settings,
             effective_protein_q_method(settings),
+            QLevel::Protein,
             "protein",
         )
+        .q_values
     };
 
     // Map back: protein_key -> q
