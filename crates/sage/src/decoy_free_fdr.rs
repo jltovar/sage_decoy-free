@@ -130,7 +130,8 @@ use crate::input::LoStratify;
 use crate::input::{
     BoundedAuxUpdateSpace, DartNullRtModel, DartTrueRtModel, EnsemblePCombiner,
     EnsemblePepCombiner, FdrSettings, FinalEvidenceSpace, HierarchicalReportingMode, JointMode,
-    LoTevTransform, ModelFit, PeptidePCombine, PhysicalAnchorMode, QCovariate, QMethod,
+    LoTevTransform, ModelFit, PCombineCalibrationMode, PeptidePCombine, PhysicalAnchorMode,
+    ProteinPCombine, QCovariate, QMethod,
 };
 use crate::lfq::{Peak, PrecursorId};
 use crate::ml::lower_order::{
@@ -9686,6 +9687,13 @@ pub fn calculate_peptide_q_df(
     // count-based selected-min penalty.
     let is_pep_native = matches!(active_evidence_space(settings), ActiveEvidenceSpace::Pep);
 
+    let peptide_pcombine_calibration = if is_pep_native {
+        None
+    } else {
+        let null_pool = rank_null_p_value_pool(features, settings);
+        build_empirical_pcombine_calibration(&null_pool, settings)
+    };
+
     #[derive(Default)]
     struct PepEvidence {
         vals: Vec<f64>,
@@ -9806,18 +9814,12 @@ pub fn calculate_peptide_q_df(
             // P-value-native path:
             // Do not apply the PEP support bonus to p-values. Instead combine the
             // peptide's PSM-level p-values with the configured p-value combiner.
-            match settings.peptide_p_combine {
-                PeptidePCombine::Fisher => {
-                    stats::combine_fisher(&ev.vals).clamp(0.0, 1.0).max(1e-300)
-                }
-                PeptidePCombine::Cauchy => combine_cauchy(&ev.vals),
-                PeptidePCombine::SidakMinP => {
-                    let n = ev.vals.len() as f64;
-                    (1.0 - (1.0 - best).powf(n)).clamp(0.0, 1.0).max(1e-300)
-                }
-                PeptidePCombine::Best => best,
-                PeptidePCombine::SecondBest => combine_second_best_p(&ev.vals),
-            }
+            combine_df_peptide_p_values(
+                &ev.vals,
+                settings.peptide_p_combine.clone(),
+                peptide_pcombine_calibration.as_ref(),
+                settings,
+            )
         };
 
         if !is_pep_native && ev.is_reference {
@@ -10056,17 +10058,7 @@ fn combine_second_best_p(p: &[f64]) -> f64 {
 }
 
 fn combine_cauchy(p: &[f64]) -> f64 {
-    // Cauchy combination (robust under dependence)
-    // p_i in (0,1); clamp for numerical stability.
-    let m = p.len() as f64;
-    let mut t_sum = 0.0;
-    for &pi in p {
-        let pi = pi.clamp(0.0, 1.0).max(1e-300).min(1.0 - 1e-16);
-        t_sum += ((0.5 - pi) * std::f64::consts::PI).tan();
-    }
-    let t = t_sum / m;
-    let p_c = 0.5 - (t.atan() / std::f64::consts::PI);
-    p_c.clamp(0.0, 1.0).max(1e-300)
+    stats::combine_cauchy_acat(p).clamp(0.0, 1.0).max(1e-300)
 }
 
 fn combine_sidak_minp(p: &[f64]) -> f64 {
@@ -10078,6 +10070,216 @@ fn combine_sidak_minp(p: &[f64]) -> f64 {
         .fold(1.0_f64, |a, b| a.min(b.clamp(0.0, 1.0).max(1e-300)));
     let p = 1.0 - (1.0 - pmin).powf(m);
     p.clamp(0.0, 1.0).max(1e-300)
+}
+
+fn rank_null_p_value_pool(features: &[DfFeature], settings: &FdrSettings) -> Vec<f64> {
+    features
+        .iter()
+        .filter(|f| f.core.rank >= settings.min_null_rank && f.core.rank <= settings.max_null_rank)
+        .filter_map(|f| f.decoy_free_p_value)
+        .map(|p| (p as f64).clamp(1e-300, 1.0))
+        .filter(|p| p.is_finite())
+        .collect()
+}
+
+fn build_empirical_pcombine_calibration(
+    null_pool: &[f64],
+    settings: &FdrSettings,
+) -> Option<stats::EmpiricalCombinerCalibration> {
+    if !matches!(
+        settings.p_combine_calibration_mode,
+        PCombineCalibrationMode::RankNull
+    ) {
+        return None;
+    }
+
+    let null_pool: Vec<f64> = null_pool
+        .iter()
+        .copied()
+        .filter(|p| p.is_finite() && *p > 0.0 && *p <= 1.0)
+        .map(|p| p.clamp(1e-300, 1.0))
+        .collect();
+
+    if null_pool.len() < settings.min_null_size {
+        log::warn!(
+            "DF p-combine calibration skipped: null_pool={} < min_null_size={}",
+            null_pool.len(),
+            settings.min_null_size
+        );
+        return None;
+    }
+
+    let min_k = settings.p_combine_calibration_min_k.max(1);
+    let max_k = settings.p_combine_calibration_max_k.max(min_k).min(100);
+
+    let reps = settings
+        .p_combine_calibration_null_replicates
+        .clamp(100, 100_000);
+
+    let tau = settings.p_combine_tfisher_tau.clamp(1e-12, 1.0);
+
+    let mut cal = stats::EmpiricalCombinerCalibration::default();
+
+    for k in min_k..=max_k {
+        let mut p_matrix: Vec<Vec<f64>> = Vec::with_capacity(reps);
+        let mut tfisher_stats = Vec::with_capacity(reps);
+        let mut gfisher_stats = Vec::with_capacity(reps);
+        let mut ordmeta_stats = Vec::with_capacity(reps);
+        let mut evalue_stats = Vec::with_capacity(reps);
+
+        for r in 0..reps {
+            let mut row = Vec::with_capacity(k);
+
+            // Deterministic pseudo-resampling without adding an RNG dependency.
+            // The stride is prime and co-prime to most pool sizes.
+            let stride = 7919usize;
+            let offset = (r
+                .wrapping_mul(stride)
+                .wrapping_add(k.wrapping_mul(104_729usize)))
+                % null_pool.len();
+
+            for j in 0..k {
+                let idx = (offset + j.wrapping_mul(stride)) % null_pool.len();
+                row.push(null_pool[idx]);
+            }
+
+            tfisher_stats.push(stats::tfisher_stat(&row, tau));
+            gfisher_stats.push(stats::fisher_stat(&row));
+            ordmeta_stats.push(stats::ordmeta_stat(&row));
+            evalue_stats.push(stats::exchangeable_evalue_stat(&row));
+
+            p_matrix.push(row);
+        }
+
+        tfisher_stats.sort_by(|a, b| a.total_cmp(b));
+        gfisher_stats.sort_by(|a, b| a.total_cmp(b));
+        ordmeta_stats.sort_by(|a, b| a.total_cmp(b));
+        evalue_stats.sort_by(|a, b| a.total_cmp(b));
+
+        if let Some(bp) = stats::fit_brown_params(&p_matrix) {
+            cal.brown_by_k.insert(k, bp);
+        }
+
+        cal.tfisher_by_k.insert(k, tfisher_stats);
+        cal.gfisher_by_k.insert(k, gfisher_stats);
+        cal.ordmeta_by_k.insert(k, ordmeta_stats);
+        cal.evalue_by_k.insert(k, evalue_stats);
+    }
+
+    log::info!(
+        "DF p-combine calibration built: null_pool={} k={}..{} reps={} tau={:.4}",
+        null_pool.len(),
+        min_k,
+        max_k,
+        reps,
+        tau
+    );
+
+    Some(cal)
+}
+
+fn combine_df_peptide_p_values(
+    vals: &[f64],
+    method: PeptidePCombine,
+    calibration: Option<&stats::EmpiricalCombinerCalibration>,
+    settings: &FdrSettings,
+) -> f64 {
+    let vals: Vec<f64> = vals
+        .iter()
+        .copied()
+        .filter(|p| p.is_finite())
+        .map(|p| p.clamp(0.0, 1.0).max(1e-300))
+        .collect();
+
+    if vals.is_empty() {
+        return 1.0;
+    }
+
+    match method {
+        PeptidePCombine::Fisher => stats::combine_fisher(&vals),
+        PeptidePCombine::Cauchy | PeptidePCombine::Acat => stats::combine_cauchy_acat(&vals),
+        PeptidePCombine::SidakMinP => combine_sidak_minp(&vals),
+        PeptidePCombine::BonferroniMinP => stats::combine_bonferroni_minp(&vals),
+        PeptidePCombine::Tippett => stats::combine_tippett(&vals),
+        PeptidePCombine::Best => vals.iter().copied().fold(1.0_f64, f64::min),
+        PeptidePCombine::SecondBest => combine_second_best_p(&vals),
+        PeptidePCombine::Hmp => stats::combine_hmp(&vals),
+        PeptidePCombine::Brown => stats::empirical_brown_p(&vals, calibration),
+        PeptidePCombine::MudholkarGeorge => stats::combine_mudholkar_george(&vals),
+        PeptidePCombine::Edgington => stats::combine_edgington(&vals),
+        PeptidePCombine::TFisher => {
+            stats::empirical_tfisher_p(&vals, settings.p_combine_tfisher_tau, calibration)
+        }
+        PeptidePCombine::GFisher => stats::empirical_gfisher_p(&vals, calibration),
+        PeptidePCombine::Ihw => {
+            log::warn!(
+                "peptide_p_combine=ihw is not a valid within-peptide p-value combiner; \
+                 use peptide_q_method=covariate_weighted_bh instead. Falling back to Fisher."
+            );
+            stats::combine_fisher(&vals)
+        }
+        PeptidePCombine::ExchangeableEValue => {
+            stats::empirical_exchangeable_evalue_p(&vals, calibration)
+        }
+        PeptidePCombine::VovkWangGeneralizedMean => stats::combine_vovk_wang_harmonic(&vals),
+        PeptidePCombine::OrdmetaWFisher => stats::empirical_ordmeta_p(&vals, calibration),
+        PeptidePCombine::Mcm => stats::combine_mcm(&vals),
+        PeptidePCombine::Cmc => stats::combine_cmc(&vals),
+    }
+    .clamp(0.0, 1.0)
+    .max(1e-300)
+}
+
+fn combine_df_protein_p_values(
+    vals: &[f64],
+    method: ProteinPCombine,
+    calibration: Option<&stats::EmpiricalCombinerCalibration>,
+    settings: &FdrSettings,
+) -> f64 {
+    let vals: Vec<f64> = vals
+        .iter()
+        .copied()
+        .filter(|p| p.is_finite())
+        .map(|p| p.clamp(0.0, 1.0).max(1e-300))
+        .collect();
+
+    if vals.is_empty() {
+        return 1.0;
+    }
+
+    match method {
+        ProteinPCombine::Fisher => stats::combine_fisher(&vals),
+        ProteinPCombine::Cauchy | ProteinPCombine::Acat => stats::combine_cauchy_acat(&vals),
+        ProteinPCombine::SidakMinP => combine_sidak_minp(&vals),
+        ProteinPCombine::BonferroniMinP => stats::combine_bonferroni_minp(&vals),
+        ProteinPCombine::Tippett => stats::combine_tippett(&vals),
+        ProteinPCombine::Best => vals.iter().copied().fold(1.0_f64, f64::min),
+        ProteinPCombine::SecondBest => combine_second_best_p(&vals),
+        ProteinPCombine::Hmp => stats::combine_hmp(&vals),
+        ProteinPCombine::Brown => stats::empirical_brown_p(&vals, calibration),
+        ProteinPCombine::MudholkarGeorge => stats::combine_mudholkar_george(&vals),
+        ProteinPCombine::Edgington => stats::combine_edgington(&vals),
+        ProteinPCombine::TFisher => {
+            stats::empirical_tfisher_p(&vals, settings.p_combine_tfisher_tau, calibration)
+        }
+        ProteinPCombine::GFisher => stats::empirical_gfisher_p(&vals, calibration),
+        ProteinPCombine::Ihw => {
+            log::warn!(
+                "protein_p_combine=ihw is not a valid within-protein p-value combiner; \
+                 use protein_q_method=covariate_weighted_bh instead. Falling back to Fisher."
+            );
+            stats::combine_fisher(&vals)
+        }
+        ProteinPCombine::ExchangeableEValue => {
+            stats::empirical_exchangeable_evalue_p(&vals, calibration)
+        }
+        ProteinPCombine::VovkWangGeneralizedMean => stats::combine_vovk_wang_harmonic(&vals),
+        ProteinPCombine::OrdmetaWFisher => stats::empirical_ordmeta_p(&vals, calibration),
+        ProteinPCombine::Mcm => stats::combine_mcm(&vals),
+        ProteinPCombine::Cmc => stats::combine_cmc(&vals),
+    }
+    .clamp(0.0, 1.0)
+    .max(1e-300)
 }
 
 // DF protein aggregation/write-back contract:
@@ -10097,6 +10299,13 @@ pub fn calculate_protein_q_df(
     // streams are PEP-native unless a valid aligned p-value stream is explicitly
     // introduced.
     let is_pep_native = matches!(active_evidence_space(settings), ActiveEvidenceSpace::Pep);
+
+    let protein_pcombine_calibration = if is_pep_native {
+        None
+    } else {
+        let null_pool = rank_null_p_value_pool(features, settings);
+        build_empirical_pcombine_calibration(&null_pool, settings)
+    };
 
     let mut peptide_passing_psm_count = 0usize;
 
@@ -10167,19 +10376,12 @@ pub fn calculate_protein_q_df(
             vals[1].clamp(0.0, 1.0).max(1e-300)
         } else {
             // P-value native combiners over at least two unique peptides
-            match settings.protein_p_combine {
-                crate::input::ProteinPCombine::Fisher => {
-                    stats::combine_fisher(&vals).clamp(0.0, 1.0).max(1e-300)
-                }
-                crate::input::ProteinPCombine::Cauchy => combine_cauchy(&vals),
-                crate::input::ProteinPCombine::SidakMinP => combine_sidak_minp(&vals),
-                crate::input::ProteinPCombine::Best => vals
-                    .iter()
-                    .copied()
-                    .filter(|p| p.is_finite())
-                    .fold(1.0_f64, |a, b| a.min(b.clamp(0.0, 1.0).max(1e-300))),
-                crate::input::ProteinPCombine::SecondBest => combine_second_best_p(&vals),
-            }
+            combine_df_protein_p_values(
+                &vals,
+                settings.protein_p_combine.clone(),
+                protein_pcombine_calibration.as_ref(),
+                settings,
+            )
         };
 
         let observed_unique_peptides = vals.len() as f64;

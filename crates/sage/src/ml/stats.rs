@@ -1,7 +1,7 @@
 //! Statistics and probability theory helpers
 
 use log::warn;
-use statrs::distribution::{ChiSquared, ContinuousCDF};
+use statrs::distribution::{ChiSquared, ContinuousCDF, Normal};
 
 pub fn mean(data: &[f64]) -> f64 {
     if data.is_empty() {
@@ -431,6 +431,369 @@ pub fn combine_fisher(p_values: &[f64]) -> f64 {
         Ok(dist) => 1.0 - dist.cdf(chi_sq_stat),
         Err(_) => 1.0,
     }
+}
+
+fn clean_p_values(p_values: &[f64]) -> Vec<f64> {
+    p_values
+        .iter()
+        .copied()
+        .filter(|p| p.is_finite())
+        .map(|p| p.clamp(1e-300, 1.0 - 1e-16))
+        .collect()
+}
+
+/// Bonferroni-corrected minimum p-value.
+pub fn combine_bonferroni_minp(p_values: &[f64]) -> f64 {
+    let p = clean_p_values(p_values);
+    if p.is_empty() {
+        return 1.0;
+    }
+
+    let k = p.len() as f64;
+    let pmin = p.iter().copied().fold(1.0_f64, f64::min);
+    (pmin * k).clamp(1e-300, 1.0)
+}
+
+/// Tippett's minimum-p method.
+/// Under independent p-values this is identical to Sidak-minP.
+pub fn combine_tippett(p_values: &[f64]) -> f64 {
+    let p = clean_p_values(p_values);
+    if p.is_empty() {
+        return 1.0;
+    }
+
+    let k = p.len() as f64;
+    let pmin = p.iter().copied().fold(1.0_f64, f64::min);
+    (1.0 - (1.0 - pmin).powf(k)).clamp(1e-300, 1.0)
+}
+
+/// Stouffer Z-score method, unweighted.
+/// Assumes independent Z contributions unless externally calibrated.
+pub fn combine_stouffer(p_values: &[f64]) -> f64 {
+    let p = clean_p_values(p_values);
+    if p.is_empty() {
+        return 1.0;
+    }
+
+    let normal = match Normal::new(0.0, 1.0) {
+        Ok(n) => n,
+        Err(_) => return 1.0,
+    };
+
+    let k = p.len() as f64;
+    let z_sum: f64 = p
+        .iter()
+        .map(|&pi| normal.inverse_cdf(1.0 - pi))
+        .filter(|z| z.is_finite())
+        .sum();
+
+    let z = z_sum / k.sqrt();
+    (1.0 - normal.cdf(z)).clamp(1e-300, 1.0)
+}
+
+/// Pearson's method: -2 * sum ln(1-p).
+/// Mostly used internally for Mudholkar-George.
+pub fn combine_pearson(p_values: &[f64]) -> f64 {
+    let p = clean_p_values(p_values);
+    if p.is_empty() {
+        return 1.0;
+    }
+
+    let k = p.len() as f64;
+    let stat: f64 = -2.0 * p.iter().map(|&pi| (1.0 - pi).max(1e-300).ln()).sum::<f64>();
+    let dof = 2.0 * k;
+
+    match ChiSquared::new(dof) {
+        Ok(dist) => dist.cdf(stat).clamp(1e-300, 1.0),
+        Err(_) => 1.0,
+    }
+}
+
+/// Mudholkar-George logit method.
+/// This implementation uses the standard logistic transform statistic and a
+/// normal approximation, which is stable for small peptide/protein support sizes.
+pub fn combine_mudholkar_george(p_values: &[f64]) -> f64 {
+    let p = clean_p_values(p_values);
+    if p.is_empty() {
+        return 1.0;
+    }
+
+    let k = p.len() as f64;
+
+    let logit_sum: f64 = p
+        .iter()
+        .map(|&pi| ((1.0 - pi) / pi).ln())
+        .filter(|x| x.is_finite())
+        .sum();
+
+    // Var(logit(U)) = pi^2 / 3 for U~Uniform(0,1).
+    let z = logit_sum / ((k * std::f64::consts::PI.powi(2) / 3.0).sqrt());
+
+    let normal = match Normal::new(0.0, 1.0) {
+        Ok(n) => n,
+        Err(_) => return 1.0,
+    };
+
+    (1.0 - normal.cdf(z)).clamp(1e-300, 1.0)
+}
+
+/// Edgington's sum-p method.
+/// Exact Irwin-Hall lower-tail CDF for moderate k.
+pub fn combine_edgington(p_values: &[f64]) -> f64 {
+    let p = clean_p_values(p_values);
+    if p.is_empty() {
+        return 1.0;
+    }
+
+    let k = p.len();
+    let s: f64 = p.iter().sum();
+
+    if s <= 0.0 {
+        return 1e-300;
+    }
+    if s >= k as f64 {
+        return 1.0;
+    }
+
+    // Irwin-Hall CDF:
+    // F(s;k) = 1/k! * sum_{j=0}^{floor(s)} (-1)^j C(k,j) (s-j)^k
+    let max_j = s.floor().min(k as f64) as usize;
+    let mut sum = 0.0_f64;
+
+    for j in 0..=max_j {
+        let comb = binom_f64(k, j);
+        let term = (s - j as f64).max(0.0).powi(k as i32);
+        if j % 2 == 0 {
+            sum += comb * term;
+        } else {
+            sum -= comb * term;
+        }
+    }
+
+    let fact = factorial_f64(k);
+    (sum / fact).clamp(1e-300, 1.0)
+}
+
+fn factorial_f64(n: usize) -> f64 {
+    (1..=n).fold(1.0_f64, |acc, x| acc * x as f64)
+}
+
+fn binom_f64(n: usize, k: usize) -> f64 {
+    if k > n {
+        return 0.0;
+    }
+
+    let k = k.min(n - k);
+    let mut out = 1.0_f64;
+    for i in 0..k {
+        out *= (n - i) as f64;
+        out /= (i + 1) as f64;
+    }
+    out
+}
+
+/// Truncated Fisher method with fixed tau.
+/// Only p-values <= tau contribute. Null distribution is approximated by
+/// Fisher on the retained subset. This is a practical screening combiner,
+/// not a full adaptive-null TFisher implementation.
+pub fn combine_tfisher(p_values: &[f64], tau: f64) -> f64 {
+    let tau = tau.clamp(1e-12, 1.0);
+    let retained: Vec<f64> = clean_p_values(p_values)
+        .into_iter()
+        .filter(|&p| p <= tau)
+        .collect();
+
+    if retained.is_empty() {
+        return 1.0;
+    }
+
+    combine_fisher(&retained).clamp(1e-300, 1.0)
+}
+
+/// Cauchy / ACAT p-value combination.
+pub fn combine_cauchy_acat(p_values: &[f64]) -> f64 {
+    let p = clean_p_values(p_values);
+    if p.is_empty() {
+        return 1.0;
+    }
+
+    let m = p.len() as f64;
+    let t_sum: f64 = p
+        .iter()
+        .map(|&pi| ((0.5 - pi) * std::f64::consts::PI).tan())
+        .filter(|x| x.is_finite())
+        .sum();
+
+    let t = t_sum / m;
+    let pc = 0.5 - t.atan() / std::f64::consts::PI;
+    pc.clamp(1e-300, 1.0)
+}
+
+/// Vovk-Wang generalized-mean family placeholder using the harmonic
+/// arbitrary-dependence member. This is intentionally conservative compared
+/// with using the raw HMP as a fully calibrated p-value.
+pub fn combine_vovk_wang_harmonic(p_values: &[f64]) -> f64 {
+    let p = clean_p_values(p_values);
+    if p.is_empty() {
+        return 1.0;
+    }
+
+    let k = p.len() as f64;
+    let h = combine_hmp(&p);
+
+    // Conservative harmonic merging scaling.
+    // Avoids treating raw HMP as automatically calibrated under arbitrary dependence.
+    (h * k).clamp(1e-300, 1.0)
+}
+
+/// MinP-CCT-MinP practical hybrid.
+/// Conservative envelope of MinP and ACAT.
+pub fn combine_mcm(p_values: &[f64]) -> f64 {
+    let minp = combine_tippett(p_values);
+    let cct = combine_cauchy_acat(p_values);
+    combine_tippett(&[minp, cct]).clamp(1e-300, 1.0)
+}
+
+/// CCT-MinP-CCT practical hybrid.
+/// Cauchy envelope of ACAT and MinP.
+pub fn combine_cmc(p_values: &[f64]) -> f64 {
+    let cct = combine_cauchy_acat(p_values);
+    let minp = combine_tippett(p_values);
+    combine_cauchy_acat(&[cct, minp]).clamp(1e-300, 1.0)
+}
+
+#[derive(Clone, Debug, Default)]
+pub struct EmpiricalCombinerCalibration {
+    /// Null statistic distributions keyed by support size k.
+    pub tfisher_by_k: std::collections::BTreeMap<usize, Vec<f64>>,
+    pub gfisher_by_k: std::collections::BTreeMap<usize, Vec<f64>>,
+    pub ordmeta_by_k: std::collections::BTreeMap<usize, Vec<f64>>,
+    pub evalue_by_k: std::collections::BTreeMap<usize, Vec<f64>>,
+
+    /// Brown parameters keyed by support size k.
+    pub brown_by_k: std::collections::BTreeMap<usize, BrownParams>,
+}
+
+pub fn empirical_upper_tail_p(stat: f64, null_stats: &[f64]) -> f64 {
+    if null_stats.is_empty() || !stat.is_finite() {
+        return 1.0;
+    }
+
+    let ge = null_stats
+        .iter()
+        .filter(|&&x| x.is_finite() && x >= stat)
+        .count();
+
+    ((ge as f64 + 1.0) / (null_stats.len() as f64 + 1.0)).clamp(1e-300, 1.0)
+}
+
+pub fn fisher_stat(p_values: &[f64]) -> f64 {
+    clean_p_values(p_values)
+        .iter()
+        .map(|&p| -2.0 * p.ln())
+        .sum::<f64>()
+}
+
+pub fn tfisher_stat(p_values: &[f64], tau: f64) -> f64 {
+    let tau = tau.clamp(1e-12, 1.0);
+
+    clean_p_values(p_values)
+        .iter()
+        .filter(|&&p| p <= tau)
+        .map(|&p| -2.0 * p.ln())
+        .sum::<f64>()
+}
+
+pub fn ordmeta_stat(p_values: &[f64]) -> f64 {
+    let mut p = clean_p_values(p_values);
+    if p.is_empty() {
+        return 0.0;
+    }
+
+    p.sort_by(|a, b| a.total_cmp(b));
+
+    let k = p.len() as f64;
+
+    p.iter()
+        .enumerate()
+        .map(|(i, &pi)| {
+            let r = (i + 1) as f64;
+            let expected = r / k;
+            -((pi / expected).clamp(1e-300, 1.0)).ln()
+        })
+        .fold(0.0_f64, f64::max)
+}
+
+pub fn exchangeable_evalue_stat(p_values: &[f64]) -> f64 {
+    let p = clean_p_values(p_values);
+    if p.is_empty() {
+        return 0.0;
+    }
+
+    let e_sum: f64 = p.iter().map(|&pi| 1.0 / pi.max(1e-300)).sum();
+    e_sum / p.len() as f64
+}
+
+pub fn empirical_tfisher_p(
+    p_values: &[f64],
+    tau: f64,
+    calibration: Option<&EmpiricalCombinerCalibration>,
+) -> f64 {
+    let k = clean_p_values(p_values).len();
+    let stat = tfisher_stat(p_values, tau);
+
+    calibration
+        .and_then(|c| c.tfisher_by_k.get(&k))
+        .map(|null| empirical_upper_tail_p(stat, null))
+        .unwrap_or_else(|| combine_tfisher(p_values, tau))
+}
+
+pub fn empirical_gfisher_p(
+    p_values: &[f64],
+    calibration: Option<&EmpiricalCombinerCalibration>,
+) -> f64 {
+    let k = clean_p_values(p_values).len();
+    let stat = fisher_stat(p_values);
+
+    calibration
+        .and_then(|c| c.gfisher_by_k.get(&k))
+        .map(|null| empirical_upper_tail_p(stat, null))
+        .unwrap_or_else(|| combine_fisher(p_values))
+}
+
+pub fn empirical_ordmeta_p(
+    p_values: &[f64],
+    calibration: Option<&EmpiricalCombinerCalibration>,
+) -> f64 {
+    let k = clean_p_values(p_values).len();
+    let stat = ordmeta_stat(p_values);
+
+    calibration
+        .and_then(|c| c.ordmeta_by_k.get(&k))
+        .map(|null| empirical_upper_tail_p(stat, null))
+        .unwrap_or_else(|| combine_tippett(p_values))
+}
+
+pub fn empirical_exchangeable_evalue_p(
+    p_values: &[f64],
+    calibration: Option<&EmpiricalCombinerCalibration>,
+) -> f64 {
+    let k = clean_p_values(p_values).len();
+    let stat = exchangeable_evalue_stat(p_values);
+
+    calibration
+        .and_then(|c| c.evalue_by_k.get(&k))
+        .map(|null| empirical_upper_tail_p(stat, null))
+        .unwrap_or_else(|| combine_hmp(p_values))
+}
+
+pub fn empirical_brown_p(
+    p_values: &[f64],
+    calibration: Option<&EmpiricalCombinerCalibration>,
+) -> f64 {
+    let k = clean_p_values(p_values).len();
+    let params = calibration.and_then(|c| c.brown_by_k.get(&k).copied());
+    combine_brown(p_values, params)
 }
 
 /// Parameters for Brown’s method approximation:

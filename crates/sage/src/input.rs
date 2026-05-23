@@ -31,9 +31,68 @@ pub enum ProteinPCombine {
     Fisher,
     #[default]
     Cauchy,
+
+    /// Alias for Cauchy/ACAT.
+    Acat,
+
+    /// Sidak-corrected minimum p-value.
     SidakMinP,
+
+    /// Bonferroni-corrected minimum p-value.
+    BonferroniMinP,
+
+    /// Tippett/minimum-p global-null combiner.
+    Tippett,
+
+    /// Best raw p-value, uncorrected. Diagnostic/permissive only.
     Best,
+
+    /// Second-best raw p-value. Conservative support rule.
     SecondBest,
+
+    /// Harmonic mean p-value style scalar aggregation.
+    Hmp,
+
+    /// Brown-style dependence correction requires fitted cross-hypothesis
+    /// dependence parameters. In the current peptide/protein scalar combiner,
+    /// this intentionally falls back to Fisher unless a calibrated Brown path
+    /// is added later.
+    Brown,
+
+    /// Mudholkar–George logit-style compromise between Fisher and Pearson.
+    MudholkarGeorge,
+
+    /// Edgington sum-p method.
+    Edgington,
+
+    /// Truncated Fisher with a fixed truncation threshold.
+    TFisher,
+
+    /// Generalized Fisher requires dependence/null calibration. In the current
+    /// scalar combiner this uses Fisher as the safe placeholder.
+    GFisher,
+
+    /// IHW requires cross-hypothesis covariates and learned weights. In the
+    /// current scalar combiner this uses Fisher as the safe placeholder.
+    Ihw,
+
+    /// Exchangeable e-value calibration requires exchangeability/randomization
+    /// calibration. In the current scalar combiner this uses HMP-like evidence.
+    ExchangeableEValue,
+
+    /// Vovk-Wang generalized-mean merging; implemented here as the harmonic
+    /// arbitrary-dependence member.
+    VovkWangGeneralizedMean,
+
+    /// Ordered-meta / weighted-Fisher requires ordered-p joint-null calibration.
+    /// In the current scalar combiner this uses Fisher as the safe placeholder.
+    OrdmetaWFisher,
+
+    /// MinP-CCT-MinP hybrid.
+    Mcm,
+
+    /// CCT-MinP-CCT hybrid.
+    Cmc,
 }
 
 #[derive(Clone, Serialize, Deserialize, Debug, Default, PartialEq, Eq)]
@@ -42,9 +101,79 @@ pub enum PeptidePCombine {
     Fisher,
     #[default]
     Cauchy,
+
+    /// Alias for Cauchy/ACAT.
+    Acat,
+
+    /// Sidak-corrected minimum p-value.
     SidakMinP,
+
+    /// Bonferroni-corrected minimum p-value.
+    BonferroniMinP,
+
+    /// Tippett/minimum-p global-null combiner.
+    Tippett,
+
+    /// Best raw p-value, uncorrected. Diagnostic/permissive only.
     Best,
+
+    /// Second-best raw p-value. Conservative support rule.
     SecondBest,
+
+    /// Harmonic mean p-value style scalar aggregation.
+    Hmp,
+
+    /// Brown-style dependence correction requires fitted cross-hypothesis
+    /// dependence parameters. In the current peptide/protein scalar combiner,
+    /// this intentionally falls back to Fisher unless a calibrated Brown path
+    /// is added later.
+    Brown,
+
+    /// Mudholkar–George logit-style compromise between Fisher and Pearson.
+    MudholkarGeorge,
+
+    /// Edgington sum-p method.
+    Edgington,
+
+    /// Truncated Fisher with a fixed truncation threshold.
+    TFisher,
+
+    /// Generalized Fisher requires dependence/null calibration. In the current
+    /// scalar combiner this uses Fisher as the safe placeholder.
+    GFisher,
+
+    /// IHW requires cross-hypothesis covariates and learned weights. In the
+    /// current scalar combiner this uses Fisher as the safe placeholder.
+    Ihw,
+
+    /// Exchangeable e-value calibration requires exchangeability/randomization
+    /// calibration. In the current scalar combiner this uses HMP-like evidence.
+    ExchangeableEValue,
+
+    /// Vovk-Wang generalized-mean merging; implemented here as the harmonic
+    /// arbitrary-dependence member.
+    VovkWangGeneralizedMean,
+
+    /// Ordered-meta / weighted-Fisher requires ordered-p joint-null calibration.
+    /// In the current scalar combiner this uses Fisher as the safe placeholder.
+    OrdmetaWFisher,
+
+    /// MinP-CCT-MinP hybrid.
+    Mcm,
+
+    /// CCT-MinP-CCT hybrid.
+    Cmc,
+}
+
+#[derive(Clone, Copy, Serialize, Deserialize, Debug, Default, PartialEq, Eq)]
+#[serde(rename_all = "snake_case")]
+pub enum PCombineCalibrationMode {
+    #[default]
+    Off,
+
+    /// Build empirical null distributions from the DF rank-null PSM pool,
+    /// stratified by support size k.
+    RankNull,
 }
 
 #[derive(Clone, Serialize, Deserialize, Debug, Default, PartialEq, Eq)]
@@ -522,6 +651,15 @@ pub struct FdrOptions {
     pub protein_p_combine: Option<ProteinPCombine>,
     pub peptide_p_combine: Option<PeptidePCombine>,
 
+    /// Optional empirical calibration for p-value combiners that require a fitted
+    /// null or dependence model: Brown, GFisher, TFisher, ordmeta-like ordered
+    /// sparse, and exchangeable-e-value-like calibration.
+    pub p_combine_calibration_mode: Option<PCombineCalibrationMode>,
+    pub p_combine_calibration_min_k: Option<usize>,
+    pub p_combine_calibration_max_k: Option<usize>,
+    pub p_combine_calibration_null_replicates: Option<usize>,
+    pub p_combine_tfisher_tau: Option<f64>,
+
     // Explicit q-value method controls.
     pub psm_q_method: Option<QMethod>,
     pub peptide_q_method: Option<QMethod>,
@@ -838,6 +976,13 @@ pub struct FdrSettings {
     // Protein/peptide p-value combiners
     pub protein_p_combine: ProteinPCombine,
     pub peptide_p_combine: PeptidePCombine,
+
+    // Empirical p-combiner calibration controls.
+    pub p_combine_calibration_mode: PCombineCalibrationMode,
+    pub p_combine_calibration_min_k: usize,
+    pub p_combine_calibration_max_k: usize,
+    pub p_combine_calibration_null_replicates: usize,
+    pub p_combine_tfisher_tau: f64,
 
     // Explicit q-value method controls
     pub psm_q_method: QMethod,
@@ -1176,6 +1321,31 @@ impl From<FdrOptions> for FdrSettings {
 
         let protein_p_combine = options.protein_p_combine.unwrap_or(ProteinPCombine::Cauchy);
         let peptide_p_combine = options.peptide_p_combine.unwrap_or(PeptidePCombine::Cauchy);
+
+        let p_combine_calibration_mode = options
+            .p_combine_calibration_mode
+            .unwrap_or(PCombineCalibrationMode::Off);
+
+        let p_combine_calibration_min_k = options
+            .p_combine_calibration_min_k
+            .unwrap_or(2)
+            .clamp(1, 100);
+
+        let p_combine_calibration_max_k = options
+            .p_combine_calibration_max_k
+            .unwrap_or(20)
+            .clamp(p_combine_calibration_min_k, 100);
+
+        let p_combine_calibration_null_replicates = options
+            .p_combine_calibration_null_replicates
+            .unwrap_or(5000)
+            .clamp(100, 100_000);
+
+        let p_combine_tfisher_tau = options
+            .p_combine_tfisher_tau
+            .unwrap_or(0.05)
+            .clamp(1e-12, 1.0);
+
         let final_evidence_space = options
             .final_evidence_space
             .unwrap_or(FinalEvidenceSpace::Auto);
@@ -1575,6 +1745,13 @@ impl From<FdrOptions> for FdrSettings {
             // Protein/peptide p-value combiners
             protein_p_combine,
             peptide_p_combine,
+
+            // Empirical p-combiner calibration controls
+            p_combine_calibration_mode,
+            p_combine_calibration_min_k,
+            p_combine_calibration_max_k,
+            p_combine_calibration_null_replicates,
+            p_combine_tfisher_tau,
 
             // Explicit q-value method controls
             psm_q_method,
