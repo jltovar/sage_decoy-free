@@ -32,28 +32,70 @@ def spectrum_path_for_raw_file(raw_file, configured_paths):
         f"Could not map raw_file={raw_file!r} to any configured spectrum path: {configured_paths}"
     )
 
+def as_float(value, default=float("nan")):
+    try:
+        if pd.isna(value):
+            return default
+        return float(value)
+    except Exception:
+        return default
+
+
+def as_int(value, default=0):
+    try:
+        if pd.isna(value):
+            return default
+        return int(value)
+    except Exception:
+        return default
+
+
+def peptidoform_with_charge(row):
+    peptide = str(row["peptidoform"])
+    charge = as_int(row["charge"])
+
+    # psm-utils/feature generators behave more reliably if charge is encoded
+    # directly in the peptidoform string, e.g. PEPTIDE/2.
+    if "/" not in peptide:
+        return f"{peptide}/{charge}"
+
+    return peptide
+
 
 def make_psm(row):
+    charge = as_int(row["charge"])
+    retention_time = as_float(row.get("retention_time", float("nan")))
+    ion_mobility = as_float(row.get("ion_mobility", float("nan")))
+    precursor_mz = as_float(row.get("precursor_mz", float("nan")))
+
     return PSM(
-		peptidoform=str(row["peptidoform"]),
-		spectrum_id=str(row["spectrum_id"]),
-		run=str(row["raw_file"]),
-		collection=None,
-		score=float(row["score"]),
-		qvalue=float(row.get("qvalue", 1.0)),
-		pep=float(row.get("pep", 1.0)),
-		is_decoy=False,
-		rank=int(row["rank"]),
-		source=str(row["raw_file"]),
+        peptidoform=peptidoform_with_charge(row),
+        spectrum_id=str(row["spectrum_id"]),
+        run=str(row["raw_file"]),
+        collection=None,
+        score=as_float(row["score"]),
+        qvalue=as_float(row.get("qvalue", 1.0), 1.0),
+        pep=as_float(row.get("pep", 1.0), 1.0),
+        is_decoy=False,
+        rank=as_int(row["rank"]),
+        source=str(row["raw_file"]),
+
+        # These top-level fields matter. Do not leave them only in metadata.
+        precursor_mz=precursor_mz,
+        retention_time=retention_time,
+        ion_mobility=ion_mobility,
+
         provenance_data={
             "raw_file": str(row["raw_file"]),
-            "sage_rank": int(row["rank"]),
-            "sage_psm_id": int(row["psm_id"]),
+            "sage_rank": as_int(row["rank"]),
+            "sage_psm_id": as_int(row["psm_id"]),
         },
+
         metadata={
-            "charge": int(row["charge"]),
-            "retention_time": float(row["retention_time"]),
-            "ion_mobility": float(row["ion_mobility"]),
+            "charge": charge,
+            "retention_time": retention_time,
+            "ion_mobility": ion_mobility,
+            "precursor_mz": precursor_mz,
         },
     )
 
@@ -80,6 +122,20 @@ def main():
         )
 
         psm_list = PSMList(psm_list=[make_psm(row) for _, row in sub_df.iterrows()])
+        
+        bad_numeric = [
+			p
+			for p in psm_list.psm_list
+			if p.precursor_mz is None
+			or p.retention_time is None
+			or p.ion_mobility is None
+		]
+		
+		if bad_numeric:
+			print(
+				f"Warning: {len(bad_numeric)} PSMs have missing top-level precursor_mz/RT/ion mobility",
+				flush=True,
+			)
 
         required_ms_data = {
             ms_data

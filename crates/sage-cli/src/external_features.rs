@@ -116,20 +116,21 @@ fn export_candidate_table(
     let mut writer = WriterBuilder::new().delimiter(b'\t').from_path(path)?;
 
     writer.write_record([
-        "psm_id",
-        "spectrum_id",
-        "raw_file",
-        "peptidoform",
-        "sequence",
-        "charge",
-        "rank",
-        "score",
-        "qvalue",
-        "pep",
-        "retention_time",
-        "ion_mobility",
-        "is_decoy",
-    ])?;
+		"psm_id",
+		"spectrum_id",
+		"raw_file",
+		"peptidoform",
+		"sequence",
+		"charge",
+		"rank",
+		"score",
+		"qvalue",
+		"pep",
+		"retention_time",
+		"ion_mobility",
+		"precursor_mz",
+		"is_decoy",
+	])?;
 
     let max_rank = max_rank.unwrap_or(u32::MAX);
 
@@ -148,27 +149,36 @@ fn export_candidate_table(
         };
 
         let export_pep = if f.core.rank == 1 {
-            f.decoy_free_pep.unwrap_or(1.0)
-        } else {
-            1.0
-        };
-
-        writer.write_record([
-            f.core.psm_id.to_string(),
-            f.core.spec_id.clone(),
-            raw_file,
-            peptide.clone(),
-            peptide,
-            f.core.charge.to_string(),
-            f.core.rank.to_string(),
-            f.core.hyperscore.to_string(),
-            export_qvalue.to_string(),
-            export_pep.to_string(),
-            f.core.rt.to_string(),
-            f.core.ims.to_string(),
-            // No fake decoys. These are all target-only Decoy-Free candidates.
-            "false".to_string(),
-        ])?;
+			f.decoy_free_pep.unwrap_or(1.0)
+		} else {
+			1.0
+		};
+		
+		const PROTON_MASS: f64 = 1.007_276_466_621;
+		let charge = f.core.charge as f64;
+		let precursor_mz = if charge > 0.0 {
+			(f.core.expmass as f64 + charge * PROTON_MASS) / charge
+		} else {
+			f64::NAN
+		};
+		
+		writer.write_record([
+			f.core.psm_id.to_string(),
+			f.core.spec_id.clone(),
+			raw_file,
+			peptide.clone(),
+			peptide,
+			f.core.charge.to_string(),
+			f.core.rank.to_string(),
+			f.core.hyperscore.to_string(),
+			export_qvalue.to_string(),
+			export_pep.to_string(),
+			f.core.rt.to_string(),
+			f.core.ims.to_string(),
+			precursor_mz.to_string(),
+			// No fake decoys. These are all target-only Decoy-Free candidates.
+			"false".to_string(),
+		])?;
     }
 
     writer.flush()?;
