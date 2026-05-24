@@ -228,8 +228,7 @@ fn write_feature_config(
             "deeplc": {
                 "deeplc_retrain": false
             },
-            "im2deep": {},
-            "ionmob": {}
+            "im2deep": {}
         },
         "rescoring_engine": {}
     });
