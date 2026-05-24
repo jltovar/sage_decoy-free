@@ -124,18 +124,18 @@ def main():
         psm_list = PSMList(psm_list=[make_psm(row) for _, row in sub_df.iterrows()])
         
         bad_numeric = [
-			p
-			for p in psm_list.psm_list
-			if p.precursor_mz is None
-			or p.retention_time is None
-			or p.ion_mobility is None
-		]
-		
-		if bad_numeric:
-			print(
-				f"Warning: {len(bad_numeric)} PSMs have missing top-level precursor_mz/RT/ion mobility",
-				flush=True,
-			)
+            p
+            for p in psm_list.psm_list
+            if p.precursor_mz is None
+            or p.retention_time is None
+            or p.ion_mobility is None
+        ]
+
+        if bad_numeric:
+            print(
+                f"Warning: {len(bad_numeric)} PSMs have missing top-level precursor_mz/RT/ion mobility",
+                flush=True,
+            )
 
         required_ms_data = {
             ms_data
