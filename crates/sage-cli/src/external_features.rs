@@ -137,6 +137,22 @@ fn export_candidate_table(
         let peptide = db[f.core.peptide_idx].to_string();
         let raw_file = raw_file_name(mzml_paths, f.core.file_id);
 
+        // DeepLC/IM2Deep need a confident calibration subset.
+        // Use Decoy-Free q/PEP for rank-1 candidates only.
+        // Lower-rank null candidates remain exported for feature generation,
+        // but they must not become calibration anchors.
+        let export_qvalue = if f.core.rank == 1 {
+            f.decoy_free_q_value.unwrap_or(1.0)
+        } else {
+            1.0
+        };
+
+        let export_pep = if f.core.rank == 1 {
+            f.decoy_free_pep.unwrap_or(1.0)
+        } else {
+            1.0
+        };
+
         writer.write_record([
             f.core.psm_id.to_string(),
             f.core.spec_id.clone(),
@@ -146,13 +162,11 @@ fn export_candidate_table(
             f.core.charge.to_string(),
             f.core.rank.to_string(),
             f.core.hyperscore.to_string(),
-            // Feature-only only. These are placeholders for parsers that expect fields.
-            // They must never be imported back as statistical authority.
-            "1.0".to_string(),
-            "1.0".to_string(),
+            export_qvalue.to_string(),
+            export_pep.to_string(),
             f.core.rt.to_string(),
             f.core.ims.to_string(),
-            // No fake decoys. The Sage-owned feature wrapper must not require decoys.
+            // No fake decoys. These are all target-only Decoy-Free candidates.
             "false".to_string(),
         ])?;
     }

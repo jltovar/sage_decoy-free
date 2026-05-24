@@ -35,16 +35,16 @@ def spectrum_path_for_raw_file(raw_file, configured_paths):
 
 def make_psm(row):
     return PSM(
-        peptidoform=str(row["peptidoform"]),
-        spectrum_id=str(row["spectrum_id"]),
-        run=str(row["raw_file"]),
-        collection=None,
-        score=float(row["score"]),
-        qvalue=1.0,
-        pep=1.0,
-        is_decoy=False,
-        rank=int(row["rank"]),
-        source=str(row["raw_file"]),
+		peptidoform=str(row["peptidoform"]),
+		spectrum_id=str(row["spectrum_id"]),
+		run=str(row["raw_file"]),
+		collection=None,
+		score=float(row["score"]),
+		qvalue=float(row.get("qvalue", 1.0)),
+		pep=float(row.get("pep", 1.0)),
+		is_decoy=False,
+		rank=int(row["rank"]),
+		source=str(row["raw_file"]),
         provenance_data={
             "raw_file": str(row["raw_file"]),
             "sage_rank": int(row["rank"]),

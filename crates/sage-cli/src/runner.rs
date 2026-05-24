@@ -643,14 +643,6 @@ impl Runner {
                 .map(|f| f.to_df())
                 .collect();
 
-            maybe_add_external_features(
-                &mut features,
-                &self.parameters.external_features,
-                &self.parameters.mzml_paths,
-                &self.database,
-            )
-            .context("TIMS2/MS2Rescore external feature generation failed")?;
-
             let fdr_settings = self.parameters.fdr.clone();
 
             if self.parameters.write_pin {
@@ -660,10 +652,23 @@ impl Runner {
 				);
             }
 
-            // Compute Decoy-Free PSM statistics, then enforce the rank-1 contract
-            // for downstream reporting, aggregation, quantification, and output.
+            // Compute Decoy-Free PSM statistics while all retained candidate ranks are still present.
+            // External MS2Rescore/TIMS2Rescore feature generation is intentionally run after this
+            // point so DeepLC/IM2Deep can see Decoy-Free q-values for calibration, but before
+            // lower-rank candidates are pruned.
             features =
                 sage_core::decoy_free_fdr::run_df_layers(&features, &fdr_settings, &self.database);
+
+            maybe_add_external_features(
+                &mut features,
+                &self.parameters.external_features,
+                &self.parameters.mzml_paths,
+                &self.database,
+            )
+            .context("TIMS2/MS2Rescore external feature generation failed")?;
+
+            // Enforce the rank-1 contract for downstream reporting, aggregation,
+            // quantification, and output.
             features.retain(|f| f.core.rank == 1);
 
             // Aggregate rank-1 Decoy-Free PSMs to peptide- and protein-level q-values.
