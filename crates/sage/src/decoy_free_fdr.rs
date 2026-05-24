@@ -9387,12 +9387,146 @@ fn finalize_stage_snapshot(
     }
 }
 
+fn log_external_feature_diagnostics(features: &[DfFeature]) {
+    let joined = features
+        .iter()
+        .filter(|f| f.core.external_features.ms2rescore_feature_joined)
+        .count();
+
+    if joined == 0 {
+        return;
+    }
+
+    log::info!(
+        "external TIMS2/MS2Rescore features present on {}/{} candidate PSMs",
+        joined,
+        features.len()
+    );
+
+    log_external_feature_one(features, "ms2rescore_ms2pip_pcc", |f| {
+        f.core.external_features.ms2rescore_ms2pip_pcc as f64
+    });
+
+    log_external_feature_one(features, "ms2rescore_spectral_angle", |f| {
+        f.core.external_features.ms2rescore_spectral_angle as f64
+    });
+
+    log_external_feature_one(features, "ms2rescore_deeplc_abs_rt_error", |f| {
+        f.core.external_features.ms2rescore_deeplc_abs_rt_error as f64
+    });
+
+    log_external_feature_one(features, "tims2rescore_abs_ccs_error", |f| {
+        f.core.external_features.tims2rescore_abs_ccs_error as f64
+    });
+
+    log_external_feature_one(features, "tims2rescore_pct_ccs_error", |f| {
+        f.core.external_features.tims2rescore_pct_ccs_error as f64
+    });
+}
+
+fn log_external_feature_one<F>(features: &[DfFeature], name: &str, getter: F)
+where
+    F: Fn(&DfFeature) -> f64,
+{
+    let rank1: Vec<f64> = features
+        .iter()
+        .filter(|f| f.core.rank == 1)
+        .map(&getter)
+        .filter(|x| x.is_finite())
+        .collect();
+
+    let rank_null: Vec<f64> = features
+        .iter()
+        .filter(|f| f.core.rank > 1)
+        .map(&getter)
+        .filter(|x| x.is_finite())
+        .collect();
+
+    if rank1.len() < 10 || rank_null.len() < 10 {
+        log::info!(
+            "external feature diagnostic {name}: insufficient finite values rank1={} rank_null={}",
+            rank1.len(),
+            rank_null.len()
+        );
+        return;
+    }
+
+    let rank1_med = external_feature_median(rank1);
+    let null_med = external_feature_median(rank_null);
+
+    let hyp_corr =
+        external_feature_pearson_pairwise(features, |f| getter(f), |f| f.core.hyperscore as f64);
+
+    let p_corr = external_feature_pearson_pairwise(
+        features,
+        |f| getter(f),
+        |f| f.decoy_free_p_value.unwrap_or(f64::NAN),
+    );
+
+    log::info!(
+        "external feature diagnostic {name}: rank1_median={:.6} rank_null_median={:.6} corr_hyperscore={:.4} corr_df_p={:.4}",
+        rank1_med,
+        null_med,
+        hyp_corr,
+        p_corr
+    );
+}
+
+fn external_feature_median(mut xs: Vec<f64>) -> f64 {
+    xs.retain(|x| x.is_finite());
+    if xs.is_empty() {
+        return f64::NAN;
+    }
+    xs.sort_by(|a, b| a.total_cmp(b));
+    xs[xs.len() / 2]
+}
+
+fn external_feature_pearson_pairwise<F, G>(features: &[DfFeature], x_getter: F, y_getter: G) -> f64
+where
+    F: Fn(&DfFeature) -> f64,
+    G: Fn(&DfFeature) -> f64,
+{
+    let pairs: Vec<(f64, f64)> = features
+        .iter()
+        .map(|f| (x_getter(f), y_getter(f)))
+        .filter(|(x, y)| x.is_finite() && y.is_finite())
+        .collect();
+
+    if pairs.len() < 10 {
+        return f64::NAN;
+    }
+
+    let n = pairs.len() as f64;
+    let mean_x = pairs.iter().map(|p| p.0).sum::<f64>() / n;
+    let mean_y = pairs.iter().map(|p| p.1).sum::<f64>() / n;
+
+    let mut num = 0.0;
+    let mut den_x = 0.0;
+    let mut den_y = 0.0;
+
+    for (x, y) in pairs {
+        let dx = x - mean_x;
+        let dy = y - mean_y;
+        num += dx * dy;
+        den_x += dx * dx;
+        den_y += dy * dy;
+    }
+
+    if den_x <= 0.0 || den_y <= 0.0 {
+        f64::NAN
+    } else {
+        num / (den_x.sqrt() * den_y.sqrt())
+    }
+}
+
 pub fn run_df_layers(
     psms: &[DfFeature],
     settings: &FdrSettings,
     db: &IndexedDatabase,
 ) -> Vec<DfFeature> {
     let mut new_features = psms.to_vec();
+
+    log_external_feature_diagnostics(&new_features);
 
     let use_ensemble = matches!(settings.model_fit, ModelFit::Ensemble);
 

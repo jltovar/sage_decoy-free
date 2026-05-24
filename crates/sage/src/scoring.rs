@@ -96,6 +96,57 @@ impl AddAssign<InitialHits> for InitialHits {
     }
 }
 
+#[derive(Clone, Copy, Debug, Serialize, Deserialize)]
+pub struct ExternalPsmFeatures {
+    pub ms2rescore_ms2pip_pcc: f32,
+    pub ms2rescore_spectral_angle: f32,
+    pub ms2rescore_fragment_intensity_agreement: f32,
+
+    pub ms2rescore_deeplc_predicted_rt: f32,
+    pub ms2rescore_deeplc_calibrated_rt: f32,
+    pub ms2rescore_deeplc_rt_error: f32,
+    pub ms2rescore_deeplc_abs_rt_error: f32,
+
+    pub tims2rescore_im2deep_predicted_ccs: f32,
+    pub tims2rescore_observed_ccs: f32,
+    pub tims2rescore_abs_ccs_error: f32,
+    pub tims2rescore_pct_ccs_error: f32,
+
+    pub tims2rescore_predicted_ion_mobility: f32,
+    pub tims2rescore_observed_ion_mobility: f32,
+    pub tims2rescore_abs_ion_mobility_error: f32,
+    pub tims2rescore_pct_ion_mobility_error: f32,
+
+    pub ms2rescore_feature_joined: bool,
+}
+
+impl Default for ExternalPsmFeatures {
+    fn default() -> Self {
+        Self {
+            ms2rescore_ms2pip_pcc: f32::NAN,
+            ms2rescore_spectral_angle: f32::NAN,
+            ms2rescore_fragment_intensity_agreement: f32::NAN,
+
+            ms2rescore_deeplc_predicted_rt: f32::NAN,
+            ms2rescore_deeplc_calibrated_rt: f32::NAN,
+            ms2rescore_deeplc_rt_error: f32::NAN,
+            ms2rescore_deeplc_abs_rt_error: f32::NAN,
+
+            tims2rescore_im2deep_predicted_ccs: f32::NAN,
+            tims2rescore_observed_ccs: f32::NAN,
+            tims2rescore_abs_ccs_error: f32::NAN,
+            tims2rescore_pct_ccs_error: f32::NAN,
+
+            tims2rescore_predicted_ion_mobility: f32::NAN,
+            tims2rescore_observed_ion_mobility: f32::NAN,
+            tims2rescore_abs_ion_mobility_error: f32::NAN,
+            tims2rescore_pct_ion_mobility_error: f32::NAN,
+
+            ms2rescore_feature_joined: false,
+        }
+    }
+}
+
 /// The core identification data produced by the search engine.
 /// This struct contains NO FDR information (neither TDC nor DF).
 /// It is the raw material that enters the FDR pipeline.
@@ -157,6 +208,7 @@ pub struct FeatureCore {
     pub lo_spectrum_candidate_count: u32,
 
     pub ms2_intensity: f32,
+    pub external_features: ExternalPsmFeatures,
     pub fragments: Option<Fragments>,
 }
 
@@ -1569,6 +1621,7 @@ impl<'db> Scorer<'db> {
                 delta_rt_model: 0.999,
                 delta_ims_model: 0.999,
                 ms2_intensity: matched_intensity,
+                external_features: ExternalPsmFeatures::default(),
                 fragments,
             })
         }

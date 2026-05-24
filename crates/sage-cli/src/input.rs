@@ -10,6 +10,7 @@ use sage_core::{
     tmt::Isobaric,
 };
 use serde::{Deserialize, Serialize};
+use std::collections::HashMap;
 
 #[derive(Serialize, Clone)]
 /// Actual search parameters - may include overrides or default values not set by user
@@ -44,8 +45,134 @@ pub struct Search {
     #[serde(skip_serializing)]
     pub annotate_matches: bool,
 
+    pub external_features: ExternalFeatureGenerationSettings,
+
     pub score_type: ScoreType,
     pub fdr: FdrSettings,
+}
+
+#[derive(Clone, Serialize, Deserialize, Debug)]
+#[serde(rename_all = "snake_case")]
+pub enum ExternalFeatureEngine {
+    Tims2rescore,
+    Ms2rescore,
+}
+
+impl Default for ExternalFeatureEngine {
+    fn default() -> Self {
+        Self::Tims2rescore
+    }
+}
+
+#[derive(Clone, Serialize, Deserialize, Debug)]
+#[serde(rename_all = "snake_case")]
+pub enum ExternalFeatureFailPolicy {
+    Error,
+    WarnAndContinue,
+    Disable,
+}
+
+impl Default for ExternalFeatureFailPolicy {
+    fn default() -> Self {
+        Self::Error
+    }
+}
+
+#[derive(Clone, Serialize, Deserialize, Debug)]
+#[serde(rename_all = "snake_case")]
+pub enum ExternalFeatureUseMode {
+    DiagnosticsOnly,
+    ScoringCovariates,
+    BoundedDfExperts,
+}
+
+impl Default for ExternalFeatureUseMode {
+    fn default() -> Self {
+        Self::DiagnosticsOnly
+    }
+}
+
+#[derive(Clone, Serialize, Deserialize, Debug)]
+pub struct ExternalFeatureGenerationOptions {
+    pub enabled: Option<bool>,
+    pub engine: Option<ExternalFeatureEngine>,
+    pub command_path: Option<String>,
+    pub python_executable: Option<String>,
+    pub temp_directory: Option<String>,
+    pub output_directory: Option<String>,
+
+    /// Optional map from Sage mzML/Bruker path basename to actual .d / miniTDF path.
+    /// Example:
+    /// {
+    ///   "sample_A.d": "/data/raw/sample_A.d"
+    /// }
+    pub spectrum_file_mapping: Option<HashMap<String, String>>,
+
+    /// Must remain true for the Decoy-Free integration.
+    pub feature_only: Option<bool>,
+
+    pub fail_policy: Option<ExternalFeatureFailPolicy>,
+    pub use_mode: Option<ExternalFeatureUseMode>,
+
+    /// Export and request features for ranks 1..=max_rank.
+    /// If absent, use report_psms.
+    pub max_rank: Option<u32>,
+}
+
+#[derive(Clone, Serialize, Debug)]
+pub struct ExternalFeatureGenerationSettings {
+    pub enabled: bool,
+    pub engine: ExternalFeatureEngine,
+    pub command_path: Option<String>,
+    pub python_executable: Option<String>,
+    pub temp_directory: Option<String>,
+    pub output_directory: Option<String>,
+    pub spectrum_file_mapping: HashMap<String, String>,
+    pub feature_only: bool,
+    pub fail_policy: ExternalFeatureFailPolicy,
+    pub use_mode: ExternalFeatureUseMode,
+    pub max_rank: Option<u32>,
+}
+
+impl Default for ExternalFeatureGenerationSettings {
+    fn default() -> Self {
+        Self {
+            enabled: false,
+            engine: ExternalFeatureEngine::Tims2rescore,
+            command_path: None,
+            python_executable: None,
+            temp_directory: None,
+            output_directory: None,
+            spectrum_file_mapping: HashMap::new(),
+            feature_only: true,
+            fail_policy: ExternalFeatureFailPolicy::Error,
+            use_mode: ExternalFeatureUseMode::DiagnosticsOnly,
+            max_rank: None,
+        }
+    }
+}
+
+impl From<Option<ExternalFeatureGenerationOptions>> for ExternalFeatureGenerationSettings {
+    fn from(value: Option<ExternalFeatureGenerationOptions>) -> Self {
+        let default = Self::default();
+        let Some(value) = value else {
+            return default;
+        };
+
+        Self {
+            enabled: value.enabled.unwrap_or(default.enabled),
+            engine: value.engine.unwrap_or(default.engine),
+            command_path: value.command_path,
+            python_executable: value.python_executable,
+            temp_directory: value.temp_directory,
+            output_directory: value.output_directory,
+            spectrum_file_mapping: value.spectrum_file_mapping.unwrap_or_default(),
+            feature_only: value.feature_only.unwrap_or(true),
+            fail_policy: value.fail_policy.unwrap_or(default.fail_policy),
+            use_mode: value.use_mode.unwrap_or(default.use_mode),
+            max_rank: value.max_rank,
+        }
+    }
 }
 
 #[derive(Deserialize)]
@@ -75,6 +202,8 @@ pub struct Input {
     pub write_pin: Option<bool>,
     pub score_type: Option<ScoreType>,
     pub fdr: Option<FdrOptions>,
+
+    pub external_features: Option<ExternalFeatureGenerationOptions>,
 }
 
 #[derive(Serialize, Deserialize, Debug)]
@@ -384,12 +513,30 @@ impl Input {
         let report_psms = self.report_psms.unwrap_or(1);
         let report_psms = if fdr_mode == FdrMode::DecoyFree && report_psms < 10 {
             log::warn!(
-                "decoy_free mode requires report_psms >= 10 to retain sufficient candidate depth for stable downstream modeling and diagnostics; overriding to 10"
-            );
+				"decoy_free mode requires report_psms >= 10 to retain sufficient candidate depth for stable downstream modeling and diagnostics; overriding to 10"
+			);
             10
         } else {
             report_psms
         };
+
+        let external_features = ExternalFeatureGenerationSettings::from(self.external_features);
+
+        if external_features.enabled && !external_features.feature_only {
+            anyhow::bail!(
+				"external_features.feature_only=false is not allowed for Decoy-Free TIMS2/MS2Rescore integration"
+			);
+        }
+
+        if let Some(max_rank) = external_features.max_rank {
+            if max_rank as usize > report_psms {
+                anyhow::bail!(
+					"external_features.max_rank={} exceeds report_psms={}; lower-rank candidates would be unavailable",
+					max_rank,
+					report_psms
+				);
+            }
+        }
 
         // Materialize FDR settings from the optional user configuration.
         let fdr_settings: FdrSettings = match self.fdr.clone() {
@@ -443,6 +590,7 @@ impl Input {
             write_pin: self.write_pin.unwrap_or(false),
             bruker_config: self.bruker_config.unwrap_or_default(),
             score_type,
+            external_features,
             fdr: fdr_settings,
         })
     }

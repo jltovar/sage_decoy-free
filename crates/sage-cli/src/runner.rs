@@ -1,6 +1,7 @@
 use super::input::Search;
 use super::output::SageResults;
 use super::telemetry;
+use crate::external_features::maybe_add_external_features;
 use anyhow::Context;
 use csv::ByteRecord;
 use log::info;
@@ -118,9 +119,19 @@ impl Runner {
 
         if decoy_free_mode && parameters.report_psms < 10 {
             log::warn!(
-                "decoy_free mode requires report_psms >= 10 to retain sufficient candidate depth for stable downstream Decoy-Free modeling and diagnostics; overriding to 10"
-            );
+				"decoy_free mode requires report_psms >= 10 to retain sufficient candidate depth for stable downstream Decoy-Free modeling and diagnostics; overriding to 10"
+			);
             parameters.report_psms = 10;
+        }
+
+        if let Some(max_rank) = parameters.external_features.max_rank {
+            if parameters.report_psms < max_rank as usize {
+                anyhow::bail!(
+					"external_features.max_rank={} exceeds report_psms={}; lower-rank candidates would be unavailable",
+					max_rank,
+					parameters.report_psms
+				);
+            }
         }
 
         let generate_decoys = parameters.database.generate_decoys;
@@ -631,6 +642,14 @@ impl Runner {
                 .into_par_iter()
                 .map(|f| f.to_df())
                 .collect();
+
+            maybe_add_external_features(
+                &mut features,
+                &self.parameters.external_features,
+                &self.parameters.mzml_paths,
+                &self.database,
+            )
+            .context("TIMS2/MS2Rescore external feature generation failed")?;
 
             let fdr_settings = self.parameters.fdr.clone();
 
@@ -1583,6 +1602,112 @@ impl Runner {
         Self::push_opt_f64(record, vals.2);
     }
 
+    fn push_external_feature_headers(headers: &mut Vec<String>) {
+        headers.extend([
+            "ms2rescore_ms2pip_pcc".to_string(),
+            "ms2rescore_spectral_angle".to_string(),
+            "ms2rescore_fragment_intensity_agreement".to_string(),
+            "ms2rescore_deeplc_predicted_rt".to_string(),
+            "ms2rescore_deeplc_calibrated_rt".to_string(),
+            "ms2rescore_deeplc_rt_error".to_string(),
+            "ms2rescore_deeplc_abs_rt_error".to_string(),
+            "tims2rescore_im2deep_predicted_ccs".to_string(),
+            "tims2rescore_observed_ccs".to_string(),
+            "tims2rescore_abs_ccs_error".to_string(),
+            "tims2rescore_pct_ccs_error".to_string(),
+            "tims2rescore_predicted_ion_mobility".to_string(),
+            "tims2rescore_observed_ion_mobility".to_string(),
+            "tims2rescore_abs_ion_mobility_error".to_string(),
+            "tims2rescore_pct_ion_mobility_error".to_string(),
+            "ms2rescore_feature_joined".to_string(),
+        ]);
+    }
+
+    fn push_external_feature_values(record: &mut csv::ByteRecord, core: &FeatureCore) {
+        let ext = core.external_features;
+
+        record.push_field(
+            ryu::Buffer::new()
+                .format(ext.ms2rescore_ms2pip_pcc)
+                .as_bytes(),
+        );
+        record.push_field(
+            ryu::Buffer::new()
+                .format(ext.ms2rescore_spectral_angle)
+                .as_bytes(),
+        );
+        record.push_field(
+            ryu::Buffer::new()
+                .format(ext.ms2rescore_fragment_intensity_agreement)
+                .as_bytes(),
+        );
+
+        record.push_field(
+            ryu::Buffer::new()
+                .format(ext.ms2rescore_deeplc_predicted_rt)
+                .as_bytes(),
+        );
+        record.push_field(
+            ryu::Buffer::new()
+                .format(ext.ms2rescore_deeplc_calibrated_rt)
+                .as_bytes(),
+        );
+        record.push_field(
+            ryu::Buffer::new()
+                .format(ext.ms2rescore_deeplc_rt_error)
+                .as_bytes(),
+        );
+        record.push_field(
+            ryu::Buffer::new()
+                .format(ext.ms2rescore_deeplc_abs_rt_error)
+                .as_bytes(),
+        );
+
+        record.push_field(
+            ryu::Buffer::new()
+                .format(ext.tims2rescore_im2deep_predicted_ccs)
+                .as_bytes(),
+        );
+        record.push_field(
+            ryu::Buffer::new()
+                .format(ext.tims2rescore_observed_ccs)
+                .as_bytes(),
+        );
+        record.push_field(
+            ryu::Buffer::new()
+                .format(ext.tims2rescore_abs_ccs_error)
+                .as_bytes(),
+        );
+        record.push_field(
+            ryu::Buffer::new()
+                .format(ext.tims2rescore_pct_ccs_error)
+                .as_bytes(),
+        );
+
+        record.push_field(
+            ryu::Buffer::new()
+                .format(ext.tims2rescore_predicted_ion_mobility)
+                .as_bytes(),
+        );
+        record.push_field(
+            ryu::Buffer::new()
+                .format(ext.tims2rescore_observed_ion_mobility)
+                .as_bytes(),
+        );
+        record.push_field(
+            ryu::Buffer::new()
+                .format(ext.tims2rescore_abs_ion_mobility_error)
+                .as_bytes(),
+        );
+        record.push_field(
+            ryu::Buffer::new()
+                .format(ext.tims2rescore_pct_ion_mobility_error)
+                .as_bytes(),
+        );
+
+        record.push_field(ext.ms2rescore_feature_joined.to_string().as_bytes());
+    }
+
     // --- DF WRITERS (Decoy-Free) ---
     fn serialize_df_feature(
         &self,
@@ -1670,6 +1795,8 @@ impl Runner {
 
         // Write MS2 Intensity
         record.push_field(ryu::Buffer::new().format(core.ms2_intensity).as_bytes());
+
+        Self::push_external_feature_values(&mut record, core);
 
         // Decoy-Free output columns.
         for col in df_cols {
@@ -1794,6 +1921,8 @@ impl Runner {
         .into_iter()
         .map(String::from)
         .collect();
+
+        Self::push_external_feature_headers(&mut headers);
 
         let df_cols = self.df_dynamic_columns();
         Self::push_df_dynamic_headers(&mut headers, &df_cols);
