@@ -22,7 +22,14 @@ pub struct ExternalFeatureJoinKey {
 
 #[derive(Clone, Debug, Default)]
 pub struct ParsedExternalPsmFeatures {
+    pub psm_id: Option<u64>,
     pub features: ExternalPsmFeatures,
+}
+
+#[derive(Clone, Debug, Default)]
+pub struct ParsedExternalFeatureTable {
+    pub by_psm_id: HashMap<u64, ParsedExternalPsmFeatures>,
+    pub by_key: HashMap<ExternalFeatureJoinKey, ParsedExternalPsmFeatures>,
 }
 
 pub fn maybe_add_external_features(
@@ -285,16 +292,25 @@ fn run_external_process(
     Ok(())
 }
 
-fn parse_feature_output(
-    path: &Path,
-) -> Result<HashMap<ExternalFeatureJoinKey, ParsedExternalPsmFeatures>> {
+fn parse_feature_output(path: &Path) -> Result<ParsedExternalFeatureTable> {
     let mut reader = ReaderBuilder::new().delimiter(b'\t').from_path(path)?;
     let headers = reader.headers()?.clone();
 
-    let mut out = HashMap::new();
+    log::info!(
+        "external feature output has {} columns: {:?}",
+        headers.len(),
+        headers.iter().collect::<Vec<_>>()
+    );
+
+    let mut out = ParsedExternalFeatureTable::default();
+    let mut row_count = 0usize;
 
     for row in reader.records() {
         let row = row?;
+        row_count += 1;
+
+        let psm_id =
+            get_any(&row, &headers, &["psm_id", "sage_psm_id"]).and_then(|x| x.parse::<u64>().ok());
 
         let raw_file =
             get_any(&row, &headers, &["raw_file", "run", "filename", "source"]).unwrap_or_default();
@@ -313,7 +329,7 @@ fn parse_feature_output(
             .and_then(|x| x.parse::<u8>().ok())
             .unwrap_or(0);
 
-        let rank = get_any(&row, &headers, &["rank"])
+        let rank = get_any(&row, &headers, &["rank", "sage_rank"])
             .and_then(|x| x.parse::<u32>().ok())
             .unwrap_or(1);
 
@@ -322,55 +338,176 @@ fn parse_feature_output(
         f.ms2rescore_ms2pip_pcc = get_f32(
             &row,
             &headers,
-            &["Ms2pip:Correlation", "ms2pip_correlation", "pcc"],
+            &[
+                "Ms2pip:Correlation",
+                "ms2pip_correlation",
+                "ms2pip_corr",
+                "pcc",
+                "correlation",
+            ],
         );
-        f.ms2rescore_spectral_angle =
-            get_f32(&row, &headers, &["spectral_angle", "Ms2pip:SpectralAngle"]);
-        f.ms2rescore_fragment_intensity_agreement =
-            get_f32(&row, &headers, &["fragment_intensity_agreement"]);
+
+        f.ms2rescore_spectral_angle = get_f32(
+            &row,
+            &headers,
+            &[
+                "spectral_angle",
+                "Ms2pip:SpectralAngle",
+                "ms2pip_spectral_angle",
+                "spectral_angle_similarity",
+            ],
+        );
+
+        f.ms2rescore_fragment_intensity_agreement = get_f32(
+            &row,
+            &headers,
+            &[
+                "fragment_intensity_agreement",
+                "ms2pip_fragment_intensity_agreement",
+            ],
+        );
 
         f.ms2rescore_deeplc_predicted_rt = get_f32(
             &row,
             &headers,
-            &["DeepLC:PredictedRetentionTime", "predicted_rt"],
+            &[
+                "DeepLC:PredictedRetentionTime",
+                "deeplc_predicted_rt",
+                "predicted_rt",
+                "rt_pred",
+            ],
         );
+
         f.ms2rescore_deeplc_calibrated_rt = get_f32(
             &row,
             &headers,
-            &["DeepLC:CalibratedRetentionTime", "calibrated_rt"],
+            &[
+                "DeepLC:CalibratedRetentionTime",
+                "deeplc_calibrated_rt",
+                "calibrated_rt",
+            ],
         );
-        f.ms2rescore_deeplc_rt_error =
-            get_f32(&row, &headers, &["DeepLC:RetentionTimeError", "rt_error"]);
+
+        f.ms2rescore_deeplc_rt_error = get_f32(
+            &row,
+            &headers,
+            &[
+                "DeepLC:RetentionTimeError",
+                "deeplc_rt_error",
+                "rt_error",
+                "delta_rt",
+            ],
+        );
+
         f.ms2rescore_deeplc_abs_rt_error = get_f32(
             &row,
             &headers,
-            &["DeepLC:AbsRetentionTimeError", "abs_rt_error"],
+            &[
+                "DeepLC:AbsRetentionTimeError",
+                "deeplc_abs_rt_error",
+                "abs_rt_error",
+                "abs_delta_rt",
+            ],
         );
 
-        f.tims2rescore_im2deep_predicted_ccs =
-            get_f32(&row, &headers, &["IM2Deep:PredictedCCS", "predicted_ccs"]);
-        f.tims2rescore_observed_ccs =
-            get_f32(&row, &headers, &["IM2Deep:ObservedCCS", "observed_ccs"]);
-        f.tims2rescore_abs_ccs_error =
-            get_f32(&row, &headers, &["IM2Deep:AbsCCSError", "abs_ccs_error"]);
+        f.tims2rescore_im2deep_predicted_ccs = get_f32(
+            &row,
+            &headers,
+            &[
+                "IM2Deep:PredictedCCS",
+                "im2deep_predicted_ccs",
+                "predicted_ccs",
+                "ccs_predicted",
+            ],
+        );
+
+        f.tims2rescore_observed_ccs = get_f32(
+            &row,
+            &headers,
+            &[
+                "IM2Deep:ObservedCCS",
+                "im2deep_observed_ccs",
+                "observed_ccs",
+                "ccs_observed",
+            ],
+        );
+
+        f.tims2rescore_abs_ccs_error = get_f32(
+            &row,
+            &headers,
+            &[
+                "IM2Deep:AbsCCSError",
+                "im2deep_abs_ccs_error",
+                "abs_ccs_error",
+                "ccs_error_abs",
+            ],
+        );
+
         f.tims2rescore_pct_ccs_error = get_f32(
             &row,
             &headers,
-            &["IM2Deep:PercentualCCSError", "percent_ccs_error"],
+            &[
+                "IM2Deep:PercentualCCSError",
+                "im2deep_pct_ccs_error",
+                "percent_ccs_error",
+                "pct_ccs_error",
+                "ccs_error_percent",
+            ],
         );
 
-        f.tims2rescore_predicted_ion_mobility =
-            get_f32(&row, &headers, &["predicted_ion_mobility"]);
-        f.tims2rescore_observed_ion_mobility =
-            get_f32(&row, &headers, &["ion_mobility", "observed_ion_mobility"]);
-        f.tims2rescore_abs_ion_mobility_error =
-            get_f32(&row, &headers, &["abs_ion_mobility_error"]);
-        f.tims2rescore_pct_ion_mobility_error =
-            get_f32(&row, &headers, &["pct_ion_mobility_error"]);
+        f.tims2rescore_predicted_ion_mobility = get_f32(
+            &row,
+            &headers,
+            &[
+                "predicted_ion_mobility",
+                "ion_mobility_predicted",
+                "im_predicted",
+            ],
+        );
+
+        f.tims2rescore_observed_ion_mobility = get_f32(
+            &row,
+            &headers,
+            &[
+                "ion_mobility",
+                "observed_ion_mobility",
+                "ion_mobility_observed",
+                "im_observed",
+            ],
+        );
+
+        f.tims2rescore_abs_ion_mobility_error = get_f32(
+            &row,
+            &headers,
+            &[
+                "abs_ion_mobility_error",
+                "ion_mobility_error_abs",
+                "abs_im_error",
+            ],
+        );
+
+        f.tims2rescore_pct_ion_mobility_error = get_f32(
+            &row,
+            &headers,
+            &[
+                "pct_ion_mobility_error",
+                "ion_mobility_error_percent",
+                "pct_im_error",
+            ],
+        );
 
         f.ms2rescore_feature_joined = true;
 
-        out.insert(
+        let parsed = ParsedExternalPsmFeatures {
+            psm_id,
+            features: f,
+        };
+
+        if let Some(id) = psm_id {
+            out.by_psm_id.insert(id, parsed.clone());
+        }
+
+        out.by_key.insert(
             ExternalFeatureJoinKey {
                 raw_file,
                 spectrum_id,
@@ -378,22 +515,41 @@ fn parse_feature_output(
                 charge,
                 rank,
             },
-            ParsedExternalPsmFeatures { features: f },
+            parsed,
         );
     }
+
+    log::info!(
+        "parsed {} external feature rows: {} keyed by psm_id, {} keyed by compound key",
+        row_count,
+        out.by_psm_id.len(),
+        out.by_key.len()
+    );
 
     Ok(out)
 }
 
 fn join_features(
     features: &mut [DfFeature],
-    parsed: HashMap<ExternalFeatureJoinKey, ParsedExternalPsmFeatures>,
+    parsed: ParsedExternalFeatureTable,
     mzml_paths: &[String],
     db: &IndexedDatabase,
 ) -> Result<()> {
     let mut joined = 0usize;
+    let mut joined_by_psm_id = 0usize;
+    let mut joined_by_key = 0usize;
+    let mut missed_examples = Vec::new();
 
     for f in features.iter_mut() {
+        let psm_id = f.core.psm_id as u64;
+
+        if let Some(parsed_features) = parsed.by_psm_id.get(&psm_id) {
+            f.core.external_features = parsed_features.features;
+            joined += 1;
+            joined_by_psm_id += 1;
+            continue;
+        }
+
         let key = ExternalFeatureJoinKey {
             raw_file: raw_file_name(mzml_paths, f.core.file_id),
             spectrum_id: f.core.spec_id.clone(),
@@ -402,17 +558,29 @@ fn join_features(
             rank: f.core.rank,
         };
 
-        if let Some(parsed_features) = parsed.get(&key) {
+        if let Some(parsed_features) = parsed.by_key.get(&key) {
             f.core.external_features = parsed_features.features;
             joined += 1;
+            joined_by_key += 1;
+        } else if missed_examples.len() < 5 {
+            missed_examples.push(format!("{:?}", key));
         }
     }
 
     log::info!(
-        "joined external TIMS2/MS2Rescore features onto {}/{} candidate PSMs",
+        "joined external TIMS2/MS2Rescore features onto {}/{} candidate PSMs (by_psm_id={}, by_compound_key={})",
         joined,
-        features.len()
+        features.len(),
+        joined_by_psm_id,
+        joined_by_key
     );
+
+    if joined == 0 {
+        log::warn!(
+            "external feature join matched zero rows; first missed keys: {:?}",
+            missed_examples
+        );
+    }
 
     Ok(())
 }
