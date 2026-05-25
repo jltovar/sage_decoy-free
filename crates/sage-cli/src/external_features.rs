@@ -98,6 +98,8 @@ fn add_external_features_inner(
 
     join_features(features, parsed, mzml_paths, db)?;
 
+    log_external_feature_local_separation(features, db);
+
     match settings.use_mode {
         ExternalFeatureUseMode::DiagnosticsOnly => {
             log::info!("external features imported for diagnostics/output only");
@@ -231,7 +233,7 @@ fn write_feature_config(
             "ms2pip": {
                 "model": "timsTOF",
                 "ms2_tolerance": 0.02,
-                "processes": 32
+                "processes": 64
             },
             "deeplc": {
                 "deeplc_retrain": false
@@ -613,6 +615,245 @@ fn join_features(
     }
 
     Ok(())
+}
+
+fn log_external_feature_local_separation(features: &[DfFeature], db: &IndexedDatabase) {
+    let joined = features
+        .iter()
+        .filter(|f| f.core.external_features.ms2rescore_feature_joined)
+        .count();
+
+    if joined == 0 {
+        log::warn!("external feature local diagnostics skipped: no joined features");
+        return;
+    }
+
+    log::info!(
+        "external feature local diagnostics: joined_features={}/{}",
+        joined,
+        features.len()
+    );
+
+    log_external_feature_one_global(features, db, "ms2rescore_ms2pip_pcc", true, |f| {
+        f.core.external_features.ms2rescore_ms2pip_pcc as f64
+    });
+
+    log_external_feature_one_global(features, db, "ms2rescore_spectral_angle", true, |f| {
+        f.core.external_features.ms2rescore_spectral_angle as f64
+    });
+
+    log_external_feature_one_global(features, db, "ms2rescore_deeplc_abs_rt_error", false, |f| {
+        f.core.external_features.ms2rescore_deeplc_abs_rt_error as f64
+    });
+
+    log_external_feature_one_global(features, db, "tims2rescore_abs_ccs_error", false, |f| {
+        f.core.external_features.tims2rescore_abs_ccs_error as f64
+    });
+
+    log_external_feature_one_global(features, db, "tims2rescore_pct_ccs_error", false, |f| {
+        f.core.external_features.tims2rescore_pct_ccs_error as f64
+    });
+
+    log_external_feature_by_matched_peaks_bin(
+        features,
+        db,
+        "ms2rescore_deeplc_abs_rt_error",
+        false,
+        |f| f.core.external_features.ms2rescore_deeplc_abs_rt_error as f64,
+    );
+
+    log_external_feature_by_matched_peaks_bin(
+        features,
+        db,
+        "tims2rescore_pct_ccs_error",
+        false,
+        |f| f.core.external_features.tims2rescore_pct_ccs_error as f64,
+    );
+
+    log_external_feature_by_matched_peaks_bin(features, db, "ms2rescore_ms2pip_pcc", true, |f| {
+        f.core.external_features.ms2rescore_ms2pip_pcc as f64
+    });
+}
+
+fn log_external_feature_one_global<F>(
+    features: &[DfFeature],
+    db: &IndexedDatabase,
+    name: &str,
+    higher_is_better: bool,
+    getter: F,
+) where
+    F: Fn(&DfFeature) -> f64,
+{
+    let mut reference = Vec::new();
+    let mut entrapment = Vec::new();
+
+    for f in features
+        .iter()
+        .filter(|f| f.core.rank == 1 && f.core.external_features.ms2rescore_feature_joined)
+    {
+        let x = getter(f);
+        if !x.is_finite() {
+            continue;
+        }
+
+        let proteins = db[f.core.peptide_idx].proteins(&db.decoy_tag, db.generate_decoys);
+        if external_feature_is_entrapment(&proteins) {
+            entrapment.push(x);
+        } else {
+            reference.push(x);
+        }
+    }
+
+    if reference.len() < 10 || entrapment.len() < 10 {
+        log::info!(
+            "external feature diagnostic {name}: insufficient rank1 reference/entrapment values reference={} entrapment={}",
+            reference.len(),
+            entrapment.len()
+        );
+        return;
+    }
+
+    let auc = external_feature_auc(&reference, &entrapment, higher_is_better);
+
+    log::info!(
+        "external feature diagnostic {name}: reference_n={} entrapment_n={} reference_median={:.6} entrapment_median={:.6} auc_ref_vs_ent={:.4} higher_is_better={}",
+        reference.len(),
+        entrapment.len(),
+        external_feature_median(reference),
+        external_feature_median(entrapment),
+        auc,
+        higher_is_better
+    );
+}
+
+fn log_external_feature_by_matched_peaks_bin<F>(
+    features: &[DfFeature],
+    db: &IndexedDatabase,
+    name: &str,
+    higher_is_better: bool,
+    getter: F,
+) where
+    F: Fn(&DfFeature) -> f64,
+{
+    let bins: &[(u32, u32, &str)] = &[
+        (0, 4, "matched_peaks_0_4"),
+        (5, 7, "matched_peaks_5_7"),
+        (8, 12, "matched_peaks_8_12"),
+        (13, u32::MAX, "matched_peaks_13_plus"),
+    ];
+
+    for &(lo, hi, label) in bins {
+        let mut reference = Vec::new();
+        let mut entrapment = Vec::new();
+
+        for f in features
+            .iter()
+            .filter(|f| f.core.rank == 1 && f.core.external_features.ms2rescore_feature_joined)
+        {
+            let mp = f.core.matched_peaks;
+            if mp < lo || mp > hi {
+                continue;
+            }
+
+            let x = getter(f);
+            if !x.is_finite() {
+                continue;
+            }
+
+            let proteins = db[f.core.peptide_idx].proteins(&db.decoy_tag, db.generate_decoys);
+            if external_feature_is_entrapment(&proteins) {
+                entrapment.push(x);
+            } else {
+                reference.push(x);
+            }
+        }
+
+        if reference.len() < 10 || entrapment.len() < 10 {
+            log::info!(
+                "external feature diagnostic {name} bin={label}: insufficient values reference={} entrapment={}",
+                reference.len(),
+                entrapment.len()
+            );
+            continue;
+        }
+
+        let auc = external_feature_auc(&reference, &entrapment, higher_is_better);
+
+        log::info!(
+            "external feature diagnostic {name} bin={label}: reference_n={} entrapment_n={} reference_median={:.6} entrapment_median={:.6} auc_ref_vs_ent={:.4} higher_is_better={}",
+            reference.len(),
+            entrapment.len(),
+            external_feature_median(reference),
+            external_feature_median(entrapment),
+            auc,
+            higher_is_better
+        );
+    }
+}
+
+fn external_feature_is_entrapment(proteins: &str) -> bool {
+    let u = proteins.to_ascii_uppercase();
+
+    u.contains("ENTRAP")
+        || u.contains("FOREIGN")
+        || u.contains("ARATH")
+        || u.contains("YEAST")
+        || u.contains("CAEEL")
+        || u.contains("DROME")
+        || u.contains("ECOLI")
+        || u.contains("HUMAN")
+        || u.contains("RAT")
+}
+
+fn external_feature_median(mut xs: Vec<f64>) -> f64 {
+    xs.retain(|x| x.is_finite());
+    if xs.is_empty() {
+        return f64::NAN;
+    }
+
+    xs.sort_by(|a, b| a.total_cmp(b));
+    xs[xs.len() / 2]
+}
+
+fn external_feature_auc(reference: &[f64], entrapment: &[f64], higher_is_better: bool) -> f64 {
+    if reference.is_empty() || entrapment.is_empty() {
+        return f64::NAN;
+    }
+
+    let mut wins = 0.0f64;
+    let mut total = 0.0f64;
+
+    for &r in reference {
+        if !r.is_finite() {
+            continue;
+        }
+
+        for &e in entrapment {
+            if !e.is_finite() {
+                continue;
+            }
+
+            total += 1.0;
+
+            if higher_is_better {
+                if r > e {
+                    wins += 1.0;
+                } else if r == e {
+                    wins += 0.5;
+                }
+            } else if r < e {
+                wins += 1.0;
+            } else if r == e {
+                wins += 0.5;
+            }
+        }
+    }
+
+    if total <= 0.0 {
+        f64::NAN
+    } else {
+        wins / total
+    }
 }
 
 fn raw_file_name(mzml_paths: &[String], file_id: usize) -> String {

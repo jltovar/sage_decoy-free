@@ -652,10 +652,12 @@ impl Runner {
 				);
             }
 
-            // Compute Decoy-Free PSM statistics while all retained candidate ranks are still present.
-            // External MS2Rescore/TIMS2Rescore feature generation is intentionally run after this
-            // point so DeepLC/IM2Deep can see Decoy-Free q-values for calibration, but before
-            // lower-rank candidates are pruned.
+            // Pass 1: native Sage Decoy-Free.
+            //
+            // This first pass deliberately uses only Sage-native features. Its purpose is to
+            // generate preliminary Decoy-Free p/PEP/q values while ranks 1..N are still present.
+            // Those preliminary values are then used only to calibrate external feature
+            // generators such as DeepLC/IM2Deep. MS2Rescore/TIMS2Rescore remains feature-only.
             features =
                 sage_core::decoy_free_fdr::run_df_layers(&features, &fdr_settings, &self.database);
 
@@ -666,6 +668,24 @@ impl Runner {
                 &self.database,
             )
             .context("TIMS2/MS2Rescore external feature generation failed")?;
+
+            // Pass 2: final Sage Decoy-Free after external features have been joined.
+            //
+            // At this stage the imported features are available for diagnostics and, later,
+            // explicitly bounded auxiliary evidence. In diagnostics_only mode this second pass
+            // should reproduce the native Sage statistical stream while logging the imported
+            // feature separation.
+            if self.parameters.external_features.enabled {
+                log::info!(
+                    "running second Decoy-Free pass after external TIMS2/MS2Rescore feature join"
+                );
+
+                features = sage_core::decoy_free_fdr::run_df_layers(
+                    &features,
+                    &fdr_settings,
+                    &self.database,
+                );
+            }
 
             // Enforce the rank-1 contract for downstream reporting, aggregation,
             // quantification, and output.
