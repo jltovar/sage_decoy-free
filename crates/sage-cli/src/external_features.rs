@@ -231,7 +231,7 @@ fn write_feature_config(
             "ms2pip": {
                 "model": "timsTOF",
                 "ms2_tolerance": 0.02,
-                "processes": 8
+                "processes": 32
             },
             "deeplc": {
                 "deeplc_retrain": false
@@ -339,6 +339,8 @@ fn parse_feature_output(path: &Path) -> Result<ParsedExternalFeatureTable> {
             &row,
             &headers,
             &[
+                "spec_pearson",
+                "spec_pearson_norm",
                 "Ms2pip:Correlation",
                 "ms2pip_correlation",
                 "ms2pip_corr",
@@ -351,6 +353,10 @@ fn parse_feature_output(path: &Path) -> Result<ParsedExternalFeatureTable> {
             &row,
             &headers,
             &[
+                "cos",
+                "cos_norm",
+                "dotprod",
+                "dotprod_norm",
                 "spectral_angle",
                 "Ms2pip:SpectralAngle",
                 "ms2pip_spectral_angle",
@@ -362,6 +368,12 @@ fn parse_feature_output(path: &Path) -> Result<ParsedExternalFeatureTable> {
             &row,
             &headers,
             &[
+                "dotprod",
+                "dotprod_norm",
+                "cos",
+                "cos_norm",
+                "spec_pearson",
+                "spec_pearson_norm",
                 "fragment_intensity_agreement",
                 "ms2pip_fragment_intensity_agreement",
             ],
@@ -371,6 +383,8 @@ fn parse_feature_output(path: &Path) -> Result<ParsedExternalFeatureTable> {
             &row,
             &headers,
             &[
+                "predicted_retention_time",
+                "predicted_retention_time_best",
                 "DeepLC:PredictedRetentionTime",
                 "deeplc_predicted_rt",
                 "predicted_rt",
@@ -382,6 +396,8 @@ fn parse_feature_output(path: &Path) -> Result<ParsedExternalFeatureTable> {
             &row,
             &headers,
             &[
+                "observed_retention_time",
+                "observed_retention_time_best",
                 "DeepLC:CalibratedRetentionTime",
                 "deeplc_calibrated_rt",
                 "calibrated_rt",
@@ -392,6 +408,8 @@ fn parse_feature_output(path: &Path) -> Result<ParsedExternalFeatureTable> {
             &row,
             &headers,
             &[
+                "rt_diff",
+                "rt_diff_best",
                 "DeepLC:RetentionTimeError",
                 "deeplc_rt_error",
                 "rt_error",
@@ -399,10 +417,12 @@ fn parse_feature_output(path: &Path) -> Result<ParsedExternalFeatureTable> {
             ],
         );
 
-        f.ms2rescore_deeplc_abs_rt_error = get_f32(
+        let rt_err = get_f32(
             &row,
             &headers,
             &[
+                "rt_diff",
+                "rt_diff_best",
                 "DeepLC:AbsRetentionTimeError",
                 "deeplc_abs_rt_error",
                 "abs_rt_error",
@@ -410,10 +430,17 @@ fn parse_feature_output(path: &Path) -> Result<ParsedExternalFeatureTable> {
             ],
         );
 
+        f.ms2rescore_deeplc_abs_rt_error = if rt_err.is_finite() {
+            rt_err.abs()
+        } else {
+            f32::NAN
+        };
+
         f.tims2rescore_im2deep_predicted_ccs = get_f32(
             &row,
             &headers,
             &[
+                "ccs_predicted_im2deep",
                 "IM2Deep:PredictedCCS",
                 "im2deep_predicted_ccs",
                 "predicted_ccs",
@@ -425,6 +452,7 @@ fn parse_feature_output(path: &Path) -> Result<ParsedExternalFeatureTable> {
             &row,
             &headers,
             &[
+                "ccs_observed_im2deep",
                 "IM2Deep:ObservedCCS",
                 "im2deep_observed_ccs",
                 "observed_ccs",
@@ -436,6 +464,7 @@ fn parse_feature_output(path: &Path) -> Result<ParsedExternalFeatureTable> {
             &row,
             &headers,
             &[
+                "abs_ccs_error_im2deep",
                 "IM2Deep:AbsCCSError",
                 "im2deep_abs_ccs_error",
                 "abs_ccs_error",
@@ -447,6 +476,7 @@ fn parse_feature_output(path: &Path) -> Result<ParsedExternalFeatureTable> {
             &row,
             &headers,
             &[
+                "perc_ccs_error_im2deep",
                 "IM2Deep:PercentualCCSError",
                 "im2deep_pct_ccs_error",
                 "percent_ccs_error",
