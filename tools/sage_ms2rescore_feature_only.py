@@ -110,7 +110,7 @@ def main():
 
     df = pd.read_csv(cfg["psm_file"], sep="\t")
 
-    all_psms = []
+    all_output_rows = []
 
     for raw_file, sub_df in df.groupby("raw_file", sort=False):
         spectrum_path = spectrum_path_for_raw_file(raw_file, cfg["spectrum_path"])
@@ -167,14 +167,46 @@ def main():
             print(f"Adding features from {fgen_name}", flush=True)
             fgen.add_features(psm_list)
 
-        all_psms.extend(psm_list.psm_list)
+        for (_, original_row), psm in zip(sub_df.iterrows(), psm_list.psm_list):
+            out_row = {
+                # Primary Sage join key.
+                "psm_id": str(original_row["psm_id"]),
+
+                # Fallback compound join key.
+                "spectrum_id": str(original_row["spectrum_id"]),
+                "spec_id": str(original_row["spectrum_id"]),
+                "raw_file": str(original_row["raw_file"]),
+                "run": str(original_row["raw_file"]),
+                "filename": str(original_row["raw_file"]),
+                "peptidoform": str(original_row["peptidoform"]),
+                "modified_peptide": str(original_row["peptidoform"]),
+                "peptide": str(original_row["peptidoform"]),
+                "charge": int(original_row["charge"]),
+                "rank": int(original_row["rank"]),
+
+                # Useful audit fields.
+                "qvalue": float(original_row.get("qvalue", 1.0)),
+                "pep": float(original_row.get("pep", 1.0)),
+                "score": float(original_row.get("score", float("nan"))),
+                "retention_time": float(original_row.get("retention_time", float("nan"))),
+                "ion_mobility": float(original_row.get("ion_mobility", float("nan"))),
+                "precursor_mz": float(original_row.get("precursor_mz", float("nan"))),
+            }
+
+            for key, value in psm.rescoring_features.items():
+                out_row[str(key)] = value
+
+            all_output_rows.append(out_row)
 
     out = cfg["output_path"] + ".psms.tsv"
     Path(out).parent.mkdir(parents=True, exist_ok=True)
 
-    psm_utils.io.write_file(PSMList(psm_list=all_psms), out, filetype="tsv")
+    out_df = pd.DataFrame(all_output_rows)
+    out_df.to_csv(out, sep="	", index=False)
 
     print(f"Wrote feature-enriched PSMs to {out}", flush=True)
+    print(f"Wrote {len(out_df)} feature rows", flush=True)
+    print(f"Output columns: {list(out_df.columns)}", flush=True)
 
 
 if __name__ == "__main__":
