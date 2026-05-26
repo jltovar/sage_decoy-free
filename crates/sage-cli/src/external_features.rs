@@ -221,6 +221,21 @@ fn write_feature_config(
         ExternalFeatureEngine::Ms2rescore => "ms2rescore",
     };
 
+    let feature_generators = settings
+        .feature_generators
+        .clone()
+        .unwrap_or_else(|| default_feature_generators(settings));
+
+    let modification_mapping = settings
+        .modification_mapping
+        .clone()
+        .unwrap_or_else(|| serde_json::json!({}));
+
+    let fixed_modifications = settings
+        .fixed_modifications
+        .clone()
+        .unwrap_or_else(|| serde_json::json!({}));
+
     let config = serde_json::json!({
         "engine": engine_name,
         "feature_only_no_decoys": true,
@@ -228,23 +243,63 @@ fn write_feature_config(
         "psm_file_type": "sage_decoy_free_external",
         "spectrum_path": spectrum_paths,
         "output_path": output_root,
-        "feature_generators": {
-            "basic": {},
-            "ms2pip": {
-                "model": "timsTOF",
-                "ms2_tolerance": 0.02,
-                "processes": 64
-            },
-            "deeplc": {
-                "deeplc_retrain": false
-            },
-            "im2deep": {}
-        },
+
+        "log_level": settings.log_level.as_deref().unwrap_or("info"),
+        "processes": settings.processes.unwrap_or(1),
+
+        "feature_generators": feature_generators,
+
+        // Used by the wrapper to normalize Sage mass-delta peptidoforms before psm-utils/MS2PIP.
+        "modification_mapping": modification_mapping,
+        "fixed_modifications": fixed_modifications,
+
+        // Explicitly empty. We do not allow Percolator/Mokapot to become statistical authority.
         "rescoring_engine": {}
     });
 
     std::fs::write(config_path, serde_json::to_vec_pretty(&config)?)?;
     Ok(())
+}
+
+fn default_feature_generators(settings: &ExternalFeatureGenerationSettings) -> serde_json::Value {
+    let ms2pip_model = settings
+        .ms2pip_model
+        .as_deref()
+        .unwrap_or(match settings.engine {
+            ExternalFeatureEngine::Tims2rescore => "timsTOF2024",
+            ExternalFeatureEngine::Ms2rescore => "timsTOF2024",
+        });
+
+    let ms2pip_ms2_tolerance = settings.ms2pip_ms2_tolerance.unwrap_or(0.02);
+    let processes = settings.processes.unwrap_or(1);
+
+    let mut deeplc = serde_json::Map::new();
+    deeplc.insert(
+        "deeplc_retrain".to_string(),
+        serde_json::json!(settings.deeplc_retrain.unwrap_or(false)),
+    );
+
+    if let Some(n_epochs) = settings.deeplc_n_epochs {
+        deeplc.insert("n_epochs".to_string(), serde_json::json!(n_epochs));
+    }
+
+    if let Some(calibration_set_size) = settings.deeplc_calibration_set_size {
+        deeplc.insert(
+            "calibration_set_size".to_string(),
+            serde_json::json!(calibration_set_size),
+        );
+    }
+
+    serde_json::json!({
+        "basic": {},
+        "ms2pip": {
+            "model": ms2pip_model,
+            "ms2_tolerance": ms2pip_ms2_tolerance,
+            "processes": processes
+        },
+        "deeplc": serde_json::Value::Object(deeplc),
+        "im2deep": {}
+    })
 }
 
 fn run_external_process(
@@ -264,30 +319,18 @@ fn run_external_process(
         Command::new(command_path)
     };
 
-    let output = cmd
+    let status = cmd
         .arg("--config")
         .arg(config_path)
-        .output()
+        .stdout(std::process::Stdio::inherit())
+        .stderr(std::process::Stdio::inherit())
+        .status()
         .with_context(|| format!("running external feature command {}", command_path))?;
 
-    if !output.stdout.is_empty() {
-        log::info!(
-            "external feature stdout:\n{}",
-            String::from_utf8_lossy(&output.stdout)
-        );
-    }
-
-    if !output.stderr.is_empty() {
-        log::warn!(
-            "external feature stderr:\n{}",
-            String::from_utf8_lossy(&output.stderr)
-        );
-    }
-
-    if !output.status.success() {
+    if !status.success() {
         bail!(
             "external feature command failed with status {:?}",
-            output.status.code()
+            status.code()
         );
     }
 

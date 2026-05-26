@@ -3,6 +3,7 @@
 import argparse
 import json
 import os
+import logging
 from pathlib import Path
 
 import pandas as pd
@@ -49,9 +50,35 @@ def as_int(value, default=0):
     except Exception:
         return default
 
+DEFAULT_MODIFICATION_MAPPING = {
+    "[+15.994915]": "[UNIMOD:35]",      # Oxidation
+    "[+15.9949]": "[UNIMOD:35]",
+    "[+15.995]": "[UNIMOD:35]",
 
-def peptidoform_with_charge(row):
-    peptide = str(row["peptidoform"])
+    "[+57.0215]": "[UNIMOD:4]",        # Carbamidomethyl
+    "[+57.021464]": "[UNIMOD:4]",
+    "[+57.02146]": "[UNIMOD:4]",
+}
+
+
+def normalize_peptidoform_mods(peptide, cfg):
+    peptide = str(peptide)
+
+    mapping = dict(DEFAULT_MODIFICATION_MAPPING)
+    user_mapping = cfg.get("modification_mapping") or {}
+
+    if not isinstance(user_mapping, dict):
+        raise RuntimeError("modification_mapping must be an object/dict")
+
+    mapping.update({str(k): str(v) for k, v in user_mapping.items()})
+
+    for src, dst in mapping.items():
+        peptide = peptide.replace(src, dst)
+
+    return peptide
+
+def peptidoform_with_charge(row, cfg):
+    peptide = normalize_peptidoform_mods(row["peptidoform"], cfg)
     charge = as_int(row["charge"])
 
     # psm-utils/feature generators behave more reliably if charge is encoded
@@ -62,14 +89,14 @@ def peptidoform_with_charge(row):
     return peptide
 
 
-def make_psm(row):
+def make_psm(row, cfg):
     charge = as_int(row["charge"])
     retention_time = as_float(row.get("retention_time", float("nan")))
     ion_mobility = as_float(row.get("ion_mobility", float("nan")))
     precursor_mz = as_float(row.get("precursor_mz", float("nan")))
 
     return PSM(
-        peptidoform=peptidoform_with_charge(row),
+        peptidoform=peptidoform_with_charge(row, cfg),
         spectrum_id=str(row["spectrum_id"]),
         run=str(row["raw_file"]),
         collection=None,
@@ -107,6 +134,12 @@ def main():
 
     with open(args.config) as handle:
         cfg = json.load(handle)
+    
+    log_level = str(cfg.get("log_level", "info")).upper()
+    logging.basicConfig(
+        level=getattr(logging, log_level, logging.INFO),
+        format="%(levelname)s:%(name)s:%(message)s",
+    )
 
     df = pd.read_csv(cfg["psm_file"], sep="\t")
 
@@ -121,7 +154,7 @@ def main():
             flush=True,
         )
 
-        psm_list = PSMList(psm_list=[make_psm(row) for _, row in sub_df.iterrows()])
+        psm_list = PSMList(psm_list=[make_psm(row, cfg) for _, row in sub_df.iterrows()])
         
         bad_numeric = [
             p

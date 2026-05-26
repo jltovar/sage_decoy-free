@@ -117,6 +117,36 @@ pub struct ExternalFeatureGenerationOptions {
     /// Export and request features for ranks 1..=max_rank.
     /// If absent, use report_psms.
     pub max_rank: Option<u32>,
+
+    #[serde(default)]
+    pub feature_generators: Option<serde_json::Value>,
+
+    #[serde(default)]
+    pub log_level: Option<String>,
+
+    #[serde(default)]
+    pub processes: Option<usize>,
+
+    #[serde(default)]
+    pub ms2pip_model: Option<String>,
+
+    #[serde(default)]
+    pub ms2pip_ms2_tolerance: Option<f64>,
+
+    #[serde(default)]
+    pub deeplc_retrain: Option<bool>,
+
+    #[serde(default)]
+    pub deeplc_n_epochs: Option<usize>,
+
+    #[serde(default)]
+    pub deeplc_calibration_set_size: Option<usize>,
+
+    #[serde(default)]
+    pub modification_mapping: Option<serde_json::Value>,
+
+    #[serde(default)]
+    pub fixed_modifications: Option<serde_json::Value>,
 }
 
 #[derive(Clone, Serialize, Debug)]
@@ -132,6 +162,35 @@ pub struct ExternalFeatureGenerationSettings {
     pub fail_policy: ExternalFeatureFailPolicy,
     pub use_mode: ExternalFeatureUseMode,
     pub max_rank: Option<u32>,
+    #[serde(default)]
+    pub feature_generators: Option<serde_json::Value>,
+
+    #[serde(default)]
+    pub log_level: Option<String>,
+
+    #[serde(default)]
+    pub processes: Option<usize>,
+
+    #[serde(default)]
+    pub ms2pip_model: Option<String>,
+
+    #[serde(default)]
+    pub ms2pip_ms2_tolerance: Option<f64>,
+
+    #[serde(default)]
+    pub deeplc_retrain: Option<bool>,
+
+    #[serde(default)]
+    pub deeplc_n_epochs: Option<usize>,
+
+    #[serde(default)]
+    pub deeplc_calibration_set_size: Option<usize>,
+
+    #[serde(default)]
+    pub modification_mapping: Option<serde_json::Value>,
+
+    #[serde(default)]
+    pub fixed_modifications: Option<serde_json::Value>,
 }
 
 impl Default for ExternalFeatureGenerationSettings {
@@ -148,6 +207,17 @@ impl Default for ExternalFeatureGenerationSettings {
             fail_policy: ExternalFeatureFailPolicy::Error,
             use_mode: ExternalFeatureUseMode::DiagnosticsOnly,
             max_rank: None,
+
+            feature_generators: None,
+            log_level: None,
+            processes: None,
+            ms2pip_model: None,
+            ms2pip_ms2_tolerance: None,
+            deeplc_retrain: None,
+            deeplc_n_epochs: None,
+            deeplc_calibration_set_size: None,
+            modification_mapping: None,
+            fixed_modifications: None,
         }
     }
 }
@@ -171,6 +241,17 @@ impl From<Option<ExternalFeatureGenerationOptions>> for ExternalFeatureGeneratio
             fail_policy: value.fail_policy.unwrap_or(default.fail_policy),
             use_mode: value.use_mode.unwrap_or(default.use_mode),
             max_rank: value.max_rank,
+
+            feature_generators: value.feature_generators,
+            log_level: value.log_level,
+            processes: value.processes,
+            ms2pip_model: value.ms2pip_model,
+            ms2pip_ms2_tolerance: value.ms2pip_ms2_tolerance,
+            deeplc_retrain: value.deeplc_retrain,
+            deeplc_n_epochs: value.deeplc_n_epochs,
+            deeplc_calibration_set_size: value.deeplc_calibration_set_size,
+            modification_mapping: value.modification_mapping,
+            fixed_modifications: value.fixed_modifications,
         }
     }
 }
