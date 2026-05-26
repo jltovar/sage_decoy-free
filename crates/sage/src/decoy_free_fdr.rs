@@ -9800,6 +9800,18 @@ pub fn apply_external_ms2rescore_bounded_experts(
         }
     };
 
+    let profiles = ExternalMs2RescoreProfiles::learn(features, settings);
+
+    log::info!(
+        "external empirical bounded expert profiles: ms2pip_pcc={} spectral_angle={} fragment_agreement={} deeplc_abs_rt={} ccs_pct={} ccs_abs={}",
+        profiles.ms2pip_pcc.summary(),
+        profiles.spectral_angle.summary(),
+        profiles.fragment_intensity_agreement.summary(),
+        profiles.deeplc_abs_rt_error.summary(),
+        profiles.ccs_pct_error.summary(),
+        profiles.ccs_abs_error.summary(),
+    );
+
     let mut n_joined = 0usize;
     let mut n_used = 0usize;
     let mut n_rescued = 0usize;
@@ -9817,54 +9829,34 @@ pub fn apply_external_ms2rescore_bounded_experts(
 
         let mut evidence = Vec::new();
 
-        // Higher is better: MS2PIP / spectral agreement.
-        if ext.ms2rescore_ms2pip_pcc.is_finite() {
-            evidence.push(external_higher_is_better_score(
-                ext.ms2rescore_ms2pip_pcc as f64,
-                0.70,
-                0.20,
-            ));
-        }
+        evidence.push(profiles.ms2pip_pcc.score(ext.ms2rescore_ms2pip_pcc as f64));
+        evidence.push(
+            profiles
+                .spectral_angle
+                .score(ext.ms2rescore_spectral_angle as f64),
+        );
+        evidence.push(
+            profiles
+                .fragment_intensity_agreement
+                .score(ext.ms2rescore_fragment_intensity_agreement as f64),
+        );
+        evidence.push(
+            profiles
+                .deeplc_abs_rt_error
+                .score(ext.ms2rescore_deeplc_abs_rt_error as f64),
+        );
+        evidence.push(
+            profiles
+                .ccs_pct_error
+                .score(ext.tims2rescore_pct_ccs_error as f64),
+        );
+        evidence.push(
+            profiles
+                .ccs_abs_error
+                .score(ext.tims2rescore_abs_ccs_error as f64),
+        );
 
-        if ext.ms2rescore_spectral_angle.is_finite() {
-            evidence.push(external_higher_is_better_score(
-                ext.ms2rescore_spectral_angle as f64,
-                0.70,
-                0.20,
-            ));
-        }
-
-        if ext.ms2rescore_fragment_intensity_agreement.is_finite() {
-            evidence.push(external_higher_is_better_score(
-                ext.ms2rescore_fragment_intensity_agreement as f64,
-                0.70,
-                0.20,
-            ));
-        }
-
-        // Lower is better: DeepLC RT error.
-        if ext.ms2rescore_deeplc_abs_rt_error.is_finite() {
-            evidence.push(external_lower_is_better_score(
-                ext.ms2rescore_deeplc_abs_rt_error as f64,
-                5.0,
-                5.0,
-            ));
-        }
-
-        // Lower is better: IM2Deep CCS error.
-        if ext.tims2rescore_pct_ccs_error.is_finite() {
-            evidence.push(external_lower_is_better_score(
-                ext.tims2rescore_pct_ccs_error as f64,
-                3.0,
-                3.0,
-            ));
-        } else if ext.tims2rescore_abs_ccs_error.is_finite() {
-            evidence.push(external_lower_is_better_score(
-                ext.tims2rescore_abs_ccs_error as f64,
-                15.0,
-                15.0,
-            ));
-        }
+        evidence.retain(|x| x.is_finite());
 
         if evidence.is_empty() {
             continue;
@@ -9874,8 +9866,6 @@ pub fn apply_external_ms2rescore_bounded_experts(
 
         let mean_evidence = evidence.iter().sum::<f64>() / evidence.len() as f64;
 
-        // Convert normalized evidence [-1, +1] into a bounded logit-confidence shift.
-        // Positive evidence rescues; negative evidence penalizes.
         let raw_shift = if mean_evidence >= 0.0 {
             mean_evidence * cfg.max_rescue_shift
         } else {
@@ -9908,8 +9898,6 @@ pub fn apply_external_ms2rescore_bounded_experts(
 
                 let posterior_p = finite_df_p_value(posterior_p);
 
-                // This is an explicitly bounded auxiliary evidence update.
-                // It does not import MS2Rescore q-values or labels.
                 f.decoy_free_p_value = Some(posterior_p);
                 f.decoy_free_pep = Some(finite_df_probability_for_logit(posterior_p));
                 f.decoy_free_score = Some(df_score_from_pep(posterior_p));
@@ -9926,33 +9914,225 @@ pub fn apply_external_ms2rescore_bounded_experts(
     recalculate_active_q_values(features, settings);
 
     log::info!(
-        "external bounded DF expert update: joined={} used={} rescued={} penalized={} max_abs_shift={:.4} rescue_cap={:.4} penalty_cap={:.4}",
+        "external empirical bounded DF expert update: joined={} used={} rescued={} penalized={} max_abs_shift={:.4} rescue_cap={:.4} penalty_cap={:.4} good_anchor_q<={:.4} good_anchor_pep<={:.4} null_ranks={}..={}",
         n_joined,
         n_used,
         n_rescued,
         n_penalized,
         max_abs_shift,
         cfg.max_rescue_shift,
-        cfg.max_penalty_shift
+        cfg.max_penalty_shift,
+        settings.physical_rescue.anchor_max_q,
+        settings.physical_rescue.anchor_max_pep,
+        settings.moments_min_null_rank,
+        settings.moments_max_null_rank,
     );
 }
 
-#[inline]
-fn external_higher_is_better_score(x: f64, good_center: f64, scale: f64) -> f64 {
-    if !x.is_finite() || scale <= 0.0 {
-        return 0.0;
-    }
-
-    ((x - good_center) / scale).clamp(-1.0, 1.0)
+#[derive(Clone, Debug)]
+struct ExternalMs2RescoreProfiles {
+    ms2pip_pcc: ExternalEmpiricalFeatureProfile,
+    spectral_angle: ExternalEmpiricalFeatureProfile,
+    fragment_intensity_agreement: ExternalEmpiricalFeatureProfile,
+    deeplc_abs_rt_error: ExternalEmpiricalFeatureProfile,
+    ccs_pct_error: ExternalEmpiricalFeatureProfile,
+    ccs_abs_error: ExternalEmpiricalFeatureProfile,
 }
 
-#[inline]
-fn external_lower_is_better_score(x: f64, good_center: f64, scale: f64) -> f64 {
-    if !x.is_finite() || scale <= 0.0 {
-        return 0.0;
+impl ExternalMs2RescoreProfiles {
+    fn learn(features: &[DfFeature], settings: &FdrSettings) -> Self {
+        Self {
+            ms2pip_pcc: ExternalEmpiricalFeatureProfile::learn(
+                "ms2rescore_ms2pip_pcc",
+                true,
+                features,
+                settings,
+                |f| f.core.external_features.ms2rescore_ms2pip_pcc as f64,
+            ),
+            spectral_angle: ExternalEmpiricalFeatureProfile::learn(
+                "ms2rescore_spectral_angle",
+                true,
+                features,
+                settings,
+                |f| f.core.external_features.ms2rescore_spectral_angle as f64,
+            ),
+            fragment_intensity_agreement: ExternalEmpiricalFeatureProfile::learn(
+                "ms2rescore_fragment_intensity_agreement",
+                true,
+                features,
+                settings,
+                |f| {
+                    f.core
+                        .external_features
+                        .ms2rescore_fragment_intensity_agreement as f64
+                },
+            ),
+            deeplc_abs_rt_error: ExternalEmpiricalFeatureProfile::learn(
+                "ms2rescore_deeplc_abs_rt_error",
+                false,
+                features,
+                settings,
+                |f| f.core.external_features.ms2rescore_deeplc_abs_rt_error as f64,
+            ),
+            ccs_pct_error: ExternalEmpiricalFeatureProfile::learn(
+                "tims2rescore_pct_ccs_error",
+                false,
+                features,
+                settings,
+                |f| f.core.external_features.tims2rescore_pct_ccs_error as f64,
+            ),
+            ccs_abs_error: ExternalEmpiricalFeatureProfile::learn(
+                "tims2rescore_abs_ccs_error",
+                false,
+                features,
+                settings,
+                |f| f.core.external_features.tims2rescore_abs_ccs_error as f64,
+            ),
+        }
+    }
+}
+
+#[derive(Clone, Debug)]
+struct ExternalEmpiricalFeatureProfile {
+    name: &'static str,
+    enabled: bool,
+    higher_is_better: bool,
+    good_median: f64,
+    null_median: f64,
+    separation: f64,
+    good_n: usize,
+    null_n: usize,
+}
+
+impl ExternalEmpiricalFeatureProfile {
+    fn learn<F>(
+        name: &'static str,
+        higher_is_better: bool,
+        features: &[DfFeature],
+        settings: &FdrSettings,
+        getter: F,
+    ) -> Self
+    where
+        F: Fn(&DfFeature) -> f64,
+    {
+        const MIN_GOOD_ANCHORS: usize = 25;
+        const MIN_NULL_ANCHORS: usize = 100;
+
+        let mut good = Vec::new();
+        let mut null = Vec::new();
+
+        for f in features {
+            if !f.core.external_features.ms2rescore_feature_joined {
+                continue;
+            }
+
+            let x = getter(f);
+            if !x.is_finite() {
+                continue;
+            }
+
+            if f.core.rank == 1 {
+                let q = f.decoy_free_q_value.unwrap_or(1.0);
+                let pep = f.decoy_free_pep.unwrap_or(1.0);
+
+                if q <= settings.physical_rescue.anchor_max_q
+                    && pep <= settings.physical_rescue.anchor_max_pep
+                {
+                    good.push(x);
+                }
+            } else if f.core.rank >= settings.moments_min_null_rank
+                && f.core.rank <= settings.moments_max_null_rank
+            {
+                null.push(x);
+            }
+        }
+
+        let good_n = good.len();
+        let null_n = null.len();
+
+        let good_median = external_empirical_median(good);
+        let null_median = external_empirical_median(null);
+
+        let separation = if good_median.is_finite() && null_median.is_finite() {
+            if higher_is_better {
+                good_median - null_median
+            } else {
+                null_median - good_median
+            }
+        } else {
+            f64::NAN
+        };
+
+        let enabled = good_n >= MIN_GOOD_ANCHORS
+            && null_n >= MIN_NULL_ANCHORS
+            && separation.is_finite()
+            && separation > 0.0;
+
+        if !enabled {
+            log::warn!(
+                "external empirical feature {name} disabled: good_n={} null_n={} good_median={:.6} null_median={:.6} separation={:.6} higher_is_better={}",
+                good_n,
+                null_n,
+                good_median,
+                null_median,
+                separation,
+                higher_is_better
+            );
+        }
+
+        Self {
+            name,
+            enabled,
+            higher_is_better,
+            good_median,
+            null_median,
+            separation,
+            good_n,
+            null_n,
+        }
     }
 
-    ((good_center - x) / scale).clamp(-1.0, 1.0)
+    fn score(&self, x: f64) -> f64 {
+        if !self.enabled || !x.is_finite() || !self.separation.is_finite() || self.separation <= 0.0
+        {
+            return f64::NAN;
+        }
+
+        let s = if self.higher_is_better {
+            // null_median maps to -1; good_median maps to +1.
+            2.0 * ((x - self.null_median) / self.separation) - 1.0
+        } else {
+            // null_median maps to -1; good_median maps to +1.
+            2.0 * ((self.null_median - x) / self.separation) - 1.0
+        };
+
+        s.clamp(-1.0, 1.0)
+    }
+
+    fn summary(&self) -> String {
+        format!(
+            "{}:enabled={} good_n={} null_n={} good_med={:.6} null_med={:.6} sep={:.6} hib={}",
+            self.name,
+            self.enabled,
+            self.good_n,
+            self.null_n,
+            self.good_median,
+            self.null_median,
+            self.separation,
+            self.higher_is_better
+        )
+    }
+}
+
+fn external_empirical_median(mut xs: Vec<f64>) -> f64 {
+    xs.retain(|x| x.is_finite());
+
+    if xs.is_empty() {
+        return f64::NAN;
+    }
+
+    xs.sort_by(|a, b| a.total_cmp(b));
+    xs[xs.len() / 2]
 }
 
 pub fn calculate_q_values(
