@@ -1,4 +1,4 @@
-use super::input::Search;
+use super::input::{ExternalFeatureUseMode, Search};
 use super::output::SageResults;
 use super::telemetry;
 use crate::external_features::maybe_add_external_features;
@@ -685,6 +685,31 @@ impl Runner {
                     &fdr_settings,
                     &self.database,
                 );
+
+                match self.parameters.external_features.use_mode {
+                    ExternalFeatureUseMode::DiagnosticsOnly => {
+                        log::info!(
+                            "external TIMS2/MS2Rescore features are diagnostics/output only; no DF score update applied"
+                        );
+                    }
+
+                    ExternalFeatureUseMode::ScoringCovariates => {
+                        log::warn!(
+                            "external_features.use_mode=scoring_covariates is not implemented yet; no DF score update applied"
+                        );
+                    }
+
+                    ExternalFeatureUseMode::BoundedDfExperts => {
+                        log::info!(
+                            "applying external TIMS2/MS2Rescore features as bounded Decoy-Free expert evidence"
+                        );
+
+                        sage_core::decoy_free_fdr::apply_external_ms2rescore_bounded_experts(
+                            &mut features,
+                            &fdr_settings,
+                        );
+                    }
+                }
             }
 
             // Enforce the rank-1 contract for downstream reporting, aggregation,
@@ -1821,7 +1846,9 @@ impl Runner {
         // Write MS2 Intensity
         record.push_field(ryu::Buffer::new().format(core.ms2_intensity).as_bytes());
 
-        Self::push_external_feature_values(&mut record, core);
+        if self.parameters.external_features.enabled {
+            Self::push_external_feature_values(&mut record, core);
+        }
 
         // Decoy-Free output columns.
         for col in df_cols {
@@ -1947,7 +1974,9 @@ impl Runner {
         .map(String::from)
         .collect();
 
-        Self::push_external_feature_headers(&mut headers);
+        if self.parameters.external_features.enabled {
+            Self::push_external_feature_headers(&mut headers);
+        }
 
         let df_cols = self.df_dynamic_columns();
         Self::push_df_dynamic_headers(&mut headers, &df_cols);

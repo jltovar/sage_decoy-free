@@ -9786,6 +9786,175 @@ pub fn run_df_layers(
     new_features
 }
 
+pub fn apply_external_ms2rescore_bounded_experts(
+    features: &mut [DfFeature],
+    settings: &FdrSettings,
+) {
+    let cfg = match settings.physical_rescue.bounded_cfg.as_ref() {
+        Some(cfg) => cfg,
+        None => {
+            log::warn!(
+                "external bounded DF experts requested, but physical_rescue.bounded_cfg is missing; no external feature update applied"
+            );
+            return;
+        }
+    };
+
+    let mut n_joined = 0usize;
+    let mut n_used = 0usize;
+    let mut n_rescued = 0usize;
+    let mut n_penalized = 0usize;
+    let mut max_abs_shift = 0.0f64;
+
+    for f in features.iter_mut().filter(|f| f.core.rank == 1) {
+        let ext = f.core.external_features;
+
+        if !ext.ms2rescore_feature_joined {
+            continue;
+        }
+
+        n_joined += 1;
+
+        let mut evidence = Vec::new();
+
+        // Higher is better: MS2PIP / spectral agreement.
+        if ext.ms2rescore_ms2pip_pcc.is_finite() {
+            evidence.push(external_higher_is_better_score(
+                ext.ms2rescore_ms2pip_pcc as f64,
+                0.70,
+                0.20,
+            ));
+        }
+
+        if ext.ms2rescore_spectral_angle.is_finite() {
+            evidence.push(external_higher_is_better_score(
+                ext.ms2rescore_spectral_angle as f64,
+                0.70,
+                0.20,
+            ));
+        }
+
+        if ext.ms2rescore_fragment_intensity_agreement.is_finite() {
+            evidence.push(external_higher_is_better_score(
+                ext.ms2rescore_fragment_intensity_agreement as f64,
+                0.70,
+                0.20,
+            ));
+        }
+
+        // Lower is better: DeepLC RT error.
+        if ext.ms2rescore_deeplc_abs_rt_error.is_finite() {
+            evidence.push(external_lower_is_better_score(
+                ext.ms2rescore_deeplc_abs_rt_error as f64,
+                5.0,
+                5.0,
+            ));
+        }
+
+        // Lower is better: IM2Deep CCS error.
+        if ext.tims2rescore_pct_ccs_error.is_finite() {
+            evidence.push(external_lower_is_better_score(
+                ext.tims2rescore_pct_ccs_error as f64,
+                3.0,
+                3.0,
+            ));
+        } else if ext.tims2rescore_abs_ccs_error.is_finite() {
+            evidence.push(external_lower_is_better_score(
+                ext.tims2rescore_abs_ccs_error as f64,
+                15.0,
+                15.0,
+            ));
+        }
+
+        if evidence.is_empty() {
+            continue;
+        }
+
+        n_used += 1;
+
+        let mean_evidence = evidence.iter().sum::<f64>() / evidence.len() as f64;
+
+        // Convert normalized evidence [-1, +1] into a bounded logit-confidence shift.
+        // Positive evidence rescues; negative evidence penalizes.
+        let raw_shift = if mean_evidence >= 0.0 {
+            mean_evidence * cfg.max_rescue_shift
+        } else {
+            mean_evidence * cfg.max_penalty_shift
+        };
+
+        let bounded_shift =
+            stats::capped_shift(raw_shift, cfg.max_rescue_shift, cfg.max_penalty_shift);
+
+        if bounded_shift.abs() <= 1e-12 {
+            continue;
+        }
+
+        max_abs_shift = max_abs_shift.max(bounded_shift.abs());
+
+        match active_evidence_space(settings) {
+            ActiveEvidenceSpace::Pep => {
+                let prior_pep = f.decoy_free_pep.unwrap_or(1.0);
+                let logit_prior = stats::safe_logit_confidence(prior_pep);
+                let posterior_pep = stats::safe_inv_logit_confidence(logit_prior + bounded_shift);
+
+                f.decoy_free_pep = Some(finite_df_probability_for_logit(posterior_pep));
+                f.decoy_free_score = Some(df_score_from_pep(posterior_pep));
+            }
+
+            ActiveEvidenceSpace::PValue => {
+                let prior_p = f.decoy_free_p_value.unwrap_or(1.0);
+                let logit_prior = stats::safe_logit_confidence(prior_p);
+                let posterior_p = stats::safe_inv_logit_confidence(logit_prior + bounded_shift);
+
+                let posterior_p = finite_df_p_value(posterior_p);
+
+                // This is an explicitly bounded auxiliary evidence update.
+                // It does not import MS2Rescore q-values or labels.
+                f.decoy_free_p_value = Some(posterior_p);
+                f.decoy_free_pep = Some(finite_df_probability_for_logit(posterior_p));
+                f.decoy_free_score = Some(df_score_from_pep(posterior_p));
+            }
+        }
+
+        if bounded_shift > 0.0 {
+            n_rescued += 1;
+        } else {
+            n_penalized += 1;
+        }
+    }
+
+    recalculate_active_q_values(features, settings);
+
+    log::info!(
+        "external bounded DF expert update: joined={} used={} rescued={} penalized={} max_abs_shift={:.4} rescue_cap={:.4} penalty_cap={:.4}",
+        n_joined,
+        n_used,
+        n_rescued,
+        n_penalized,
+        max_abs_shift,
+        cfg.max_rescue_shift,
+        cfg.max_penalty_shift
+    );
+}
+
+#[inline]
+fn external_higher_is_better_score(x: f64, good_center: f64, scale: f64) -> f64 {
+    if !x.is_finite() || scale <= 0.0 {
+        return 0.0;
+    }
+
+    ((x - good_center) / scale).clamp(-1.0, 1.0)
+}
+
+#[inline]
+fn external_lower_is_better_score(x: f64, good_center: f64, scale: f64) -> f64 {
+    if !x.is_finite() || scale <= 0.0 {
+        return 0.0;
+    }
+
+    ((good_center - x) / scale).clamp(-1.0, 1.0)
+}
+
 pub fn calculate_q_values(
     psms: &[DfFeature],
     settings: &FdrSettings,
