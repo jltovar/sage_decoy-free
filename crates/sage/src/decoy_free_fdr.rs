@@ -10000,6 +10000,7 @@ struct ExternalEmpiricalFeatureProfile {
     good_median: f64,
     null_median: f64,
     separation: f64,
+    auc: f64,
     good_n: usize,
     null_n: usize,
 }
@@ -10017,6 +10018,11 @@ impl ExternalEmpiricalFeatureProfile {
     {
         const MIN_GOOD_ANCHORS: usize = 25;
         const MIN_NULL_ANCHORS: usize = 100;
+
+        // Do not allow tiny, technically-positive differences to become active evidence.
+        const MIN_EMPIRICAL_AUC: f64 = 0.58;
+        const MIN_ABS_SEPARATION_FLOOR: f64 = 1e-4;
+        const MIN_RELATIVE_SEPARATION_FRAC: f64 = 0.05;
 
         let mut good = Vec::new();
         let mut null = Vec::new();
@@ -10050,8 +10056,8 @@ impl ExternalEmpiricalFeatureProfile {
         let good_n = good.len();
         let null_n = null.len();
 
-        let good_median = external_empirical_median(good);
-        let null_median = external_empirical_median(null);
+        let good_median = external_empirical_median(&good);
+        let null_median = external_empirical_median(&null);
 
         let separation = if good_median.is_finite() && null_median.is_finite() {
             if higher_is_better {
@@ -10063,21 +10069,33 @@ impl ExternalEmpiricalFeatureProfile {
             f64::NAN
         };
 
+        let auc = external_empirical_auc(&good, &null, higher_is_better);
+
+        let scale_floor =
+            good_median.abs().max(null_median.abs()).max(1.0) * MIN_RELATIVE_SEPARATION_FRAC;
+
+        let min_required_separation = MIN_ABS_SEPARATION_FLOOR.max(scale_floor);
+
         let enabled = good_n >= MIN_GOOD_ANCHORS
             && null_n >= MIN_NULL_ANCHORS
             && separation.is_finite()
-            && separation > 0.0;
+            && separation >= min_required_separation
+            && auc.is_finite()
+            && auc >= MIN_EMPIRICAL_AUC;
 
         if !enabled {
             log::warn!(
-                "external empirical feature {name} disabled: good_n={} null_n={} good_median={:.6} null_median={:.6} separation={:.6} higher_is_better={}",
-                good_n,
-                null_n,
-                good_median,
-                null_median,
-                separation,
-                higher_is_better
-            );
+				"external empirical feature {name} disabled: good_n={} null_n={} good_median={:.6} null_median={:.6} separation={:.6} min_required_separation={:.6} auc={:.4} min_auc={:.4} higher_is_better={}",
+				good_n,
+				null_n,
+				good_median,
+				null_median,
+				separation,
+				min_required_separation,
+				auc,
+				MIN_EMPIRICAL_AUC,
+				higher_is_better
+			);
         }
 
         Self {
@@ -10087,6 +10105,7 @@ impl ExternalEmpiricalFeatureProfile {
             good_median,
             null_median,
             separation,
+            auc,
             good_n,
             null_n,
         }
@@ -10111,21 +10130,67 @@ impl ExternalEmpiricalFeatureProfile {
 
     fn summary(&self) -> String {
         format!(
-            "{}:enabled={} good_n={} null_n={} good_med={:.6} null_med={:.6} sep={:.6} hib={}",
-            self.name,
-            self.enabled,
-            self.good_n,
-            self.null_n,
-            self.good_median,
-            self.null_median,
-            self.separation,
-            self.higher_is_better
-        )
+			"{}:enabled={} good_n={} null_n={} good_med={:.6} null_med={:.6} sep={:.6} auc={:.4} hib={}",
+			self.name,
+			self.enabled,
+			self.good_n,
+			self.null_n,
+			self.good_median,
+			self.null_median,
+			self.separation,
+			self.auc,
+			self.higher_is_better
+		)
     }
 }
 
-fn external_empirical_median(mut xs: Vec<f64>) -> f64 {
-    xs.retain(|x| x.is_finite());
+fn external_empirical_auc(good: &[f64], null: &[f64], higher_is_better: bool) -> f64 {
+    if good.is_empty() || null.is_empty() {
+        return f64::NAN;
+    }
+
+    let mut wins = 0.0f64;
+    let mut total = 0.0f64;
+
+    for &g in good {
+        if !g.is_finite() {
+            continue;
+        }
+
+        for &n in null {
+            if !n.is_finite() {
+                continue;
+            }
+
+            total += 1.0;
+
+            if higher_is_better {
+                if g > n {
+                    wins += 1.0;
+                } else if g == n {
+                    wins += 0.5;
+                }
+            } else if g < n {
+                wins += 1.0;
+            } else if g == n {
+                wins += 0.5;
+            }
+        }
+    }
+
+    if total <= 0.0 {
+        f64::NAN
+    } else {
+        wins / total
+    }
+}
+
+fn external_empirical_median(xs: &[f64]) -> f64 {
+    let mut xs = xs
+        .iter()
+        .copied()
+        .filter(|x| x.is_finite())
+        .collect::<Vec<_>>();
 
     if xs.is_empty() {
         return f64::NAN;
