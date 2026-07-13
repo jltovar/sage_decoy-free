@@ -450,7 +450,6 @@ fn weighted_median(peps: &[f64], weights: &[f64]) -> Option<f64> {
 /// rank ordering and cumulative-mean q-value construction in the ensemble
 /// path. It is intentionally treated as a PEP-like consensus score rather
 /// than a guaranteed calibrated posterior.
-
 fn combine_peps(
     peps: &[f64],
     weights: &[f64],
@@ -487,11 +486,13 @@ fn combine_peps(
 
         EnsemblePepCombiner::Mean => mean_f64(&valid_peps).unwrap_or(1.0).clamp(1e-300, 1.0),
 
-        EnsemblePepCombiner::WeightedMean => weighted_mean(&valid_peps, weights)
+        // Keep values paired with their original weights while filtering. Filtering
+        // `valid_peps` first would shift every weight after a non-finite expert.
+        EnsemblePepCombiner::WeightedMean => weighted_mean(peps, weights)
             .unwrap_or(1.0)
             .clamp(1e-300, 1.0),
 
-        EnsemblePepCombiner::WeightedMedian => weighted_median(&valid_peps, weights)
+        EnsemblePepCombiner::WeightedMedian => weighted_median(peps, weights)
             .unwrap_or(1.0)
             .clamp(1e-300, 1.0),
 
@@ -694,8 +695,8 @@ fn lo_constructed_e_value(f: &DfFeature, settings: &FdrSettings) -> Option<f64> 
 }
 
 #[derive(Clone, Debug)]
-struct LoTevByKey {
-    by_key: FnvHashMap<(u32, u8, usize, String), f64>,
+struct LoTevByIndex {
+    by_index: Vec<Option<f64>>,
     valid: usize,
     invalid: usize,
 }
@@ -728,12 +729,12 @@ fn build_lo_tev_from_spectrum_tail_components(
     features: &[DfFeature],
     settings: &FdrSettings,
     _pool: &RankNullPool,
-) -> LoTevByKey {
-    let mut by_key: FnvHashMap<(u32, u8, usize, String), f64> = FnvHashMap::default();
+) -> LoTevByIndex {
+    let mut by_index = vec![None; features.len()];
     let mut valid = 0usize;
     let mut invalid = 0usize;
 
-    for f in features {
+    for (idx, f) in features.iter().enumerate() {
         if f.core.rank < 1 {
             invalid += 1;
             continue;
@@ -751,15 +752,7 @@ fn build_lo_tev_from_spectrum_tail_components(
             continue;
         };
 
-        by_key.insert(
-            (
-                f.core.rank,
-                f.core.charge,
-                f.core.file_id,
-                f.core.spec_id.clone(),
-            ),
-            x_lo,
-        );
+        by_index[idx] = Some(x_lo);
         valid += 1;
     }
 
@@ -772,8 +765,8 @@ fn build_lo_tev_from_spectrum_tail_components(
         settings.lo_tev_transform
     );
 
-    LoTevByKey {
-        by_key,
+    LoTevByIndex {
+        by_index,
         valid,
         invalid,
     }
@@ -2245,7 +2238,7 @@ fn log_lower_order_rank1_score_diagnostics(
     features: &[DfFeature],
     work: &WorkSet,
     db: &IndexedDatabase,
-    tev_map: &FnvHashMap<(u32, u8, usize, String), f64>,
+    tev_by_index: &[Option<f64>],
     settings: &FdrSettings,
 ) {
     let mut tev_all = Vec::new();
@@ -2277,13 +2270,8 @@ fn log_lower_order_rank1_score_diagnostics(
         let is_cont = is_contam_str(&prot);
         let is_ref = f.core.label == 1 && !is_ent && !is_cont;
 
-        match tev_map.get(&(
-            f.core.rank,
-            f.core.charge,
-            f.core.file_id,
-            f.core.spec_id.clone(),
-        )) {
-            Some(&x) if x.is_finite() => {
+        match tev_by_index.get(idx).copied().flatten() {
+            Some(x) if x.is_finite() => {
                 tev_all.push(x);
 
                 if f.core.label == 1 {
@@ -2439,35 +2427,99 @@ fn lo_bucket_id(settings: &FdrSettings, charge: u8) -> u8 {
 }
 
 // --- STAGE STRUCTS ---
+#[derive(Clone, Copy, Debug)]
+struct RankNullRow {
+    feature_idx: usize,
+    peptide_idx: u32,
+    rank: u32,
+    score: f64,
+    charge: u8,
+}
+
+#[derive(Clone, Debug)]
+struct RankNullSource {
+    rows: Arc<[RankNullRow]>,
+    rank1_scores_desc: Arc<[(u32, f64)]>,
+}
+
+impl RankNullSource {
+    fn build(features: &[DfFeature], work: &WorkSet, settings: &FdrSettings) -> Self {
+        let mut rank1_scores_desc: Vec<(u32, f64)> = work
+            .rank1_indices
+            .iter()
+            .filter_map(|&idx| {
+                let feature = &features[idx];
+                Some((feature.core.peptide_idx.0, tev(feature)?))
+            })
+            .collect();
+        rank1_scores_desc.sort_unstable_by(|a, b| b.1.total_cmp(&a.1));
+
+        let rows: Vec<RankNullRow> = features
+            .iter()
+            .enumerate()
+            .filter_map(|(feature_idx, feature)| {
+                let rank = feature.core.rank;
+                if rank < settings.min_null_rank || rank > settings.max_null_rank {
+                    return None;
+                }
+
+                Some(RankNullRow {
+                    feature_idx,
+                    peptide_idx: feature.core.peptide_idx.0,
+                    rank,
+                    score: tev(feature)?,
+                    charge: feature.core.charge,
+                })
+            })
+            .collect();
+
+        Self {
+            rows: rows.into(),
+            rank1_scores_desc: rank1_scores_desc.into(),
+        }
+    }
+}
+
 #[derive(Clone, Debug)]
 struct RankNullPool {
-    fit_data: Vec<(u32, f64, u8, usize, String)>,
-    null_indices: Vec<usize>,
+    source: Arc<[RankNullRow]>,
+    selected_rows: Vec<usize>,
 }
 
 impl RankNullPool {
+    fn rows(&self) -> impl Iterator<Item = RankNullRow> + '_ {
+        self.selected_rows.iter().map(|&idx| self.source[idx])
+    }
+
+    #[cfg(any(test, feature = "bench"))]
+    fn len(&self) -> usize {
+        self.selected_rows.len()
+    }
+
     /// Return hyperscore values for pool members whose rank is in [min..=max].
     /// Note: ranks are the original per-PSM hit rank used to build the global pool.
     fn scores_in_window(&self, min: u32, max: u32) -> Vec<f64> {
-        self.fit_data
-            .iter()
-            .filter_map(|(rank, score, _charge, _file_id, _spec_id)| {
-                if *rank >= min && *rank <= max {
-                    Some(*score)
-                } else {
-                    None
-                }
-            })
+        self.rows()
+            .filter(|row| row.rank >= min && row.rank <= max)
+            .map(|row| row.score)
             .collect()
     }
 
-    /// Return (rank, hyperscore, charge) tuples for pool members whose rank is in [min..=max].
-    fn fit_data_in_window(&self, min: u32, max: u32) -> Vec<(u32, f64, u8, usize, String)> {
-        self.fit_data
-            .iter()
-            .cloned()
-            .filter(|(rank, _score, _charge, _file_id, _spec_id)| *rank >= min && *rank <= max)
+    fn indexed_fit_data_in_window(&self, min: u32, max: u32) -> Vec<(usize, u32, f64, u8)> {
+        self.rows()
+            .filter(|row| row.rank >= min && row.rank <= max)
+            .map(|row| (row.feature_idx, row.rank, row.score, row.charge))
             .collect()
+    }
+
+    fn count_in_window(&self, min: u32, max: u32) -> usize {
+        self.rows()
+            .filter(|row| row.rank >= min && row.rank <= max)
+            .count()
+    }
+
+    fn feature_indices(&self) -> Vec<usize> {
+        self.rows().map(|row| row.feature_idx).collect()
     }
 }
 
@@ -2477,7 +2529,7 @@ struct Engines {
     mle_params: Option<(f64, f64)>,
 
     lo_model: Option<LowerOrderModel>,
-    lo_tev_by_key: Option<Arc<FnvHashMap<(u32, u8, usize, String), f64>>>,
+    lo_tev_by_index: Option<Arc<[Option<f64>]>>,
 
     msfdr_seeded: Option<MsfdrSeededModel>,
     msfdr_1smix: Option<Msfdr1SmixModel>,
@@ -2489,123 +2541,49 @@ struct Engines {
 
 // --- BUILD RANK-NULL POOL ---
 fn build_rank_null_pool(
-    features: &[DfFeature],
-    work: &WorkSet,
+    source: &RankNullSource,
     settings: &FdrSettings,
     null_purification_factor: f64,
     label: &str,
 ) -> Option<RankNullPool> {
     let min_null_size = settings.min_null_size;
-
-    let min_rank = settings.min_null_rank;
-    let max_rank = settings.max_null_rank;
-
     let p_factor = null_purification_factor.clamp(0.0, 0.9);
 
-    let mut rank1_scores: Vec<(u32, f64)> = work
-        .rank1_indices
-        .iter()
-        .filter_map(|&i| {
-            let f = &features[i];
-            Some((f.core.peptide_idx.0, tev(f)?))
-        })
-        .collect();
-
-    let purification_threshold = if rank1_scores.len() >= 10 && p_factor > 0.0 {
-        rank1_scores.sort_by(|a, b| b.1.total_cmp(&a.1));
-
-        let top_k = ((rank1_scores.len() as f64) * p_factor).round() as usize;
-        let top_k = top_k.max(5).min(rank1_scores.len());
-
-        rank1_scores[top_k - 1].1
+    let purification_threshold = if source.rank1_scores_desc.len() >= 10 && p_factor > 0.0 {
+        let top_k = ((source.rank1_scores_desc.len() as f64) * p_factor).round() as usize;
+        let top_k = top_k.max(5).min(source.rank1_scores_desc.len());
+        source.rank1_scores_desc[top_k - 1].1
     } else {
         f64::INFINITY
     };
 
-    let purified_peptides: FnvHashSet<u32> = rank1_scores
+    let purified_peptides: FnvHashSet<u32> = source
+        .rank1_scores_desc
         .iter()
         .filter(|(_, score)| *score >= purification_threshold)
         .map(|(idx, _)| *idx)
         .collect();
 
-    let mut fit_data: Vec<(u32, f64, u8, usize, String)> = Vec::new();
-    let mut null_indices: Vec<usize> = Vec::new();
+    let mut selected_rows: Vec<usize> = source
+        .rows
+        .iter()
+        .enumerate()
+        .filter(|(_, row)| !purified_peptides.contains(&row.peptide_idx))
+        .map(|(idx, _)| idx)
+        .collect();
 
-    for (idx, psm) in features.iter().enumerate() {
-        let r: u32 = psm.core.rank as u32;
-
-        if r < min_rank || r > max_rank {
-            continue;
-        }
-
-        if purified_peptides.contains(&psm.core.peptide_idx.0) {
-            continue;
-        }
-
-        let s = match tev(psm) {
-            Some(v) => v,
-            None => continue,
-        };
-
-        fit_data.push((
-            r,
-            s,
-            psm.core.charge,
-            psm.core.file_id,
-            psm.core.spec_id.clone(),
-        ));
-        null_indices.push(idx);
-    }
-
-    if fit_data.len() < min_null_size {
+    if selected_rows.len() < min_null_size {
         log::warn!(
             "{label}: purified null too small with purification_factor={:.3}; falling back to unpurified null.",
             p_factor
         );
-
-        fit_data.clear();
-        null_indices.clear();
-
-        for (idx, psm) in features.iter().enumerate() {
-            let r: u32 = psm.core.rank as u32;
-
-            if r < min_rank || r > max_rank {
-                continue;
-            }
-
-            let s = match tev(psm) {
-                Some(v) => v,
-                None => continue,
-            };
-
-            fit_data.push((
-                r,
-                s,
-                psm.core.charge,
-                psm.core.file_id,
-                psm.core.spec_id.clone(),
-            ));
-            null_indices.push(idx);
-        }
+        selected_rows = (0..source.rows.len()).collect();
     }
 
-    let mut fit2: Vec<(u32, f64, u8, usize, String)> = Vec::with_capacity(fit_data.len());
-    let mut idx2: Vec<usize> = Vec::with_capacity(null_indices.len());
-
-    for (k, (r, s, z, file_id, spec_id)) in fit_data.into_iter().enumerate() {
-        if s.is_finite() {
-            fit2.push((r, s, z, file_id, spec_id));
-            idx2.push(null_indices[k]);
-        }
-    }
-
-    let fit_data = fit2;
-    let null_indices = idx2;
-
-    if fit_data.len() < min_null_size {
+    if selected_rows.len() < min_null_size {
         log::warn!(
             "{label}: null pool too small after fallback: n={} < min_null_size={}",
-            fit_data.len(),
+            selected_rows.len(),
             min_null_size
         );
         return None;
@@ -2614,13 +2592,105 @@ fn build_rank_null_pool(
     log::info!(
         "{label}: rank-null pool built with purification_factor={:.3}; rows={}",
         p_factor,
-        fit_data.len()
+        selected_rows.len()
     );
 
     Some(RankNullPool {
-        fit_data,
-        null_indices,
+        source: Arc::clone(&source.rows),
+        selected_rows,
     })
+}
+
+#[cfg(feature = "bench")]
+#[doc(hidden)]
+pub struct NullPoolBenchmark {
+    features: Vec<DfFeature>,
+    work: WorkSet,
+    settings: FdrSettings,
+}
+
+#[cfg(feature = "bench")]
+impl NullPoolBenchmark {
+    pub fn new(spectra: usize, ranks_per_spectrum: u32) -> Self {
+        use crate::database::PeptideIx;
+        use crate::input::{FdrMode, FdrOptions};
+        use crate::scoring::{ExternalPsmFeatures, FeatureCore};
+
+        assert!(ranks_per_spectrum >= 2);
+
+        let mut features = Vec::with_capacity(spectra * ranks_per_spectrum as usize);
+        for spectrum in 0..spectra {
+            let spec_id = format!("controllerType=0 controllerNumber=1 scan={spectrum}");
+            for rank in 1..=ranks_per_spectrum {
+                let peptide = spectrum * ranks_per_spectrum as usize + rank as usize;
+                features.push(
+                    FeatureCore {
+                        peptide_idx: PeptideIx(peptide as u32),
+                        psm_id: features.len(),
+                        peptide_len: 12,
+                        spec_id: spec_id.clone(),
+                        file_id: spectrum % 8,
+                        rank,
+                        label: 1,
+                        expmass: 1_000.0,
+                        calcmass: 1_000.0,
+                        charge: 2 + (spectrum % 3) as u8,
+                        rt: 0.5,
+                        aligned_rt: 0.5,
+                        predicted_rt: 0.5,
+                        delta_rt_model: 0.0,
+                        ims: 1.0,
+                        predicted_ims: 1.0,
+                        delta_ims_model: 0.0,
+                        delta_mass: 0.0,
+                        isotope_error: 0.0,
+                        average_ppm: 0.0,
+                        hyperscore: 100.0 - rank as f64 + (spectrum % 17) as f64 * 0.01,
+                        delta_next: 1.0,
+                        delta_best: rank.saturating_sub(1) as f64,
+                        matched_peaks: 20,
+                        longest_b: 5,
+                        longest_y: 5,
+                        longest_y_pct: 0.5,
+                        missed_cleavages: 0,
+                        matched_intensity_pct: 50.0,
+                        scored_candidates: 100,
+                        poisson_log10_p_value: -3.0,
+                        lo_spectrum_tail_p: 0.01,
+                        lo_spectrum_candidate_count: 100,
+                        ms2_intensity: 1_000.0,
+                        external_features: ExternalPsmFeatures::default(),
+                        fragments: None,
+                    }
+                    .to_df(),
+                );
+            }
+        }
+
+        let mut options = FdrOptions::default();
+        options.mode = Some(FdrMode::DecoyFree);
+        options.model_fit = Some(ModelFit::Moments);
+        options.min_null_rank = Some(2);
+        options.max_null_rank = Some(ranks_per_spectrum);
+        options.min_null_size = Some(10);
+        let settings = FdrSettings::from(options);
+        let work = WorkSet::build(&features);
+
+        Self {
+            features,
+            work,
+            settings,
+        }
+    }
+
+    pub fn build_all(&self) -> usize {
+        let source = RankNullSource::build(&self.features, &self.work, &self.settings);
+        [0.25, 0.25, 0.15, 0.25, 0.20]
+            .into_iter()
+            .filter_map(|factor| build_rank_null_pool(&source, &self.settings, factor, "benchmark"))
+            .map(|pool| pool.len())
+            .sum()
+    }
 }
 
 fn winsorize_scores_for_fit(scores: &[f64], lower_q: f64, upper_q: f64) -> Vec<f64> {
@@ -2740,11 +2810,11 @@ fn fit_engines(
     gates: RunGates,
 ) -> Option<Engines> {
     let min_null_size = settings.min_null_size;
+    let null_source = RankNullSource::build(features, work, settings);
 
     let moments_pool = if gates.run_mom {
         build_rank_null_pool(
-            features,
-            work,
+            &null_source,
             settings,
             settings.moments_purification_factor,
             "Moments",
@@ -2755,8 +2825,7 @@ fn fit_engines(
 
     let mle_pool = if gates.run_mle {
         build_rank_null_pool(
-            features,
-            work,
+            &null_source,
             settings,
             settings.mle_purification_factor,
             "MLE",
@@ -2767,8 +2836,7 @@ fn fit_engines(
 
     let lower_order_pool = if gates.run_lo {
         build_rank_null_pool(
-            features,
-            work,
+            &null_source,
             settings,
             settings.lower_order_purification_factor,
             "LowerOrder",
@@ -2779,8 +2847,7 @@ fn fit_engines(
 
     let msfdr_seeded_pool = if gates.run_msfdr_seeded {
         build_rank_null_pool(
-            features,
-            work,
+            &null_source,
             settings,
             settings.msfdr_seeded_purification_factor,
             "MSFDR seeded",
@@ -2791,8 +2858,7 @@ fn fit_engines(
 
     let nokoi_pool = if gates.run_nokoi {
         build_rank_null_pool(
-            features,
-            work,
+            &null_source,
             settings,
             settings.nokoi_null_purification_factor,
             "Nokoi",
@@ -2871,7 +2937,7 @@ fn fit_engines(
 
     // 2) LO
     let mut lo_model = None;
-    let mut lo_tev_by_key: Option<Arc<FnvHashMap<(u32, u8, usize, String), f64>>> = None;
+    let mut lo_tev_by_index: Option<Arc<[Option<f64>]>> = None;
 
     if gates.run_lo {
         let Some(lower_order_pool) = lower_order_pool.as_ref() else {
@@ -2881,13 +2947,15 @@ fn fit_engines(
 
         let lo_tev_map =
             build_lo_tev_from_spectrum_tail_components(features, settings, lower_order_pool);
-
-        lo_tev_by_key = Some(Arc::new(lo_tev_map.by_key.clone()));
+        let lo_tev_valid = lo_tev_map.valid;
+        let lo_tev_invalid = lo_tev_map.invalid;
+        let tev_by_index: Arc<[Option<f64>]> = lo_tev_map.by_index.into();
+        lo_tev_by_index = Some(Arc::clone(&tev_by_index));
 
         log::info!(
             "LO spectrum-local TEV diagnostics: valid={} invalid={} source=core.lo_spectrum_tail_p+core.lo_spectrum_candidate_count candidate_count_power={:.3} evalue_scale={:.3} tev_transform={:?}",
-            lo_tev_map.valid,
-            lo_tev_map.invalid,
+            lo_tev_valid,
+            lo_tev_invalid,
             settings.lo_evalue_candidate_count_power,
             settings.lo_evalue_scale,
             settings.lo_tev_transform
@@ -2898,18 +2966,13 @@ fn fit_engines(
 
         for &i in &work.rank1_indices {
             let f = &features[i];
-            if let Some(&x_lo) = lo_tev_map.by_key.get(&(
-                f.core.rank,
-                f.core.charge,
-                f.core.file_id,
-                f.core.spec_id.clone(),
-            )) {
+            if let Some(x_lo) = tev_by_index.get(i).copied().flatten() {
                 let bid = lo_bucket_id(settings, f.core.charge);
                 rank1_scores_by_charge.push((x_lo, bid));
             }
         }
 
-        let lo_raw = lower_order_pool.fit_data_in_window(
+        let lo_raw = lower_order_pool.indexed_fit_data_in_window(
             settings.lower_order_min_null_rank,
             settings.lower_order_max_null_rank,
         );
@@ -2922,11 +2985,9 @@ fn fit_engines(
         ) {
             let lo_fit_data: Vec<(u32, f64, u8)> = lo_raw
                 .into_iter()
-                .filter_map(|(k, _x_raw, charge, file_id, spec_id)| {
-                    let x_lo = lo_tev_map
-                        .by_key
-                        .get(&(k, charge, file_id, spec_id.clone()))?;
-                    Some((k, *x_lo, lo_bucket_id(settings, charge)))
+                .filter_map(|(feature_idx, k, _x_raw, charge)| {
+                    let x_lo = tev_by_index.get(feature_idx).copied().flatten()?;
+                    Some((k, x_lo, lo_bucket_id(settings, charge)))
                 })
                 .collect();
 
@@ -3185,14 +3246,14 @@ fn fit_engines(
             return None;
         };
 
-        let nokoi_data = nokoi_pool
-            .fit_data_in_window(settings.nokoi_min_null_rank, settings.nokoi_max_null_rank);
+        let nokoi_count =
+            nokoi_pool.count_in_window(settings.nokoi_min_null_rank, settings.nokoi_max_null_rank);
 
         if window_ok(
             "Nokoi",
             settings.nokoi_min_null_rank,
             settings.nokoi_max_null_rank,
-            nokoi_data.len(),
+            nokoi_count,
         ) {
             let mut rank1_hs: Vec<f64> = work
                 .rank1_indices
@@ -3234,6 +3295,7 @@ fn fit_engines(
                 l1_lambda_steps: settings.nokoi_l1_lambda_steps,
             };
 
+            let nokoi_null_indices = nokoi_pool.feature_indices();
             if let Some((probs, null_scores_oof)) = nokoi::rescore_df_crossfit(
                 features,
                 &config,
@@ -3241,7 +3303,7 @@ fn fit_engines(
                 settings.nokoi_max_null_rank,
                 settings.nokoi_k_folds,
                 is_positive,
-                &nokoi_pool.null_indices,
+                &nokoi_null_indices,
             ) {
                 let nokoi_evidence =
                     nokoi::build_nokoi_evidence_from_crossfit_null(&probs, &null_scores_oof);
@@ -3313,7 +3375,7 @@ fn fit_engines(
         mom_params,
         mle_params,
         lo_model,
-        lo_tev_by_key,
+        lo_tev_by_index,
         msfdr_seeded,
         msfdr_1smix,
         msfdr_2smix,
@@ -3415,7 +3477,7 @@ fn score_base_rank1(
     let mom_params = engines.mom_params;
     let mle_params = engines.mle_params;
     let lo_model = engines.lo_model.clone();
-    let lo_tev_by_key = engines.lo_tev_by_key.clone();
+    let lo_tev_by_index = engines.lo_tev_by_index.clone();
     let msfdr_seeded = engines.msfdr_seeded.clone();
     let msfdr_1smix = engines.msfdr_1smix.clone();
     let msfdr_2smix = engines.msfdr_2smix.clone();
@@ -3453,16 +3515,12 @@ fn score_base_rank1(
                 1.0
             };
 
-            let p_lo = if let (Some(ref m), Some(ref tev_map)) = (&lo_model, &lo_tev_by_key) {
+            let p_lo = if let (Some(ref m), Some(ref tev_by_index)) = (&lo_model, &lo_tev_by_index)
+            {
                 let bid = lo_bucket_id(settings, psm.core.charge);
 
-                match tev_map.get(&(
-                    psm.core.rank,
-                    psm.core.charge,
-                    psm.core.file_id,
-                    psm.core.spec_id.clone(),
-                )) {
-                    Some(&x_eval) => {
+                match tev_by_index.get(idx).copied().flatten() {
+                    Some(x_eval) => {
                         let p = m.p_value(x_eval, bid);
                         if p.is_finite() {
                             p.clamp(0.0, 1.0).max(1e-300)
@@ -3637,8 +3695,8 @@ fn score_base_rank1(
 			);
         }
 
-        if let Some(ref tev_map) = lo_tev_by_key {
-            log_lower_order_rank1_score_diagnostics(features, &workset, db, tev_map, settings);
+        if let Some(ref tev_by_index) = lo_tev_by_index {
+            log_lower_order_rank1_score_diagnostics(features, &workset, db, tev_by_index, settings);
         } else {
             log::warn!("LO rank1 TEV/component diagnostics skipped: no LO TEV map was available.");
         }
@@ -11279,6 +11337,14 @@ pub fn decoy_free_precursor(
     peaks: &mut FnvHashMap<(PrecursorId, bool), (Peak, Vec<f64>)>,
     threshold: f32,
 ) -> usize {
+    // Peak::default() starts at q=0. Reset every target before any fallible fit so
+    // an early return cannot leak a permissive, stale q-value into output.
+    for ((_, is_decoy), (peak, _)) in peaks.iter_mut() {
+        if !*is_decoy {
+            peak.q_value = 1.0;
+        }
+    }
+
     // In decoy-free LFQ, (is_decoy==true) are *shadow/off-target* samples (target-derived null).
     let mut null_scores: Vec<f64> = peaks
         .iter()
@@ -11298,10 +11364,10 @@ pub fn decoy_free_precursor(
 
     // Robustify: winsorize upper tail so occasional real peaks in shadow channel
     // don't dominate the null fit.
-    null_scores.sort_by(|a, b| a.total_cmp(b));
     let n = null_scores.len();
     let p95_idx = ((n as f64 - 1.0) * 0.95).round() as usize;
-    let cap = null_scores[p95_idx].max(1e-12);
+    let (_, cap, _) = null_scores.select_nth_unstable_by(p95_idx, |a, b| a.total_cmp(b));
+    let cap = (*cap).max(1e-12);
 
     // Apply cap (winsorization)
     for v in &mut null_scores {
@@ -11338,7 +11404,126 @@ pub fn decoy_free_precursor(
         }
     }
     peaks
-        .values()
-        .filter(|(peak, _)| peak.score.is_finite() && peak.q_value <= threshold)
+        .iter()
+        .filter(|((_, is_decoy), (peak, _))| {
+            !*is_decoy && peak.score.is_finite() && peak.q_value <= threshold
+        })
         .count()
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::database::PeptideIx;
+
+    fn test_peak(score: f64) -> (Peak, Vec<f64>) {
+        (
+            Peak {
+                score,
+                ..Peak::default()
+            },
+            Vec::new(),
+        )
+    }
+
+    #[test]
+    fn weighted_pep_combiners_preserve_weight_alignment() {
+        let peps = [f64::NAN, 0.2, 0.8];
+        let weights = [100.0, 1.0, 9.0];
+
+        let mean = combine_peps(
+            &peps,
+            &weights,
+            EnsemblePepCombiner::WeightedMean,
+            0.0,
+            0.5,
+            1,
+            1e-12,
+        );
+        let median = combine_peps(
+            &peps,
+            &weights,
+            EnsemblePepCombiner::WeightedMedian,
+            0.0,
+            0.5,
+            1,
+            1e-12,
+        );
+
+        assert!((mean - 0.74).abs() < 1e-12);
+        assert_eq!(median, 0.8);
+    }
+
+    #[test]
+    fn decoy_free_precursor_fails_closed_without_enough_nulls() {
+        let mut peaks = FnvHashMap::default();
+        peaks.insert(
+            (PrecursorId::Combined(PeptideIx(0)), false),
+            test_peak(10.0),
+        );
+
+        assert_eq!(decoy_free_precursor(&mut peaks, 0.01), 0);
+        assert_eq!(
+            peaks[&(PrecursorId::Combined(PeptideIx(0)), false)]
+                .0
+                .q_value,
+            1.0
+        );
+    }
+
+    #[test]
+    fn decoy_free_precursor_counts_only_targets() {
+        let mut peaks = FnvHashMap::default();
+        peaks.insert(
+            (PrecursorId::Combined(PeptideIx(0)), false),
+            test_peak(10.0),
+        );
+
+        for i in 0..200 {
+            peaks.insert(
+                (PrecursorId::Combined(PeptideIx(i + 1)), true),
+                test_peak(i as f64 / 200.0),
+            );
+        }
+
+        assert_eq!(decoy_free_precursor(&mut peaks, 1.0), 1);
+    }
+
+    #[test]
+    fn rank_null_pools_share_compact_source_and_preserve_fallback() {
+        use crate::input::{FdrMode, FdrOptions};
+
+        let rows: Vec<RankNullRow> = (0..20)
+            .map(|idx| RankNullRow {
+                feature_idx: idx,
+                peptide_idx: idx as u32,
+                rank: 2,
+                score: 20.0 - idx as f64,
+                charge: 2,
+            })
+            .collect();
+        let rank1_scores_desc: Vec<(u32, f64)> =
+            (0..10).map(|idx| (idx, 100.0 - idx as f64)).collect();
+        let source = RankNullSource {
+            rows: rows.into(),
+            rank1_scores_desc: rank1_scores_desc.into(),
+        };
+
+        let mut options = FdrOptions::default();
+        options.mode = Some(FdrMode::DecoyFree);
+        options.model_fit = Some(ModelFit::Moments);
+        options.min_null_size = Some(1);
+        let settings = FdrSettings::from(options.clone());
+
+        let purified = build_rank_null_pool(&source, &settings, 0.2, "test").unwrap();
+        assert!(Arc::ptr_eq(&source.rows, &purified.source));
+        assert_eq!(purified.len(), 15);
+        assert!(purified.rows().all(|row| row.peptide_idx >= 5));
+
+        options.min_null_size = Some(18);
+        let fallback_settings = FdrSettings::from(options);
+        let fallback = build_rank_null_pool(&source, &fallback_settings, 0.2, "test").unwrap();
+        assert!(Arc::ptr_eq(&source.rows, &fallback.source));
+        assert_eq!(fallback.len(), 20);
+    }
 }

@@ -43,7 +43,7 @@ fn xorshift64(mut x: u64) -> u64 {
 fn u01_from_u64(seed: u64) -> f32 {
     // take top 24 bits -> [0, 2^24) then normalize
     let v = (seed >> 40) as u32;
-    (v as f32) / (u32::MAX as f32)
+    (v as f32) / ((1u32 << 24) as f32)
 }
 
 /// Deterministic shadow mass shift (Da, before /charge) for a given precursor identity.
@@ -460,9 +460,9 @@ impl Traces {
     }
 
     fn apply_time_warps(matrix: &mut Matrix, time_warps: &[isize]) {
+        let mut shifted = vec![0.0; matrix.cols];
         for (row, warp) in time_warps.iter().enumerate() {
             let run = matrix.row_slice_mut(row);
-            let mut shifted = vec![0.0; run.len()];
             for (i, val) in shifted.iter_mut().enumerate() {
                 let j = i as isize + warp;
                 if j >= 0 && j < run.len() as isize {
@@ -624,10 +624,16 @@ impl Grid {
             .sum::<f32>()
             .sqrt() as f64;
 
+        let mut summed_squared_intensities = vec![0.0; self.matrix.cols];
+        let mut convolved = vec![0.0; self.matrix.cols];
         for file in 0..self.files {
-            let mut summed_squared_intensities = vec![0.0; self.matrix.cols];
+            summed_squared_intensities.fill(0.0);
             for isotope in 0..N_ISOTOPES {
-                let convolved = convolve(self.matrix.row_slice(file * N_ISOTOPES + isotope), &k);
+                convolve_into(
+                    self.matrix.row_slice(file * N_ISOTOPES + isotope),
+                    &k,
+                    &mut convolved,
+                );
                 for (col, intensity) in convolved.iter().enumerate() {
                     spectral_angle[(file, col)] += intensity * self.distribution[isotope] as f64;
                     summed_squared_intensities[col] += intensity.powi(2);
@@ -673,15 +679,64 @@ fn gaussian_kernel(sigma: f64, len: usize) -> Vec<f64> {
     kernel
 }
 
-fn convolve(slice: &[f64], kernel: &[f64]) -> Vec<f64> {
+fn convolve_into(slice: &[f64], kernel: &[f64], output: &mut [f64]) {
+    debug_assert_eq!(slice.len(), output.len());
     let n = kernel.len() - (kernel.len() / 2);
-    (0..slice.len())
-        .map(|idx| {
-            let k = &kernel[kernel.len().saturating_sub(n + idx)..];
-            let w = &slice[idx.saturating_sub(n - 1)..];
-            w.iter().zip(k).fold(0.0, |acc, (x, y)| acc + x * y)
-        })
-        .collect()
+    for (idx, value) in output.iter_mut().enumerate() {
+        let k = &kernel[kernel.len().saturating_sub(n + idx)..];
+        let w = &slice[idx.saturating_sub(n - 1)..];
+        *value = w.iter().zip(k).fold(0.0, |acc, (x, y)| acc + x * y);
+    }
+}
+
+#[cfg(feature = "bench")]
+#[doc(hidden)]
+pub struct LfqScratchBenchmark {
+    matrix: Matrix,
+    time_warps: Vec<isize>,
+    convolution_rows: Vec<Vec<f64>>,
+    convolution_scratch: Vec<f64>,
+    kernel: Vec<f64>,
+}
+
+#[cfg(feature = "bench")]
+impl LfqScratchBenchmark {
+    pub fn new(rows: usize, cols: usize) -> Self {
+        let data: Vec<f64> = (0..rows * cols)
+            .map(|i| ((i % 97) as f64 * 0.01).sin().abs())
+            .collect();
+        let matrix = Matrix::new(data, rows, cols);
+        let time_warps = (0..rows).map(|row| row as isize % 9 - 4).collect();
+        let convolution_rows = (0..rows)
+            .map(|row| {
+                (0..cols)
+                    .map(|col| (((row * cols + col) % 89) as f64 * 0.02).cos().abs())
+                    .collect()
+            })
+            .collect();
+
+        Self {
+            matrix,
+            time_warps,
+            convolution_rows,
+            convolution_scratch: vec![0.0; cols],
+            kernel: gaussian_kernel(0.5, K_WIDTH),
+        }
+    }
+
+    pub fn apply_time_warps(&mut self) -> f64 {
+        Traces::apply_time_warps(&mut self.matrix, &self.time_warps);
+        self.matrix[(0, 0)]
+    }
+
+    pub fn convolve_all_rows(&mut self) -> f64 {
+        let mut sum = 0.0;
+        for row in &self.convolution_rows {
+            convolve_into(row, &self.kernel, &mut self.convolution_scratch);
+            sum += self.convolution_scratch[row.len() / 2];
+        }
+        sum
+    }
 }
 
 impl Query<'_> {
@@ -715,5 +770,34 @@ impl Query<'_> {
         self.mass_lookup(mass).filter(move |precursor| {
             (precursor.mobility_hi >= mobility) && (precursor.mobility_lo <= mobility)
         })
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn u01_uses_the_full_unit_interval() {
+        assert_eq!(u01_from_u64(0), 0.0);
+
+        let near_one = u01_from_u64(0xFFFF_FF00_0000_0000);
+        assert!(near_one >= 0.999_999);
+        assert!(near_one < 1.0);
+    }
+
+    #[test]
+    fn shadow_shifts_span_the_configured_range() {
+        let shifts: Vec<f32> = (0..1_000)
+            .map(|peptide| shadow_shift_da(PeptideIx(peptide), 2, 0))
+            .collect();
+
+        assert!(shifts
+            .iter()
+            .all(|&shift| { (SHADOW_SHIFT_MIN_DA..=SHADOW_SHIFT_MAX_DA).contains(&shift) }));
+
+        let min = shifts.iter().copied().fold(f32::INFINITY, f32::min);
+        let max = shifts.iter().copied().fold(f32::NEG_INFINITY, f32::max);
+        assert!(max - min > 0.8 * (SHADOW_SHIFT_MAX_DA - SHADOW_SHIFT_MIN_DA));
     }
 }

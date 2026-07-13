@@ -29,8 +29,15 @@ adjustp = "0.1.6"
 rand = "0.8"
 
 [dev-dependencies]
+criterion = "0.4"
 quickcheck = "1"
 quickcheck_macros = "1"
 
 [features]
+bench = []
 decoy_free_debug = []
+
+[[bench]]
+name = "decoy_free_perf"
+harness = false
+required-features = ["bench"]

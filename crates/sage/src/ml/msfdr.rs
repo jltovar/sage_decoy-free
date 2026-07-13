@@ -1364,7 +1364,7 @@ mod tests {
                 0.5,
                 0.2,
             )
-            .is_none()
+            .is_none(),
             "2Smix fit should return None for rank1 <20"
         );
 
@@ -1380,7 +1380,7 @@ mod tests {
                 0.5,
                 0.2,
             )
-            .is_none()
+            .is_none(),
             "2Smix fit should return None for pool <20"
         );
     }
