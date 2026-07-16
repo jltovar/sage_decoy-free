@@ -1230,6 +1230,34 @@ peptide-supported PSM flag
 
 ---
 
+## Recommended publication framing
+
+The safest interpretation of the current data is:
+
+> Conventional TDA/TDC remains an effective peptide-level benchmark, but in ultra-low-input proteomics it can become count-starved at the protein level.  The decoy-free framework addresses this by replacing sparse decoy counting with continuous evidence modeling and protein-supported hierarchical inference.  In ISB18, TDA/TDC and DF observe the same unfiltered protein set, but TDA/TDC reports zero significant proteins at protein q ≤ 1%, whereas DF reports 16–18 proteins with zero entrapment proteins.  The current challenge is no longer whether DF can recover proteins, but how to make the DF models uniformly calibrated, auditable, and robust across datasets.
+
+---
+
+## Unsupported or removed keys
+
+The following keys appeared in earlier configs or drafts but are not accepted by the current uploaded `FdrOptions` structure:
+
+```text
+msfdr1_smix_min_null_rank
+msfdr1_smix_max_null_rank
+```
+
+If they are present in a JSON file, they should be removed to avoid confusion.  MSFDR1_SMIX is rank-1 based in the current code and is configured with:
+
+```text
+msfdr1_bottom_frac_init
+msfdr1_top_frac_init
+msfdr1_pi_clamp_min
+msfdr1_pi_clamp_max
+```
+
+---
+
 ## File-level implementation map
 
 The current uploaded code is organized roughly as follows:

@@ -2720,6 +2720,91 @@ fn winsorize_scores_for_fit(scores: &[f64], lower_q: f64, upper_q: f64) -> Vec<f
         .collect()
 }
 
+/// Mean and variance of a standard Gumbel after quantile winsorization.
+///
+/// If `Z ~ Gumbel(0, 1)` and `W = clamp(Z, Q(lower_q), Q(upper_q))`, these
+/// moments let us undo the location/scale bias introduced by clamping.  A
+/// deterministic midpoint rule is used over the standard-Gumbel quantile
+/// function.  This is evaluated once per model fit and is negligible next to
+/// sorting the rank-null pool.
+fn standard_gumbel_winsorized_moments(lower_q: f64, upper_q: f64) -> Option<(f64, f64)> {
+    let lower_q = lower_q.clamp(0.0, 1.0);
+    let upper_q = upper_q.clamp(lower_q, 1.0);
+
+    if lower_q == 0.0 && upper_q == 1.0 {
+        return Some((
+            statrs::consts::EULER_MASCHERONI,
+            std::f64::consts::PI.powi(2) / 6.0,
+        ));
+    }
+
+    const GRID_SIZE: usize = 1 << 16;
+    let mut sum = 0.0;
+    let mut sum_sq = 0.0;
+
+    for index in 0..GRID_SIZE {
+        let probability = (index as f64 + 0.5) / GRID_SIZE as f64;
+        let clipped_probability = probability.clamp(lower_q, upper_q);
+        let quantile = -(-clipped_probability.ln()).ln();
+        sum += quantile;
+        sum_sq += quantile * quantile;
+    }
+
+    let n = GRID_SIZE as f64;
+    let mean = sum / n;
+    let variance = sum_sq / n - mean * mean;
+    if mean.is_finite() && variance.is_finite() && variance > 0.0 {
+        Some((mean, variance))
+    } else {
+        None
+    }
+}
+
+/// Bias-corrected Gumbel method-of-moments fit for already winsorized scores.
+///
+/// For `X = mu + beta * Z`, winsorizing at fixed quantiles preserves the
+/// location-scale form: `E[X_w] = mu + beta E[Z_w]` and
+/// `Var[X_w] = beta^2 Var[Z_w]`.  Ordinary Gumbel moments applied directly to
+/// `X_w` underestimate beta, especially with an upper clamp at 0.90.
+fn fit_gumbel_winsorized_moments(
+    winsorized_scores: &[f64],
+    lower_q: f64,
+    upper_q: f64,
+) -> (f64, f64) {
+    let finite: Vec<f64> = winsorized_scores
+        .iter()
+        .copied()
+        .filter(|value| value.is_finite())
+        .collect();
+    if finite.len() < 2 {
+        return (f64::NAN, f64::NAN);
+    }
+
+    let n = finite.len() as f64;
+    let mean = finite.iter().sum::<f64>() / n;
+    let variance = finite
+        .iter()
+        .map(|value| (value - mean).powi(2))
+        .sum::<f64>()
+        / n;
+    let Some((standard_mean, standard_variance)) =
+        standard_gumbel_winsorized_moments(lower_q, upper_q)
+    else {
+        return (f64::NAN, f64::NAN);
+    };
+
+    if !variance.is_finite() || variance <= 0.0 {
+        return (f64::NAN, f64::NAN);
+    }
+    let beta = (variance / standard_variance).sqrt();
+    let mu = mean - beta * standard_mean;
+    if mu.is_finite() && beta.is_finite() && beta > 0.0 {
+        (mu, beta)
+    } else {
+        (f64::NAN, f64::NAN)
+    }
+}
+
 #[derive(Clone, Copy, Debug)]
 struct RunGates {
     run_mom: bool,
@@ -2900,7 +2985,7 @@ fn fit_engines(
             );
 
             log::info!(
-                "Moments robust fit: enabled=true raw_n={} fit_n={} winsor_q=[{:.3}, {:.3}]",
+                "Moments robust fit: enabled=true bias_corrected=true raw_n={} fit_n={} winsor_q=[{:.3}, {:.3}]",
                 scores.len(),
                 x.len(),
                 settings.moments_winsor_lower_q,
@@ -2918,7 +3003,15 @@ fn fit_engines(
             settings.moments_max_null_rank,
             fit_scores.len(),
         ) {
-            let (mu, beta) = fit_gumbel_moments(&fit_scores);
+            let (mu, beta) = if settings.moments_robust_fit {
+                fit_gumbel_winsorized_moments(
+                    &fit_scores,
+                    settings.moments_winsor_lower_q,
+                    settings.moments_winsor_upper_q,
+                )
+            } else {
+                fit_gumbel_moments(&fit_scores)
+            };
             if mu.is_finite() && beta.is_finite() && beta > 0.0 {
                 Some((mu, beta))
             } else {
@@ -11452,6 +11545,37 @@ mod tests {
 
         assert!((mean - 0.74).abs() < 1e-12);
         assert_eq!(median, 0.8);
+    }
+
+    #[test]
+    fn winsorized_moments_remove_gumbel_location_scale_bias() {
+        const N: usize = 1 << 16;
+        let expected_mu = 12.25;
+        let expected_beta = 2.4;
+        let scores: Vec<f64> = (0..N)
+            .map(|index| {
+                let probability = (index as f64 + 0.5) / N as f64;
+                let standard_quantile = -(-probability.ln()).ln();
+                expected_mu + expected_beta * standard_quantile
+            })
+            .collect();
+        let winsorized = winsorize_scores_for_fit(&scores, 0.01, 0.90);
+
+        let (corrected_mu, corrected_beta) = fit_gumbel_winsorized_moments(&winsorized, 0.01, 0.90);
+        let (_, uncorrected_beta) = fit_gumbel_moments(&winsorized);
+
+        assert!((corrected_mu - expected_mu).abs() < 1e-3);
+        assert!((corrected_beta - expected_beta).abs() < 1e-3);
+        assert!(uncorrected_beta < expected_beta * 0.82);
+    }
+
+    #[test]
+    fn winsorized_moments_fail_closed_for_degenerate_quantiles() {
+        let scores = vec![1.0, 2.0, 3.0, 4.0];
+        let winsorized = winsorize_scores_for_fit(&scores, 0.5, 0.5);
+        let (mu, beta) = fit_gumbel_winsorized_moments(&winsorized, 0.5, 0.5);
+        assert!(mu.is_nan());
+        assert!(beta.is_nan());
     }
 
     #[test]
