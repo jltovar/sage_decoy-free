@@ -10,7 +10,7 @@
         "static_mods": {
             "C": 57.0216
         },
-        "decoy_prefix": "rev_"
+        "decoy_tag": "rev_"
     },
     "deisotope": true,
     "chimera": false,
