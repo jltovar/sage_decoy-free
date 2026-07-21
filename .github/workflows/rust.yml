@@ -10,6 +10,21 @@ env:
   CARGO_TERM_COLOR: always
 
 jobs:
+  msrv:
+    name: Minimum supported Rust 1.85
+    runs-on: ubuntu-latest
+
+    steps:
+    - uses: actions/checkout@v3
+    - name: Install Rust 1.85
+      uses: actions-rs/toolchain@v1
+      with:
+        toolchain: 1.85.0
+        profile: minimal
+        override: true
+    - name: Check locked workspace at MSRV
+      run: cargo check --workspace --all-features --locked
+
   build:
 
     runs-on: ubuntu-latest

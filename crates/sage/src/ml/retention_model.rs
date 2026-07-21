@@ -3,7 +3,7 @@
 //! See Klammer et al., Anal. Chem. 2007, 79, 16, 6111–6118
 //! https://doi.org/10.1021/ac070262k
 
-use super::{gauss::Gauss, matrix::Matrix};
+use super::regression::LinearRegression;
 use crate::database::IndexedDatabase;
 use crate::mass::VALID_AA;
 use crate::peptide::Peptide;
@@ -132,71 +132,33 @@ impl RetentionModel {
             map[(aa - b'A') as usize] = idx;
         }
 
-        // Build gated indices once
-        let gated_idx: Vec<usize> = training_set
-            .iter()
-            .enumerate()
-            .filter_map(|(i, feat)| filter(feat).then_some(i))
-            .collect();
-
-        // 1) Collect aligned RTs for the training PSMs
-        let rt = gated_idx
-            .par_iter()
-            .map(|&i| training_set[i].aligned_rt as f64)
-            .collect::<Vec<f64>>();
-
-        if rt.len() < 10 {
+        let training_n = training_set.par_iter().filter(|feat| filter(feat)).count();
+        if training_n < 10 {
             log::warn!(
                 "Not enough high-quality PSMs ({}) to train the retention time model.",
-                rt.len()
+                training_n
             );
             return None;
         }
 
-        let rt_mean = rt.iter().sum::<f64>() / rt.len() as f64;
-        let rt_var = rt.iter().map(|rt| (rt - rt_mean).powi(2)).sum::<f64>();
+        let lr = LinearRegression::fit::<_, FEATURES>(
+            training_set,
+            |feat| filter(feat),
+            |psm| Self::embed(&db[psm.peptide_idx], &map),
+            |psm| psm.aligned_rt as f64,
+        )
+        .or_else(|| {
+            log::warn!("Retention model training aborted: singular fit or invalid RT variance");
+            None
+        })?;
 
-        let rt = Matrix::col_vector(rt);
-
-        // 2) Build the design matrix
-        let features = gated_idx
-            .par_iter()
-            .flat_map_iter(|&i| {
-                let psm = &training_set[i];
-                Self::embed(&db[psm.peptide_idx], &map)
-            })
-            .collect::<Vec<_>>();
-
-        let rows = features.len() / FEATURES;
-        let features = Matrix::new(features, rows, FEATURES);
-
-        let f_t = features.transpose();
-        let cov = f_t.dot(&features);
-        let b = f_t.dot(&rt);
-
-        let beta = Gauss::solve(cov, b)?;
-
-        let predicted_rt = features.dot(&beta).take();
-        let sum_squared_error = predicted_rt
-            .iter()
-            .zip(rt.take())
-            .map(|(pred, act)| (pred - act).powi(2))
-            .sum::<f64>();
-
-        let r2 = if rt_var > 0.0 {
-            1.0 - (sum_squared_error / rt_var)
-        } else {
-            0.0
-        };
-        let residual_spread = (sum_squared_error / rows as f64).sqrt();
-        log::info!("- fit retention time model, rsq = {}", r2);
-
+        log::info!("- fit retention time model, rsq = {}", lr.r2);
         Some(Self {
-            beta: beta.take(),
+            beta: lr.beta,
             map,
-            r2,
-            training_n: rows,
-            residual_spread,
+            r2: lr.r2,
+            training_n: lr.training_n,
+            residual_spread: lr.mse.sqrt(),
         })
     }
 
@@ -210,70 +172,24 @@ impl RetentionModel {
             map[(aa - b'A') as usize] = idx;
         }
 
-        // Vanilla gate is: label==1 && spectrum_q<=0.01
-        // We proxy spectrum_q<=0.01 via selected_psm_ids (computed in runner from TdcFeature q-values).
-        let gated_idx: Vec<usize> = training_set
-            .iter()
-            .enumerate()
-            .filter_map(|(i, feat)| {
-                (feat.label == 1 && selected_psm_ids.contains(&feat.psm_id)).then_some(i)
-            })
-            .collect();
+        let lr = LinearRegression::fit_vanilla_compat::<_, FEATURES>(
+            training_set,
+            |feat| feat.label == 1 && selected_psm_ids.contains(&feat.psm_id),
+            |psm| Self::embed(&db[psm.peptide_idx], &map),
+            |psm| psm.aligned_rt as f64,
+        )?;
 
-        if gated_idx.is_empty() {
-            return None;
-        }
-
-        let rt = gated_idx
-            .par_iter()
-            .map(|&i| training_set[i].aligned_rt as f64)
-            .collect::<Vec<f64>>();
-
-        // Vanilla has no min-N check here.
-        let rt_mean = rt.iter().sum::<f64>() / rt.len() as f64;
-        let rt_var = rt.iter().map(|rt| (rt - rt_mean).powi(2)).sum::<f64>();
-
-        let rt = Matrix::col_vector(rt);
-
-        let features = gated_idx
-            .par_iter()
-            .flat_map_iter(|&i| {
-                let psm = &training_set[i];
-                Self::embed(&db[psm.peptide_idx], &map)
-            })
-            .collect::<Vec<_>>();
-
-        let rows = features.len() / FEATURES;
-        let features = Matrix::new(features, rows, FEATURES);
-
-        let f_t = features.transpose();
-        let cov = f_t.dot(&features);
-        let b = f_t.dot(&rt);
-
-        // Vanilla Gauss behavior (important for parity).
-        let beta = Gauss::solve_vanilla_compat(cov, b)?;
-
-        let predicted_rt = features.dot(&beta).take();
-        let sum_squared_error = predicted_rt
-            .iter()
-            .zip(rt.take())
-            .map(|(pred, act)| (pred - act).powi(2))
-            .sum::<f64>();
-
-        let r2 = if rt_var > 0.0 {
-            1.0 - (sum_squared_error / rt_var)
-        } else {
-            0.0
-        };
-        let residual_spread = (sum_squared_error / rows as f64).sqrt();
+        // The historical RT path explicitly reported zero r-squared for a
+        // constant response, unlike the IMS compatibility path.
+        let r2 = if lr.target_variance > 0.0 { lr.r2 } else { 0.0 };
         log::info!("- fit retention time model, rsq = {}", r2);
 
         Some(Self {
-            beta: beta.take(),
+            beta: lr.beta,
             map,
             r2,
-            training_n: rows,
-            residual_spread,
+            training_n: lr.training_n,
+            residual_spread: lr.mse.sqrt(),
         })
     }
 

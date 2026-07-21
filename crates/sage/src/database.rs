@@ -21,7 +21,7 @@ pub struct EnzymeBuilder {
     /// Maximum peptide length that will be fragmented
     pub max_len: Option<usize>,
     pub cleave_at: Option<String>,
-    pub restrict: Option<char>,
+    pub restrict: Option<String>,
     pub c_terminal: Option<bool>,
     pub semi_enzymatic: Option<bool>,
 }
@@ -33,7 +33,7 @@ impl Default for EnzymeBuilder {
             min_len: Some(5),
             max_len: Some(50),
             cleave_at: Some("KR".into()),
-            restrict: Some('P'),
+            restrict: Some("P".into()),
             c_terminal: Some(true),
             semi_enzymatic: Some(false),
         }
@@ -46,9 +46,9 @@ impl From<EnzymeBuilder> for EnzymeParameters {
             missed_cleavages: en.missed_cleavages.unwrap_or(1),
             min_len: en.min_len.unwrap_or(5),
             max_len: en.max_len.unwrap_or(50),
-            enyzme: Enzyme::new(
+            enzyme: Enzyme::new(
                 &en.cleave_at.unwrap_or_else(|| "KR".into()),
-                en.restrict,
+                &en.restrict.unwrap_or_else(|| "".into()),
                 en.c_terminal.unwrap_or(true),
                 en.semi_enzymatic.unwrap_or(false),
             ),
@@ -566,19 +566,13 @@ pub struct IndexedQuery<'d> {
 }
 
 impl IndexedQuery<'_> {
-    /// Search for a specified `fragment_mz` within the database
-    pub fn page_search(&self, fragment_mz: f32, charge: u8) -> impl Iterator<Item = &Theoretical> {
-        let mass = fragment_mz * charge as f32;
-
-        // Account for multiplication of observed decharged mass
-        // - relative tolerance needs to be proportionally decreased
-        let tol = match self.fragment_tol {
-            Tolerance::Ppm(lo, hi) => Tolerance::Ppm(lo / charge as f32, hi / charge as f32),
-            Tolerance::Pct(_, _) => unreachable!("Pct tolerance should never be used on mz"),
-            Tolerance::Da(_, _) => self.fragment_tol,
-        };
-
-        let (fragment_lo, fragment_hi) = tol.bounds(mass);
+    /// Search for a specified neutral fragment `mass` within the database.
+    ///
+    /// The caller converts observed m/z-like stored masses to neutral mass for
+    /// each charge hypothesis. PPM is a relative error and therefore must not be
+    /// divided by charge after that conversion.
+    pub fn page_search(&self, mass: f32) -> impl Iterator<Item = &Theoretical> {
+        let (fragment_lo, fragment_hi) = self.fragment_tol.bounds(mass);
         let (precursor_lo, precursor_hi) = self.precursor_tol.bounds(self.precursor_mass);
 
         // Locate the left and right page indices that contain matching fragments
@@ -643,32 +637,20 @@ impl IndexedQuery<'_> {
 /// # Invariants
 ///
 /// * `slice[left] <= low || left == 0`
-/// * `slice[right] <= high && (slice[right+1] > high || right == slice.len())`
+/// * `slice[right] > high || right == slice.len()`
 /// * `0 <= left <= right <= slice.len()`
 #[inline]
 pub fn binary_search_slice<T, F, S>(slice: &[T], key: F, low: S, high: S) -> (usize, usize)
 where
     F: Fn(&T, &S) -> Ordering,
 {
-    let left_idx = match slice.binary_search_by(|a| key(a, &low)) {
-        Ok(idx) | Err(idx) => {
-            let mut idx = idx.saturating_sub(1);
-            while idx > 0 && key(&slice[idx], &low) != Ordering::Less {
-                idx -= 1;
-            }
-            idx
-        }
-    };
+    let left_idx = slice
+        .partition_point(|a| key(a, &low) == Ordering::Less)
+        .saturating_sub(1);
 
-    let right_idx = match slice[left_idx..].binary_search_by(|a| key(a, &high)) {
-        Ok(idx) | Err(idx) => {
-            let mut idx = idx + left_idx;
-            while idx < slice.len() && key(&slice[idx], &high) != Ordering::Greater {
-                idx = idx.saturating_add(1);
-            }
-            idx.min(slice.len())
-        }
-    };
+    let right_idx =
+        slice[left_idx..].partition_point(|a| key(a, &high) != Ordering::Greater) + left_idx;
+
     (left_idx, right_idx)
 }
 

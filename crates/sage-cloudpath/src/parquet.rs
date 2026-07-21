@@ -34,7 +34,9 @@ pub fn build_schema() -> Result<Type, parquet::errors::ParquetError> {
             required byte_array peptide (utf8);
             required byte_array stripped_peptide (utf8);
             required byte_array proteins (utf8);
+            required byte_array protein_groups (utf8);
             required int32 num_proteins;
+            required int32 num_protein_groups;
             required int32 rank;
             required boolean is_decoy;
             required float expmass;
@@ -69,6 +71,7 @@ pub fn build_schema() -> Result<Type, parquet::errors::ParquetError> {
             required float spectrum_q;
             required float peptide_q;
             required float protein_q;
+            required float protein_group_q;
             optional group reporter_ion_intensity (LIST) {
                 repeated group list {
                     optional float element;
@@ -208,9 +211,14 @@ pub fn serialize_features(
             ByteArrayType
         );
         write_col!(
+            |f: &TdcFeature| f.protein_groups.as_deref().unwrap_or("").into(),
+            ByteArrayType
+        );
+        write_col!(
             |f: &TdcFeature| database[f.core.peptide_idx].proteins.len() as i32,
             Int32Type
         );
+        write_col_top!(num_protein_groups, Int32Type);
         write_col!(rank, Int32Type);
         write_col!(|f: &TdcFeature| f.core.label == -1, BoolType);
         write_col!(expmass, FloatType);
@@ -259,6 +267,7 @@ pub fn serialize_features(
         write_col_top!(spectrum_q, FloatType);
         write_col_top!(peptide_q, FloatType);
         write_col_top!(protein_q, FloatType);
+        write_col_top!(protein_group_q, FloatType);
 
         if let Some(col) = rg.next_column()? {
             if reporter_ions.is_empty() {
