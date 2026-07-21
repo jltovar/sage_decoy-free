@@ -241,6 +241,13 @@ pub struct DfFeature {
     #[serde(flatten)]
     pub core: FeatureCore,
 
+    /// Parsimonious protein-group assignment used by Decoy-Free protein
+    /// inference. A slash joins indistinguishable proteins within one group;
+    /// a semicolon separates multiple groups for an ambiguous peptide.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub protein_groups: Option<String>,
+    pub num_protein_groups: u32,
+
     // --- DECOY-FREE: Core Columns ---
     #[serde(skip_serializing_if = "Option::is_none")]
     pub decoy_free_p_value: Option<f64>,
@@ -767,6 +774,8 @@ impl FeatureCore {
     pub fn to_df(self) -> DfFeature {
         DfFeature {
             core: self,
+            protein_groups: None,
+            num_protein_groups: 0,
             decoy_free_p_value: None,
             decoy_free_pep: None,
             decoy_free_score: None,

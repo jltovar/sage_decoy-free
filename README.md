@@ -438,6 +438,19 @@ A minimal DF configuration uses the `fdr` block inside the Sage JSON configurati
 }
 ```
 
+Decoy-free protein grouping is opt-in. To evaluate IDPicker-style parsimonious
+groups while retaining decoy-free protein calibration, add:
+
+```json
+"decoy_free_protein_grouping": true
+```
+
+This changes the protein hypothesis from a single raw accession to a single
+inferred group. Indistinguishable accessions are reported with `/` inside one
+group; peptides mapping to multiple groups remain excluded from protein-level
+evidence. The setting does not run picked target-decoy group FDR. Leave it off
+(the default) when reproducing previously validated decoy-free results.
+
 ---
 
 ## Recommended full example configuration
@@ -667,6 +680,7 @@ The following block is a cleaned, code-consistent broad configuration for ultra-
 | `precursor_fdr` | float | `0.01` | PSM/precursor threshold. |
 | `peptide_fdr` | float | `0.01` | Peptide threshold. |
 | `protein_fdr` | float | `0.01` | Protein threshold. |
+| `decoy_free_protein_grouping` | bool | `false` | Opt-in parsimonious protein hypotheses; q-values remain Decoy-Free, not picked TDC. |
 | `report_psms_by_peptide_q` | bool | `false` | Reporting-only. Does not change native p/PEP streams. |
 
 ### Rank-null pool controls
@@ -1014,6 +1028,13 @@ decoy_free_protein_q
 ```
 
 Only these fields represent the selected last-good active DF stream.  They are the fields to use for final filtering and downstream interpretation.
+
+The DF TSV also reports `protein_groups` and `num_protein_groups`. When
+`decoy_free_protein_grouping` is enabled, `decoy_free_protein_q` is the q-value
+of the single inferred `protein_groups` hypothesis on that row. Rows mapping to
+more than one inferred group receive a protein q-value of 1.0. When grouping is
+disabled, these columns mirror raw protein assignments and preserve the prior
+single-accession rule.
 
 ### Stage snapshots
 

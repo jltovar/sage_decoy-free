@@ -144,6 +144,7 @@ use crate::scoring::{DfFeature, TdcFeature};
 use fnv::{FnvHashMap, FnvHashSet};
 use rayon::prelude::*;
 use statrs::distribution::{ContinuousCDF, Gumbel};
+use std::borrow::Cow;
 use std::collections::HashMap;
 use std::sync::Arc;
 
@@ -890,6 +891,24 @@ fn df_unique_protein_key_for_feature(f: &DfFeature, db: &IndexedDatabase) -> Opt
     Some(peptide.proteins(&db.decoy_tag, db.generate_decoys))
 }
 
+/// Return the single protein hypothesis assigned to a Decoy-Free feature.
+///
+/// Once group annotation has run, a slash-delimited indistinguishable group is
+/// one hypothesis, while a semicolon-delimited assignment remains ambiguous and
+/// is excluded. If annotation has not run, fall back to the historical
+/// unique-protein rule so direct callers retain fail-safe behavior.
+#[inline]
+fn df_inferred_protein_key_for_feature<'a>(
+    f: &'a DfFeature,
+    db: &IndexedDatabase,
+) -> Option<Cow<'a, str>> {
+    match (f.protein_groups.as_deref(), f.num_protein_groups) {
+        (Some(group), 1) if !group.is_empty() => Some(Cow::Borrowed(group)),
+        (Some(_), _) => None,
+        (None, _) => df_unique_protein_key_for_feature(f, db).map(Cow::Owned),
+    }
+}
+
 #[derive(Clone, Copy, Debug, Default)]
 pub struct EntrapmentCounts {
     pub psms: usize,
@@ -914,22 +933,23 @@ pub fn calculate_entrapment_counts_df(
         .filter(|f| f.core.rank == 1 && f.core.label == 1)
     {
         let peptide = &db[feat.core.peptide_idx];
-        let protein_key = peptide.proteins(&db.decoy_tag, db.generate_decoys);
+        let raw_protein_key = peptide.proteins(&db.decoy_tag, db.generate_decoys);
+        let is_entrapment_peptide = is_entrapment_str(&raw_protein_key);
 
-        if !is_entrapment_str(&protein_key) {
-            continue;
-        }
-
-        if feat.decoy_free_q_value.unwrap_or(1.0) <= peptide_fdr {
+        if is_entrapment_peptide && feat.decoy_free_q_value.unwrap_or(1.0) <= peptide_fdr {
             counts.psms += 1;
         }
 
-        if feat.decoy_free_peptide_q.unwrap_or(1.0) <= peptide_fdr {
+        if is_entrapment_peptide && feat.decoy_free_peptide_q.unwrap_or(1.0) <= peptide_fdr {
             peptide_set.insert(peptide.to_string());
         }
 
         if feat.decoy_free_protein_q.unwrap_or(1.0) <= protein_fdr {
-            protein_set.insert(protein_key);
+            if let Some(protein_key) = df_inferred_protein_key_for_feature(feat, db) {
+                if is_entrapment_str(protein_key.as_ref()) {
+                    protein_set.insert(protein_key.into_owned());
+                }
+            }
         }
     }
 
@@ -10990,6 +11010,16 @@ pub fn calculate_protein_q_df(
     db: &IndexedDatabase,
     settings: &FdrSettings,
 ) -> usize {
+    // Protein grouping defines hypotheses only; Decoy-Free evidence aggregation
+    // and q-value calibration below remain unchanged. The mode is opt-in so
+    // previously validated configurations retain their raw unique-protein path.
+    crate::protein_grouping::generate_protein_groups_df(
+        db,
+        features,
+        settings.decoy_free_protein_grouping,
+        Some(settings.peptide_fdr as f64),
+    );
+
     // Protein inference consumes the peptide-passing pool derived from the finalized
     // active DF stream. Optional stages may change which PSMs pass peptide-level DF,
     // but they must not change the downstream aggregation contract.
@@ -11033,16 +11063,20 @@ pub fn calculate_protein_q_df(
             None => continue,
         };
 
-        // Unique-only protein inference using the same source as TSV `num_proteins`
+        // Use exactly one inferred protein hypothesis. With grouping enabled,
+        // an indistinguishable slash-delimited group is one hypothesis and a
+        // peptide spanning multiple semicolon-delimited groups is excluded.
+        // With grouping disabled, this reduces to the historical unique-protein
+        // rule because raw assignments were written as fallback groups.
         let peptide = &db[feat.core.peptide_idx];
-        if peptide.proteins.len() != 1 {
+        let Some(protein_key) = df_inferred_protein_key_for_feature(feat, db) else {
             continue;
-        }
-
-        let protein_key = peptide.proteins(&db.decoy_tag, db.generate_decoys);
+        };
         let peptide_seq = peptide.to_string();
 
-        let peptide_map = protein_peptide_map.entry(protein_key).or_default();
+        let peptide_map = protein_peptide_map
+            .entry(protein_key.into_owned())
+            .or_default();
         peptide_map
             .entry(peptide_seq)
             .and_modify(|prev| *prev = prev.min(v))
@@ -11225,28 +11259,30 @@ pub fn calculate_protein_q_df(
             continue;
         }
 
-        let protein_key = db[feat.core.peptide_idx].proteins(&db.decoy_tag, db.generate_decoys);
-        let q = *best_q.get(&protein_key).unwrap_or(&1.0);
+        let q = df_inferred_protein_key_for_feature(feat, db)
+            .and_then(|protein_key| best_q.get(protein_key.as_ref()).copied())
+            .unwrap_or(1.0);
         feat.decoy_free_protein_q = Some(finite_df_p_value(q));
     }
 
     best_q
-        .values()
-        .filter(|&&q| q <= settings.protein_fdr as f64)
+        .iter()
+        .filter(|(protein_key, &q)| {
+            !is_contam_str(protein_key)
+                && !is_entrapment_str(protein_key)
+                && q <= settings.protein_fdr as f64
+        })
         .count()
 }
 
 #[inline]
-fn df_row_unique_protein_key(feat: &DfFeature, db: &IndexedDatabase) -> Option<String> {
-    let peptide = &db[feat.core.peptide_idx];
-
-    // Keep Level 4 aligned with protein inference:
-    // only uniquely assigned peptides can define a protein-supported row.
-    if peptide.proteins.len() != 1 {
-        return None;
-    }
-
-    Some(peptide.proteins(&db.decoy_tag, db.generate_decoys))
+fn df_row_single_protein_hypothesis_key<'a>(
+    feat: &'a DfFeature,
+    db: &IndexedDatabase,
+) -> Option<Cow<'a, str>> {
+    // Keep Level 4 aligned with protein inference: only peptides assigned to one
+    // inferred protein hypothesis can define a protein-supported row.
+    df_inferred_protein_key_for_feature(feat, db)
 }
 
 #[inline]
@@ -11319,11 +11355,11 @@ pub fn apply_hierarchical_reporting_df(
             continue;
         }
 
-        let Some(protein_key) = df_row_unique_protein_key(feat, db) else {
+        let Some(protein_key) = df_row_single_protein_hypothesis_key(feat, db) else {
             continue;
         };
 
-        accepted_proteins.insert(protein_key);
+        accepted_proteins.insert(protein_key.into_owned());
     }
 
     if accepted_proteins.is_empty() {
@@ -11344,7 +11380,7 @@ pub fn apply_hierarchical_reporting_df(
     //
     // This is the peptide-cleaning layer:
     // a peptide is reportable if it is independently accepted at peptide level
-    // and maps uniquely to an accepted protein.
+    // and maps to exactly one accepted protein hypothesis.
     //
     // Do not use Ent_ here.
     let mut protein_supported_peptides: FnvHashSet<String> = FnvHashSet::default();
@@ -11358,11 +11394,11 @@ pub fn apply_hierarchical_reporting_df(
             continue;
         }
 
-        let Some(protein_key) = df_row_unique_protein_key(feat, db) else {
+        let Some(protein_key) = df_row_single_protein_hypothesis_key(feat, db) else {
             continue;
         };
 
-        if !accepted_proteins.contains(&protein_key) {
+        if !accepted_proteins.contains(protein_key.as_ref()) {
             continue;
         }
 
@@ -11374,8 +11410,8 @@ pub fn apply_hierarchical_reporting_df(
     // Define protein-supported PSMs.
     //
     // This is intentionally protein-supported, not merely peptide-supported:
-    // the PSM must independently pass the PSM threshold and map uniquely to an
-    // accepted protein.
+    // the PSM must independently pass the PSM threshold and map to exactly one
+    // accepted protein hypothesis.
     //
     // Do not use Ent_ here.
     let mut protein_supported_psm_count = 0usize;
@@ -11399,8 +11435,8 @@ pub fn apply_hierarchical_reporting_df(
         let peptide_is_protein_supported = protein_supported_peptides.contains(&peptide_key);
 
         let psm_is_protein_supported = df_row_passes_strict_psm_threshold(feat, settings)
-            && df_row_unique_protein_key(feat, db)
-                .map(|protein_key| accepted_proteins.contains(&protein_key))
+            && df_row_single_protein_hypothesis_key(feat, db)
+                .map(|protein_key| accepted_proteins.contains(protein_key.as_ref()))
                 .unwrap_or(false);
 
         feat.decoy_free_protein_supported_peptide = Some(peptide_is_protein_supported);
@@ -11508,6 +11544,7 @@ pub fn decoy_free_precursor(
 mod tests {
     use super::*;
     use crate::database::PeptideIx;
+    use crate::peptide::Peptide;
 
     fn test_peak(score: f64) -> (Peak, Vec<f64>) {
         (
@@ -11611,6 +11648,140 @@ mod tests {
         }
 
         assert_eq!(decoy_free_precursor(&mut peaks, 1.0), 1);
+    }
+
+    fn indistinguishable_group_fixture() -> (IndexedDatabase, Vec<DfFeature>) {
+        let peptides = ["PEPTIDEA", "PEPTIDEB"]
+            .into_iter()
+            .map(|sequence| Peptide {
+                sequence: sequence.as_bytes().to_vec().into(),
+                modifications: vec![0.0; sequence.len()],
+                proteins: vec![Arc::from("protA"), Arc::from("protB")],
+                ..Default::default()
+            })
+            .collect();
+
+        let db = IndexedDatabase {
+            peptides,
+            decoy_tag: "rev_".to_string(),
+            generate_decoys: false,
+            ..IndexedDatabase::default()
+        };
+
+        let features = [0.001, 0.002]
+            .into_iter()
+            .enumerate()
+            .map(|(ix, pep)| {
+                let mut feature = crate::scoring::FeatureCore {
+                    peptide_idx: PeptideIx(ix as u32),
+                    rank: 1,
+                    label: 1,
+                    ..Default::default()
+                }
+                .to_df();
+                feature.decoy_free_pep = Some(pep);
+                feature.decoy_free_p_value = Some(pep);
+                feature.decoy_free_q_value = Some(pep);
+                feature.decoy_free_peptide_q = Some(pep);
+                feature
+            })
+            .collect();
+
+        (db, features)
+    }
+
+    #[test]
+    fn decoy_free_protein_grouping_uses_one_group_hypothesis() {
+        use crate::input::{FdrMode, FdrOptions};
+
+        let (db, mut features) = indistinguishable_group_fixture();
+        let mut settings = FdrSettings::from(FdrOptions {
+            mode: Some(FdrMode::DecoyFree),
+            final_evidence_space: Some(FinalEvidenceSpace::Pep),
+            decoy_free_protein_grouping: Some(true),
+            peptide_fdr: Some(0.01),
+            protein_fdr: Some(0.01),
+            ..Default::default()
+        });
+        settings.hierarchical_reporting = HierarchicalReportingMode::Strict;
+
+        let passing = calculate_protein_q_df(&mut features, &db, &settings);
+
+        for feature in &features {
+            assert_eq!(feature.protein_groups.as_deref(), Some("protA/protB"));
+            assert_eq!(feature.num_protein_groups, 1);
+            let protein_q = feature.decoy_free_protein_q.unwrap();
+            assert!(
+                (protein_q - 0.002).abs() < 1e-12,
+                "unexpected protein q-value: {protein_q}"
+            );
+        }
+        assert_eq!(passing, 1);
+
+        let (protein_supported_peptides, protein_supported_psms) =
+            apply_hierarchical_reporting_df(&mut features, &db, &settings);
+        assert_eq!(protein_supported_peptides, 2);
+        assert_eq!(protein_supported_psms, 2);
+        assert!(features.iter().all(|feature| {
+            feature.decoy_free_protein_supported_peptide == Some(true)
+                && feature.decoy_free_peptide_supported_psm == Some(true)
+        }));
+    }
+
+    #[test]
+    fn decoy_free_protein_grouping_is_opt_in() {
+        use crate::input::{FdrMode, FdrOptions};
+
+        let (db, mut features) = indistinguishable_group_fixture();
+        let settings = FdrSettings::from(FdrOptions {
+            mode: Some(FdrMode::DecoyFree),
+            final_evidence_space: Some(FinalEvidenceSpace::Pep),
+            decoy_free_protein_grouping: Some(false),
+            peptide_fdr: Some(0.01),
+            protein_fdr: Some(0.01),
+            ..Default::default()
+        });
+
+        let passing = calculate_protein_q_df(&mut features, &db, &settings);
+
+        assert_eq!(passing, 0);
+        for feature in features {
+            assert_eq!(feature.protein_groups.as_deref(), Some("protA;protB"));
+            assert_eq!(feature.num_protein_groups, 2);
+            assert_eq!(feature.decoy_free_protein_q, Some(1.0));
+        }
+    }
+
+    #[test]
+    fn decoy_free_group_entrapment_counts_use_the_group_hypothesis() {
+        use crate::input::{FdrMode, FdrOptions};
+
+        let (mut db, mut features) = indistinguishable_group_fixture();
+        for peptide in &mut db.peptides {
+            peptide.proteins = vec![Arc::from("Ent_protA"), Arc::from("Ent_protB")];
+        }
+
+        let settings = FdrSettings::from(FdrOptions {
+            mode: Some(FdrMode::DecoyFree),
+            final_evidence_space: Some(FinalEvidenceSpace::Pep),
+            decoy_free_protein_grouping: Some(true),
+            peptide_fdr: Some(0.01),
+            protein_fdr: Some(0.01),
+            ..Default::default()
+        });
+
+        // Entrapment groups are evaluated and receive q-values, but are not
+        // reported as target protein discoveries.
+        assert_eq!(calculate_protein_q_df(&mut features, &db, &settings), 0);
+        let counts = calculate_entrapment_counts_df(&features, &db, 0.01, 0.01);
+
+        assert_eq!(counts.psms, 2);
+        assert_eq!(counts.peptides, 2);
+        assert_eq!(counts.proteins, 1);
+        assert_eq!(
+            features[0].protein_groups.as_deref(),
+            Some("Ent_protA/Ent_protB")
+        );
     }
 
     #[test]
