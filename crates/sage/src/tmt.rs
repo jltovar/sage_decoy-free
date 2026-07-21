@@ -1,12 +1,7 @@
 //! TMT quantification
 #![allow(clippy::excessive_precision)]
-#![allow(unused_imports)]
-use crate::database::binary_search_slice;
-use crate::ion_series::{IonSeries, Kind};
-use crate::mass::{Tolerance, H2O, NH3, PROTON};
-use crate::peptide::Peptide;
-use crate::scoring::Scorer;
-use crate::spectrum::{self, Peak, Precursor, ProcessedSpectrum};
+use crate::mass::{Tolerance, PROTON};
+use crate::spectrum::{self, ProcessedSpectrum};
 use rayon::prelude::*;
 use serde::{Deserialize, Serialize};
 
@@ -72,19 +67,33 @@ pub struct Purity {
 pub struct Quant<'ms3> {
     pub hit_purity: Purity,
     pub chimera_purity: Option<Purity>,
-    pub intensities: Vec<Option<&'ms3 Peak>>,
-    pub spectrum: &'ms3 ProcessedSpectrum<Peak>,
+    /// Quanitified TMT reporter ion intensities
+    pub intensities: Vec<Option<f32>>,
+    /// MS3 spectrum
+    pub spectrum: &'ms3 ProcessedSpectrum,
 }
 
-pub fn find_reporter_ions<'a>(
-    peaks: &'a [Peak],
+/// Return a vector containing the peaks closest to the m/zs defined in
+/// `labels`, within a given tolerance window.
+/// This function is MS-level agnostic, so it can be used for either MS2 or MS3
+/// quant.
+pub fn find_reporter_ions(
+    masses: &[f32],
+    intensities: &[f32],
     labels: &[f32],
     label_tolerance: Tolerance,
-) -> Vec<Option<&'a Peak>> {
+) -> Vec<Option<f32>> {
     labels
         .iter()
         .map(|&label| {
-            spectrum::select_most_intense_peak(peaks, label, label_tolerance, Some(-PROTON))
+            spectrum::select_most_intense_peak(
+                masses,
+                intensities,
+                label,
+                label_tolerance,
+                Some(-PROTON),
+            )
+            .map(|idx| intensities[idx])
         })
         .collect()
 }
@@ -104,6 +113,76 @@ const TMT18PLEX: [f32; 18] = [
     134.154565, 135.15160,
 ];
 
+/// Search MS/MS and quantify isobaric tag intensities from an SPS-MS3 spectrum
+///
+/// * `scorer`: used for searching/scoring precursor MS2 spectrum
+/// * `spectra`: a slice (generally entire mzML) of spectra, that can be searched for precursor spectra
+/// * `ms3`: The MS3 spectrum to search and quantify
+/// * `isobaric_labels`: specify label m/zs to be used
+/// * `isobaric_tolerance`: specify label tolerance
+// pub fn quantify_sps<'a, 'b>(
+//     scorer: &'a Scorer<'a>,
+//     spectra: &[ProcessedSpectrum],
+//     ms3: &'b ProcessedSpectrum,
+//     isobaric_labels: &Isobaric,
+//     isobaric_tolerance: Tolerance,
+// ) -> Option<Quant<'b>> {
+//     let first_precursor = ms3
+//         .precursors
+//         .first()
+//         .expect("MS3 scan without at least one precursor!");
+
+//     let ms2 = spectrum::find_spectrum_by_id(
+//         spectra,
+//         first_precursor
+//             .scan
+//             .expect("MS3 scan without a MS2 precursor scan ID"),
+//     )
+//     .expect("Couldn't locate parent MS2 scan!");
+
+//     let ms1_charge = ms2
+//         .precursors
+//         .get(0)
+//         .and_then(|p| p.charge)
+//         .unwrap_or(2)
+//         .saturating_sub(1);
+
+//     let scores = scorer.score_chimera(ms2);
+//     let hit = scores.first()?.clone();
+//     let peptide = &scorer.db[hit.peptide_idx];
+//     let hit_purity = purity_of_match(
+//         &ms3.precursors,
+//         ms2,
+//         &mk_theoretical(peptide),
+//         ms1_charge,
+//         scorer.fragment_tol,
+//     );
+
+//     let chimera = scores.get(1).cloned();
+//     let chimera_purity = chimera.as_ref().map(|score| {
+//         purity_of_match(
+//             &ms3.precursors,
+//             ms2,
+//             &mk_theoretical(&scorer.db[score.peptide_idx]),
+//             ms1_charge,
+//             scorer.fragment_tol,
+//         )
+//     });
+
+//     Some(Quant {
+//         hit,
+//         hit_purity,
+//         chimera,
+//         chimera_purity,
+//         intensities: find_reporter_ions(
+//             &ms3.peaks,
+//             isobaric_labels.reporter_masses(),
+//             isobaric_tolerance,
+//         ),
+//         spectrum: ms3,
+//     })
+// }
+
 #[derive(Clone)]
 pub struct TmtQuant {
     pub spec_id: String,
@@ -112,8 +191,15 @@ pub struct TmtQuant {
     pub peaks: Vec<f32>,
 }
 
+/// Quantify isobaric tags from an MS2 or MS3 spectrum
+///
+/// * `spectra`: a slice (generally entire mzML) of spectra, that can be searched
+///   for precursor spectra
+/// * `isobaric_labels`: specify label m/zs to be used
+/// * `isobaric_tolerance`: specify label tolerance
+/// * `level`: MSn level to extract isobaric peaks from
 pub fn quantify(
-    spectra: &[ProcessedSpectrum<Peak>],
+    spectra: &[ProcessedSpectrum],
     isobaric_labels: &Isobaric,
     isobaric_tolerance: Tolerance,
     level: u8,
@@ -133,12 +219,13 @@ pub fn quantify(
             };
 
             let peaks = find_reporter_ions(
-                &spectrum.peaks,
+                &spectrum.masses,
+                &spectrum.intensities,
                 isobaric_labels.reporter_masses(),
                 isobaric_tolerance,
             )
             .into_iter()
-            .map(|peak| peak.map(|p| p.intensity).unwrap_or_default())
+            .map(|peak| peak.unwrap_or_default())
             .collect();
 
             Some(TmtQuant {

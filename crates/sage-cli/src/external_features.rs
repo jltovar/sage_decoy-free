@@ -1,5 +1,6 @@
 use anyhow::{bail, Context, Result};
 use csv::{ReaderBuilder, WriterBuilder};
+use sage_cloudpath::Url;
 use sage_core::database::IndexedDatabase;
 use sage_core::scoring::{DfFeature, ExternalPsmFeatures};
 use std::collections::HashMap;
@@ -35,7 +36,7 @@ pub struct ParsedExternalFeatureTable {
 pub fn maybe_add_external_features(
     features: &mut [DfFeature],
     settings: &ExternalFeatureGenerationSettings,
-    mzml_paths: &[String],
+    mzml_paths: &[Url],
     db: &IndexedDatabase,
 ) -> Result<()> {
     if !settings.enabled {
@@ -70,7 +71,7 @@ pub fn maybe_add_external_features(
 fn add_external_features_inner(
     features: &mut [DfFeature],
     settings: &ExternalFeatureGenerationSettings,
-    mzml_paths: &[String],
+    mzml_paths: &[Url],
     db: &IndexedDatabase,
 ) -> Result<()> {
     let tmp_dir = settings
@@ -118,7 +119,7 @@ fn add_external_features_inner(
 fn export_candidate_table(
     features: &[DfFeature],
     path: &Path,
-    mzml_paths: &[String],
+    mzml_paths: &[Url],
     db: &IndexedDatabase,
     max_rank: Option<u32>,
 ) -> Result<()> {
@@ -199,22 +200,19 @@ fn write_feature_config(
     psm_path: &Path,
     output_root: &Path,
     config_path: &Path,
-    mzml_paths: &[String],
+    mzml_paths: &[Url],
 ) -> Result<()> {
     let spectrum_paths: Vec<String> = mzml_paths
         .iter()
-        .map(|p| {
-            let key = Path::new(p)
-                .file_name()
-                .and_then(|x| x.to_str())
-                .unwrap_or(p);
-            settings
-                .spectrum_file_mapping
-                .get(key)
-                .cloned()
-                .unwrap_or_else(|| p.clone())
+        .map(|url| {
+            let key = raw_file_name_for_url(url);
+            if let Some(mapped) = settings.spectrum_file_mapping.get(&key) {
+                external_process_path_from_str(mapped)
+            } else {
+                external_process_path(url)
+            }
         })
-        .collect();
+        .collect::<Result<_>>()?;
 
     let engine_name = match settings.engine {
         ExternalFeatureEngine::Tims2rescore => "tims2rescore",
@@ -607,7 +605,7 @@ fn parse_feature_output(path: &Path) -> Result<ParsedExternalFeatureTable> {
 fn join_features(
     features: &mut [DfFeature],
     parsed: ParsedExternalFeatureTable,
-    mzml_paths: &[String],
+    mzml_paths: &[Url],
     db: &IndexedDatabase,
 ) -> Result<()> {
     let mut joined = 0usize;
@@ -899,13 +897,53 @@ fn external_feature_auc(reference: &[f64], entrapment: &[f64], higher_is_better:
     }
 }
 
-fn raw_file_name(mzml_paths: &[String], file_id: usize) -> String {
+fn raw_file_name(mzml_paths: &[Url], file_id: usize) -> String {
     mzml_paths
         .get(file_id)
-        .and_then(|p| Path::new(p).file_name())
-        .and_then(|x| x.to_str())
-        .unwrap_or_else(|| mzml_paths.get(file_id).map(String::as_str).unwrap_or(""))
+        .map(raw_file_name_for_url)
+        .unwrap_or_default()
+}
+
+/// Return the same basename that the pre-URL integration used for join keys.
+/// Local file URLs are converted back to paths first so percent-encoded names
+/// (for example, spaces) do not leak into the exported `raw_file` column.
+fn raw_file_name_for_url(url: &Url) -> String {
+    if url.scheme() == "file" {
+        if let Ok(path) = url.to_file_path() {
+            if let Some(name) = path.file_name().and_then(|name| name.to_str()) {
+                return name.to_string();
+            }
+        }
+    }
+
+    url.path_segments()
+        .and_then(|mut segments| segments.next_back())
+        .filter(|name| !name.is_empty())
+        .unwrap_or_else(|| url.as_str())
         .to_string()
+}
+
+/// Convert an internal URL to the spelling expected by an external process.
+/// Local `file://` URLs must cross the process boundary as native filesystem
+/// paths; remote object-store URLs remain URLs for tools that support them.
+fn external_process_path(url: &Url) -> Result<String> {
+    if url.scheme() == "file" {
+        let path = url
+            .to_file_path()
+            .map_err(|_| anyhow::anyhow!("invalid local file URL: {url}"))?;
+        return Ok(path.to_string_lossy().into_owned());
+    }
+
+    Ok(url.as_str().to_string())
+}
+
+/// Apply the same boundary conversion to an explicitly configured spectrum
+/// mapping while preserving ordinary local paths and Windows drive paths.
+fn external_process_path_from_str(path: &str) -> Result<String> {
+    match sage_cloudpath::try_parse_url(path) {
+        Some(url) => external_process_path(&url),
+        None => Ok(path.to_string()),
+    }
 }
 
 fn get_any(row: &csv::StringRecord, headers: &csv::StringRecord, names: &[&str]) -> Option<String> {
@@ -921,4 +959,44 @@ fn get_f32(row: &csv::StringRecord, headers: &csv::StringRecord, names: &[&str])
     get_any(row, headers, names)
         .and_then(|x| x.parse::<f32>().ok())
         .unwrap_or(f32::NAN)
+}
+
+#[cfg(test)]
+mod path_tests {
+    use super::*;
+
+    #[test]
+    fn local_url_round_trips_at_external_process_boundary() {
+        let path = std::env::current_dir().unwrap().join("sample name.mzML");
+        let url = Url::from_file_path(&path).unwrap();
+
+        assert_eq!(
+            external_process_path(&url).unwrap(),
+            path.to_string_lossy().into_owned()
+        );
+        assert_eq!(raw_file_name_for_url(&url), "sample name.mzML");
+    }
+
+    #[test]
+    fn mapped_file_url_round_trips_but_plain_paths_are_unchanged() {
+        let path = std::env::current_dir().unwrap().join("mapped sample.mzML");
+        let url = Url::from_file_path(&path).unwrap();
+
+        assert_eq!(
+            external_process_path_from_str(url.as_str()).unwrap(),
+            path.to_string_lossy().into_owned()
+        );
+        assert_eq!(
+            external_process_path_from_str("relative/sample.mzML").unwrap(),
+            "relative/sample.mzML"
+        );
+    }
+
+    #[test]
+    fn remote_urls_keep_url_and_basename_spelling() {
+        let url = Url::parse("s3://bucket/prefix/sample.mzML").unwrap();
+
+        assert_eq!(external_process_path(&url).unwrap(), url.as_str());
+        assert_eq!(raw_file_name_for_url(&url), "sample.mzML");
+    }
 }

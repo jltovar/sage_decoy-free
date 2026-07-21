@@ -153,11 +153,18 @@ pub fn picked_peptide(db: &IndexedDatabase, features: &mut [TdcFeature]) -> usiz
 }
 
 pub fn picked_protein(db: &IndexedDatabase, features: &mut [TdcFeature]) -> usize {
+    // Critical: All non-proteotypic, non-unique, or shared peptides are discarded
+    // else the assumptions of picked protein FDR are invalid. Shared peptides are
+    // still reported, albeit with protein FDR = 1.0
     let mut map: FnvHashMap<_, Competition<String>> = FnvHashMap::default();
-    for feat in features.iter() {
-        let decoy = db[feat.core.peptide_idx].decoy;
-        let entry = map.entry(&db[feat.core.peptide_idx].proteins).or_default();
-        let proteins = db[feat.core.peptide_idx].proteins(&db.decoy_tag, db.generate_decoys);
+    for feat in features
+        .iter()
+        .filter(|x| db[x.core.peptide_idx].proteins.len() == 1)
+    {
+        let peptide = &db[feat.core.peptide_idx];
+        let decoy = peptide.decoy;
+        let entry = map.entry(&peptide.proteins).or_default();
+        let proteins = peptide.proteins(&db.decoy_tag, db.generate_decoys);
         match decoy {
             true => {
                 entry.reverse = entry.reverse.max(feat.discriminant_score);
@@ -170,12 +177,62 @@ pub fn picked_protein(db: &IndexedDatabase, features: &mut [TdcFeature]) -> usiz
         }
     }
 
+    if map.is_empty() {
+        return 0;
+    }
     let (scores, passing) = Competition::assign_q_value(map, 0.01);
 
-    features.par_iter_mut().for_each(|feat| {
-        let proteins = db[feat.core.peptide_idx].proteins(&db.decoy_tag, db.generate_decoys);
-        feat.protein_q = scores[&proteins];
-    });
+    features
+        .par_iter_mut()
+        .filter(|x| db[x.core.peptide_idx].proteins.len() == 1)
+        .for_each(|feat| {
+            let proteins = db[feat.core.peptide_idx].proteins(&db.decoy_tag, db.generate_decoys);
+            if let Some(q) = scores.get(&proteins) {
+                feat.protein_q = *q;
+            }
+        });
+
+    passing
+}
+
+pub fn picked_protein_group(db: &IndexedDatabase, features: &mut [TdcFeature]) -> usize {
+    // Critical: All non-proteotypic, non-unique, or shared peptides are discarded
+    // else the assumptions of picked group FDR are invalid. Shared peptides are
+    // still reported, albeit with protein group FDR = 1.0
+    let mut map: FnvHashMap<_, Competition<String>> = FnvHashMap::default();
+    for feat in features
+        .iter()
+        .filter(|x| x.num_protein_groups == 1 && x.protein_groups.is_some())
+    {
+        let decoy = db[feat.core.peptide_idx].decoy;
+        let entry = map.entry(feat.protein_groups.clone()).or_default();
+        match decoy {
+            true => {
+                entry.reverse = entry.reverse.max(feat.discriminant_score);
+                entry.reverse_ix = feat.protein_groups.clone();
+            }
+            false => {
+                entry.forward = entry.forward.max(feat.discriminant_score);
+                entry.foward_ix = feat.protein_groups.clone();
+            }
+        }
+    }
+
+    if map.is_empty() {
+        return 0;
+    }
+    let (scores, passing) = Competition::assign_q_value(map, 0.01);
+
+    features
+        .par_iter_mut()
+        .filter(|x| x.num_protein_groups == 1 && x.protein_groups.is_some())
+        .for_each(|feat| {
+            if let Some(protein_groups) = feat.protein_groups.as_deref() {
+                if let Some(q) = scores.get(protein_groups) {
+                    feat.protein_group_q = *q;
+                }
+            }
+        });
 
     passing
 }

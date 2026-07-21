@@ -9,6 +9,7 @@ pub mod mobility_model;
 pub mod msfdr;
 pub mod nokoi;
 pub mod qvalue;
+pub mod regression;
 pub mod retention_alignment;
 pub mod retention_model;
 pub mod skew_normal;

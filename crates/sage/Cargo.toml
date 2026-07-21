@@ -6,7 +6,7 @@ authors = [
     "jltovar <jltovar>",
 ]
 edition = "2021"
-rust-version = "1.62"
+rust-version = "1.85"
 description = "A very fast proteomics database search tool, now decoy-free"
 readme = "README.md"
 license = "MIT"

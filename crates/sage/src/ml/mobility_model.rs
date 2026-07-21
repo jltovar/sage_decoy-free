@@ -3,7 +3,7 @@
 //! The model uses a linear feature embedding and solves the associated
 //! normal equations to obtain regression coefficients.
 
-use super::{gauss::Gauss, matrix::Matrix};
+use super::regression::LinearRegression;
 use crate::database::IndexedDatabase;
 use crate::mass::VALID_AA;
 use crate::peptide::Peptide;
@@ -113,7 +113,7 @@ const NEGATIVE_AA_IDXS: [usize; 2] = [b'D' as usize - b'A' as usize, b'E' as usi
 
 const TINY_AA_IDXS: [usize; 3] = [
     b'G' as usize - b'A' as usize,
-    b'A' as usize - b'A' as usize,
+    0,
     b'S' as usize - b'A' as usize,
 ];
 
@@ -204,63 +204,36 @@ impl MobilityModel {
             map[(aa - b'A') as usize] = idx;
         }
 
-        let keep = |feat: &&FeatureCore| filter(feat) && feat.ims > 0.0;
-
-        let ims = training_set
+        let training_n = training_set
             .par_iter()
-            .filter(keep)
-            .map(|psm| psm.ims as f64)
-            .collect::<Vec<f64>>();
-
-        if ims.len() < 10 {
+            .filter(|feat| filter(feat) && feat.ims > 0.0)
+            .count();
+        if training_n < 10 {
             log::warn!(
                 "Not enough high-quality IMS PSMs ({}) to train the ion mobility model.",
-                ims.len()
+                training_n
             );
             return None;
         }
 
-        let ims_mean = ims.iter().sum::<f64>() / ims.len() as f64;
-        let ims_var = ims.iter().map(|v| (v - ims_mean).powi(2)).sum::<f64>();
+        let lr = LinearRegression::fit::<_, FEATURES>(
+            training_set,
+            |feat| filter(feat) && feat.ims > 0.0,
+            |psm| Self::embed(&db[psm.peptide_idx], &psm.charge, &map),
+            |psm| psm.ims as f64,
+        )
+        .or_else(|| {
+            log::warn!("Mobility model training aborted: singular fit or invalid IMS variance");
+            None
+        })?;
 
-        if ims_var == 0.0 {
-            log::warn!("Mobility model training aborted: ims variance is zero");
-            return None;
-        }
-
-        let rt = Matrix::col_vector(ims);
-
-        let x = training_set
-            .par_iter()
-            .filter(keep)
-            .flat_map_iter(|psm| Self::embed(&db[psm.peptide_idx], &psm.charge, &map))
-            .collect::<Vec<_>>();
-
-        let rows = x.len() / FEATURES;
-        let features = Matrix::new(x, rows, FEATURES);
-
-        let f_t = features.transpose();
-        let cov = f_t.dot(&features);
-        let b = f_t.dot(&rt);
-
-        let beta = Gauss::solve(cov, b)?;
-
-        let predicted_im = features.dot(&beta).take();
-        let sum_squared_error = predicted_im
-            .iter()
-            .zip(rt.take())
-            .map(|(pred, act)| (pred - act).powi(2))
-            .sum::<f64>();
-
-        let mse: f64 = sum_squared_error / predicted_im.len() as f64;
-        let r2 = 1.0 - (sum_squared_error / ims_var);
-        log::info!("- fit mobility model, rsq = {}, mse = {}", r2, mse);
+        log::info!("- fit mobility model, rsq = {}, mse = {}", lr.r2, lr.mse);
         Some(Self {
-            beta: beta.take(),
+            beta: lr.beta,
             map,
-            r2,
-            mse,
-            training_n: rows,
+            r2: lr.r2,
+            mse: lr.mse,
+            training_n: lr.training_n,
         })
     }
 
@@ -276,52 +249,20 @@ impl MobilityModel {
             map[(aa - b'A') as usize] = idx;
         }
 
-        // Preserve the upstream training set definition without ims > 0 filtering.
-        let ims = training_set
-            .par_iter()
-            .filter(|feat| filter(*feat))
-            .map(|psm| psm.ims as f64)
-            .collect::<Vec<f64>>();
+        let lr = LinearRegression::fit_vanilla_compat::<_, FEATURES>(
+            training_set,
+            |feat| filter(feat),
+            |psm| Self::embed(&db[psm.peptide_idx], &psm.charge, &map),
+            |psm| psm.ims as f64,
+        )?;
 
-        // Preserve the upstream behavior by proceeding without minimum-count
-        // or variance-based early termination.
-        let ims_mean = ims.iter().sum::<f64>() / ims.len() as f64;
-        let ims_var = ims.iter().map(|v| (v - ims_mean).powi(2)).sum::<f64>();
-
-        let rt = Matrix::col_vector(ims);
-
-        let x = training_set
-            .par_iter()
-            .filter(|feat| filter(*feat))
-            .flat_map_iter(|psm| Self::embed(&db[psm.peptide_idx], &psm.charge, &map))
-            .collect::<Vec<_>>();
-
-        let rows = x.len() / FEATURES;
-        let features = Matrix::new(x, rows, FEATURES);
-
-        let f_t = features.transpose();
-        let cov = f_t.dot(&features);
-        let b = f_t.dot(&rt);
-
-        let beta = Gauss::solve_vanilla_compat(cov, b)?;
-
-        let predicted_im = features.dot(&beta).take();
-        let sum_squared_error = predicted_im
-            .iter()
-            .zip(rt.take())
-            .map(|(pred, act)| (pred - act).powi(2))
-            .sum::<f64>();
-
-        let mse: f64 = sum_squared_error / predicted_im.len() as f64;
-        let r2 = 1.0 - (sum_squared_error / ims_var);
-
-        log::info!("- fit mobility model, rsq = {}, mse = {}", r2, mse);
+        log::info!("- fit mobility model, rsq = {}, mse = {}", lr.r2, lr.mse);
         Some(Self {
-            beta: beta.take(),
+            beta: lr.beta,
             map,
-            r2,
-            mse,
-            training_n: rows,
+            r2: lr.r2,
+            mse: lr.mse,
+            training_n: lr.training_n,
         })
     }
 

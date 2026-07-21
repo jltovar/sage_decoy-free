@@ -231,12 +231,8 @@ impl MzMLReader {
                                     precursor.mz = extract_value!(ev);
                                 }
                             }
-                            ISO_WINDOW_LOWER => {
-                                iso_window_lo = Some(extract_value!(ev));
-                            }
-                            ISO_WINDOW_UPPER => {
-                                iso_window_hi = Some(extract_value!(ev));
-                            }
+                            ISO_WINDOW_LOWER => iso_window_lo = Some(extract_value!(ev)),
+                            ISO_WINDOW_UPPER => iso_window_hi = Some(extract_value!(ev)),
                             _ => {}
                         }
                     }
@@ -248,11 +244,13 @@ impl MzMLReader {
                             }
                             SELECTED_ION_MZ => {
                                 // DDA / PRM priority:
-                                // Always overwrite with the selected ion m/z.
-                                // This is typically monoisotopic and possibly deisotoped/refined
-                                // by the vendor’s processing, and should be used instead of the
-                                // isolation window center when present.
-                                precursor.mz = extract_value!(ev);
+                                // Prefer a non-zero selected-ion m/z, which is typically
+                                // monoisotopic and vendor-refined, over the isolation center.
+                                // A zero placeholder must not erase a valid isolation fallback.
+                                let val = extract_value!(ev);
+                                if val != 0.0 {
+                                    precursor.mz = val;
+                                }
                             }
                             SELECTED_ION_INT => {
                                 precursor.intensity = Some(extract_value!(ev));
@@ -612,6 +610,105 @@ mod test {
         assert!((s.scan_start_time - 25.066).abs() < 0.0001);
         assert_eq!(s.ion_injection_time, 0.0);
         assert_eq!(s.intensity.len(), s.mz.len());
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn parse_spectrum_issue_210() -> Result<(), MzMLError> {
+        // Handle cases where both isolation window target m/z is set and different than selected ion m/z
+        let s = r#"
+        <spectrum id="spectrum=8678309" index="8678309" defaultArrayLength="102" dataProcessingRef="dp_sp_1">
+            <cvParam cvRef="MS" accession="MS:1000127" name="centroid spectrum" />
+            <cvParam cvRef="MS" accession="MS:1000511" name="ms level" value="2" />
+            <precursorList count="1">
+                <precursor>
+                    <isolationWindow>
+                        <cvParam cvRef="MS" accession="MS:1000827" name="isolation window target m/z" value="457.75" unitAccession="MS:1000040" unitName="m/z" unitCvRef="MS" />
+                        <cvParam cvRef="MS" accession="MS:1000828" name="isolation window lower offset" value="1.5" unitAccession="MS:1000040" unitName="m/z" unitCvRef="MS" />
+                        <cvParam cvRef="MS" accession="MS:1000829" name="isolation window upper offset" value="0.75" unitAccession="MS:1000040" unitName="m/z" unitCvRef="MS" />
+                    </isolationWindow>
+                    <selectedIonList count="1">
+                        <selectedIon>
+                            <cvParam cvRef="MS" accession="MS:1000744" name="selected ion m/z" value="457.723968505859" unitAccession="MS:1000040" unitName="m/z" unitCvRef="MS" />
+                            <cvParam cvRef="MS" accession="MS:1000041" name="charge state" value="2" />
+                        </selectedIon>
+                    </selectedIonList>
+                </precursor>
+            </precursorList>
+        </spectrum>
+        "#;
+        let mut spectra = MzMLReader::with_file_id(0).parse(s.as_bytes()).await?;
+
+        assert_eq!(spectra.len(), 1);
+        let s = spectra.pop().unwrap();
+        assert!((s.precursors[0].mz - 457.723968) < 0.0001);
+        assert_eq!(
+            s.precursors[0].isolation_window,
+            Some(Tolerance::Da(-1.5, 0.75))
+        );
+
+        // Check different ordering of fields in mzML
+        let s = r#"
+        <spectrum id="spectrum=8678309" index="8678309" defaultArrayLength="102" dataProcessingRef="dp_sp_1">
+            <cvParam cvRef="MS" accession="MS:1000127" name="centroid spectrum" />
+            <cvParam cvRef="MS" accession="MS:1000511" name="ms level" value="2" />
+            <precursorList count="1">
+                <precursor>
+                    <selectedIonList count="1">
+                        <selectedIon>
+                            <cvParam cvRef="MS" accession="MS:1000744" name="selected ion m/z" value="457.723968505859" unitAccession="MS:1000040" unitName="m/z" unitCvRef="MS" />
+                            <cvParam cvRef="MS" accession="MS:1000041" name="charge state" value="2" />
+                        </selectedIon>
+                    </selectedIonList>
+                    <isolationWindow>
+                        <cvParam cvRef="MS" accession="MS:1000827" name="isolation window target m/z" value="457.75" unitAccession="MS:1000040" unitName="m/z" unitCvRef="MS" />
+                        <cvParam cvRef="MS" accession="MS:1000828" name="isolation window lower offset" value="1.5" unitAccession="MS:1000040" unitName="m/z" unitCvRef="MS" />
+                        <cvParam cvRef="MS" accession="MS:1000829" name="isolation window upper offset" value="0.75" unitAccession="MS:1000040" unitName="m/z" unitCvRef="MS" />
+                    </isolationWindow>
+                </precursor>
+            </precursorList>
+        </spectrum>
+        "#;
+        let mut spectra = MzMLReader::with_file_id(0).parse(s.as_bytes()).await?;
+
+        assert_eq!(spectra.len(), 1);
+        let s = spectra.pop().unwrap();
+        assert!((s.precursors[0].mz - 457.723968) < 0.0001);
+        assert_eq!(
+            s.precursors[0].isolation_window,
+            Some(Tolerance::Da(-1.5, 0.75))
+        );
+
+        // Check fallback keeping iso window m/z of fields in mzML
+        let s = r#"
+        <spectrum id="spectrum=8678309" index="8678309" defaultArrayLength="102" dataProcessingRef="dp_sp_1">
+            <cvParam cvRef="MS" accession="MS:1000127" name="centroid spectrum" />
+            <cvParam cvRef="MS" accession="MS:1000511" name="ms level" value="2" />
+            <precursorList count="1">
+                <precursor>
+                    <isolationWindow>
+                        <cvParam cvRef="MS" accession="MS:1000827" name="isolation window target m/z" value="457.75" unitAccession="MS:1000040" unitName="m/z" unitCvRef="MS" />
+                        <cvParam cvRef="MS" accession="MS:1000828" name="isolation window lower offset" value="1.5" unitAccession="MS:1000040" unitName="m/z" unitCvRef="MS" />
+                        <cvParam cvRef="MS" accession="MS:1000829" name="isolation window upper offset" value="0.75" unitAccession="MS:1000040" unitName="m/z" unitCvRef="MS" />
+                    </isolationWindow>
+                    <selectedIonList count="1">
+                        <selectedIon>
+                            <cvParam cvRef="MS" accession="MS:1000041" name="charge state" value="2" />
+                        </selectedIon>
+                    </selectedIonList>
+                </precursor>
+            </precursorList>
+        </spectrum>
+        "#;
+        let mut spectra = MzMLReader::with_file_id(0).parse(s.as_bytes()).await?;
+
+        assert_eq!(spectra.len(), 1);
+        let s = spectra.pop().unwrap();
+        assert!((s.precursors[0].mz - 457.75) < 0.0001);
+        assert_eq!(
+            s.precursors[0].isolation_window,
+            Some(Tolerance::Da(-1.5, 0.75))
+        );
         Ok(())
     }
 }

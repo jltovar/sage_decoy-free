@@ -1,17 +1,9 @@
 use clap::{value_parser, Arg, Command, ValueHint};
 use rayon::ThreadPoolBuilder;
 use sage_cli::input::Input;
-use sage_cli::runner::Runner; // ← add this to increase stack size to fix stack overflow
+use sage_cli::runner::Runner;
 
 fn main() -> anyhow::Result<()> {
-    // ── enlarge Rayon worker-thread stacks ───────────────────────────
-    ThreadPoolBuilder::new()
-        .stack_size(64 * 1024 * 1024) // 64 MiB per worker thread
-        .build_global()
-        .expect("configure Rayon pool");
-
-    // ── the rest of your original startup code ───────────────────────
-
     env_logger::Builder::default()
         .filter_level(log::LevelFilter::Error)
         .parse_env(env_logger::Env::default().filter_or("SAGE_LOG", "error,sage=info"))
@@ -91,6 +83,13 @@ fn main() -> anyhow::Result<()> {
                 .action(clap::ArgAction::SetFalse)
                 .help("Disable sending telemetry data"),
         )
+        .arg(
+            Arg::new("stack-size")
+                .long("stack-size")
+                .value_parser(value_parser!(u32).range(1..))
+                .help("Set Rayon worker thread stack size in MiB (default: 64 MiB)")
+                .value_hint(ValueHint::Other),
+        )
         .help_template(
             "{usage-heading} {usage}\n\n\
              {about-with-newline}\n\
@@ -98,6 +97,20 @@ fn main() -> anyhow::Result<()> {
              {all-args}{after-help}",
         )
         .get_matches();
+
+    // Decoy-free Lower Order and ensemble workflows can require substantially
+    // more stack than vanilla Sage. Preserve the fork's proven-safe default,
+    // while exposing upstream's override for constrained environments.
+    let stack_size_mib = matches.get_one::<u32>("stack-size").copied().unwrap_or(64);
+    let stack_size_bytes = stack_size_mib as usize * 1024 * 1024;
+    log::trace!(
+        "setting Rayon worker thread stack size to {} MiB",
+        stack_size_mib
+    );
+    ThreadPoolBuilder::new()
+        .stack_size(stack_size_bytes)
+        .build_global()
+        .expect("configure Rayon pool");
 
     let parallel = matches
         .get_one::<u16>("batch-size")
