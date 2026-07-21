@@ -1,15 +1,19 @@
-//! TDC-only protein grouping and inference using IDPicker-style bipartite graph analysis
+//! Protein grouping and inference using IDPicker-style bipartite graph analysis.
 //!
 //! Proteins with identical peptide evidence are collapsed into groups, then a
 //! greedy set cover finds an (almost) minimal set of protein groups that
 //! explains all observed peptides.
+//!
+//! Group construction is shared between TDC and Decoy-Free workflows, but their
+//! statistical calibration remains separate. In particular, Decoy-Free grouping
+//! never invokes picked target-decoy competition.
 //!
 //! Reference: Zhang, B., Chambers, M. C., & Tabb, D. L. (2007). Proteomic
 //! parsimony through bipartite graph analysis improves accuracy and transparency.
 //! J. Proteome Res., 6(9), 3549-3557. https://doi.org/10.1021/pr070230d
 
 use crate::database::{IndexedDatabase, PeptideIx};
-use crate::scoring::TdcFeature;
+use crate::scoring::{DfFeature, TdcFeature};
 use fnv::{FnvHashMap, FnvHashSet};
 use itertools::Itertools;
 use log::info;
@@ -388,6 +392,109 @@ fn annotate_features(
     );
 }
 
+/// Annotate Decoy-Free features with parsimonious protein groups.
+///
+/// Group construction uses only rank-1 target peptides with a finite Decoy-Free
+/// peptide q-value at or below the requested threshold. When grouping is disabled, the
+/// raw protein assignments are still written so downstream code can retain the
+/// historical unique-protein behavior.
+///
+/// This function assigns protein hypotheses only. Their q-values are calculated
+/// separately by `calculate_protein_q_df`; picked target-decoy group FDR is never
+/// used on this path.
+pub fn generate_protein_groups_df(
+    db: &IndexedDatabase,
+    features: &mut [DfFeature],
+    protein_grouping: bool,
+    confident_peptide_threshold: Option<f64>,
+) {
+    let time = Instant::now();
+
+    // This function can be called more than once as the active DF stream is
+    // finalized. Always rebuild from the current peptide q-values.
+    features.par_iter_mut().for_each(|feat| {
+        feat.protein_groups = None;
+        feat.num_protein_groups = 0;
+    });
+
+    if protein_grouping {
+        if confident_peptide_threshold.is_some() {
+            annotate_features_df(features, db, confident_peptide_threshold);
+        }
+        annotate_features_df(features, db, None);
+    }
+
+    // Fail-safe fallback: an ungrouped row keeps its raw protein assignment.
+    // With grouping disabled, num_protein_groups therefore equals num_proteins
+    // and the legacy unique-protein inference contract is unchanged.
+    features
+        .par_iter_mut()
+        .filter(|f| f.protein_groups.is_none())
+        .for_each(|feat| {
+            let peptide = &db[feat.core.peptide_idx];
+            feat.protein_groups = Some(peptide.proteins(&db.decoy_tag, db.generate_decoys));
+            feat.num_protein_groups = peptide.proteins.len() as u32;
+        });
+
+    info!(
+        "Grouped and inferred Decoy-Free proteins in {:?}ms (enabled={})",
+        time.elapsed().as_millis(),
+        protein_grouping
+    );
+}
+
+fn annotate_features_df(
+    features: &mut [DfFeature],
+    db: &IndexedDatabase,
+    confident_peptide_threshold: Option<f64>,
+) {
+    let time = Instant::now();
+    let threshold = confident_peptide_threshold.unwrap_or(1.0).clamp(0.0, 1.0);
+
+    let peptides: FnvHashSet<PeptideIx> = features
+        .par_iter()
+        .filter(|f| {
+            f.core.rank == 1
+                && f.core.label == 1
+                && f.decoy_free_peptide_q
+                    .map(|q| q.is_finite() && q <= threshold)
+                    .unwrap_or(false)
+        })
+        .map(|f| f.core.peptide_idx)
+        .collect();
+
+    info!(
+        "Decoy-Free protein grouping: {} unique peptides (threshold={}) in {:?}ms",
+        peptides.len(),
+        threshold,
+        time.elapsed().as_millis()
+    );
+
+    let lookup = ProteinGrouper::build(db, peptides).into_group_map();
+
+    let annotated: u32 = features
+        .par_iter_mut()
+        .filter(|f| f.protein_groups.is_none())
+        .map(|feat| {
+            let peptide = &db[feat.core.peptide_idx];
+            match lookup.group_string(peptide, db) {
+                Some(groups) => {
+                    feat.num_protein_groups = groups.matches(';').count() as u32 + 1;
+                    feat.protein_groups = Some(groups);
+                    1u32
+                }
+                None => 0,
+            }
+        })
+        .sum();
+
+    info!(
+        "-  annotated {} Decoy-Free features in {:?}ms",
+        annotated,
+        time.elapsed().as_millis()
+    );
+}
+
 #[cfg(test)]
 mod test {
     use super::*;
@@ -455,6 +562,45 @@ mod test {
             generate_decoys: false,
             ..IndexedDatabase::default()
         };
+        (db, features)
+    }
+
+    fn build_db_and_df_features(
+        proteins: &[Vec<&str>],
+        q_vals: &[f64],
+    ) -> (IndexedDatabase, Vec<DfFeature>) {
+        let features = proteins
+            .iter()
+            .enumerate()
+            .map(|(ix, _)| {
+                let mut feature = FeatureCore {
+                    peptide_idx: PeptideIx(ix as u32),
+                    rank: 1,
+                    label: 1,
+                    ..Default::default()
+                }
+                .to_df();
+                feature.decoy_free_peptide_q = Some(q_vals[ix]);
+                feature
+            })
+            .collect();
+
+        let db = IndexedDatabase {
+            peptides: proteins
+                .iter()
+                .enumerate()
+                .map(|(ix, prots)| Peptide {
+                    sequence: format!("PEPTIDE{ix}").into_bytes().into(),
+                    modifications: vec![0.0; format!("PEPTIDE{ix}").len()],
+                    proteins: prots.iter().map(|&s| Arc::from(s)).collect(),
+                    ..Default::default()
+                })
+                .collect(),
+            decoy_tag: "rev_".to_string(),
+            generate_decoys: false,
+            ..IndexedDatabase::default()
+        };
+
         (db, features)
     }
 
@@ -660,5 +806,33 @@ mod test {
         assert_eq!(features[0].num_protein_groups, 1);
         assert_eq!(features[1].num_protein_groups, 1);
         assert_eq!(features[2].num_protein_groups, 2);
+    }
+
+    #[test]
+    fn test_decoy_free_grouping_collapses_indistinguishable_proteins() {
+        let proteins = vec![vec!["protA", "protB"], vec!["protA", "protB"]];
+        let q_vals = vec![0.001, 0.002];
+        let (db, mut features) = build_db_and_df_features(&proteins, &q_vals);
+
+        generate_protein_groups_df(&db, &mut features, true, Some(0.01));
+
+        for feature in features {
+            assert_eq!(feature.protein_groups.as_deref(), Some("protA/protB"));
+            assert_eq!(feature.num_protein_groups, 1);
+        }
+    }
+
+    #[test]
+    fn test_decoy_free_grouping_disabled_preserves_unique_protein_contract() {
+        let proteins = vec![vec!["protA", "protB"], vec!["protC"]];
+        let q_vals = vec![0.001, 0.002];
+        let (db, mut features) = build_db_and_df_features(&proteins, &q_vals);
+
+        generate_protein_groups_df(&db, &mut features, false, Some(0.01));
+
+        assert_eq!(features[0].protein_groups.as_deref(), Some("protA;protB"));
+        assert_eq!(features[0].num_protein_groups, 2);
+        assert_eq!(features[1].protein_groups.as_deref(), Some("protC"));
+        assert_eq!(features[1].num_protein_groups, 1);
     }
 }

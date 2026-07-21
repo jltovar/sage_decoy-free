@@ -686,6 +686,11 @@ pub struct FdrOptions {
     pub protein_fdr: Option<f32>,
     pub precursor_fdr: Option<f32>,
 
+    /// Opt in to IDPicker-style parsimonious protein grouping for Decoy-Free
+    /// protein inference. This is deliberately separate from picked-group FDR:
+    /// group-level evidence remains calibrated by the Decoy-Free model.
+    pub decoy_free_protein_grouping: Option<bool>,
+
     /// Reporting-only option.
     /// If true, accepted peptide-level discoveries may report all rank-1 PSMs
     /// supporting accepted target peptides. This does not change the native
@@ -1009,6 +1014,11 @@ pub struct FdrSettings {
     pub peptide_fdr: f32,
     pub protein_fdr: f32,
     pub precursor_fdr: f32,
+
+    /// Use parsimonious protein groups as the Decoy-Free protein hypotheses.
+    /// Defaults to false so existing validated Decoy-Free configurations retain
+    /// their unique-protein inference until this mode is explicitly evaluated.
+    pub decoy_free_protein_grouping: bool,
 
     /// Reporting-only option.
     /// When true, peptide-accepted rank-1 target PSMs receive a reporting q-value
@@ -1379,6 +1389,8 @@ impl From<FdrOptions> for FdrSettings {
             .protein_q_covariate_weight_strength
             .unwrap_or(0.75)
             .clamp(0.0, 5.0);
+
+        let decoy_free_protein_grouping = options.decoy_free_protein_grouping.unwrap_or(false);
 
         let min_storey_n = options.min_storey_n.unwrap_or(300);
         let min_null_size = options.min_null_size.unwrap_or(300);
@@ -1776,6 +1788,8 @@ impl From<FdrOptions> for FdrSettings {
             peptide_fdr,
             protein_fdr,
             precursor_fdr,
+
+            decoy_free_protein_grouping,
 
             report_psms_by_peptide_q,
 

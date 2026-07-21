@@ -1780,9 +1780,15 @@ impl Runner {
 
         record.push_field(peptide.to_string().as_bytes());
         record.push_field(protein_key.as_bytes());
+        record.push_field(feature.protein_groups.as_deref().unwrap_or("").as_bytes());
         record.push_field(
             itoa::Buffer::new()
                 .format(peptide.proteins.len())
+                .as_bytes(),
+        );
+        record.push_field(
+            itoa::Buffer::new()
+                .format(feature.num_protein_groups)
                 .as_bytes(),
         );
         record.push_field(filenames[core.file_id].as_bytes());
@@ -1942,7 +1948,9 @@ impl Runner {
             "psm_id",
             "peptide",
             "proteins",
+            "protein_groups",
             "num_proteins",
+            "num_protein_groups",
             "filename",
             "scannr",
             "rank",
