@@ -9,8 +9,6 @@ from pathlib import Path
 import pandas as pd
 import psm_utils.io
 from psm_utils import PSM, PSMList
-from ms2rescore.feature_generators import FEATURE_GENERATORS
-from ms2rescore.parse_spectra import add_precursor_values
 
 
 def spectrum_path_for_raw_file(raw_file, configured_paths):
@@ -134,7 +132,15 @@ def main():
 
     with open(args.config) as handle:
         cfg = json.load(handle)
-    
+
+    # Keep these imports out of module scope. MS2PIP uses Python's "spawn"
+    # multiprocessing context, which imports this script as __mp_main__ in every
+    # worker. Importing MS2Rescore at module scope also imports DeepLC/TensorFlow,
+    # causing every CPU worker to initialize CUDA and potentially exhaust GPU
+    # memory. The parent process still loads MS2Rescore normally when main runs.
+    from ms2rescore.feature_generators import FEATURE_GENERATORS
+    from ms2rescore.parse_spectra import add_precursor_values
+
     log_level = str(cfg.get("log_level", "info")).upper()
     logging.basicConfig(
         level=getattr(logging, log_level, logging.INFO),
