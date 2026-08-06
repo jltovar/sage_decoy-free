@@ -27,7 +27,8 @@ species FASTAs, and a workflow JSON. The workflow will:
 7. evaluate requested null windows in memory from those retained candidates;
 8. lock the highest-yield window satisfying PSM, peptide, and protein entrapment-FDP limits;
 9. measure MS2Rescore and retain it only when its configured gain/calibration gates pass;
-10. run the target-only search using the locked configuration;
+10. run the target-only search under an explicit calibration policy, defaulting to a locked
+    dataset-local window with nuisance parameters refit in the target-only candidate space;
 11. assemble Ensemble automatically from the independently selected expert windows and
     stage-matched frozen artifacts;
 12. emit raw-q and Level-4/reportable counts, FDP, direct optimized/MS2Rescore/target-only
@@ -162,13 +163,49 @@ annotation is requested. If MS2Rescore is selected for that stage, its external 
 still independently cacheable under the target-only search fingerprint. No annotation cache can
 cross a FASTA, dataset, candidate calibration, generator environment, or rank-depth boundary.
 
+## Phase 5: explicit target-only calibration
+
+`target_only_calibration_policy` replaces the ambiguous term "locked" and defaults to
+`refit_with_locked_window`. The setting is workflow-wide and can be overridden on an individual
+model while Lower Order is being evaluated. The policies are:
+
+- `refit_with_locked_window`: retain the window selected on the dataset's +entrapment search, but
+  re-estimate nuisance parameters in the target-only candidate space. Target-only outcomes never
+  retune the window. This is the initial legacy-parity policy and the default.
+- `reuse_dataset_artifact`: apply the complete fitted +entrapment artifact from the same dataset
+  without refitting its nuisance state. Artifact model, dataset, search configuration, source
+  candidate fingerprint, and `sage-candidate-id-v1` schema must match or the stage fails closed.
+- `compare_both`: materialize both interpretations in separate directories and validation rows.
+  The refit result is the release candidate; reuse is retained as a diagnostic comparison and
+  cannot veto that release candidate.
+
+Every target-only checkpoint records the policy plus a separate `window_provenance` object with
+the source dataset, model, +entrapment stage, selected ranks, source artifact hash, candidate
+fingerprint, and candidate-ID schema. Fitted nuisance-state provenance remains in
+`fitted_model_artifacts.json`; it is not conflated with window provenance.
+
+The first target-only interpretation always performs a fresh target-FASTA spectrum search and
+writes its own immutable candidate pool and, when needed, MS2Rescore annotation cache. Under
+`compare_both`, the second interpretation reuses that exact target-only candidate pool, so the
+policy comparison cannot be confounded by a second spectrum search. Its MS2Rescore annotation
+cache is reused only when the preliminary calibration inputs are identical; otherwise Phase 4's
+fingerprint correctly generates a policy-specific annotation set. If matched-fragment output is
+requested, it is materialized for the first (refit/release) interpretation; immutable candidate
+pools deliberately do not persist fragment payloads for the diagnostic second stage.
+
+Legacy validation manifests with a stage named `target_only` remain readable. For engineering
+parity, that legacy name maps only to `target_only_refit_with_locked_window`, because the frozen
+legacy shell workflow retained the window and refit the target-only nuisance parameters.
+
 ## Portable Nokoi
 
 Nokoi now writes its final logistic model, exact feature schema, imputation medians,
 normalization means/standard deviations, selected L1 penalty, deterministic fold metadata,
 out-of-fold null-score distribution, dataset-local pi0, and frozen monotone p-to-PEP calibration.
-The target-only stage may evaluate the artifact fitted earlier in the same dataset workflow
-without training a new classifier or re-estimating the null/PEP calibration. A separate holdout
+The `reuse_dataset_artifact` target-only policy may evaluate the artifact fitted earlier in the
+same dataset workflow without training a new classifier or re-estimating the null/PEP calibration.
+The default `refit_with_locked_window` interpretation instead refits Nokoi in the target-only
+candidate space and must be evaluated during model-specific parity. A separate holdout
 dataset fits its own Nokoi model and null window under the same predeclared procedure. Missing,
 cross-dataset, incompatible, or incomplete artifacts fail closed.
 
@@ -193,10 +230,11 @@ workflows.
 
 The entrapment search writes `lower_order_model_artifact.json`. It contains the complete fitted
 charge-stratified model, rank window, TEV transformation, candidate-count power/scale,
-extrapolation strength, version, and reference candidate-count distribution. The target-only
-stage validates and loads this artifact without refitting. Candidate counts are empirically
-quantile-normalized to the reference +entrapment distribution. Missing or incompatible artifacts
-fail closed.
+extrapolation strength, version, and reference candidate-count distribution. Under
+`reuse_dataset_artifact`, the target-only stage validates and loads this artifact without
+refitting. Candidate counts are empirically quantile-normalized to the reference +entrapment
+distribution. Under `refit_with_locked_window`, Lower Order retains only its selected ranks and
+fits target-only nuisance state. Missing or incompatible reuse artifacts fail closed.
 
 This normalization is intentionally auditable and must first pass the complete ISB18 parity and
 same-dataset target-only tests before Lower Order is restored as an Ensemble default. A costly
@@ -228,6 +266,11 @@ match. Important workflow reports include:
 - `validation.release_gate.json`
 - `ensemble.lock.json`
 - `workflow.state.json`
+
+Concrete target-only results are written under
+`MODEL/target_only/refit_with_locked_window/` and/or
+`MODEL/target_only/reuse_dataset_artifact/`. Their stage names and validation rows are likewise
+explicit; `compare_both` never overwrites one interpretation with the other.
 
 Expert reports mark an accepted entrapment count below the configured stability minimum as
 underpowered even when the point FDP estimate is zero. The warning is not an automatic veto,

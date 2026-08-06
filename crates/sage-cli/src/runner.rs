@@ -654,7 +654,10 @@ impl Runner {
         let mut outputs = if let (Some(request), Some((search, analysis, directory))) =
             (candidate_pool.as_ref(), pool_identity.as_ref())
         {
-            if inspect_compatible_pool(directory, search, request.required_rank_depth)?.is_some() {
+            if request.allow_reuse
+                && inspect_compatible_pool(directory, search, request.required_rank_depth)?
+                    .is_some()
+            {
                 anyhow::ensure!(
                     !self.parameters.quant.lfq
                         && self.parameters.quant.tmt.is_none()

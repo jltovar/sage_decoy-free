@@ -10245,6 +10245,14 @@ pub struct FittedArtifactProvenance {
     pub dataset_id: String,
     pub dataset_fingerprint: String,
     pub search_config_sha256: String,
+    /// Strict fingerprint of the immutable candidate population on which the
+    /// nuisance state was fitted.
+    #[serde(default)]
+    pub fit_search_fingerprint: String,
+    /// Durable candidate identity contract used by cached joins and artifact
+    /// provenance validation.
+    #[serde(default)]
+    pub candidate_id_schema: String,
     pub fit_stage: String,
     pub model: String,
 }

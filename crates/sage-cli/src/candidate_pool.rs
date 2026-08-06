@@ -113,6 +113,11 @@ pub struct CandidatePoolEntry {
 pub struct CandidatePoolRequest {
     pub root: PathBuf,
     pub required_rank_depth: usize,
+    /// Whether an existing compatible pool may satisfy this request. Workflow
+    /// stages set this to false when a fresh search is methodologically
+    /// required, while still writing the resulting immutable pool for a later
+    /// analysis of the same candidate population.
+    pub allow_reuse: bool,
 }
 
 fn sha256_bytes(bytes: &[u8]) -> String {
@@ -633,6 +638,7 @@ mod tests {
                 Some(CandidatePoolRequest {
                     root: pool_root.clone(),
                     required_rank_depth: 1,
+                    allow_reuse: true,
                 }),
             )
             .unwrap();
@@ -647,6 +653,7 @@ mod tests {
                 Some(CandidatePoolRequest {
                     root: pool_root,
                     required_rank_depth: 1,
+                    allow_reuse: true,
                 }),
             )
             .unwrap();
@@ -660,6 +667,20 @@ mod tests {
             first_usage.analysis_fingerprint,
             second_usage.analysis_fingerprint
         );
+
+        let forced = Runner::new(build_search(&root.join("forced"), 0.03), 1).unwrap();
+        let (_, forced_usage) = forced
+            .run_with_candidate_pool(
+                1,
+                false,
+                Some(CandidatePoolRequest {
+                    root: root.join("pools"),
+                    required_rank_depth: 1,
+                    allow_reuse: false,
+                }),
+            )
+            .unwrap();
+        assert!(!forced_usage.unwrap().reused);
         std::fs::remove_dir_all(root).unwrap();
     }
 }

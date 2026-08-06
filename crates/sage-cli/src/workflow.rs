@@ -1,5 +1,6 @@
 use crate::candidate_pool::{
     content_sha256, search_fingerprint, CandidatePoolRequest, CandidatePoolUsage,
+    CANDIDATE_ID_SCHEMA,
 };
 use crate::entrapment::{
     compare_generated_to_legacy, entrapment_generation_input_sha256, generate_foreign_entrapment,
@@ -15,10 +16,11 @@ use crate::input::Input;
 use crate::provenance::{freeze_baseline, sha256_file, write_json_atomic, BaselineManifest};
 use crate::runner::Runner;
 use crate::validation::{
-    accepted_target_peptides, expert_quality_gates, parity_comparisons, stage_comparisons,
-    summarize_run, tdc_benchmark_comparisons, transfer_stability, EffectiveRatios,
-    ExpertQualityGate, ParityComparison, ParityPair, RunValidationSummary, StageComparison,
-    TdcBenchmarkComparison, ValidationMode, ValidationRun,
+    accepted_target_peptides, expert_quality_gates, is_target_only_stage, parity_comparisons,
+    stage_comparisons, summarize_run, tdc_benchmark_comparisons, transfer_stability,
+    EffectiveRatios, ExpertQualityGate, ParityComparison, ParityPair, RunValidationSummary,
+    StageComparison, TargetOnlyCalibrationPolicy, TdcBenchmarkComparison, ValidationMode,
+    ValidationRun,
 };
 use anyhow::{Context, Result};
 use sage_core::decoy_free_fdr::{DfRunArtifacts, FittedArtifactProvenance};
@@ -67,6 +69,10 @@ pub struct ModelWorkflow {
     pub maximum_raw_fdp_increase: Option<f64>,
     #[serde(default)]
     pub minimum_level4_peptide_gain: Option<usize>,
+    /// Optional model-specific exception to the workflow-wide target-only
+    /// calibration policy (for example, while Lower Order is evaluated).
+    #[serde(default)]
+    pub target_only_calibration_policy: Option<TargetOnlyCalibrationPolicy>,
 }
 
 #[derive(Clone, Debug, Serialize, Deserialize)]
@@ -190,6 +196,10 @@ pub struct EnsembleExpertLock {
     pub incremental_target_peptides: usize,
     pub gate_reasons: Vec<String>,
     pub gate_warnings: Vec<String>,
+    #[serde(default)]
+    pub fit_search_fingerprint: String,
+    #[serde(default)]
+    pub candidate_id_schema: String,
 }
 
 #[derive(Clone, Debug, Serialize, Deserialize)]
@@ -211,6 +221,7 @@ struct CompletedExpert {
     calibration_stage: String,
     calibration_results: PathBuf,
     target_only_results: PathBuf,
+    calibration_search_fingerprint: String,
 }
 
 struct SharedDatabase {
@@ -251,6 +262,38 @@ pub struct WorkflowManifest {
     pub locked_expert_artifacts: BTreeMap<String, PathBuf>,
     #[serde(default)]
     pub artifact_reuse_policy: ArtifactReusePolicy,
+    /// Dataset-local target-only calibration semantics. The parity-oriented
+    /// default locks the selected window but refits nuisance state.
+    #[serde(default)]
+    pub target_only_calibration_policy: TargetOnlyCalibrationPolicy,
+}
+
+#[derive(Clone, Debug, Serialize, Deserialize)]
+pub struct WindowProvenance {
+    pub schema_version: u32,
+    pub source_stage: String,
+    pub source_model: String,
+    pub source_dataset_id: String,
+    pub source_dataset_fingerprint: String,
+    #[serde(default)]
+    pub min_rank: Option<u32>,
+    #[serde(default)]
+    pub max_rank: Option<u32>,
+    #[serde(default)]
+    pub source_fitted_artifact: Option<PathBuf>,
+    #[serde(default)]
+    pub source_fitted_artifact_sha256: Option<String>,
+    #[serde(default)]
+    pub source_search_fingerprint: Option<String>,
+    pub candidate_id_schema: String,
+}
+
+#[derive(Clone, Debug, Serialize)]
+struct TargetOnlyStageContext {
+    policy: TargetOnlyCalibrationPolicy,
+    release_candidate: bool,
+    window_provenance: WindowProvenance,
+    allow_candidate_pool_reuse: bool,
 }
 
 #[derive(Clone, Debug, Serialize, Deserialize)]
@@ -273,6 +316,12 @@ pub struct StageRecord {
     pub candidate_pool: Option<CandidatePoolUsage>,
     #[serde(default)]
     pub ms2rescore_annotation_cache: Option<ExternalAnnotationCacheUsage>,
+    #[serde(default)]
+    pub target_only_calibration_policy: Option<TargetOnlyCalibrationPolicy>,
+    #[serde(default = "default_true")]
+    pub release_candidate: bool,
+    #[serde(default)]
+    pub window_provenance: Option<WindowProvenance>,
 }
 
 #[derive(Clone, Debug, Serialize, Deserialize)]
@@ -336,6 +385,23 @@ fn default_minimum_entrapment_peptides_for_stable_estimate() -> usize {
 }
 fn default_parity_tolerance() -> f64 {
     0.001
+}
+
+fn concrete_target_only_policies(
+    policy: TargetOnlyCalibrationPolicy,
+) -> Vec<(TargetOnlyCalibrationPolicy, bool)> {
+    match policy {
+        TargetOnlyCalibrationPolicy::RefitWithLockedWindow => {
+            vec![(TargetOnlyCalibrationPolicy::RefitWithLockedWindow, true)]
+        }
+        TargetOnlyCalibrationPolicy::ReuseDatasetArtifact => {
+            vec![(TargetOnlyCalibrationPolicy::ReuseDatasetArtifact, true)]
+        }
+        TargetOnlyCalibrationPolicy::CompareBoth => vec![
+            (TargetOnlyCalibrationPolicy::RefitWithLockedWindow, true),
+            (TargetOnlyCalibrationPolicy::ReuseDatasetArtifact, false),
+        ],
+    }
 }
 
 impl WorkflowManifest {
@@ -712,6 +778,7 @@ fn apply_ensemble_lock(
     external: bool,
     dataset: &DatasetIdentity,
     policy: &ArtifactReusePolicy,
+    reuse_fitted_artifacts: bool,
 ) -> Result<()> {
     fdr.enable_moments = Some(false);
     fdr.enable_mle = Some(false);
@@ -726,6 +793,20 @@ fn apply_ensemble_lock(
         "Ensemble lock has only {enabled} eligible experts"
     );
     for expert in lock.experts.iter().filter(|expert| expert.enabled) {
+        apply_window(fdr, &expert.model, &expert.window);
+        match expert.model {
+            ModelFit::Moments => fdr.enable_moments = Some(true),
+            ModelFit::Mle => fdr.enable_mle = Some(true),
+            ModelFit::LowerOrder => fdr.enable_lower_order = Some(true),
+            ModelFit::Msfdr => fdr.enable_msfdr_seeded = Some(true),
+            ModelFit::Msfdr1Smix => fdr.enable_msfdr_1smix = Some(true),
+            ModelFit::Msfdr2Smix => fdr.enable_msfdr_2smix = Some(true),
+            ModelFit::Nokoi => fdr.enable_nokoi = Some(true),
+            ModelFit::Ensemble => anyhow::bail!("nested Ensemble expert is invalid"),
+        }
+        if !reuse_fitted_artifacts {
+            continue;
+        }
         let (artifact_path, expected_sha256) = if external {
             (
                 expert
@@ -763,32 +844,31 @@ fn apply_ensemble_lock(
             "Ensemble expert artifact does not contain {:?}",
             expert.model
         );
-        validate_artifact_reuse(&artifacts, dataset, policy, &expert.model)?;
-        apply_window(fdr, &expert.model, &expert.window);
-        match expert.model {
-            ModelFit::Moments => {
-                fdr.enable_moments = Some(true);
+        match policy {
+            ArtifactReusePolicy::DatasetLocalOnly => anyhow::ensure!(
+                expert.candidate_id_schema == CANDIDATE_ID_SCHEMA
+                    && !expert.fit_search_fingerprint.is_empty(),
+                "Ensemble expert {:?} search provenance is missing or incompatible",
+                expert.model
+            ),
+            ArtifactReusePolicy::CrossDatasetDiagnostic
+                if expert.candidate_id_schema != CANDIDATE_ID_SCHEMA
+                    || expert.fit_search_fingerprint.is_empty() =>
+            {
+                log::warn!(
+                    "cross-dataset diagnostic Ensemble expert {:?} lacks Phase 5 search provenance",
+                    expert.model
+                );
             }
-            ModelFit::Mle => {
-                fdr.enable_mle = Some(true);
-            }
-            ModelFit::LowerOrder => {
-                fdr.enable_lower_order = Some(true);
-            }
-            ModelFit::Msfdr => {
-                fdr.enable_msfdr_seeded = Some(true);
-            }
-            ModelFit::Msfdr1Smix => {
-                fdr.enable_msfdr_1smix = Some(true);
-            }
-            ModelFit::Msfdr2Smix => {
-                fdr.enable_msfdr_2smix = Some(true);
-            }
-            ModelFit::Nokoi => {
-                fdr.enable_nokoi = Some(true);
-            }
-            ModelFit::Ensemble => anyhow::bail!("nested Ensemble expert is invalid"),
+            ArtifactReusePolicy::CrossDatasetDiagnostic => {}
         }
+        validate_artifact_reuse(
+            &artifacts,
+            dataset,
+            policy,
+            &expert.model,
+            Some(&expert.fit_search_fingerprint),
+        )?;
         apply_fitted_artifacts(fdr, &expert.model, artifacts)?;
     }
     Ok(())
@@ -832,6 +912,7 @@ fn build_ensemble_lock(
                 dataset,
                 &ArtifactReusePolicy::DatasetLocalOnly,
                 &expert.model,
+                Some(&expert.calibration_search_fingerprint),
             ) {
                 reasons.push(format!("optimized artifact provenance is invalid: {error}"));
             }
@@ -854,6 +935,7 @@ fn build_ensemble_lock(
                             dataset,
                             &ArtifactReusePolicy::DatasetLocalOnly,
                             &expert.model,
+                            Some(&expert.calibration_search_fingerprint),
                         )
                         .is_ok()
                 });
@@ -868,6 +950,8 @@ fn build_ensemble_lock(
             mode: ValidationMode::DecoyFree,
             expected_search_space: Some("+Ent".into()),
             calibration_stage: None,
+            target_only_calibration_policy: None,
+            release_candidate: true,
         };
         let summaries = summarize_run(
             &run,
@@ -996,6 +1080,8 @@ fn build_ensemble_lock(
             incremental_target_peptides: incremental,
             gate_reasons: reasons,
             gate_warnings: warnings,
+            fit_search_fingerprint: expert.calibration_search_fingerprint.clone(),
+            candidate_id_schema: CANDIDATE_ID_SCHEMA.into(),
         });
     }
     let enabled = locked.iter().filter(|expert| expert.enabled).count();
@@ -1005,7 +1091,7 @@ fn build_ensemble_lock(
         manifest.validation.minimum_ensemble_experts
     );
     Ok(EnsembleLock {
-        schema_version: 2,
+        schema_version: 3,
         source_manifest_hash: manifest_hash.into(),
         dataset_fingerprint: dataset.fingerprint.clone(),
         experts: locked,
@@ -1017,12 +1103,15 @@ fn fitted_artifact_provenance(
     dataset: &DatasetIdentity,
     stage: &str,
     model: &ModelFit,
+    fit_search_fingerprint: &str,
 ) -> FittedArtifactProvenance {
     FittedArtifactProvenance {
-        schema_version: 1,
+        schema_version: 2,
         dataset_id: dataset.dataset_id.clone(),
         dataset_fingerprint: dataset.fingerprint.clone(),
         search_config_sha256: dataset.search_config_sha256.clone(),
+        fit_search_fingerprint: fit_search_fingerprint.into(),
+        candidate_id_schema: CANDIDATE_ID_SCHEMA.into(),
         fit_stage: stage.into(),
         model: model_slug(model).into(),
     }
@@ -1033,6 +1122,7 @@ fn validate_artifact_reuse(
     dataset: &DatasetIdentity,
     policy: &ArtifactReusePolicy,
     expected_model: &ModelFit,
+    expected_fit_search_fingerprint: Option<&str>,
 ) -> Result<()> {
     let Some(provenance) = artifacts.provenance.as_ref() else {
         return match policy {
@@ -1047,16 +1137,16 @@ fn validate_artifact_reuse(
             }
         };
     };
-    anyhow::ensure!(
-        provenance.schema_version == 1,
-        "unsupported fitted artifact provenance schema {}",
-        provenance.schema_version
-    );
     let dataset_matches = provenance.dataset_fingerprint == dataset.fingerprint;
     let config_matches = provenance.search_config_sha256 == dataset.search_config_sha256;
     let model_matches = provenance.model == model_slug(expected_model);
     match policy {
         ArtifactReusePolicy::DatasetLocalOnly => {
+            anyhow::ensure!(
+                provenance.schema_version == 2,
+                "fitted artifact provenance schema {} lacks Phase 5 search-assumption safeguards",
+                provenance.schema_version
+            );
             anyhow::ensure!(
                 dataset_matches,
                 "artifact was fitted on dataset '{}' ({}) but current dataset is '{}' ({})",
@@ -1075,8 +1165,32 @@ fn validate_artifact_reuse(
                 provenance.model,
                 expected_model
             );
+            anyhow::ensure!(
+                provenance.candidate_id_schema == CANDIDATE_ID_SCHEMA,
+                "artifact candidate identity schema '{}' does not match '{}'",
+                provenance.candidate_id_schema,
+                CANDIDATE_ID_SCHEMA
+            );
+            anyhow::ensure!(
+                !provenance.fit_search_fingerprint.is_empty(),
+                "artifact fit search fingerprint is missing"
+            );
+            if let Some(expected) = expected_fit_search_fingerprint {
+                anyhow::ensure!(
+                    provenance.fit_search_fingerprint == expected,
+                    "artifact fit search fingerprint does not match the selected calibration candidate pool"
+                );
+            }
         }
         ArtifactReusePolicy::CrossDatasetDiagnostic => {
+            if provenance.schema_version != 2
+                || provenance.candidate_id_schema != CANDIDATE_ID_SCHEMA
+                || provenance.fit_search_fingerprint.is_empty()
+            {
+                log::warn!(
+                    "cross-dataset diagnostic artifact lacks complete Phase 5 search provenance"
+                );
+            }
             if !dataset_matches || !config_matches || !model_matches {
                 log::warn!(
                     "explicit diagnostic-only artifact reuse: fit_dataset={} current_dataset={} fit_config={} current_config={} fit_model={} current_model={}",
@@ -1099,6 +1213,7 @@ fn stamp_fitted_artifacts(
     stage: &str,
     model: &ModelFit,
     inherited: Option<FittedArtifactProvenance>,
+    fit_search_fingerprint: &str,
 ) -> Result<Option<FittedArtifactProvenance>> {
     let path = output_directory.join("fitted_model_artifacts.json");
     if !path.is_file() {
@@ -1106,7 +1221,9 @@ fn stamp_fitted_artifacts(
     }
     let mut artifacts: DfRunArtifacts = serde_json::from_slice(&std::fs::read(&path)?)
         .with_context(|| format!("invalid fitted artifacts {}", path.display()))?;
-    let provenance = inherited.unwrap_or_else(|| fitted_artifact_provenance(dataset, stage, model));
+    let provenance = inherited.unwrap_or_else(|| {
+        fitted_artifact_provenance(dataset, stage, model, fit_search_fingerprint)
+    });
     artifacts.provenance = Some(provenance.clone());
     write_json_atomic(&path, &artifacts)?;
     Ok(Some(provenance))
@@ -1121,9 +1238,10 @@ fn hash_stage(
     external: bool,
     frozen_artifact: Option<&Path>,
     ensemble_lock: Option<&EnsembleLock>,
+    target_only: Option<&TargetOnlyStageContext>,
 ) -> Result<String> {
     let mut hasher = Sha256::new();
-    hasher.update(b"sage-workflow-stage-v4-ms2rescore-annotation-cache\0");
+    hasher.update(b"sage-workflow-stage-v5-explicit-target-calibration\0");
     hasher.update(serde_json::to_vec(manifest)?);
     hasher.update(serde_json::to_vec(model)?);
     hasher.update(dataset.fingerprint.as_bytes());
@@ -1150,6 +1268,9 @@ fn hash_stage(
     if let Some(lock) = ensemble_lock {
         hasher.update(serde_json::to_vec(lock)?);
     }
+    if let Some(target_only) = target_only {
+        hasher.update(serde_json::to_vec(target_only)?);
+    }
     Ok(format!("{:x}", hasher.finalize()))
 }
 
@@ -1166,8 +1287,34 @@ fn run_search_stage(
     plan_only: bool,
     frozen_model_artifacts: Option<&Path>,
     ensemble_lock: Option<&EnsembleLock>,
+    target_only: Option<&TargetOnlyStageContext>,
     runtime: &mut WorkflowRuntime,
 ) -> Result<StageRecord> {
+    if let Some(context) = target_only {
+        anyhow::ensure!(
+            context.policy != TargetOnlyCalibrationPolicy::CompareBoth,
+            "compare_both must be expanded into concrete target-only stages"
+        );
+        anyhow::ensure!(
+            stage == context.policy.stage_name(),
+            "target-only stage name does not match its calibration policy"
+        );
+        match context.policy {
+            TargetOnlyCalibrationPolicy::RefitWithLockedWindow => anyhow::ensure!(
+                frozen_model_artifacts.is_none(),
+                "refit_with_locked_window must not receive fitted nuisance state"
+            ),
+            TargetOnlyCalibrationPolicy::ReuseDatasetArtifact => {
+                if !plan_only && model.model != ModelFit::Ensemble {
+                    anyhow::ensure!(
+                        frozen_model_artifacts.is_some(),
+                        "reuse_dataset_artifact requires a fitted dataset-local artifact"
+                    );
+                }
+            }
+            TargetOnlyCalibrationPolicy::CompareBoth => unreachable!(),
+        }
+    }
     let input_hash = hash_stage(
         manifest,
         dataset,
@@ -1177,6 +1324,7 @@ fn run_search_stage(
         external,
         frozen_model_artifacts,
         ensemble_lock,
+        target_only,
     )?;
     let results = output_directory.join("results.sage.tsv");
     let config_snapshot = output_directory.join("workflow.search.resolved.json");
@@ -1230,6 +1378,9 @@ fn run_search_stage(
             external,
             dataset,
             &manifest.artifact_reuse_policy,
+            target_only.is_none_or(|context| {
+                context.policy == TargetOnlyCalibrationPolicy::ReuseDatasetArtifact
+            }),
         )?;
     }
     apply_window(fdr, &model.model, &model.window);
@@ -1261,6 +1412,12 @@ fn run_search_stage(
             dataset,
             &manifest.artifact_reuse_policy,
             &model.model,
+            target_only.and_then(|context| {
+                context
+                    .window_provenance
+                    .source_search_fingerprint
+                    .as_deref()
+            }),
         )?;
         let provenance = artifacts.provenance.clone().or_else(|| {
             (manifest.artifact_reuse_policy == ArtifactReusePolicy::CrossDatasetDiagnostic).then(
@@ -1272,6 +1429,8 @@ fn run_search_stage(
                         sha256_file(path).unwrap_or_else(|_| "unavailable".into())
                     ),
                     search_config_sha256: "unknown".into(),
+                    fit_search_fingerprint: String::new(),
+                    candidate_id_schema: String::new(),
                     fit_stage: "unknown".into(),
                     model: model_slug(&model.model).into(),
                 },
@@ -1308,10 +1467,16 @@ fn run_search_stage(
         results,
         config_snapshot: config_snapshot.clone(),
         external_features_enabled: external,
-        calibration_mode: if frozen_model_artifacts.is_some() {
-            "locked_fitted_artifact".into()
-        } else {
-            "fit_current_search_space".into()
+        calibration_mode: match target_only.map(|context| context.policy) {
+            Some(TargetOnlyCalibrationPolicy::RefitWithLockedWindow) => {
+                "refit_with_locked_window".into()
+            }
+            Some(TargetOnlyCalibrationPolicy::ReuseDatasetArtifact) => {
+                "reuse_dataset_artifact".into()
+            }
+            Some(TargetOnlyCalibrationPolicy::CompareBoth) => unreachable!(),
+            None if frozen_model_artifacts.is_some() => "reuse_dataset_artifact".into(),
+            None => "fit_current_search_space".into(),
         },
         dataset_id: dataset.dataset_id.clone(),
         dataset_fingerprint: dataset.fingerprint.clone(),
@@ -1320,6 +1485,9 @@ fn run_search_stage(
             .map(|provenance| provenance.dataset_fingerprint.clone()),
         candidate_pool: None,
         ms2rescore_annotation_cache: None,
+        target_only_calibration_policy: target_only.map(|context| context.policy),
+        release_candidate: target_only.is_none_or(|context| context.release_candidate),
+        window_provenance: target_only.map(|context| context.window_provenance.clone()),
     };
     std::fs::create_dir_all(output_directory)?;
     write_json_atomic(&checkpoint, &record)?;
@@ -1351,29 +1519,33 @@ fn run_search_stage(
     // actual search parameters that produced or consumed the pool.
     write_json_atomic(&config_snapshot, &runner.parameters)?;
 
-    let candidate_pool = matches!(stage, "optimized" | "ms2rescore").then(|| {
-        let requested_by_model = model
-            .candidate_windows
-            .iter()
-            .map(|window| window.max_rank as usize)
-            .chain(model.window.iter().map(|window| window.max_rank as usize))
-            .max()
-            .unwrap_or(1);
-        let requested_by_external = external.then_some(
-            runner
-                .parameters
-                .external_features
-                .max_rank
-                .map(|rank| rank as usize)
-                .unwrap_or(runner.parameters.report_psms),
-        );
-        CandidatePoolRequest {
-            root: manifest.output_root.join("candidate_pools"),
-            required_rank_depth: requested_by_external
-                .map(|rank| rank.max(requested_by_model))
-                .unwrap_or(requested_by_model),
-        }
-    });
+    let candidate_pool = (matches!(stage, "optimized" | "ms2rescore") || target_only.is_some())
+        .then(|| {
+            let requested_by_model = model
+                .candidate_windows
+                .iter()
+                .map(|window| window.max_rank as usize)
+                .chain(model.window.iter().map(|window| window.max_rank as usize))
+                .max()
+                .unwrap_or(1);
+            let requested_by_external = external.then_some(
+                runner
+                    .parameters
+                    .external_features
+                    .max_rank
+                    .map(|rank| rank as usize)
+                    .unwrap_or(runner.parameters.report_psms),
+            );
+            CandidatePoolRequest {
+                root: manifest.output_root.join("candidate_pools"),
+                required_rank_depth: requested_by_external
+                    .map(|rank| rank.max(requested_by_model))
+                    .unwrap_or(requested_by_model),
+                allow_reuse: target_only
+                    .map(|context| context.allow_candidate_pool_reuse)
+                    .unwrap_or(true),
+            }
+        });
     let annotation_cache = external.then(|| ExternalAnnotationCacheRequest {
         root: manifest.output_root.join("ms2rescore_annotations"),
     });
@@ -1401,6 +1573,12 @@ fn run_search_stage(
         stage,
         &model.model,
         inherited_artifact_provenance,
+        record
+            .candidate_pool
+            .as_ref()
+            .context("fitted workflow stage has no candidate-pool provenance")?
+            .search_fingerprint
+            .as_str(),
     )?;
     record.artifact_fit_dataset_fingerprint = stamped
         .as_ref()
@@ -1602,6 +1780,7 @@ pub fn execute_workflow(
             plan_only,
             imported_diagnostic_artifact,
             ensemble_lock.as_ref(),
+            None,
             &mut runtime,
         )?;
         stages.push(optimized.clone());
@@ -1640,6 +1819,7 @@ pub fn execute_workflow(
                 plan_only,
                 imported_diagnostic_artifact,
                 ensemble_lock.as_ref(),
+                None,
                 &mut runtime,
             )?;
             stages.push(record.clone());
@@ -1661,6 +1841,8 @@ pub fn execute_workflow(
                         mode: ValidationMode::DecoyFree,
                         expected_search_space: Some("+Ent".into()),
                         calibration_stage: None,
+                        target_only_calibration_policy: None,
+                        release_candidate: true,
                     },
                     &manifest.validation.effective_ratios,
                     manifest.validation.fdr_threshold,
@@ -1673,6 +1855,8 @@ pub fn execute_workflow(
                         mode: ValidationMode::DecoyFree,
                         expected_search_space: Some("+Ent".into()),
                         calibration_stage: None,
+                        target_only_calibration_policy: None,
+                        release_candidate: true,
                     },
                     &manifest.validation.effective_ratios,
                     manifest.validation.fdr_threshold,
@@ -1715,22 +1899,77 @@ pub fn execute_workflow(
         } else {
             anyhow::bail!("fitted model artifacts were not produced by the entrapment search")
         };
-        let target_only = run_search_stage(
-            &manifest,
-            &dataset,
-            &locked_model,
-            "target_only",
-            &manifest.target_fasta,
-            &model_root.join("target_only"),
-            use_ms2_for_final,
-            manifest.annotate_target_matches,
-            parallel,
-            plan_only,
-            frozen_model_artifacts,
-            ensemble_lock.as_ref(),
-            &mut runtime,
-        )?;
-        stages.push(target_only.clone());
+        let calibration_record = if use_ms2_for_final {
+            ms2_record
+                .as_ref()
+                .context("selected MS2Rescore stage is missing")?
+        } else {
+            &optimized
+        };
+        let selected_artifact = frozen_model_artifacts.map(Path::to_path_buf);
+        let window_provenance = WindowProvenance {
+            schema_version: 1,
+            source_stage: calibration_record.stage.clone(),
+            source_model: model_slug(&locked_model.model).into(),
+            source_dataset_id: dataset.dataset_id.clone(),
+            source_dataset_fingerprint: dataset.fingerprint.clone(),
+            min_rank: locked_model.window.as_ref().map(|window| window.min_rank),
+            max_rank: locked_model.window.as_ref().map(|window| window.max_rank),
+            source_fitted_artifact: selected_artifact.clone(),
+            source_fitted_artifact_sha256: selected_artifact
+                .as_ref()
+                .filter(|path| path.is_file())
+                .map(|path| sha256_file(path))
+                .transpose()?,
+            source_search_fingerprint: calibration_record
+                .candidate_pool
+                .as_ref()
+                .map(|usage| usage.search_fingerprint.clone()),
+            candidate_id_schema: CANDIDATE_ID_SCHEMA.into(),
+        };
+        let requested_policy = locked_model
+            .target_only_calibration_policy
+            .unwrap_or(manifest.target_only_calibration_policy);
+        let target_policies = concrete_target_only_policies(requested_policy);
+        let mut release_target_only = None;
+        for (index, (policy, release_candidate)) in target_policies.iter().copied().enumerate() {
+            let context = TargetOnlyStageContext {
+                policy,
+                release_candidate,
+                window_provenance: window_provenance.clone(),
+                allow_candidate_pool_reuse: index > 0,
+            };
+            let target_only = run_search_stage(
+                &manifest,
+                &dataset,
+                &locked_model,
+                policy.stage_name(),
+                &manifest.target_fasta,
+                &model_root.join("target_only").join(match policy {
+                    TargetOnlyCalibrationPolicy::RefitWithLockedWindow => {
+                        "refit_with_locked_window"
+                    }
+                    TargetOnlyCalibrationPolicy::ReuseDatasetArtifact => "reuse_dataset_artifact",
+                    TargetOnlyCalibrationPolicy::CompareBoth => unreachable!(),
+                }),
+                use_ms2_for_final,
+                manifest.annotate_target_matches && index == 0,
+                parallel,
+                plan_only,
+                (policy == TargetOnlyCalibrationPolicy::ReuseDatasetArtifact)
+                    .then_some(frozen_model_artifacts)
+                    .flatten(),
+                ensemble_lock.as_ref(),
+                Some(&context),
+                &mut runtime,
+            )?;
+            if release_candidate {
+                release_target_only = Some(target_only.clone());
+            }
+            stages.push(target_only);
+        }
+        let target_only =
+            release_target_only.context("target-only policy has no release result")?;
         if model.model != ModelFit::Ensemble && !plan_only {
             anyhow::ensure!(
                 frozen_model_artifacts.is_some(),
@@ -1756,6 +1995,12 @@ pub fn execute_workflow(
                     optimized.results.clone()
                 },
                 target_only_results: target_only.results,
+                calibration_search_fingerprint: calibration_record
+                    .candidate_pool
+                    .as_ref()
+                    .context("calibration stage has no candidate-pool provenance")?
+                    .search_fingerprint
+                    .clone(),
             });
         }
     }
@@ -1776,14 +2021,22 @@ pub fn execute_workflow(
             stage: stage.stage.clone(),
             results: stage.results.clone(),
             mode: ValidationMode::DecoyFree,
-            expected_search_space: Some(if stage.stage == "target_only" {
+            expected_search_space: Some(if is_target_only_stage(&stage.stage) {
                 "No Ent".into()
             } else {
                 "+Ent".into()
             }),
-            calibration_stage: (stage.stage == "target_only")
-                .then(|| selected_calibration_stages.get(&stage.model).cloned())
+            calibration_stage: is_target_only_stage(&stage.stage)
+                .then(|| {
+                    stage
+                        .window_provenance
+                        .as_ref()
+                        .map(|provenance| provenance.source_stage.clone())
+                        .or_else(|| selected_calibration_stages.get(&stage.model).cloned())
+                })
                 .flatten(),
+            target_only_calibration_policy: stage.target_only_calibration_policy,
+            release_candidate: stage.release_candidate,
         }
     }));
     let mut validation = Vec::new();
@@ -1866,14 +2119,17 @@ pub fn execute_workflow(
     if !missing_runs.is_empty() {
         release_reasons.push("required validation runs are missing".into());
     }
-    if stability.iter().any(|comparison| !comparison.stable) {
+    if stability
+        .iter()
+        .any(|comparison| comparison.release_candidate && !comparison.stable)
+    {
         release_reasons.push("one or more search-space transfers are unstable".into());
     }
     if manifest.validation.tdc_reference_method.is_none() || tdc_benchmarks.is_empty() {
         release_reasons.push("a matched TDC benchmark is missing".into());
     } else if !tdc_benchmarks
         .iter()
-        .any(|comparison| comparison.improves_peptide_yield)
+        .any(|comparison| comparison.release_candidate && comparison.improves_peptide_yield)
     {
         release_reasons.push(
             "no calibrated Decoy-Free result improves peptide yield over the matched TDC".into(),
@@ -1891,7 +2147,7 @@ pub fn execute_workflow(
     }
     let calibrated_tdc_improvements = tdc_benchmarks
         .iter()
-        .filter(|comparison| comparison.improves_peptide_yield)
+        .filter(|comparison| comparison.release_candidate && comparison.improves_peptide_yield)
         .count();
     let release_gate = ReleaseGate {
         eligible_for_statistical_default_change: release_reasons.is_empty(),
@@ -2081,6 +2337,7 @@ mod tests {
                 ms2rescore: Ms2RescorePolicy::Measure,
                 maximum_raw_fdp_increase: None,
                 minimum_level4_peptide_gain: None,
+                target_only_calibration_policy: None,
             }],
             baseline: None,
             validation: ValidationWorkflow {
@@ -2105,6 +2362,7 @@ mod tests {
             ensemble_lock: None,
             locked_expert_artifacts: BTreeMap::new(),
             artifact_reuse_policy: ArtifactReusePolicy::DatasetLocalOnly,
+            target_only_calibration_policy: TargetOnlyCalibrationPolicy::RefitWithLockedWindow,
         }
     }
 
@@ -2120,8 +2378,83 @@ mod tests {
             ms2rescore: Ms2RescorePolicy::Measure,
             maximum_raw_fdp_increase: None,
             minimum_level4_peptide_gain: None,
+            target_only_calibration_policy: None,
         });
         manifest.validate().unwrap();
+        std::fs::remove_dir_all(directory).unwrap();
+    }
+
+    #[test]
+    fn target_only_policy_defaults_to_refit_and_compare_both_marks_reuse_diagnostic() {
+        let directory = test_directory("target-only-policy-default");
+        let manifest = minimal_manifest(&directory, ValidationDatasetRole::Development);
+        let mut value = serde_json::to_value(&manifest).unwrap();
+        value
+            .as_object_mut()
+            .unwrap()
+            .remove("target_only_calibration_policy");
+        value["models"][0]
+            .as_object_mut()
+            .unwrap()
+            .remove("target_only_calibration_policy");
+        let restored: WorkflowManifest = serde_json::from_value(value).unwrap();
+        assert_eq!(
+            restored.target_only_calibration_policy,
+            TargetOnlyCalibrationPolicy::RefitWithLockedWindow
+        );
+        assert_eq!(
+            concrete_target_only_policies(TargetOnlyCalibrationPolicy::CompareBoth),
+            vec![
+                (TargetOnlyCalibrationPolicy::RefitWithLockedWindow, true),
+                (TargetOnlyCalibrationPolicy::ReuseDatasetArtifact, false),
+            ]
+        );
+        std::fs::remove_dir_all(directory).unwrap();
+    }
+
+    #[test]
+    fn compare_both_plan_materializes_distinct_target_only_interpretations() {
+        let directory = test_directory("target-only-compare-plan");
+        let mut manifest = minimal_manifest(&directory, ValidationDatasetRole::Development);
+        let workspace = Path::new(env!("CARGO_MANIFEST_DIR")).join("../..");
+        manifest.search_config = workspace.join("tests/config.json");
+        manifest.spectra = vec![workspace
+            .join("tests/LQSRPAAPPAPGPGQLTLR.mzML")
+            .display()
+            .to_string()];
+        manifest.target_only_calibration_policy = TargetOnlyCalibrationPolicy::CompareBoth;
+        manifest.models[0].ms2rescore = Ms2RescorePolicy::Never;
+        let manifest_path = directory.join("workflow.json");
+        write_json_atomic(&manifest_path, &manifest).unwrap();
+
+        let state = execute_workflow(&manifest_path, &directory, 1, true).unwrap();
+        let refit = state
+            .stages
+            .iter()
+            .find(|stage| {
+                stage.stage == TargetOnlyCalibrationPolicy::RefitWithLockedWindow.stage_name()
+            })
+            .unwrap();
+        let reuse = state
+            .stages
+            .iter()
+            .find(|stage| {
+                stage.stage == TargetOnlyCalibrationPolicy::ReuseDatasetArtifact.stage_name()
+            })
+            .unwrap();
+        assert!(refit.release_candidate);
+        assert!(!reuse.release_candidate);
+        assert_eq!(refit.calibration_mode, "refit_with_locked_window");
+        assert_eq!(reuse.calibration_mode, "reuse_dataset_artifact");
+        assert_ne!(refit.results, reuse.results);
+        assert_eq!(
+            refit
+                .window_provenance
+                .as_ref()
+                .unwrap()
+                .source_dataset_fingerprint,
+            state.dataset.fingerprint
+        );
         std::fs::remove_dir_all(directory).unwrap();
     }
 
@@ -2137,10 +2470,12 @@ mod tests {
         };
         let artifacts = DfRunArtifacts {
             provenance: Some(FittedArtifactProvenance {
-                schema_version: 1,
+                schema_version: 2,
                 dataset_id: "isb".into(),
                 dataset_fingerprint: "isb-fingerprint".into(),
                 search_config_sha256: "same-config".into(),
+                fit_search_fingerprint: "isb-search".into(),
+                candidate_id_schema: CANDIDATE_ID_SCHEMA.into(),
                 fit_stage: "optimized".into(),
                 model: "moments".into(),
             }),
@@ -2151,6 +2486,7 @@ mod tests {
             &current,
             &ArtifactReusePolicy::DatasetLocalOnly,
             &ModelFit::Moments,
+            None,
         )
         .is_err());
         assert!(validate_artifact_reuse(
@@ -2158,6 +2494,44 @@ mod tests {
             &current,
             &ArtifactReusePolicy::CrossDatasetDiagnostic,
             &ModelFit::Moments,
+            None,
+        )
+        .is_ok());
+    }
+
+    #[test]
+    fn dataset_artifact_reuse_fails_closed_on_candidate_population_mismatch() {
+        let current = DatasetIdentity {
+            schema_version: 1,
+            dataset_id: "isb".into(),
+            fingerprint: "isb-fingerprint".into(),
+            target_fasta_sha256: "isb-target".into(),
+            spectra_sha256: vec!["isb-spectra".into()],
+            search_config_sha256: "same-config".into(),
+        };
+        let artifacts = DfRunArtifacts {
+            provenance: Some(fitted_artifact_provenance(
+                &current,
+                "optimized",
+                &ModelFit::Moments,
+                "source-search",
+            )),
+            ..DfRunArtifacts::default()
+        };
+        assert!(validate_artifact_reuse(
+            &artifacts,
+            &current,
+            &ArtifactReusePolicy::DatasetLocalOnly,
+            &ModelFit::Moments,
+            Some("different-search"),
+        )
+        .is_err());
+        assert!(validate_artifact_reuse(
+            &artifacts,
+            &current,
+            &ArtifactReusePolicy::DatasetLocalOnly,
+            &ModelFit::Moments,
+            Some("source-search"),
         )
         .is_ok());
     }
@@ -2311,6 +2685,7 @@ mod tests {
             ms2rescore: Ms2RescorePolicy::Never,
             maximum_raw_fdp_increase: None,
             minimum_level4_peptide_gain: None,
+            target_only_calibration_policy: None,
         };
         let manifest = WorkflowManifest {
             schema_version: 1,
@@ -2372,6 +2747,7 @@ mod tests {
             ensemble_lock: None,
             locked_expert_artifacts: BTreeMap::new(),
             artifact_reuse_policy: ArtifactReusePolicy::DatasetLocalOnly,
+            target_only_calibration_policy: TargetOnlyCalibrationPolicy::RefitWithLockedWindow,
         };
         let dataset = DatasetIdentity {
             schema_version: 1,
@@ -2392,6 +2768,7 @@ mod tests {
                 } else {
                     &ModelFit::Mle
                 },
+                "test-search-fingerprint",
             ));
             write_json_atomic(path, &artifacts).unwrap();
         }
@@ -2404,6 +2781,7 @@ mod tests {
                 calibration_stage: "optimized".into(),
                 calibration_results: moments_calibration,
                 target_only_results: moments_target,
+                calibration_search_fingerprint: "test-search-fingerprint".into(),
             },
             CompletedExpert {
                 model: ModelFit::Mle,
@@ -2413,6 +2791,7 @@ mod tests {
                 calibration_stage: "optimized".into(),
                 calibration_results: mle_calibration,
                 target_only_results: mle_target,
+                calibration_search_fingerprint: "test-search-fingerprint".into(),
             },
         ];
         let lock = build_ensemble_lock(&manifest, "manifest-hash", &dataset, &experts).unwrap();
@@ -2435,6 +2814,33 @@ mod tests {
                     .as_ref()
                     .is_some_and(|window| window.min_rank == 8 && window.max_rank == 25)
         }));
+        let mut refit = FdrOptions::default();
+        apply_ensemble_lock(
+            &mut refit,
+            &lock,
+            false,
+            &dataset,
+            &ArtifactReusePolicy::DatasetLocalOnly,
+            false,
+        )
+        .unwrap();
+        assert_eq!(refit.moments_min_null_rank, Some(9));
+        assert_eq!(refit.moments_max_null_rank, Some(18));
+        assert!(refit.moments_frozen_parameters.is_none());
+        assert!(refit.mle_frozen_parameters.is_none());
+
+        let mut reuse = FdrOptions::default();
+        apply_ensemble_lock(
+            &mut reuse,
+            &lock,
+            false,
+            &dataset,
+            &ArtifactReusePolicy::DatasetLocalOnly,
+            true,
+        )
+        .unwrap();
+        assert!(reuse.moments_frozen_parameters.is_some());
+        assert!(reuse.mle_frozen_parameters.is_some());
         std::fs::remove_dir_all(directory).unwrap();
     }
 }

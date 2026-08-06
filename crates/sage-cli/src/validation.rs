@@ -11,6 +11,38 @@ pub enum ValidationMode {
     Tdc,
 }
 
+#[derive(Clone, Copy, Debug, Default, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(rename_all = "snake_case")]
+pub enum TargetOnlyCalibrationPolicy {
+    /// Lock only the dataset-local null window and re-estimate nuisance state
+    /// in the target-only candidate space. This is the legacy-parity default.
+    #[default]
+    RefitWithLockedWindow,
+    /// Apply the complete fitted +entrapment artifact without refitting it.
+    ReuseDatasetArtifact,
+    /// Materialize both interpretations as independent, provenance-bearing
+    /// target-only stages. This value is orchestration-only.
+    CompareBoth,
+}
+
+impl TargetOnlyCalibrationPolicy {
+    pub fn stage_name(self) -> &'static str {
+        match self {
+            Self::RefitWithLockedWindow => "target_only_refit_with_locked_window",
+            Self::ReuseDatasetArtifact => "target_only_reuse_dataset_artifact",
+            Self::CompareBoth => "target_only_compare_both",
+        }
+    }
+}
+
+pub fn is_target_only_stage(stage: &str) -> bool {
+    stage == "target_only" || stage.starts_with("target_only_")
+}
+
+fn default_release_candidate() -> bool {
+    true
+}
+
 #[derive(Clone, Debug, Serialize, Deserialize)]
 pub struct ValidationRun {
     pub method: String,
@@ -24,6 +56,14 @@ pub struct ValidationRun {
     /// MS2Rescore stage from being credited as the calibration source.
     #[serde(default)]
     pub calibration_stage: Option<String>,
+    /// Explicit interpretation used for target-only calibration. Legacy
+    /// `target_only` validation rows may omit this field.
+    #[serde(default)]
+    pub target_only_calibration_policy: Option<TargetOnlyCalibrationPolicy>,
+    /// `compare_both` retains one diagnostic interpretation without allowing
+    /// it to veto the release candidate selected by the manifest.
+    #[serde(default = "default_release_candidate")]
+    pub release_candidate: bool,
 }
 
 #[derive(Clone, Debug, Serialize, Deserialize)]
@@ -58,6 +98,10 @@ pub struct RunValidationSummary {
     pub mode: ValidationMode,
     #[serde(default)]
     pub calibration_stage: Option<String>,
+    #[serde(default)]
+    pub target_only_calibration_policy: Option<TargetOnlyCalibrationPolicy>,
+    #[serde(default = "default_release_candidate")]
+    pub release_candidate: bool,
     pub complete: bool,
     pub search_space: String,
     pub layer: String,
@@ -378,6 +422,8 @@ pub fn summarize_run(
             results: run.results.clone(),
             mode: run.mode.clone(),
             calibration_stage: run.calibration_stage.clone(),
+            target_only_calibration_policy: run.target_only_calibration_policy,
+            release_candidate: run.release_candidate,
             complete: true,
             search_space: observed_search_space.into(),
             layer: layer.into(),
@@ -406,6 +452,10 @@ pub struct TransferStability {
     pub peptide_fraction_change: Option<f64>,
     pub protein_fraction_change: Option<f64>,
     pub stable: bool,
+    #[serde(default)]
+    pub target_only_calibration_policy: Option<TargetOnlyCalibrationPolicy>,
+    #[serde(default = "default_release_candidate")]
+    pub release_candidate: bool,
 }
 
 #[derive(Clone, Debug, Serialize, Deserialize)]
@@ -472,7 +522,13 @@ pub fn parity_comparisons(
         {
             if let Some(native) = summaries.iter().find(|row| {
                 row.method == pair.native_method
-                    && row.stage == baseline.stage
+                    && (row.stage == baseline.stage
+                        || (baseline.stage == "target_only"
+                            && row.stage
+                                == TargetOnlyCalibrationPolicy::RefitWithLockedWindow.stage_name())
+                        || (row.stage == "target_only"
+                            && baseline.stage
+                                == TargetOnlyCalibrationPolicy::RefitWithLockedWindow.stage_name()))
                     && row.layer == baseline.layer
             }) {
                 let psm = fraction(baseline.psm.target, native.psm.target);
@@ -521,6 +577,10 @@ pub struct TdcBenchmarkComparison {
     pub calibration_stage: Option<String>,
     pub calibration_constrained: bool,
     pub improves_peptide_yield: bool,
+    #[serde(default)]
+    pub target_only_calibration_policy: Option<TargetOnlyCalibrationPolicy>,
+    #[serde(default = "default_release_candidate")]
+    pub release_candidate: bool,
 }
 
 pub fn tdc_benchmark_comparisons(
@@ -541,14 +601,23 @@ pub fn tdc_benchmark_comparisons(
         } else {
             decoy_free.layer.as_str()
         };
-        if let Some(tdc) = summaries.iter().find(|row| {
+        let exact_tdc = summaries.iter().find(|row| {
             row.method == tdc_method
                 && matches!(row.mode, ValidationMode::Tdc)
                 && row.stage == decoy_free.stage
                 && row.layer == comparable_tdc_layer
-        }) {
+        });
+        let compatible_target_only_tdc = is_target_only_stage(&decoy_free.stage).then(|| {
+            summaries.iter().find(|row| {
+                row.method == tdc_method
+                    && matches!(row.mode, ValidationMode::Tdc)
+                    && is_target_only_stage(&row.stage)
+                    && row.layer == comparable_tdc_layer
+            })
+        });
+        if let Some(tdc) = exact_tdc.or_else(|| compatible_target_only_tdc.flatten()) {
             let peptide_difference = decoy_free.peptide.target as i64 - tdc.peptide.target as i64;
-            let calibration = if decoy_free.stage == "target_only" {
+            let calibration = if is_target_only_stage(&decoy_free.stage) {
                 let requested = decoy_free.calibration_stage.as_deref();
                 requested
                     .and_then(|stage| {
@@ -588,6 +657,8 @@ pub fn tdc_benchmark_comparisons(
                 calibration_stage: calibration.map(|row| row.stage.clone()),
                 calibration_constrained: calibrated,
                 improves_peptide_yield: calibrated && peptide_difference > 0,
+                target_only_calibration_policy: decoy_free.target_only_calibration_policy,
+                release_candidate: decoy_free.release_candidate,
             });
         }
     }
@@ -596,17 +667,29 @@ pub fn tdc_benchmark_comparisons(
 
 pub fn stage_comparisons(summaries: &[RunValidationSummary]) -> Vec<StageComparison> {
     let mut output = Vec::new();
-    let pairs = [
-        ("optimized", "ms2rescore"),
-        ("ms2rescore", "target_only"),
-        ("optimized", "target_only"),
-    ];
     let methods = summaries
         .iter()
         .map(|row| row.method.as_str())
         .collect::<BTreeSet<_>>();
     for method in methods {
         for layer in ["raw_q", "level4", "reportable_q"] {
+            let mut pairs = vec![("optimized", "ms2rescore")];
+            let target_stages = summaries
+                .iter()
+                .filter(|row| {
+                    row.method == method && row.layer == layer && is_target_only_stage(&row.stage)
+                })
+                .map(|row| row.stage.as_str())
+                .collect::<BTreeSet<_>>();
+            for target_stage in &target_stages {
+                pairs.push(("ms2rescore", target_stage));
+                pairs.push(("optimized", target_stage));
+            }
+            let refit_stage = TargetOnlyCalibrationPolicy::RefitWithLockedWindow.stage_name();
+            let reuse_stage = TargetOnlyCalibrationPolicy::ReuseDatasetArtifact.stage_name();
+            if target_stages.contains(refit_stage) && target_stages.contains(reuse_stage) {
+                pairs.push((refit_stage, reuse_stage));
+            }
             for (from_stage, to_stage) in pairs {
                 let from = summaries.iter().find(|row| {
                     row.method == method && row.layer == layer && row.stage == from_stage
@@ -673,8 +756,9 @@ pub fn expert_quality_gates(
                 .iter()
                 .find(|row| {
                     row.method == method
-                        && row.stage == "target_only"
+                        && is_target_only_stage(&row.stage)
                         && row.layer == validation_layer
+                        && row.release_candidate
                 })
                 .and_then(|row| row.calibration_stage.as_deref());
             let best = selected_stage
@@ -715,7 +799,7 @@ pub fn expert_quality_gates(
             }
             if stability
                 .iter()
-                .find(|row| row.method == method)
+                .find(|row| row.method == method && row.release_candidate)
                 .is_some_and(|row| !row.stable)
             {
                 reasons.push("target-only search-space transfer is unstable".into());
@@ -756,8 +840,15 @@ pub fn transfer_stability(
             .iter()
             .find(|row| row.stage == "ms2rescore")
             .or_else(|| rows.iter().find(|row| row.stage == "optimized"));
-        let to = rows.iter().find(|row| row.stage == "target_only");
-        if let (Some(from), Some(to)) = (from, to) {
+        let targets = rows
+            .iter()
+            .filter(|row| is_target_only_stage(&row.stage))
+            .copied()
+            .collect::<Vec<_>>();
+        for to in targets {
+            let Some(from) = from else {
+                continue;
+            };
             let psm = fraction(from.psm.target, to.psm.target);
             let peptide = fraction(from.peptide.target, to.peptide.target);
             let protein = fraction(from.protein.target, to.protein.target);
@@ -773,6 +864,8 @@ pub fn transfer_stability(
                 peptide_fraction_change: peptide,
                 protein_fraction_change: protein,
                 stable,
+                target_only_calibration_policy: to.target_only_calibration_policy,
+                release_candidate: to.release_candidate,
             });
         }
     }
@@ -803,6 +896,8 @@ mod tests {
             results: PathBuf::new(),
             mode: ValidationMode::DecoyFree,
             calibration_stage: None,
+            target_only_calibration_policy: None,
+            release_candidate: true,
             complete: true,
             search_space: "+Ent".into(),
             layer: layer.into(),
@@ -868,6 +963,75 @@ mod tests {
         assert_eq!(result.len(), 1);
         assert!(result[0].stable);
         assert_eq!(result[0].from_stage, "optimized");
+    }
+
+    #[test]
+    fn compare_both_keeps_separate_transfer_evidence_and_release_status() {
+        let mut refit = summary(
+            "moments",
+            TargetOnlyCalibrationPolicy::RefitWithLockedWindow.stage_name(),
+            "level4",
+            95,
+            0,
+        );
+        refit.target_only_calibration_policy =
+            Some(TargetOnlyCalibrationPolicy::RefitWithLockedWindow);
+        let mut reuse = summary(
+            "moments",
+            TargetOnlyCalibrationPolicy::ReuseDatasetArtifact.stage_name(),
+            "level4",
+            60,
+            0,
+        );
+        reuse.target_only_calibration_policy =
+            Some(TargetOnlyCalibrationPolicy::ReuseDatasetArtifact);
+        reuse.release_candidate = false;
+        let result = transfer_stability(
+            &[
+                summary("moments", "optimized", "level4", 100, 1),
+                refit,
+                reuse,
+            ],
+            0.10,
+        );
+        assert_eq!(result.len(), 2);
+        assert!(result.iter().any(|row| row.release_candidate && row.stable));
+        assert!(result
+            .iter()
+            .any(|row| !row.release_candidate && !row.stable));
+    }
+
+    #[test]
+    fn legacy_target_only_parity_maps_only_to_refit_semantics() {
+        let baseline = summary("legacy", "target_only", "level4", 100, 0);
+        let refit = summary(
+            "native",
+            TargetOnlyCalibrationPolicy::RefitWithLockedWindow.stage_name(),
+            "level4",
+            100,
+            0,
+        );
+        let mut reuse = summary(
+            "native",
+            TargetOnlyCalibrationPolicy::ReuseDatasetArtifact.stage_name(),
+            "level4",
+            50,
+            0,
+        );
+        reuse.release_candidate = false;
+        let result = parity_comparisons(
+            &[baseline, refit, reuse],
+            &[ParityPair {
+                baseline_method: "legacy".into(),
+                native_method: "native".into(),
+                stages: vec!["target_only".into()],
+                layers: vec!["level4".into()],
+                maximum_fraction_difference: None,
+            }],
+            0.0,
+        );
+        assert_eq!(result.len(), 1);
+        assert!(result[0].within_tolerance);
     }
 
     #[test]

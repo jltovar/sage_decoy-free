@@ -1,0 +1,57 @@
+{
+  "schema_version": 1,
+  "phase": 5,
+  "title": "Explicit target-only calibration policies",
+  "date": "2026-08-06",
+  "source_commit": "d73bac6",
+  "status": "passed",
+  "scope": "Engineering implementation and local behavioral verification; ISB model-by-model parity remains Phase 6 and PXD Moments parity remains Phase 7.",
+  "policies": {
+    "default": "refit_with_locked_window",
+    "refit_with_locked_window": "Retain the dataset-local +entrapment window, refit nuisance parameters in the target-only candidate space, and never tune the window from target-only outcomes.",
+    "reuse_dataset_artifact": "Reuse the complete same-dataset +entrapment fitted artifact without refitting nuisance state.",
+    "compare_both": "Materialize both interpretations separately; refit is the release candidate and reuse is retained as diagnostic evidence."
+  },
+  "implemented_safeguards": [
+    "Workflow-wide policy with optional model-specific override",
+    "Explicit target-only stage names and separate output directories",
+    "Separate locked-window provenance and fitted nuisance-state provenance",
+    "Fail-closed dataset, model, search-configuration, candidate-fingerprint, and stable-ID-schema checks for dataset-local artifact reuse",
+    "Candidate-population provenance for each locked Ensemble expert",
+    "Fresh target-FASTA candidate search for the first target-only interpretation",
+    "Exact immutable target candidate-pool reuse for the second compare_both interpretation",
+    "Policy-specific MS2Rescore annotation fingerprints remain fail-closed",
+    "Legacy target_only validation rows map to refit_with_locked_window for parity",
+    "Diagnostic compare_both reuse rows cannot veto release transfer or TDC gates"
+  ],
+  "verification": {
+    "rust_workspace_tests": {
+      "passed": 162,
+      "failed": 0,
+      "includes_integration_and_doctests": true
+    },
+    "python_tests": {
+      "passed": 9,
+      "failed": 0
+    },
+    "release_build": "passed",
+    "cargo_fmt_check": "passed",
+    "git_diff_check": "passed",
+    "workflow_example_json": "valid",
+    "full_scale_isb_or_pxd_search_started": false
+  },
+  "behavioral_tests": [
+    "Default policy and compare_both release/diagnostic expansion",
+    "Separate compare_both target stage records, provenance, modes, and paths",
+    "Forced fresh candidate search followed by compatible-pool reuse",
+    "Artifact rejection on source candidate-population mismatch",
+    "Ensemble window-only refit versus complete artifact reuse",
+    "Separate transfer evidence for both policies",
+    "Legacy target-only parity selects refit semantics only"
+  ],
+  "next": [
+    "Run Phase 6 ISB model-by-model parity with refit_with_locked_window as the initial target-only policy",
+    "Retain both target-only interpretations while evaluating Lower Order",
+    "Run only PXD Moments as the required PXD parity model in Phase 7"
+  ]
+}

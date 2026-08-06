@@ -9,6 +9,7 @@
     "/path/to/development_02.mzML"
   ],
   "output_root": "/path/to/native_workflow/development",
+  "target_only_calibration_policy": "refit_with_locked_window",
   "entrapment": {
     "database_mode": "native_generated",
     "foreign_fastas": [
@@ -41,6 +42,7 @@
     },
     {
       "model": "lower_order",
+      "target_only_calibration_policy": "compare_both",
       "candidate_windows": [
         { "min_rank": 2, "max_rank": 5 },
         { "min_rank": 6, "max_rank": 9 }
