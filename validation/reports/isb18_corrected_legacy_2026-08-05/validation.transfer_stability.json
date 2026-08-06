@@ -1,0 +1,92 @@
+[
+  {
+    "method": "ensemble",
+    "from_stage": "ms2rescore",
+    "to_stage": "target_only",
+    "psm_fraction_change": 0.21516984644020476,
+    "peptide_fraction_change": 0.03651685393258427,
+    "protein_fraction_change": 0.0,
+    "stable": true
+  },
+  {
+    "method": "lower_order",
+    "from_stage": "ms2rescore",
+    "to_stage": "target_only",
+    "psm_fraction_change": -0.9103326369918046,
+    "peptide_fraction_change": -0.8503401360544217,
+    "protein_fraction_change": -0.4444444444444444,
+    "stable": false
+  },
+  {
+    "method": "mle",
+    "from_stage": "ms2rescore",
+    "to_stage": "target_only",
+    "psm_fraction_change": 0.2419925329141285,
+    "peptide_fraction_change": 0.045871559633027525,
+    "protein_fraction_change": 0.0,
+    "stable": true
+  },
+  {
+    "method": "moments",
+    "from_stage": "ms2rescore",
+    "to_stage": "target_only",
+    "psm_fraction_change": 0.25963740458015266,
+    "peptide_fraction_change": 0.08284023668639054,
+    "protein_fraction_change": 0.0,
+    "stable": true
+  },
+  {
+    "method": "msfdr",
+    "from_stage": "ms2rescore",
+    "to_stage": "target_only",
+    "psm_fraction_change": 0.23054925549748545,
+    "peptide_fraction_change": 0.04664723032069971,
+    "protein_fraction_change": 0.0,
+    "stable": true
+  },
+  {
+    "method": "msfdr1_smix",
+    "from_stage": "ms2rescore",
+    "to_stage": "target_only",
+    "psm_fraction_change": 0.02570694087403599,
+    "peptide_fraction_change": -0.027777777777777776,
+    "protein_fraction_change": 0.0,
+    "stable": true
+  },
+  {
+    "method": "msfdr2_smix",
+    "from_stage": "ms2rescore",
+    "to_stage": "target_only",
+    "psm_fraction_change": 0.0035617367706919944,
+    "peptide_fraction_change": -0.054313099041533544,
+    "protein_fraction_change": 0.0,
+    "stable": true
+  },
+  {
+    "method": "nokoi",
+    "from_stage": "ms2rescore",
+    "to_stage": "target_only",
+    "psm_fraction_change": 0.07166217776067718,
+    "peptide_fraction_change": -0.05962059620596206,
+    "protein_fraction_change": 0.0,
+    "stable": true
+  },
+  {
+    "method": "tdc_fork",
+    "from_stage": "optimized",
+    "to_stage": "target_only",
+    "psm_fraction_change": 0.06896551724137931,
+    "peptide_fraction_change": 0.14435695538057744,
+    "protein_fraction_change": null,
+    "stable": true
+  },
+  {
+    "method": "tdc_upstream",
+    "from_stage": "optimized",
+    "to_stage": "target_only",
+    "psm_fraction_change": 0.07278354632587859,
+    "peptide_fraction_change": 0.11253196930946291,
+    "protein_fraction_change": null,
+    "stable": true
+  }
+]

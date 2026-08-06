@@ -1,3 +1,6 @@
+use crate::ml::lower_order::LowerOrderArtifact;
+use crate::ml::msfdr::{Msfdr1SmixModel, Msfdr2SmixModel, MsfdrSeededModel};
+use crate::ml::nokoi::NokoiArtifact;
 use serde::{Deserialize, Serialize};
 
 #[derive(Clone, Serialize, Deserialize, Debug, Default, PartialEq, Eq)]
@@ -23,6 +26,97 @@ pub enum ModelFit {
 
     Nokoi,
     Ensemble,
+}
+
+#[derive(Clone, Serialize, Deserialize, Debug)]
+pub struct NullWindowCandidate {
+    pub min_rank: u32,
+    pub max_rank: u32,
+}
+
+#[derive(Clone, Copy, Serialize, Deserialize, Debug, Default, PartialEq, Eq)]
+#[serde(rename_all = "snake_case")]
+pub enum NullWindowValidationScope {
+    RawQ,
+    #[default]
+    Level4,
+}
+
+#[derive(Clone, Serialize, Deserialize, Debug)]
+pub struct NullWindowOptimizerOptions {
+    pub candidates: Vec<NullWindowCandidate>,
+    #[serde(default)]
+    pub validation_scope: NullWindowValidationScope,
+    #[serde(default = "default_optimizer_fdr")]
+    pub fdr_threshold: f64,
+    #[serde(default = "default_effective_ratio")]
+    pub psm_entrapment_ratio: f64,
+    #[serde(default = "default_effective_ratio")]
+    pub peptide_entrapment_ratio: f64,
+    #[serde(default = "default_effective_ratio")]
+    pub protein_entrapment_ratio: f64,
+    #[serde(default = "default_optimizer_max_fdp")]
+    pub maximum_entrapment_fdp: f64,
+    #[serde(default = "default_minimum_entrapment_count")]
+    pub minimum_entrapment_count_for_stable_estimate: usize,
+    /// Emit the full normal-analysis INFO diagnostics for every trial. The
+    /// default is false because compact trial metrics and warnings are enough
+    /// during an optimizer grid; the selected analysis is still materialized
+    /// normally by the runner.
+    #[serde(default)]
+    pub verbose_diagnostics: bool,
+}
+
+/// Frozen empirical calibration for one imported MS2Rescore feature.
+#[derive(Clone, Serialize, Deserialize, Debug)]
+pub struct ExternalEmpiricalFeatureProfile {
+    pub name: String,
+    pub enabled: bool,
+    pub higher_is_better: bool,
+    pub good_median: Option<f64>,
+    pub null_median: Option<f64>,
+    pub separation: Option<f64>,
+    pub auc: Option<f64>,
+    pub good_n: usize,
+    pub null_n: usize,
+}
+
+/// Portable set of empirical MS2Rescore profiles learned on the development
+/// +entrapment search. Holdout and target-only searches must evaluate these
+/// profiles without relearning their medians, direction, or enablement gates.
+#[derive(Clone, Serialize, Deserialize, Debug)]
+pub struct ExternalMs2RescoreProfiles {
+    pub schema_version: u32,
+    pub model_version: String,
+    pub ms2pip_pcc: ExternalEmpiricalFeatureProfile,
+    pub spectral_angle: ExternalEmpiricalFeatureProfile,
+    pub fragment_intensity_agreement: ExternalEmpiricalFeatureProfile,
+    pub deeplc_abs_rt_error: ExternalEmpiricalFeatureProfile,
+    pub ccs_pct_error: ExternalEmpiricalFeatureProfile,
+    pub ccs_abs_error: ExternalEmpiricalFeatureProfile,
+}
+
+fn default_optimizer_fdr() -> f64 {
+    0.01
+}
+fn default_effective_ratio() -> f64 {
+    1.0
+}
+fn default_optimizer_max_fdp() -> f64 {
+    0.01
+}
+fn default_minimum_entrapment_count() -> usize {
+    3
+}
+
+#[derive(Clone, Serialize, Deserialize, Debug)]
+pub struct FrozenGumbelParameters {
+    pub schema_version: u32,
+    pub model_version: String,
+    pub min_rank: u32,
+    pub max_rank: u32,
+    pub mu: f64,
+    pub beta: f64,
 }
 
 #[derive(Clone, Serialize, Deserialize, Debug, Default, PartialEq, Eq)]
@@ -826,6 +920,23 @@ pub struct FdrOptions {
     // validation readout only.
     pub lo_tnm_extrapolation_strength: Option<f64>,
 
+    /// Frozen Lower Order fit used to transfer calibration between databases.
+    /// When present, the model is evaluated without refitting its parameters.
+    pub lower_order_frozen_artifact: Option<LowerOrderArtifact>,
+
+    /// Evaluate these null windows from one retained candidate set and select
+    /// the highest-yield window that satisfies the entrapment FDP constraint.
+    pub null_window_optimizer: Option<NullWindowOptimizerOptions>,
+    pub moments_frozen_parameters: Option<FrozenGumbelParameters>,
+    pub mle_frozen_parameters: Option<FrozenGumbelParameters>,
+    pub msfdr_seeded_frozen_model: Option<MsfdrSeededModel>,
+    pub msfdr_1smix_frozen_model: Option<Msfdr1SmixModel>,
+    pub msfdr_2smix_frozen_model: Option<Msfdr2SmixModel>,
+    pub nokoi_frozen_artifact: Option<NokoiArtifact>,
+    /// Frozen empirical MS2Rescore profiles for leakage-free search-space and
+    /// holdout transfer.
+    pub external_ms2rescore_frozen_profiles: Option<ExternalMs2RescoreProfiles>,
+
     // LowerOrder TNM estimator.
     //
     // There is no TNM mode knob. The production LO path infers the rank-1 TNM by
@@ -1095,6 +1206,15 @@ pub struct FdrSettings {
     pub lo_evalue_scale: f64,
     pub lo_tev_transform: LoTevTransform,
     pub lo_tnm_extrapolation_strength: f64,
+    pub lower_order_frozen_artifact: Option<LowerOrderArtifact>,
+    pub null_window_optimizer: Option<NullWindowOptimizerOptions>,
+    pub moments_frozen_parameters: Option<FrozenGumbelParameters>,
+    pub mle_frozen_parameters: Option<FrozenGumbelParameters>,
+    pub msfdr_seeded_frozen_model: Option<MsfdrSeededModel>,
+    pub msfdr_1smix_frozen_model: Option<Msfdr1SmixModel>,
+    pub msfdr_2smix_frozen_model: Option<Msfdr2SmixModel>,
+    pub nokoi_frozen_artifact: Option<NokoiArtifact>,
+    pub external_ms2rescore_frozen_profiles: Option<ExternalMs2RescoreProfiles>,
 
     // =========================================================================
     // E) MSFDR specific resolved null window + knobs
@@ -1572,6 +1692,16 @@ impl From<FdrOptions> for FdrSettings {
             .lo_tnm_extrapolation_strength
             .unwrap_or(1.0)
             .clamp(0.25, 5.0);
+        let lower_order_frozen_artifact = options.lower_order_frozen_artifact.clone();
+        let null_window_optimizer = options.null_window_optimizer.clone();
+        let moments_frozen_parameters = options.moments_frozen_parameters.clone();
+        let mle_frozen_parameters = options.mle_frozen_parameters.clone();
+        let msfdr_seeded_frozen_model = options.msfdr_seeded_frozen_model.clone();
+        let msfdr_1smix_frozen_model = options.msfdr_1smix_frozen_model.clone();
+        let msfdr_2smix_frozen_model = options.msfdr_2smix_frozen_model.clone();
+        let nokoi_frozen_artifact = options.nokoi_frozen_artifact.clone();
+        let external_ms2rescore_frozen_profiles =
+            options.external_ms2rescore_frozen_profiles.clone();
 
         // ---------------------------------------------------------------------
         // E) MSFDR specific resolved null window + knobs
@@ -1862,6 +1992,15 @@ impl From<FdrOptions> for FdrSettings {
             lo_evalue_scale,
             lo_tev_transform,
             lo_tnm_extrapolation_strength,
+            lower_order_frozen_artifact,
+            null_window_optimizer,
+            moments_frozen_parameters,
+            mle_frozen_parameters,
+            msfdr_seeded_frozen_model,
+            msfdr_1smix_frozen_model,
+            msfdr_2smix_frozen_model,
+            nokoi_frozen_artifact,
+            external_ms2rescore_frozen_profiles,
 
             // =========================================================================
             // E) MSFDR specific resolved null window + knobs

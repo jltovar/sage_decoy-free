@@ -1,0 +1,946 @@
+use anyhow::{Context, Result};
+use csv::StringRecord;
+use serde::{Deserialize, Serialize};
+use std::collections::{BTreeMap, BTreeSet};
+use std::path::PathBuf;
+
+#[derive(Clone, Debug, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum ValidationMode {
+    DecoyFree,
+    Tdc,
+}
+
+#[derive(Clone, Debug, Serialize, Deserialize)]
+pub struct ValidationRun {
+    pub method: String,
+    pub stage: String,
+    pub results: PathBuf,
+    pub mode: ValidationMode,
+    #[serde(default)]
+    pub expected_search_space: Option<String>,
+    /// For a target-only result, identify the +entrapment stage whose frozen
+    /// calibration artifact was applied. This prevents a measured but rejected
+    /// MS2Rescore stage from being credited as the calibration source.
+    #[serde(default)]
+    pub calibration_stage: Option<String>,
+}
+
+#[derive(Clone, Debug, Serialize, Deserialize)]
+pub struct EffectiveRatios {
+    pub psm: f64,
+    pub peptide: f64,
+    pub protein: f64,
+}
+
+impl Default for EffectiveRatios {
+    fn default() -> Self {
+        Self {
+            psm: 1.0,
+            peptide: 1.0,
+            protein: 1.0,
+        }
+    }
+}
+
+#[derive(Clone, Debug, Serialize, Deserialize)]
+pub struct IdentificationCount {
+    pub target: usize,
+    pub entrapment: usize,
+    pub combined_entrapment_fdp: Option<f64>,
+}
+
+#[derive(Clone, Debug, Serialize, Deserialize)]
+pub struct RunValidationSummary {
+    pub method: String,
+    pub stage: String,
+    pub results: PathBuf,
+    pub mode: ValidationMode,
+    #[serde(default)]
+    pub calibration_stage: Option<String>,
+    pub complete: bool,
+    pub search_space: String,
+    pub layer: String,
+    pub psm: IdentificationCount,
+    pub peptide: IdentificationCount,
+    pub protein: IdentificationCount,
+    pub counting_definition: String,
+}
+
+fn column(headers: &StringRecord, names: &[&str]) -> Option<usize> {
+    names
+        .iter()
+        .find_map(|name| headers.iter().position(|header| header == *name))
+}
+
+fn parse_bool(value: Option<&str>) -> bool {
+    matches!(
+        value.unwrap_or("").trim().to_ascii_lowercase().as_str(),
+        "true" | "t" | "1" | "yes" | "y"
+    )
+}
+
+fn parse_f64(value: Option<&str>) -> Option<f64> {
+    value?.parse::<f64>().ok().filter(|value| value.is_finite())
+}
+
+fn parse_i64(value: Option<&str>) -> Option<i64> {
+    value?.parse::<i64>().ok()
+}
+
+fn canonical_peptide(peptide: &str) -> String {
+    let mut output = String::new();
+    let mut bracket_depth = 0_u32;
+    for character in peptide.chars() {
+        match character {
+            '[' => bracket_depth += 1,
+            ']' => bracket_depth = bracket_depth.saturating_sub(1),
+            _ if bracket_depth == 0 && character.is_ascii_alphabetic() => {
+                let upper = character.to_ascii_uppercase();
+                output.push(if upper == 'I' { 'L' } else { upper });
+            }
+            _ => {}
+        }
+    }
+    output
+}
+
+fn protein_key(proteins: &str) -> Option<String> {
+    if proteins.split(';').count() != 1 {
+        return None;
+    }
+    let key = proteins.trim();
+    (!key.is_empty()).then(|| key.to_owned())
+}
+
+fn is_contaminant(proteins: &str) -> bool {
+    proteins.contains("Cont_")
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum ProteinClass {
+    Target,
+    Entrapment,
+    Ambiguous,
+}
+
+fn protein_class(proteins: &str) -> Option<ProteinClass> {
+    if is_contaminant(proteins) {
+        return None;
+    }
+    let mut target = false;
+    let mut entrapment = false;
+    for protein in proteins.split(';').map(str::trim).filter(|x| !x.is_empty()) {
+        if protein.contains("Ent_") {
+            entrapment = true;
+        } else {
+            target = true;
+        }
+    }
+    match (target, entrapment) {
+        (true, false) => Some(ProteinClass::Target),
+        (false, true) => Some(ProteinClass::Entrapment),
+        (true, true) | (false, false) => Some(ProteinClass::Ambiguous),
+    }
+}
+
+pub fn accepted_target_peptides(
+    results: &PathBuf,
+    mode: &ValidationMode,
+    fdr_threshold: f64,
+    require_level4: bool,
+) -> Result<BTreeSet<String>> {
+    let mut reader = csv::ReaderBuilder::new()
+        .delimiter(b'\t')
+        .from_path(results)
+        .with_context(|| format!("failed to open {}", results.display()))?;
+    let headers = reader.headers()?.clone();
+    let rank = column(&headers, &["rank"]).context("results missing rank")?;
+    let label = column(&headers, &["label"]).context("results missing label")?;
+    let proteins = column(&headers, &["proteins"]).context("results missing proteins")?;
+    let peptide = column(&headers, &["peptide", "sequence"]).context("results missing peptide")?;
+    let peptide_q = match mode {
+        ValidationMode::DecoyFree => column(&headers, &["decoy_free_peptide_q"]),
+        ValidationMode::Tdc => column(&headers, &["peptide_q"]),
+    }
+    .context("results missing peptide q-value")?;
+    let supported = column(&headers, &["decoy_free_protein_supported_peptide"]);
+    if require_level4 && matches!(mode, ValidationMode::DecoyFree) && supported.is_none() {
+        anyhow::bail!("Level-4 peptide support column is missing");
+    }
+    let mut accepted = BTreeSet::new();
+    for row in reader.records() {
+        let row = row?;
+        if parse_i64(row.get(rank)) != Some(1)
+            || parse_i64(row.get(label)) != Some(1)
+            || !parse_f64(row.get(peptide_q)).is_some_and(|q| q <= fdr_threshold)
+        {
+            continue;
+        }
+        let protein = row.get(proteins).unwrap_or("");
+        if protein_class(protein) != Some(ProteinClass::Target) {
+            continue;
+        }
+        if require_level4
+            && matches!(mode, ValidationMode::DecoyFree)
+            && !parse_bool(supported.and_then(|index| row.get(index)))
+        {
+            continue;
+        }
+        let key = canonical_peptide(row.get(peptide).unwrap_or(""));
+        if !key.is_empty() {
+            accepted.insert(key);
+        }
+    }
+    Ok(accepted)
+}
+
+fn combined_fdp(
+    count: &IdentificationCount,
+    effective_r: f64,
+    has_entrapment: bool,
+) -> Option<f64> {
+    let total = count.target + count.entrapment;
+    if !has_entrapment || total == 0 || !effective_r.is_finite() || effective_r <= 0.0 {
+        return None;
+    }
+    Some(((count.entrapment as f64) * (1.0 + 1.0 / effective_r) / total as f64).clamp(0.0, 1.0))
+}
+
+pub fn summarize_run(
+    run: &ValidationRun,
+    ratios: &EffectiveRatios,
+    fdr_threshold: f64,
+) -> Result<Vec<RunValidationSummary>> {
+    if !run.results.is_file() {
+        return Ok(Vec::new());
+    }
+    let mut reader = csv::ReaderBuilder::new()
+        .delimiter(b'\t')
+        .from_path(&run.results)
+        .with_context(|| format!("failed to open {}", run.results.display()))?;
+    let headers = reader.headers()?.clone();
+    let rank = column(&headers, &["rank"]).context("results missing rank")?;
+    let label = column(&headers, &["label"]).context("results missing label")?;
+    let proteins = column(&headers, &["proteins"]).context("results missing proteins")?;
+    let peptide = column(&headers, &["peptide", "sequence"]).context("results missing peptide")?;
+    let psm_id = column(&headers, &["psm_id"]);
+    let filename = column(&headers, &["filename"]);
+    let scan = column(&headers, &["scannr"]);
+
+    let decoy_free = matches!(run.mode, ValidationMode::DecoyFree);
+    let psm_q = if decoy_free {
+        column(&headers, &["decoy_free_q_value"])
+    } else {
+        column(
+            &headers,
+            &["spectrum_q", "sage_discriminant_q_value", "q_value"],
+        )
+    }
+    .context("results missing PSM q-value")?;
+    let peptide_q = if decoy_free {
+        column(&headers, &["decoy_free_peptide_q"])
+    } else {
+        column(&headers, &["peptide_q"])
+    }
+    .context("results missing peptide q-value")?;
+    let protein_q = if decoy_free {
+        column(&headers, &["decoy_free_protein_q"])
+    } else {
+        column(&headers, &["protein_group_q", "protein_q"])
+    }
+    .context("results missing protein q-value")?;
+    let peptide_supported = column(&headers, &["decoy_free_protein_supported_peptide"]);
+    let psm_supported = column(&headers, &["decoy_free_peptide_supported_psm"]);
+    let has_level4 = decoy_free && peptide_supported.is_some() && psm_supported.is_some();
+
+    #[derive(Default)]
+    struct Sets {
+        target_psm: BTreeSet<String>,
+        ent_psm: BTreeSet<String>,
+        target_peptide: BTreeSet<String>,
+        ent_peptide: BTreeSet<String>,
+        target_protein: BTreeSet<String>,
+        ent_protein: BTreeSet<String>,
+    }
+
+    let mut raw = Sets::default();
+    let mut reportable = Sets::default();
+    let mut has_entrapment = false;
+    for (row_index, row) in reader.records().enumerate() {
+        let row = row?;
+        if parse_i64(row.get(rank)) != Some(1) || parse_i64(row.get(label)) != Some(1) {
+            continue;
+        }
+        let protein_text = row.get(proteins).unwrap_or("");
+        if is_contaminant(protein_text) {
+            continue;
+        }
+        let entrapment = match protein_class(protein_text) {
+            Some(ProteinClass::Target) => false,
+            Some(ProteinClass::Entrapment) => true,
+            Some(ProteinClass::Ambiguous) | None => continue,
+        };
+        let protein = protein_key(protein_text);
+        has_entrapment |= entrapment;
+        let peptide = canonical_peptide(row.get(peptide).unwrap_or(""));
+        if peptide.is_empty() {
+            continue;
+        }
+        let psm = psm_id
+            .and_then(|index| row.get(index).map(ToOwned::to_owned))
+            .or_else(|| {
+                Some(format!(
+                    "{}:{}:{}",
+                    filename
+                        .and_then(|index| row.get(index))
+                        .unwrap_or("unknown"),
+                    scan.and_then(|index| row.get(index)).unwrap_or("unknown"),
+                    row_index
+                ))
+            })
+            .unwrap();
+
+        let insert = |sets: &mut Sets, psm_ok: bool, peptide_ok: bool, protein_ok: bool| {
+            if psm_ok {
+                if entrapment {
+                    sets.ent_psm.insert(psm.clone());
+                } else {
+                    sets.target_psm.insert(psm.clone());
+                }
+            }
+            if peptide_ok {
+                if entrapment {
+                    sets.ent_peptide.insert(peptide.clone());
+                } else {
+                    sets.target_peptide.insert(peptide.clone());
+                }
+            }
+            if protein_ok {
+                if let Some(protein) = protein.as_ref() {
+                    if entrapment {
+                        sets.ent_protein.insert(protein.clone());
+                    } else {
+                        sets.target_protein.insert(protein.clone());
+                    }
+                }
+            }
+        };
+
+        let raw_psm = parse_f64(row.get(psm_q)).is_some_and(|q| q <= fdr_threshold);
+        let raw_peptide = parse_f64(row.get(peptide_q)).is_some_and(|q| q <= fdr_threshold);
+        let raw_protein = parse_f64(row.get(protein_q)).is_some_and(|q| q <= fdr_threshold);
+        insert(&mut raw, raw_psm, raw_peptide, raw_protein);
+
+        if has_level4 {
+            insert(
+                &mut reportable,
+                raw_psm && parse_bool(psm_supported.and_then(|index| row.get(index))),
+                raw_peptide && parse_bool(peptide_supported.and_then(|index| row.get(index))),
+                raw_protein,
+            );
+        } else {
+            insert(&mut reportable, raw_psm, raw_peptide, raw_protein);
+        }
+    }
+
+    let observed_search_space = if has_entrapment { "+Ent" } else { "No Ent" };
+    if let Some(expected) = run.expected_search_space.as_deref() {
+        anyhow::ensure!(
+            expected == observed_search_space,
+            "{} expected search space {expected}, but results contain {observed_search_space}",
+            run.results.display()
+        );
+    }
+
+    let make = |layer: &str, sets: &Sets| {
+        let mut psm = IdentificationCount {
+            target: sets.target_psm.len(),
+            entrapment: sets.ent_psm.len(),
+            combined_entrapment_fdp: None,
+        };
+        let mut peptide = IdentificationCount {
+            target: sets.target_peptide.len(),
+            entrapment: sets.ent_peptide.len(),
+            combined_entrapment_fdp: None,
+        };
+        let mut protein = IdentificationCount {
+            target: sets.target_protein.len(),
+            entrapment: sets.ent_protein.len(),
+            combined_entrapment_fdp: None,
+        };
+        psm.combined_entrapment_fdp = combined_fdp(&psm, ratios.psm, has_entrapment);
+        peptide.combined_entrapment_fdp = combined_fdp(&peptide, ratios.peptide, has_entrapment);
+        protein.combined_entrapment_fdp = combined_fdp(&protein, ratios.protein, has_entrapment);
+        RunValidationSummary {
+            method: run.method.clone(),
+            stage: run.stage.clone(),
+            results: run.results.clone(),
+            mode: run.mode.clone(),
+            calibration_stage: run.calibration_stage.clone(),
+            complete: true,
+            search_space: observed_search_space.into(),
+            layer: layer.into(),
+            psm,
+            peptide,
+            protein,
+            counting_definition: "rank=1,label=1,non-contaminant,unambiguous target/entrapment mapping; peptide removes bracketed modifications and canonicalizes I/L; protein requires one inferred protein key"
+                .into(),
+        }
+    };
+    Ok(vec![
+        make("raw_q", &raw),
+        make(
+            if has_level4 { "level4" } else { "reportable_q" },
+            &reportable,
+        ),
+    ])
+}
+
+#[derive(Clone, Debug, Serialize, Deserialize)]
+pub struct TransferStability {
+    pub method: String,
+    pub from_stage: String,
+    pub to_stage: String,
+    pub psm_fraction_change: Option<f64>,
+    pub peptide_fraction_change: Option<f64>,
+    pub protein_fraction_change: Option<f64>,
+    pub stable: bool,
+}
+
+#[derive(Clone, Debug, Serialize, Deserialize)]
+pub struct StageComparison {
+    pub method: String,
+    pub layer: String,
+    pub from_stage: String,
+    pub to_stage: String,
+    pub target_psm_change: i64,
+    pub target_peptide_change: i64,
+    pub target_protein_change: i64,
+    pub peptide_fdp_change: Option<f64>,
+}
+
+#[derive(Clone, Debug, Serialize, Deserialize)]
+pub struct ParityPair {
+    pub baseline_method: String,
+    pub native_method: String,
+    /// Restrict parity to stages whose semantics are intentionally unchanged.
+    /// An empty list preserves the historical behavior of comparing every
+    /// common stage.
+    #[serde(default)]
+    pub stages: Vec<String>,
+    /// Restrict parity to selected reporting layers. An empty list compares
+    /// every common layer.
+    #[serde(default)]
+    pub layers: Vec<String>,
+    /// Optional pair-specific tolerance for known cross-platform numerical
+    /// variation. The comparison still reports every metric's fraction change.
+    #[serde(default)]
+    pub maximum_fraction_difference: Option<f64>,
+}
+
+#[derive(Clone, Debug, Serialize, Deserialize)]
+pub struct ParityComparison {
+    pub baseline_method: String,
+    pub native_method: String,
+    pub stage: String,
+    pub layer: String,
+    pub psm_fraction_change: Option<f64>,
+    pub peptide_fraction_change: Option<f64>,
+    pub protein_fraction_change: Option<f64>,
+    pub within_tolerance: bool,
+}
+
+pub fn parity_comparisons(
+    summaries: &[RunValidationSummary],
+    pairs: &[ParityPair],
+    maximum_fraction_difference: f64,
+) -> Vec<ParityComparison> {
+    let fraction = |baseline: usize, native: usize| {
+        (baseline > 0).then_some((native as f64 - baseline as f64) / baseline as f64)
+    };
+    let mut output = Vec::new();
+    for pair in pairs {
+        let pair_tolerance = pair
+            .maximum_fraction_difference
+            .unwrap_or(maximum_fraction_difference);
+        for baseline in summaries
+            .iter()
+            .filter(|row| row.method == pair.baseline_method)
+            .filter(|row| pair.stages.is_empty() || pair.stages.contains(&row.stage))
+            .filter(|row| pair.layers.is_empty() || pair.layers.contains(&row.layer))
+        {
+            if let Some(native) = summaries.iter().find(|row| {
+                row.method == pair.native_method
+                    && row.stage == baseline.stage
+                    && row.layer == baseline.layer
+            }) {
+                let psm = fraction(baseline.psm.target, native.psm.target);
+                let peptide = fraction(baseline.peptide.target, native.peptide.target);
+                let protein = fraction(baseline.protein.target, native.protein.target);
+                let within_tolerance = [
+                    (baseline.psm.target, native.psm.target, psm),
+                    (baseline.peptide.target, native.peptide.target, peptide),
+                    (baseline.protein.target, native.protein.target, protein),
+                ]
+                .into_iter()
+                .all(|(baseline, native, change)| {
+                    if baseline == 0 {
+                        native == 0
+                    } else {
+                        change.is_some_and(|value| value.abs() <= pair_tolerance)
+                    }
+                });
+                output.push(ParityComparison {
+                    baseline_method: pair.baseline_method.clone(),
+                    native_method: pair.native_method.clone(),
+                    stage: baseline.stage.clone(),
+                    layer: baseline.layer.clone(),
+                    psm_fraction_change: psm,
+                    peptide_fraction_change: peptide,
+                    protein_fraction_change: protein,
+                    within_tolerance,
+                });
+            }
+        }
+    }
+    output
+}
+
+#[derive(Clone, Debug, Serialize, Deserialize)]
+pub struct TdcBenchmarkComparison {
+    pub decoy_free_method: String,
+    pub tdc_method: String,
+    pub stage: String,
+    pub layer: String,
+    pub tdc_layer: String,
+    pub psm_yield_difference: i64,
+    pub peptide_yield_difference: i64,
+    pub protein_yield_difference: i64,
+    pub peptide_entrapment_fdp: Option<f64>,
+    pub calibration_stage: Option<String>,
+    pub calibration_constrained: bool,
+    pub improves_peptide_yield: bool,
+}
+
+pub fn tdc_benchmark_comparisons(
+    summaries: &[RunValidationSummary],
+    tdc_method: Option<&str>,
+    maximum_fdp: f64,
+) -> Vec<TdcBenchmarkComparison> {
+    let Some(tdc_method) = tdc_method else {
+        return Vec::new();
+    };
+    let mut output = Vec::new();
+    for decoy_free in summaries
+        .iter()
+        .filter(|row| matches!(row.mode, ValidationMode::DecoyFree))
+    {
+        let comparable_tdc_layer = if decoy_free.layer == "level4" {
+            "reportable_q"
+        } else {
+            decoy_free.layer.as_str()
+        };
+        if let Some(tdc) = summaries.iter().find(|row| {
+            row.method == tdc_method
+                && matches!(row.mode, ValidationMode::Tdc)
+                && row.stage == decoy_free.stage
+                && row.layer == comparable_tdc_layer
+        }) {
+            let peptide_difference = decoy_free.peptide.target as i64 - tdc.peptide.target as i64;
+            let calibration = if decoy_free.stage == "target_only" {
+                let requested = decoy_free.calibration_stage.as_deref();
+                requested
+                    .and_then(|stage| {
+                        summaries.iter().find(|row| {
+                            row.method == decoy_free.method
+                                && row.stage == stage
+                                && row.layer == decoy_free.layer
+                                && matches!(row.mode, ValidationMode::DecoyFree)
+                        })
+                    })
+                    .or_else(|| {
+                        ["ms2rescore", "optimized"].into_iter().find_map(|stage| {
+                            summaries.iter().find(|row| {
+                                row.method == decoy_free.method
+                                    && row.stage == stage
+                                    && row.layer == decoy_free.layer
+                                    && matches!(row.mode, ValidationMode::DecoyFree)
+                            })
+                        })
+                    })
+            } else {
+                Some(decoy_free)
+            };
+            let calibration_fdp = calibration.and_then(|row| row.peptide.combined_entrapment_fdp);
+            let calibrated = calibration_fdp.is_some_and(|fdp| fdp <= maximum_fdp);
+            output.push(TdcBenchmarkComparison {
+                decoy_free_method: decoy_free.method.clone(),
+                tdc_method: tdc_method.into(),
+                stage: decoy_free.stage.clone(),
+                layer: decoy_free.layer.clone(),
+                tdc_layer: tdc.layer.clone(),
+                psm_yield_difference: decoy_free.psm.target as i64 - tdc.psm.target as i64,
+                peptide_yield_difference: peptide_difference,
+                protein_yield_difference: decoy_free.protein.target as i64
+                    - tdc.protein.target as i64,
+                peptide_entrapment_fdp: calibration_fdp,
+                calibration_stage: calibration.map(|row| row.stage.clone()),
+                calibration_constrained: calibrated,
+                improves_peptide_yield: calibrated && peptide_difference > 0,
+            });
+        }
+    }
+    output
+}
+
+pub fn stage_comparisons(summaries: &[RunValidationSummary]) -> Vec<StageComparison> {
+    let mut output = Vec::new();
+    let pairs = [
+        ("optimized", "ms2rescore"),
+        ("ms2rescore", "target_only"),
+        ("optimized", "target_only"),
+    ];
+    let methods = summaries
+        .iter()
+        .map(|row| row.method.as_str())
+        .collect::<BTreeSet<_>>();
+    for method in methods {
+        for layer in ["raw_q", "level4", "reportable_q"] {
+            for (from_stage, to_stage) in pairs {
+                let from = summaries.iter().find(|row| {
+                    row.method == method && row.layer == layer && row.stage == from_stage
+                });
+                let to = summaries.iter().find(|row| {
+                    row.method == method && row.layer == layer && row.stage == to_stage
+                });
+                if let (Some(from), Some(to)) = (from, to) {
+                    output.push(StageComparison {
+                        method: method.into(),
+                        layer: layer.into(),
+                        from_stage: from_stage.into(),
+                        to_stage: to_stage.into(),
+                        target_psm_change: to.psm.target as i64 - from.psm.target as i64,
+                        target_peptide_change: to.peptide.target as i64
+                            - from.peptide.target as i64,
+                        target_protein_change: to.protein.target as i64
+                            - from.protein.target as i64,
+                        peptide_fdp_change: match (
+                            from.peptide.combined_entrapment_fdp,
+                            to.peptide.combined_entrapment_fdp,
+                        ) {
+                            (Some(a), Some(b)) => Some(b - a),
+                            _ => None,
+                        },
+                    });
+                }
+            }
+        }
+    }
+    output
+}
+
+#[derive(Clone, Debug, Serialize, Deserialize)]
+pub struct ExpertQualityGate {
+    pub model: String,
+    pub eligible: bool,
+    pub reasons: Vec<String>,
+    pub validation_stage: Option<String>,
+    pub validation_layer: String,
+    pub target_peptides: usize,
+    pub entrapment_peptides: usize,
+    pub peptide_fdp: Option<f64>,
+    pub underpowered: bool,
+    pub warnings: Vec<String>,
+}
+
+pub fn expert_quality_gates(
+    summaries: &[RunValidationSummary],
+    stability: &[TransferStability],
+    maximum_fdp: f64,
+    minimum_entrapment_peptides: usize,
+    validation_layer: &str,
+) -> Vec<ExpertQualityGate> {
+    let methods = summaries
+        .iter()
+        .filter(|row| row.method != "ensemble" && matches!(row.mode, ValidationMode::DecoyFree))
+        .map(|row| row.method.as_str())
+        .collect::<BTreeSet<_>>();
+    methods
+        .into_iter()
+        .map(|method| {
+            let selected_stage = summaries
+                .iter()
+                .find(|row| {
+                    row.method == method
+                        && row.stage == "target_only"
+                        && row.layer == validation_layer
+                })
+                .and_then(|row| row.calibration_stage.as_deref());
+            let best = selected_stage
+                .and_then(|stage| {
+                    summaries.iter().find(|row| {
+                        row.method == method
+                            && row.stage == stage
+                            && row.layer == validation_layer
+                    })
+                })
+                .or_else(|| {
+                    ["ms2rescore", "optimized"].into_iter().find_map(|stage| {
+                        summaries.iter().find(|row| {
+                            row.method == method
+                                && row.stage == stage
+                                && row.layer == validation_layer
+                        })
+                    })
+                });
+            let mut reasons = Vec::new();
+            let mut warnings = Vec::new();
+            if best.is_none() {
+                reasons.push(format!("missing {validation_layer} entrapment validation"));
+            }
+            let target_peptides = best.map(|row| row.peptide.target).unwrap_or(0);
+            let entrapment_peptides = best.map(|row| row.peptide.entrapment).unwrap_or(0);
+            let fdp = best.and_then(|row| row.peptide.combined_entrapment_fdp);
+            if target_peptides == 0 {
+                reasons.push("no accepted target peptides".into());
+            }
+            if !fdp.is_some_and(|value| value <= maximum_fdp) {
+                reasons.push("peptide entrapment FDP is missing or above threshold".into());
+            }
+            if entrapment_peptides < minimum_entrapment_peptides {
+                warnings.push(format!(
+                    "accepted entrapment peptide count {entrapment_peptides} is below the stability minimum {minimum_entrapment_peptides}"
+                ));
+            }
+            if stability
+                .iter()
+                .find(|row| row.method == method)
+                .is_some_and(|row| !row.stable)
+            {
+                reasons.push("target-only search-space transfer is unstable".into());
+            }
+            ExpertQualityGate {
+                model: method.into(),
+                eligible: reasons.is_empty(),
+                reasons,
+                validation_stage: best.map(|row| row.stage.clone()),
+                validation_layer: validation_layer.into(),
+                target_peptides,
+                entrapment_peptides,
+                peptide_fdp: fdp,
+                underpowered: entrapment_peptides < minimum_entrapment_peptides,
+                warnings,
+            }
+        })
+        .collect()
+}
+
+pub fn transfer_stability(
+    summaries: &[RunValidationSummary],
+    maximum_fraction_loss: f64,
+) -> Vec<TransferStability> {
+    let reportable = summaries
+        .iter()
+        .filter(|summary| summary.layer == "level4" || summary.layer == "reportable_q")
+        .collect::<Vec<_>>();
+    let mut by_method: BTreeMap<&str, Vec<&RunValidationSummary>> = BTreeMap::new();
+    for summary in reportable {
+        by_method.entry(&summary.method).or_default().push(summary);
+    }
+    let fraction =
+        |from: usize, to: usize| (from > 0).then_some((to as f64 - from as f64) / from as f64);
+    let mut output = Vec::new();
+    for (method, rows) in by_method {
+        let from = rows
+            .iter()
+            .find(|row| row.stage == "ms2rescore")
+            .or_else(|| rows.iter().find(|row| row.stage == "optimized"));
+        let to = rows.iter().find(|row| row.stage == "target_only");
+        if let (Some(from), Some(to)) = (from, to) {
+            let psm = fraction(from.psm.target, to.psm.target);
+            let peptide = fraction(from.peptide.target, to.peptide.target);
+            let protein = fraction(from.protein.target, to.protein.target);
+            let stable = [psm, peptide, protein]
+                .into_iter()
+                .flatten()
+                .all(|change| change >= -maximum_fraction_loss);
+            output.push(TransferStability {
+                method: method.into(),
+                from_stage: from.stage.clone(),
+                to_stage: to.stage.clone(),
+                psm_fraction_change: psm,
+                peptide_fraction_change: peptide,
+                protein_fraction_change: protein,
+                stable,
+            });
+        }
+    }
+    output
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn summary(
+        method: &str,
+        stage: &str,
+        layer: &str,
+        targets: usize,
+        entrapments: usize,
+    ) -> RunValidationSummary {
+        let count = IdentificationCount {
+            target: targets,
+            entrapment: entrapments,
+            combined_entrapment_fdp: Some(
+                (2.0 * entrapments as f64 / (targets + entrapments).max(1) as f64).min(1.0),
+            ),
+        };
+        RunValidationSummary {
+            method: method.into(),
+            stage: stage.into(),
+            results: PathBuf::new(),
+            mode: ValidationMode::DecoyFree,
+            calibration_stage: None,
+            complete: true,
+            search_space: "+Ent".into(),
+            layer: layer.into(),
+            psm: count.clone(),
+            peptide: count.clone(),
+            protein: count,
+            counting_definition: "test".into(),
+        }
+    }
+
+    #[test]
+    fn parity_rejects_nonzero_native_when_baseline_is_zero() {
+        let summaries = vec![
+            summary("baseline", "optimized", "level4", 0, 0),
+            summary("native", "optimized", "level4", 1, 0),
+        ];
+        let result = parity_comparisons(
+            &summaries,
+            &[ParityPair {
+                baseline_method: "baseline".into(),
+                native_method: "native".into(),
+                stages: Vec::new(),
+                layers: Vec::new(),
+                maximum_fraction_difference: None,
+            }],
+            0.001,
+        );
+        assert_eq!(result.len(), 1);
+        assert!(!result[0].within_tolerance);
+    }
+
+    #[test]
+    fn parity_can_exclude_a_stage_with_intentionally_changed_semantics() {
+        let summaries = vec![
+            summary("baseline", "optimized", "level4", 100, 0),
+            summary("native", "optimized", "level4", 100, 0),
+            summary("baseline", "target_only", "level4", 200, 0),
+            summary("native", "target_only", "level4", 100, 0),
+        ];
+        let result = parity_comparisons(
+            &summaries,
+            &[ParityPair {
+                baseline_method: "baseline".into(),
+                native_method: "native".into(),
+                stages: vec!["optimized".into()],
+                layers: Vec::new(),
+                maximum_fraction_difference: None,
+            }],
+            0.001,
+        );
+        assert_eq!(result.len(), 1);
+        assert_eq!(result[0].stage, "optimized");
+        assert!(result[0].within_tolerance);
+    }
+
+    #[test]
+    fn transfer_uses_optimized_when_ms2rescore_is_not_run() {
+        let summaries = vec![
+            summary("moments", "optimized", "level4", 100, 1),
+            summary("moments", "target_only", "level4", 95, 0),
+        ];
+        let result = transfer_stability(&summaries, 0.10);
+        assert_eq!(result.len(), 1);
+        assert!(result[0].stable);
+        assert_eq!(result[0].from_stage, "optimized");
+    }
+
+    #[test]
+    fn expert_gate_warns_about_underpowered_zero_entrapment_result() {
+        let summaries = vec![summary("moments", "optimized", "level4", 500, 0)];
+        let gates = expert_quality_gates(&summaries, &[], 0.01, 3, "level4");
+        assert_eq!(gates.len(), 1);
+        assert!(gates[0].eligible);
+        assert!(gates[0].underpowered);
+        assert!(gates[0]
+            .warnings
+            .iter()
+            .any(|reason| reason.contains("stability minimum")));
+    }
+
+    #[test]
+    fn expert_gate_uses_the_artifact_selected_for_target_only() {
+        let optimized = summary("moments", "optimized", "level4", 500, 0);
+        let rejected_ms2 = summary("moments", "ms2rescore", "level4", 510, 10);
+        let mut target_only = summary("moments", "target_only", "level4", 505, 0);
+        target_only.calibration_stage = Some("optimized".into());
+        let gates = expert_quality_gates(
+            &[optimized, rejected_ms2, target_only],
+            &[],
+            0.01,
+            3,
+            "level4",
+        );
+        assert_eq!(gates.len(), 1);
+        assert_eq!(gates[0].validation_stage.as_deref(), Some("optimized"));
+        assert!(gates[0].eligible);
+    }
+
+    #[test]
+    fn stage_report_includes_direct_optimized_to_target_only_change() {
+        let summaries = vec![
+            summary("moments", "optimized", "level4", 100, 1),
+            summary("moments", "ms2rescore", "level4", 105, 1),
+            summary("moments", "target_only", "level4", 103, 0),
+        ];
+        let comparisons = stage_comparisons(&summaries);
+        assert!(comparisons.iter().any(|comparison| {
+            comparison.from_stage == "optimized"
+                && comparison.to_stage == "target_only"
+                && comparison.target_peptide_change == 3
+        }));
+    }
+
+    #[test]
+    fn target_only_tdc_comparison_uses_declared_entrapment_calibration() {
+        let calibration = summary("moments", "optimized", "level4", 100, 0);
+        let mut target_only = summary("moments", "target_only", "level4", 110, 0);
+        target_only.calibration_stage = Some("optimized".into());
+        target_only.peptide.combined_entrapment_fdp = None;
+        let mut tdc = summary("tdc_primary", "target_only", "reportable_q", 105, 0);
+        tdc.mode = ValidationMode::Tdc;
+        tdc.peptide.combined_entrapment_fdp = None;
+        let mut secondary_tdc = summary("tdc_secondary", "target_only", "level4", 50, 0);
+        secondary_tdc.mode = ValidationMode::Tdc;
+
+        let comparisons = tdc_benchmark_comparisons(
+            &[calibration, target_only, tdc, secondary_tdc],
+            Some("tdc_primary"),
+            0.01,
+        );
+        assert_eq!(comparisons.len(), 1);
+        assert_eq!(comparisons[0].stage, "target_only");
+        assert_eq!(
+            comparisons[0].calibration_stage.as_deref(),
+            Some("optimized")
+        );
+        assert!(comparisons[0].calibration_constrained);
+        assert!(comparisons[0].improves_peptide_yield);
+        assert_eq!(comparisons[0].peptide_yield_difference, 5);
+    }
+}

@@ -7,6 +7,12 @@ use std::collections::HashMap;
 use std::path::{Path, PathBuf};
 use std::process::Command;
 
+use crate::candidate_pool::stable_candidate_id;
+use crate::external_feature_cache::{
+    annotation_identity, cache_directory, load_cache, usage as cache_usage, write_cache,
+    ExternalAnnotationCacheRequest, ExternalAnnotationCacheUsage, ExternalAnnotationInput,
+    ExternalAnnotationRecord,
+};
 use crate::input::{
     ExternalFeatureEngine, ExternalFeatureFailPolicy, ExternalFeatureGenerationSettings,
     ExternalFeatureUseMode,
@@ -38,19 +44,33 @@ pub fn maybe_add_external_features(
     settings: &ExternalFeatureGenerationSettings,
     mzml_paths: &[Url],
     db: &IndexedDatabase,
-) -> Result<()> {
+    search_fingerprint: Option<&str>,
+    cache_request: Option<&ExternalAnnotationCacheRequest>,
+) -> Result<Option<ExternalAnnotationCacheUsage>> {
     if !settings.enabled {
-        return Ok(());
+        return Ok(None);
     }
 
     if !settings.feature_only {
         bail!("external feature generation must run in feature-only mode");
     }
 
-    let result = add_external_features_inner(features, settings, mzml_paths, db);
+    anyhow::ensure!(
+        search_fingerprint.is_some() == cache_request.is_some(),
+        "MS2Rescore cache requires both a search fingerprint and a cache root"
+    );
+
+    let result = add_external_features_inner(
+        features,
+        settings,
+        mzml_paths,
+        db,
+        search_fingerprint,
+        cache_request,
+    );
 
     match (&settings.fail_policy, result) {
-        (_, Ok(())) => Ok(()),
+        (_, Ok(usage)) => Ok(usage),
 
         (ExternalFeatureFailPolicy::Error, Err(e)) => Err(e),
 
@@ -58,12 +78,12 @@ pub fn maybe_add_external_features(
             log::warn!(
                 "external feature generation failed; continuing without imported features: {e:#}"
             );
-            Ok(())
+            Ok(None)
         }
 
         (ExternalFeatureFailPolicy::Disable, Err(e)) => {
             log::info!("external feature generation disabled after failure: {e:#}");
-            Ok(())
+            Ok(None)
         }
     }
 }
@@ -73,7 +93,41 @@ fn add_external_features_inner(
     settings: &ExternalFeatureGenerationSettings,
     mzml_paths: &[Url],
     db: &IndexedDatabase,
-) -> Result<()> {
+    search_fingerprint: Option<&str>,
+    cache_request: Option<&ExternalAnnotationCacheRequest>,
+) -> Result<Option<ExternalAnnotationCacheUsage>> {
+    let requested_max_rank = settings.max_rank.unwrap_or_else(|| {
+        features
+            .iter()
+            .map(|feature| feature.core.rank)
+            .max()
+            .unwrap_or(0)
+    });
+    let prepared_cache = match (search_fingerprint, cache_request) {
+        (Some(search_fingerprint), Some(request)) => {
+            let (inputs, candidate_indices) =
+                annotation_inputs(features, db, search_fingerprint, requested_max_rank);
+            let identity =
+                annotation_identity(search_fingerprint, settings, &inputs, requested_max_rank)?;
+            let directory = cache_directory(&request.root, &identity);
+            if let Some((manifest, records)) = load_cache(&directory, &identity)? {
+                apply_cached_annotations(features, &candidate_indices, records)?;
+                log::info!(
+                    "MS2Rescore annotation cache: reused {}/{} joined annotations from {} (fingerprint={})",
+                    manifest.joined_annotation_count,
+                    manifest.annotation_count,
+                    directory.display(),
+                    identity.digest
+                );
+                log_external_feature_local_separation(features, db);
+                return Ok(Some(cache_usage(&directory, &manifest, true)));
+            }
+            Some((identity, directory, candidate_indices))
+        }
+        (None, None) => None,
+        _ => unreachable!("cache arguments were validated by caller"),
+    };
+
     let tmp_dir = settings
         .temp_directory
         .as_ref()
@@ -92,12 +146,33 @@ fn add_external_features_inner(
 
     write_feature_config(settings, &psm_path, &output_root, &config_path, mzml_paths)?;
 
+    // A configured temp directory may contain output from an earlier run. Never
+    // allow a successful-but-empty wrapper invocation to make stale annotations
+    // appear current.
+    if output_tsv.is_file() {
+        std::fs::remove_file(&output_tsv).with_context(|| {
+            format!(
+                "removing stale external feature output {}",
+                output_tsv.display()
+            )
+        })?;
+    }
+
     run_external_process(settings, &config_path)?;
 
     let parsed = parse_feature_output(&output_tsv)
         .with_context(|| format!("parsing external feature output {}", output_tsv.display()))?;
 
     join_features(features, parsed, mzml_paths, db)?;
+
+    let joined = features
+        .iter()
+        .filter(|feature| feature.core.external_features.ms2rescore_feature_joined)
+        .count();
+    anyhow::ensure!(
+        joined > 0 || features.is_empty(),
+        "external feature generator returned no joinable MS2Rescore annotations"
+    );
 
     log_external_feature_local_separation(features, db);
 
@@ -113,6 +188,94 @@ fn add_external_features_inner(
         }
     }
 
+    if let Some((identity, directory, candidate_indices)) = prepared_cache {
+        let records = candidate_indices
+            .into_iter()
+            .map(|(index, stable_id)| ExternalAnnotationRecord {
+                stable_id,
+                features: features[index].core.external_features,
+            })
+            .collect();
+        let manifest = write_cache(&directory, &identity, records)?;
+        log::info!(
+            "MS2Rescore annotation cache: wrote {}/{} joined annotations to {} (fingerprint={})",
+            manifest.joined_annotation_count,
+            manifest.annotation_count,
+            directory.display(),
+            identity.digest
+        );
+        if settings.output_directory.is_none() {
+            for intermediate in [&psm_path, &config_path, &output_tsv] {
+                if intermediate.is_file() {
+                    if let Err(error) = std::fs::remove_file(intermediate) {
+                        log::warn!(
+                            "could not remove cached MS2Rescore intermediate {}: {error}",
+                            intermediate.display()
+                        );
+                    }
+                }
+            }
+        }
+        return Ok(Some(cache_usage(&directory, &manifest, false)));
+    }
+
+    Ok(None)
+}
+
+fn annotation_inputs(
+    features: &[DfFeature],
+    db: &IndexedDatabase,
+    search_fingerprint: &str,
+    requested_max_rank: u32,
+) -> (Vec<ExternalAnnotationInput>, Vec<(usize, String)>) {
+    let mut inputs = Vec::new();
+    let mut candidate_indices = Vec::new();
+    for (index, feature) in features
+        .iter()
+        .enumerate()
+        .filter(|(_, feature)| feature.core.rank <= requested_max_rank)
+    {
+        let peptide = db[feature.core.peptide_idx].to_string();
+        let stable_id = stable_candidate_id(search_fingerprint, &feature.core, &peptide);
+        inputs.push(ExternalAnnotationInput {
+            stable_id: stable_id.clone(),
+            score: feature.core.hyperscore,
+            q_value: feature.decoy_free_q_value,
+            pep: feature.decoy_free_pep,
+            retention_time: feature.core.rt,
+            ion_mobility: feature.core.ims,
+            precursor_mass: feature.core.expmass,
+            charge: feature.core.charge,
+            rank: feature.core.rank,
+        });
+        candidate_indices.push((index, stable_id));
+    }
+    (inputs, candidate_indices)
+}
+
+fn apply_cached_annotations(
+    features: &mut [DfFeature],
+    candidate_indices: &[(usize, String)],
+    records: Vec<ExternalAnnotationRecord>,
+) -> Result<()> {
+    anyhow::ensure!(
+        records.len() == candidate_indices.len(),
+        "MS2Rescore annotation cache candidate-count mismatch"
+    );
+    let mut by_id = records
+        .into_iter()
+        .map(|record| (record.stable_id, record.features))
+        .collect::<HashMap<_, _>>();
+    for (index, stable_id) in candidate_indices {
+        let annotation = by_id
+            .remove(stable_id)
+            .with_context(|| format!("MS2Rescore annotation cache is missing {stable_id}"))?;
+        features[*index].core.external_features = annotation;
+    }
+    anyhow::ensure!(
+        by_id.is_empty(),
+        "MS2Rescore annotation cache contains candidates not present in the current analysis"
+    );
     Ok(())
 }
 
@@ -894,6 +1057,44 @@ fn external_feature_auc(reference: &[f64], entrapment: &[f64], higher_is_better:
         f64::NAN
     } else {
         wins / total
+    }
+}
+
+#[cfg(test)]
+mod cache_tests {
+    use super::*;
+    use sage_core::scoring::FeatureCore;
+
+    #[test]
+    fn cached_annotations_join_only_by_stable_candidate_id() {
+        let mut features = vec![FeatureCore::default().to_df()];
+        let mut annotation = ExternalPsmFeatures::default();
+        annotation.ms2rescore_feature_joined = true;
+        annotation.ms2rescore_ms2pip_pcc = 0.75;
+        apply_cached_annotations(
+            &mut features,
+            &[(0, "stable-candidate".into())],
+            vec![ExternalAnnotationRecord {
+                stable_id: "stable-candidate".into(),
+                features: annotation,
+            }],
+        )
+        .unwrap();
+        assert!(features[0].core.external_features.ms2rescore_feature_joined);
+        assert_eq!(
+            features[0].core.external_features.ms2rescore_ms2pip_pcc,
+            0.75
+        );
+
+        assert!(apply_cached_annotations(
+            &mut features,
+            &[(0, "different-candidate".into())],
+            vec![ExternalAnnotationRecord {
+                stable_id: "stable-candidate".into(),
+                features: annotation,
+            }],
+        )
+        .is_err());
     }
 }
 

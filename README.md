@@ -75,6 +75,45 @@ Among the null-rank windows that keep entrapment proteins at zero or below the c
 
 The selected null window should then be copied into the final Sage JSON and used for the production run without entrapment sequences.
 
+### Native Phase 2 workflow
+
+The Rust workflow now internalizes the FASTA-generation and null-window-optimization boundary.
+These two parts have independent parity gates: optimizer tests can consume the exact frozen legacy
+entrapment FASTA, while `sage audit-entrapment entrapment.audit.json` compares native FASTA
+generation with a `make_entrapment.sh`/FDRBench reference without running a spectral search.
+
+Native generation supports automatic foreign-source selection, an explicit source, and automatic
+selection with a user override. It records selected accessions, shared-peptide exclusions, source
+mappings, order-sensitive hashes, seed reproducibility, and Sage-measured protein, peptide, and
+peptidoform ratios. Workflow searches require the ratios measured from their own active FASTA;
+hard-coded ratios from another dataset are rejected.
+
+For legacy comparison only, `fdrbench004_compatibility` reproduces FDRBench 0.0.4's length-only
+shared-peptide exclusion and Java seeded selection. New production workflows default to
+`sage_search_space`, which uses the peptides Sage can actually search. See
+[`DECOY_FREE_WORKFLOW.md`](DECOY_FREE_WORKFLOW.md) and
+[`entrapment.audit.example.json`](entrapment.audit.example.json).
+
+### Native Phase 3 candidate sharing and Phase 4 MS2Rescore caching
+
+`sage workflow` now performs one native spectrum search per strict search fingerprint and persists
+the pre-FDR candidates in a compressed, immutable pool. Compatible model fits and null-window
+grids reuse that pool while receiving separate analysis fingerprints. Statistical changes such as
+q-value methods, covariates, Storey parameters, FDR thresholds, RT/IMS adjustments, rescue gates,
+or null windows therefore trigger a refit but not another spectrum search. FASTA, spectrum,
+digestion/modification, tolerance, scoring, preprocessing, or retained-depth changes select a new
+pool automatically.
+
+The exact lean optimizer retains compact metrics and timing for every trial, drops nonselected
+feature/artifact payloads immediately, and materializes the selected window once with full normal
+diagnostics. Stable candidate IDs now support a separate, compressed MS2Rescore annotation cache.
+The MS2Rescore stage reuses the native candidate pool, while its external annotations remain
+outside that immutable pool and are reused only when the search, preliminary q/PEP calibration
+input, rank depth, generator settings, mapped spectra, wrapper, and Python/package environment all
+match. A changed model/window calibration receives a different annotation cache, preserving exact
+DeepLC behavior. See [`DECOY_FREE_WORKFLOW.md`](DECOY_FREE_WORKFLOW.md) for fingerprint,
+capability, integrity, and fail-closed rules.
+
 
 ## Practical implication
 
@@ -108,9 +147,11 @@ The branch also supports bounded physical evidence updates. RT and IMS evidence 
 
 This branch is experimental. The DF code is designed to fail closed whenever the mandatory base model cannot produce a valid rank-1 stream. Optional post-base stages are nonfatal: if RT, IMS, peptide reproducibility rescue, or protein reproducibility rescue cannot produce a valid update, the previous last-good active stream is kept.
 
-The current implementation does **not** implement automatic expert outlier rejection for ensemble mode. Static enable/disable flags and static weights are available, but failed or low-quality experts are not dynamically vetoed based on diagnostics. If an expert is known to be unstable for a dataset, disable it with `enable_* = false` or set its `ensemble_weight_*` to `0.0` for weighted/ensemble paths that honor weights.
+Direct one-off Ensemble searches still honor the static enable/disable flags and weights in the search JSON. The native `sage workflow` path adds automatic, fail-closed expert-quality gates and writes a dataset-local expert set for development or holdout validation. Holdout datasets run the same predeclared optimization procedure; they do not import another dataset's selected windows or fitted experts.
 
-The current implementation does **not** implement automatic dynamic null-window discovery. Null-rank windows are configured manually and then clamped into the global `min_null_rank..=max_null_rank` range. Lower-ranked candidates are assumed to be enriched for random matches, but this assumption must be validated per dataset.
+Direct one-off searches use configured null-rank windows. The native `sage workflow` path can scan declared candidate windows in memory from one retained candidate set, select the highest-yield feasible window, and lock it for later stages.
+
+See [`DECOY_FREE_WORKFLOW.md`](DECOY_FREE_WORKFLOW.md) and [`workflow.example.json`](workflow.example.json) for the resumable development/holdout workflow and validation-only audits of completed result tables.
 
 The current implementation exposes `msfdr2_smix_min_null_rank` and `msfdr2_smix_max_null_rank`, but there are no `msfdr1_smix_min_null_rank` or `msfdr1_smix_max_null_rank` options in `FdrOptions`. MSFDR1_SMIX is a rank-1 semi-mixture path controlled by initialization fractions and pi clamps. Do **not** put `msfdr1_smix_min_null_rank` or `msfdr1_smix_max_null_rank` in the JSON config; they are not accepted by the current code.
 
@@ -1009,7 +1050,7 @@ Important limitations remain:
 - DF model calibration is model- and dataset-dependent.
 - Higher discovery power must be checked against entrapment or other external validation.
 - Physical evidence should be bounded and gated; RT/IMS/mass-error agreement should not rescue arbitrary low-quality PSMs without base evidence support.
-- Ensemble mode currently uses static weights, not learned expert-quality gating.
+- Direct Ensemble mode uses static weights; the native validation workflow adds automatic inclusion gates but does not learn weights from holdout data.
 
 
 ## Output field semantics
@@ -1126,7 +1167,7 @@ NOKOI uses a cross-fit classifier-like approach with lower-rank null evidence an
 
 ### Ensemble
 
-The ensemble is designed to combine evidence from multiple experts.  In the current implementation, expert inclusion is controlled by static flags and weights.  There is no automatic per-run expert-quality gate or outlier veto.  If one expert is pathological, it can still influence the ensemble unless disabled or downweighted by configuration.
+The ensemble is designed to combine evidence from multiple experts. Direct searches use static flags and weights. The native workflow optimizes each constituent window independently within the current dataset, rejects experts that fail calibration/transfer/artifact/support gates, and creates `ensemble.lock.json` automatically. It keeps native and MS2Rescore-fitted artifacts separate. A holdout dataset applies the same locked expert-selection procedure to its own independently optimized experts; it never imports another dataset's expert windows or fitted models in normal operation.
 
 ---
 
@@ -1147,7 +1188,7 @@ The current ISB18 validation figures suggest the following practical interpretat
 
 ### 1. Dynamic null-window selection
 
-Current rank windows are manually configured.  This is fragile across datasets with different depth, score distributions, and input amounts.  A future implementation should scan candidate null windows and choose windows by stability and null-likeness diagnostics, such as:
+The native workflow now scans declared candidate windows without rereading spectra and selects the highest-yield window satisfying PSM, peptide, and protein entrapment-FDP constraints. Further diagnostics can still be added, such as:
 
 ```text
 candidate count per rank
@@ -1161,7 +1202,7 @@ EM convergence stability
 
 ### 2. Ensemble expert QC and outlier rejection
 
-Current ensemble mode lacks automatic expert-quality filtering.  A future implementation should compute expert diagnostics before combination, for example:
+The native workflow now vetoes experts with missing/fallback artifacts, failed entrapment calibration, underpowered accepted-entrapment counts, unstable target-only transfer, or no incremental Level-4 peptide yield. Additional diagnostics could include:
 
 ```text
 finite-value fraction
@@ -1302,13 +1343,13 @@ The current uploaded code is organized roughly as follows:
 
 The current code supports a large configuration surface, but several improvements would make the workflow more robust and easier to validate:
 
-1. **Dynamic null-window selection.** Replace fixed null-rank windows with an automatic scanner that evaluates candidate windows for adequate support, weak target-like mass/RT structure, stable pi0 estimates, and EM convergence.
-2. **Expert diagnostics and adaptive ensemble weighting.** Each expert should emit diagnostics such as finite-rate, q-value saturation, pi0, discovery count, rank concordance, EM boundary solutions, and entrapment behavior. Ensemble weights should then be downweighted or set to zero for failed experts.
+1. **Broader null-window diagnostics.** Extend the implemented in-memory constrained scanner with mass/RT null-likeness, pi0-stability, and EM-convergence diagnostics.
+2. **Adaptive Ensemble weighting.** The workflow now excludes failed experts; future work can predeclare a weighting procedure and evaluate it with dataset-local holdout optimization.
 3. **Bounded joint physical evidence.** RT, IMS, and delta-mass evidence should eventually be represented as local-FDR or empirical-Bayes evidence terms, but with caps, minimum support, reliability gates, and clear audit fields.
 4. **Entrapment-guided calibration.** Where validation entrapments are available, use monotone recalibration, such as isotonic regression, to map reported q-values onto observed entrapment-estimated FDR.
 5. **Layer-separated output fields.** Future output should preserve base, physical, reproducibility, and final hierarchical evidence separately so that every rescue/demotion is auditable.
 
-These are not implemented in the current uploaded code base. They are future directions that I hope to implement.
+The first two items now have conservative workflow implementations as described above; the listed extensions remain future work.
 
 ---
 

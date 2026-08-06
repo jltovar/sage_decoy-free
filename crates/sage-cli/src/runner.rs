@@ -1,6 +1,11 @@
 use super::input::{ExternalFeatureUseMode, Search};
 use super::output::SageResults;
 use super::telemetry;
+use crate::candidate_pool::{
+    analysis_fingerprint, inspect_compatible_pool, load_pool, manifest_path, pool_directory,
+    search_fingerprint, write_pool, CandidatePoolRequest, CandidatePoolUsage,
+};
+use crate::external_feature_cache::{ExternalAnnotationCacheRequest, ExternalAnnotationCacheUsage};
 use crate::external_features::maybe_add_external_features;
 use anyhow::Context;
 use csv::ByteRecord;
@@ -20,10 +25,11 @@ use sage_core::scoring::{DfFeature, FeatureCore, Scorer, TdcFeature};
 use sage_core::spectrum::{ProcessedSpectrum, RawSpectrum, SpectrumProcessor};
 use sage_core::tmt::TmtQuant;
 use std::collections::{HashMap, HashSet};
+use std::sync::Arc;
 use std::time::Instant;
 
 pub struct Runner {
-    pub database: IndexedDatabase,
+    pub database: Arc<IndexedDatabase>,
     pub parameters: Search,
     pub start: Instant,
     pub decoy_free_mode: bool,
@@ -163,7 +169,7 @@ impl Runner {
                         parameters.database.prefilter_chunk_size,
                     );
                     let mini_runner = Self {
-                        database: IndexedDatabase::default(),
+                        database: Arc::new(IndexedDatabase::default()),
                         parameters: parameters.clone(),
                         start,
                         decoy_free_mode,
@@ -182,11 +188,42 @@ impl Runner {
         );
 
         Ok(Self {
-            database,
+            database: Arc::new(database),
             parameters,
             start,
             decoy_free_mode,
         })
+    }
+
+    /// Construct another analysis runner over an already-built database index.
+    /// The caller must guard reuse with the same strict search fingerprint used
+    /// for the candidate pool.
+    pub fn with_shared_database(
+        mut parameters: Search,
+        database: Arc<IndexedDatabase>,
+    ) -> anyhow::Result<Self> {
+        let decoy_free_mode = matches!(parameters.fdr.mode, FdrMode::DecoyFree);
+        if decoy_free_mode && parameters.report_psms < 10 {
+            parameters.report_psms = 10;
+        }
+        if let Some(max_rank) = parameters.external_features.max_rank {
+            anyhow::ensure!(
+                parameters.report_psms >= max_rank as usize,
+                "external_features.max_rank={} exceeds report_psms={}",
+                max_rank,
+                parameters.report_psms
+            );
+        }
+        Ok(Self {
+            database,
+            parameters,
+            start: Instant::now(),
+            decoy_free_mode,
+        })
+    }
+
+    pub fn shared_database(&self) -> Arc<IndexedDatabase> {
+        Arc::clone(&self.database)
     }
 
     pub fn prefilter_peptides(self, parallel: usize, fasta: Fasta) -> Vec<Peptide> {
@@ -539,7 +576,33 @@ impl Runner {
             .collect::<SageResults>()
     }
 
-    pub fn run(mut self, parallel: usize, parquet: bool) -> anyhow::Result<telemetry::Telemetry> {
+    pub fn run(self, parallel: usize, parquet: bool) -> anyhow::Result<telemetry::Telemetry> {
+        self.run_with_candidate_pool(parallel, parquet, None)
+            .map(|(telemetry, _)| telemetry)
+    }
+
+    pub fn run_with_candidate_pool(
+        self,
+        parallel: usize,
+        parquet: bool,
+        candidate_pool: Option<CandidatePoolRequest>,
+    ) -> anyhow::Result<(telemetry::Telemetry, Option<CandidatePoolUsage>)> {
+        let (telemetry, candidate_pool, _) =
+            self.run_with_workflow_caches(parallel, parquet, candidate_pool, None)?;
+        Ok((telemetry, candidate_pool))
+    }
+
+    pub fn run_with_workflow_caches(
+        mut self,
+        parallel: usize,
+        parquet: bool,
+        candidate_pool: Option<CandidatePoolRequest>,
+        annotation_cache: Option<ExternalAnnotationCacheRequest>,
+    ) -> anyhow::Result<(
+        telemetry::Telemetry,
+        Option<CandidatePoolUsage>,
+        Option<ExternalAnnotationCacheUsage>,
+    )> {
         let scorer = Scorer {
             db: &self.database,
             precursor_tol: self.parameters.precursor_tol,
@@ -558,8 +621,79 @@ impl Runner {
             score_type: self.parameters.score_type,
         };
 
-        // Collect all results into a single container
-        let mut outputs = self.batch_files(&scorer, parallel);
+        let pool_identity = candidate_pool
+            .as_ref()
+            .map(|request| {
+                let search = search_fingerprint(&self.parameters)?;
+                anyhow::ensure!(
+                    request.required_rank_depth <= search.retained_rank_depth,
+                    "candidate pool retains ranks 1..={} but analysis requires rank {}",
+                    search.retained_rank_depth,
+                    request.required_rank_depth
+                );
+                let analysis = analysis_fingerprint(&self.parameters, &search)?;
+                let directory = pool_directory(&request.root, &search);
+                Ok::<_, anyhow::Error>((search, analysis, directory))
+            })
+            .transpose()?;
+
+        let mut pool_was_loaded = false;
+        let mut pool_usage = None;
+        let annotation_search_fingerprint = if annotation_cache.is_some() {
+            Some(match pool_identity.as_ref() {
+                Some((search, _, _)) => search.clone(),
+                None => search_fingerprint(&self.parameters)?,
+            })
+        } else {
+            None
+        };
+        let mut annotation_usage = None;
+
+        // Collect all results into a single container, or restore the immutable
+        // pre-FDR candidates when an exact compatible pool already exists.
+        let mut outputs = if let (Some(request), Some((search, analysis, directory))) =
+            (candidate_pool.as_ref(), pool_identity.as_ref())
+        {
+            if inspect_compatible_pool(directory, search, request.required_rank_depth)?.is_some() {
+                anyhow::ensure!(
+                    !self.parameters.quant.lfq
+                        && self.parameters.quant.tmt.is_none()
+                        && !self.parameters.annotate_matches,
+                    "candidate-pool reuse currently supports identification/statistical stages only; LFQ, TMT, and matched-fragment output require a fresh search"
+                );
+                let (manifest, features) = load_pool(
+                    directory,
+                    search,
+                    request.required_rank_depth,
+                    &self.database,
+                )?;
+                pool_was_loaded = true;
+                log::info!(
+                    "candidate pool: reused {} candidates from {} (fingerprint={}, ranks=1..={})",
+                    manifest.candidate_count,
+                    directory.display(),
+                    search.digest,
+                    manifest.capabilities.retained_rank_depth
+                );
+                pool_usage = Some(CandidatePoolUsage {
+                    search_fingerprint: search.digest.clone(),
+                    analysis_fingerprint: analysis.digest.clone(),
+                    manifest: manifest_path(directory),
+                    payload: directory.join(&manifest.payload_file),
+                    reused: true,
+                    candidate_count: manifest.candidate_count,
+                    retained_rank_depth: manifest.capabilities.retained_rank_depth,
+                });
+                SageResults {
+                    features,
+                    ..SageResults::default()
+                }
+            } else {
+                self.batch_files(&scorer, parallel)
+            }
+        } else {
+            self.batch_files(&scorer, parallel)
+        };
 
         let filenames = self
             .parameters
@@ -589,7 +723,7 @@ impl Runner {
             }
 
             // Train RT and IMS models on target rank-1 PSMs only.
-            let alignments = if self.parameters.predict_rt {
+            let alignments = if self.parameters.predict_rt && !pool_was_loaded {
                 let selector = |f: &FeatureCore| f.rank == 1 && f.label == 1;
 
                 let local = sage_core::ml::retention_alignment::global_alignment(
@@ -615,6 +749,35 @@ impl Runner {
                 None
             };
 
+            if !pool_was_loaded {
+                if let (Some(request), Some((search, analysis, directory))) =
+                    (candidate_pool.as_ref(), pool_identity.as_ref())
+                {
+                    let manifest =
+                        write_pool(directory, search, &outputs.features, &self.database)?;
+                    log::info!(
+                        "candidate pool: wrote {} candidates to {} (fingerprint={}, ranks=1..={})",
+                        manifest.candidate_count,
+                        directory.display(),
+                        search.digest,
+                        manifest.capabilities.retained_rank_depth
+                    );
+                    pool_usage = Some(CandidatePoolUsage {
+                        search_fingerprint: search.digest.clone(),
+                        analysis_fingerprint: analysis.digest.clone(),
+                        manifest: manifest_path(directory),
+                        payload: directory.join(&manifest.payload_file),
+                        reused: false,
+                        candidate_count: manifest.candidate_count,
+                        retained_rank_depth: manifest.capabilities.retained_rank_depth,
+                    });
+                    anyhow::ensure!(
+                        request.required_rank_depth <= manifest.capabilities.retained_rank_depth,
+                        "new candidate pool does not satisfy required rank depth"
+                    );
+                }
+            }
+
             // Convert generic PSM features to the Decoy-Free feature representation.
             let mut features: Vec<DfFeature> = outputs
                 .features
@@ -622,7 +785,8 @@ impl Runner {
                 .map(|f| f.to_df())
                 .collect();
 
-            let fdr_settings = self.parameters.fdr.clone();
+            let mut fdr_settings = self.parameters.fdr.clone();
+            let mut optimizer_evaluations = None;
 
             if self.parameters.write_pin {
                 log::warn!(
@@ -637,14 +801,38 @@ impl Runner {
             // generate preliminary Decoy-Free p/PEP/q values while ranks 1..N are still present.
             // Those preliminary values are then used only to calibrate external feature
             // generators such as DeepLC/IM2Deep. MS2Rescore/TIMS2Rescore remains feature-only.
-            features =
-                sage_core::decoy_free_fdr::run_df_layers(&features, &fdr_settings, &self.database);
+            let mut fitted_artifacts;
+            if fdr_settings.null_window_optimizer.is_some() {
+                let optimized = sage_core::decoy_free_fdr::optimize_null_window(
+                    &features,
+                    &fdr_settings,
+                    &self.database,
+                )
+                .map_err(anyhow::Error::msg)?;
+                features = optimized.features;
+                fdr_settings = optimized.settings;
+                fitted_artifacts = optimized.artifacts;
+                optimizer_evaluations = Some(optimized.evaluations);
+            } else {
+                let (first_pass_features, artifacts) =
+                    sage_core::decoy_free_fdr::run_df_layers_with_artifacts(
+                        &features,
+                        &fdr_settings,
+                        &self.database,
+                    );
+                features = first_pass_features;
+                fitted_artifacts = artifacts;
+            }
 
-            maybe_add_external_features(
+            annotation_usage = maybe_add_external_features(
                 &mut features,
                 &self.parameters.external_features,
                 &self.parameters.mzml_paths,
                 &self.database,
+                annotation_search_fingerprint
+                    .as_ref()
+                    .map(|fingerprint| fingerprint.digest.as_str()),
+                annotation_cache.as_ref(),
             )
             .context("TIMS2/MS2Rescore external feature generation failed")?;
 
@@ -659,11 +847,14 @@ impl Runner {
                     "running second Decoy-Free pass after external TIMS2/MS2Rescore feature join"
                 );
 
-                features = sage_core::decoy_free_fdr::run_df_layers(
-                    &features,
-                    &fdr_settings,
-                    &self.database,
-                );
+                let (rescored_features, rescored_artifacts) =
+                    sage_core::decoy_free_fdr::run_df_layers_with_artifacts(
+                        &features,
+                        &fdr_settings,
+                        &self.database,
+                    );
+                features = rescored_features;
+                fitted_artifacts = rescored_artifacts;
 
                 match self.parameters.external_features.use_mode {
                     ExternalFeatureUseMode::DiagnosticsOnly => {
@@ -683,10 +874,11 @@ impl Runner {
                             "applying external TIMS2/MS2Rescore features as bounded Decoy-Free expert evidence"
                         );
 
-                        sage_core::decoy_free_fdr::apply_external_ms2rescore_bounded_experts(
-                            &mut features,
-                            &fdr_settings,
-                        );
+                        fitted_artifacts.external_ms2rescore =
+                            sage_core::decoy_free_fdr::apply_external_ms2rescore_bounded_experts(
+                                &mut features,
+                                &fdr_settings,
+                            );
                     }
                 }
             }
@@ -822,6 +1014,26 @@ impl Runner {
                                 .total_cmp(&b.core.poisson_log10_p_value)
                         })
                 });
+
+                if let Some(artifact) = fitted_artifacts.lower_order.as_ref() {
+                    let path = self.make_path("lower_order_model_artifact.json");
+                    let bytes = serde_json::to_vec_pretty(artifact)
+                        .context("serialize Lower Order model artifact")?;
+                    sage_cloudpath::write_bytes_sync(&path, bytes)?;
+                    self.parameters.output_paths.push(path);
+                }
+                let path = self.make_path("fitted_model_artifacts.json");
+                let bytes = serde_json::to_vec_pretty(&fitted_artifacts)
+                    .context("serialize fitted model artifacts")?;
+                sage_cloudpath::write_bytes_sync(&path, bytes)?;
+                self.parameters.output_paths.push(path);
+                if let Some(evaluations) = optimizer_evaluations.as_ref() {
+                    let path = self.make_path("null_window_evaluations.json");
+                    let bytes = serde_json::to_vec_pretty(evaluations)
+                        .context("serialize null-window evaluations")?;
+                    sage_cloudpath::write_bytes_sync(&path, bytes)?;
+                    self.parameters.output_paths.push(path);
+                }
 
                 self.parameters
                     .output_paths
@@ -1080,7 +1292,7 @@ impl Runner {
             run_time,
         );
 
-        Ok(telemetry)
+        Ok((telemetry, pool_usage, annotation_usage))
     }
 
     // TDC output writers.

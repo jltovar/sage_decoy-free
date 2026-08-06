@@ -1,0 +1,12 @@
+{
+  "schema_version": 1,
+  "search_config": "/Users/kgousset/Library/CloudStorage/OneDrive-Personal/github/sage_decoy-free/validation/configs/pxd001468_moments_macos_execution_2026-08-05.json",
+  "target_fasta": "/Users/kgousset/Library/CloudStorage/OneDrive-Personal/FASTA_Files/FASTA/validation/PXD001468.fasta",
+  "output_directory": "/Users/kgousset/Library/CloudStorage/OneDrive-Personal/Search_Data_Files/SAGE_DECOYFREE/VALIDATION/NATIVE_WORKFLOW/PXD001468/PHASE2_FROZEN_FASTA_2026-08-06",
+  "database_mode": "frozen_legacy",
+  "foreign_fastas": [],
+  "output_fasta": "/Users/kgousset/Library/CloudStorage/OneDrive-Personal/FASTA_Files/FASTA/target_entrapment/PXD001468_foreign_species_entrapment_protein.fasta",
+  "frozen_legacy_fasta": "/Users/kgousset/Library/CloudStorage/OneDrive-Personal/FASTA_Files/FASTA/target_entrapment/PXD001468_foreign_species_entrapment_protein.fasta",
+  "seed": 2000,
+  "protein_fold": 1
+}

@@ -1,0 +1,189 @@
+{
+  "schema_version": 1,
+  "created_unix_seconds": 1785947403,
+  "source_commit": "f97b94813730b48c2fc19f9a36e3e3b132a2bcb9",
+  "source_dirty": true,
+  "status": "corrected_selected_outputs_complete",
+  "files": [
+    {
+      "path": "/Users/kgousset/Library/CloudStorage/OneDrive-Personal/FASTA_Files/FASTA/target_entrapment/PXD001468_foreign_species_entrapment_protein.fasta",
+      "size": 24114139,
+      "modified_unix_seconds": 1776356103,
+      "sha256": "71c13d87887cdda7fdc9ee482af3ef6068d8e18ce57ec9168382f12a0a88de53"
+    },
+    {
+      "path": "/Users/kgousset/Library/CloudStorage/OneDrive-Personal/FASTA_Files/FASTA/target_entrapment/PXD001468_foreign_species_entrapment_protein.log",
+      "size": 566121,
+      "modified_unix_seconds": 1776356111,
+      "sha256": "437e88617514e0d14d419f304d65f7ea8cd034892cfd268ce97d690e82581b11"
+    },
+    {
+      "path": "/Users/kgousset/Library/CloudStorage/OneDrive-Personal/FASTA_Files/FASTA/validation/PXD001468.fasta",
+      "size": 13661007,
+      "modified_unix_seconds": 1768929823,
+      "sha256": "3e17f8a0538151f9ed267c542ed911945881cf8e877af89489a85e238dbf2141"
+    },
+    {
+      "path": "/Users/kgousset/Library/CloudStorage/OneDrive-Personal/Search_Data_Files/SAGE_DECOYFREE/VALIDATION/PXD001468/DECOY/3rd_no_ent/results.json",
+      "size": 11161,
+      "modified_unix_seconds": 1785198079,
+      "sha256": "a03b228b71202e878804e23002b6cdc2cbc42f2e2a3d34453065fa3b9cd25840"
+    },
+    {
+      "path": "/Users/kgousset/Library/CloudStorage/OneDrive-Personal/Search_Data_Files/SAGE_DECOYFREE/VALIDATION/PXD001468/DECOY/3rd_no_ent/results.sage.tsv",
+      "size": 503320778,
+      "modified_unix_seconds": 1785198078,
+      "sha256": "4ca3ba215227f2117c873260106b379c8bd685993a5346d0171567bdb416cb56"
+    },
+    {
+      "path": "/Users/kgousset/Library/CloudStorage/OneDrive-Personal/Search_Data_Files/SAGE_DECOYFREE/VALIDATION/PXD001468/DECOY/VANILLA/3rd_no_ent/results.json",
+      "size": 4718,
+      "modified_unix_seconds": 1785165111,
+      "sha256": "b168921f1ad10e7efddc3ee998f66fcf242e82de8e588a8038404b4f575abb98"
+    },
+    {
+      "path": "/Users/kgousset/Library/CloudStorage/OneDrive-Personal/Search_Data_Files/SAGE_DECOYFREE/VALIDATION/PXD001468/DECOY/VANILLA/3rd_no_ent/results.sage.tsv",
+      "size": 505787723,
+      "modified_unix_seconds": 1785165111,
+      "sha256": "eef76d3ff4dbd44fd7a1bc6cac3d0e595e42216b4c87f18d428f01f292acce32"
+    },
+    {
+      "path": "/Users/kgousset/Library/CloudStorage/OneDrive-Personal/Search_Data_Files/SAGE_DECOYFREE/VALIDATION/PXD001468/DECOY/VANILLA/results.json",
+      "size": 4749,
+      "modified_unix_seconds": 1785084537,
+      "sha256": "4da58a7bd597d703ceefdc1540026ffd382398afe82eeb16f56b37a176bdddf8"
+    },
+    {
+      "path": "/Users/kgousset/Library/CloudStorage/OneDrive-Personal/Search_Data_Files/SAGE_DECOYFREE/VALIDATION/PXD001468/DECOY/VANILLA/results.sage.tsv",
+      "size": 517350686,
+      "modified_unix_seconds": 1785084537,
+      "sha256": "ea8e7503d18503063f2fc7a2d40c7ff090722c005274d74efa1305d9bbde5c48"
+    },
+    {
+      "path": "/Users/kgousset/Library/CloudStorage/OneDrive-Personal/Search_Data_Files/SAGE_DECOYFREE/VALIDATION/PXD001468/DECOY/VANILLA/vanilla_validation_PXD001468_ent_decoy.json",
+      "size": 3646,
+      "modified_unix_seconds": 1784578671,
+      "sha256": "8753239c5a534f8f5bb5abbabf64e5837567d6dea2fd59c20515658aeec92a6e"
+    },
+    {
+      "path": "/Users/kgousset/Library/CloudStorage/OneDrive-Personal/Search_Data_Files/SAGE_DECOYFREE/VALIDATION/PXD001468/DECOY/VANILLA/vanilla_validation_PXD001468_no_ent_decoy.json",
+      "size": 3615,
+      "modified_unix_seconds": 1784995253,
+      "sha256": "ac25c78000deba75924d02cd7434b8507d44543fef010ea774360e4757eb59fd"
+    },
+    {
+      "path": "/Users/kgousset/Library/CloudStorage/OneDrive-Personal/Search_Data_Files/SAGE_DECOYFREE/VALIDATION/PXD001468/DECOY/results.json",
+      "size": 11181,
+      "modified_unix_seconds": 1785192433,
+      "sha256": "4d65a8f4fc6b125493be50f7f597144ee9cd5f7b6b9afbabc082406c32be569d"
+    },
+    {
+      "path": "/Users/kgousset/Library/CloudStorage/OneDrive-Personal/Search_Data_Files/SAGE_DECOYFREE/VALIDATION/PXD001468/DECOY/results.sage.tsv",
+      "size": 515496061,
+      "modified_unix_seconds": 1785192433,
+      "sha256": "b433d347576c851adf9bdff7d7fb239f213b7344f8d0d9a4aab10d2e93c1cca4"
+    },
+    {
+      "path": "/Users/kgousset/Library/CloudStorage/OneDrive-Personal/Search_Data_Files/SAGE_DECOYFREE/VALIDATION/PXD001468/DECOY/validation_PXD001468_ent_decoy.json",
+      "size": 3638,
+      "modified_unix_seconds": 1784654996,
+      "sha256": "5ce61495f40a854d7e4b1d693493ada81bb52b3f7039a8ff7f8e6106291e887e"
+    },
+    {
+      "path": "/Users/kgousset/Library/CloudStorage/OneDrive-Personal/Search_Data_Files/SAGE_DECOYFREE/VALIDATION/PXD001468/DECOY/validation_PXD001468_no_ent_decoy.json",
+      "size": 3607,
+      "modified_unix_seconds": 1784995388,
+      "sha256": "3a20abe0e17343e02ac6c09a87444f1795480a5ce883bbb1794362ac4faf2323"
+    },
+    {
+      "path": "/Users/kgousset/Library/CloudStorage/OneDrive-Personal/Search_Data_Files/SAGE_DECOYFREE/VALIDATION/PXD001468/DECOYFREE/MOMENTS/2nd_ms2rescore/results.json",
+      "size": 12324,
+      "modified_unix_seconds": 1785889722,
+      "sha256": "483be59ec74e1c2a586c87b04115db88cf53dbf20c730a915f38be7a0b2dcb56"
+    },
+    {
+      "path": "/Users/kgousset/Library/CloudStorage/OneDrive-Personal/Search_Data_Files/SAGE_DECOYFREE/VALIDATION/PXD001468/DECOYFREE/MOMENTS/2nd_ms2rescore/results.sage.tsv",
+      "size": 924533896,
+      "modified_unix_seconds": 1785889720,
+      "sha256": "32166052e80d31cff74f36a2d75094ab4b0aacd15d5b474844569d896ce5302c"
+    },
+    {
+      "path": "/Users/kgousset/Library/CloudStorage/OneDrive-Personal/Search_Data_Files/SAGE_DECOYFREE/VALIDATION/PXD001468/DECOYFREE/MOMENTS/2nd_ms2rescore_validation_PXD001468_ent_decoyfree.json",
+      "size": 11061,
+      "modified_unix_seconds": 1784995969,
+      "sha256": "ada2e728cf6559f4e9046c5b438f869b81d989b20711ad38ee6e63b46e07faac"
+    },
+    {
+      "path": "/Users/kgousset/Library/CloudStorage/OneDrive-Personal/Search_Data_Files/SAGE_DECOYFREE/VALIDATION/PXD001468/DECOYFREE/MOMENTS/3rd_no_ent/results.json",
+      "size": 12414,
+      "modified_unix_seconds": 1785923793,
+      "sha256": "56601f90747b60f8b951f04155b4641cfada3ee78001c0c1613f5c24c738e70d"
+    },
+    {
+      "path": "/Users/kgousset/Library/CloudStorage/OneDrive-Personal/Search_Data_Files/SAGE_DECOYFREE/VALIDATION/PXD001468/DECOYFREE/MOMENTS/3rd_no_ent/results.sage.tsv",
+      "size": 915961030,
+      "modified_unix_seconds": 1785923785,
+      "sha256": "59ec9aea906d8383470faf495631a64f4035e0311cae316ffb4deb95458810db"
+    },
+    {
+      "path": "/Users/kgousset/Library/CloudStorage/OneDrive-Personal/Search_Data_Files/SAGE_DECOYFREE/VALIDATION/PXD001468/DECOYFREE/MOMENTS/best_result.txt",
+      "size": 1593,
+      "modified_unix_seconds": 1785845676,
+      "sha256": "7befb9afa0cc29a8611b01056e0910e2408dcca7be12d00df05db3f99febff10"
+    },
+    {
+      "path": "/Users/kgousset/Library/CloudStorage/OneDrive-Personal/Search_Data_Files/SAGE_DECOYFREE/VALIDATION/PXD001468/DECOYFREE/MOMENTS/cumulative_results_long.csv",
+      "size": 17438,
+      "modified_unix_seconds": 1785845676,
+      "sha256": "550935920d96566d41a63e4abf1c05c1a5f568540c2b48c97f9636e663422952"
+    },
+    {
+      "path": "/Users/kgousset/Library/CloudStorage/OneDrive-Personal/Search_Data_Files/SAGE_DECOYFREE/VALIDATION/PXD001468/DECOYFREE/MOMENTS/cumulative_results_wide.csv",
+      "size": 6257,
+      "modified_unix_seconds": 1785845676,
+      "sha256": "fbdf3e87436afbe11f4f072f7d6f22f346d2dcdfd4ea32f2474bbf53ecbd0248"
+    },
+    {
+      "path": "/Users/kgousset/Library/CloudStorage/OneDrive-Personal/Search_Data_Files/SAGE_DECOYFREE/VALIDATION/PXD001468/DECOYFREE/MOMENTS/json/run_026.json",
+      "size": 10687,
+      "modified_unix_seconds": 1785767424,
+      "sha256": "71009871037870ec091507762908dacc0fca3c1c15b11341cd7b62001d3eafca"
+    },
+    {
+      "path": "/Users/kgousset/Library/CloudStorage/OneDrive-Personal/Search_Data_Files/SAGE_DECOYFREE/VALIDATION/PXD001468/DECOYFREE/MOMENTS/logs/run_026.log",
+      "size": 59968,
+      "modified_unix_seconds": 1785770267,
+      "sha256": "720f5ce362071c72236af75f77831d486712109742cc5cf6b6496253febb21ed"
+    },
+    {
+      "path": "/Users/kgousset/Library/CloudStorage/OneDrive-Personal/Search_Data_Files/SAGE_DECOYFREE/VALIDATION/PXD001468/DECOYFREE/MOMENTS/results.json",
+      "size": 12327,
+      "modified_unix_seconds": 1785845676,
+      "sha256": "cc97ffb30baf19ea3671f3b75e9c2d82cea034de7f9e463651effa09bd9dbdbf"
+    },
+    {
+      "path": "/Users/kgousset/Library/CloudStorage/OneDrive-Personal/Search_Data_Files/SAGE_DECOYFREE/VALIDATION/PXD001468/DECOYFREE/MOMENTS/results.sage.tsv",
+      "size": 799875821,
+      "modified_unix_seconds": 1785845685,
+      "sha256": "a8d82a9ed47594fedfa21980f509cd76fbc8feedf189e7e19469d38b304999f6"
+    },
+    {
+      "path": "/Users/kgousset/Library/CloudStorage/OneDrive-Personal/Search_Data_Files/SAGE_DECOYFREE/VALIDATION/PXD001468/DECOYFREE/MOMENTS/search_trace.txt",
+      "size": 19833,
+      "modified_unix_seconds": 1785845685,
+      "sha256": "d372e412256fe0a30e06f2a01cf86ecb97ed2dc862bb5ac6cfd983f004a3f6d0"
+    },
+    {
+      "path": "/Users/kgousset/Library/CloudStorage/OneDrive-Personal/Search_Data_Files/SAGE_DECOYFREE/VALIDATION/PXD001468/DECOYFREE/MOMENTS/validation_PXD001468_ent_decoyfree.json",
+      "size": 11043,
+      "modified_unix_seconds": 1784995955,
+      "sha256": "1af3d460167e3cbbdb9ebf2b8a8e676bccdc786da2036ef4a99df83db1d88cf6"
+    },
+    {
+      "path": "/Users/kgousset/Library/CloudStorage/OneDrive-Personal/Search_Data_Files/SAGE_DECOYFREE/VALIDATION/PXD001468/DECOYFREE/MOMENTS/validation_PXD001468_no_ent_decoyfree.json",
+      "size": 11015,
+      "modified_unix_seconds": 1784995984,
+      "sha256": "ff67211241e758d153dec2676d74c7dd2c514ab0770723eafd2a555947a4aea7"
+    }
+  ]
+}

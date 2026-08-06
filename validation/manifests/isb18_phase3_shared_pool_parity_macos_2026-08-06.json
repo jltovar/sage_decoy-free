@@ -1,0 +1,69 @@
+{
+  "schema_version": 1,
+  "name": "isb18_phase3_shared_pool_parity_macos_2026-08-06",
+  "dataset_id": "ISB18",
+  "search_config": "/Users/kgousset/Library/CloudStorage/OneDrive-Personal/github/sage_decoy-free/validation/configs/isb18_moments_macos_execution_2026-08-05.json",
+  "target_fasta": "/Users/kgousset/Library/CloudStorage/OneDrive-Personal/FASTA_Files/FASTA/validation/ISB18.fasta",
+  "spectra": [
+    "/Users/kgousset/Library/CloudStorage/OneDrive-Personal/Raw_Data_Files/validation/mzml/ISB18/OR20070924_S_mix7_02.mzML",
+    "/Users/kgousset/Library/CloudStorage/OneDrive-Personal/Raw_Data_Files/validation/mzml/ISB18/OR20070924_S_mix7_03.mzML",
+    "/Users/kgousset/Library/CloudStorage/OneDrive-Personal/Raw_Data_Files/validation/mzml/ISB18/OR20070924_S_mix7_04.mzML",
+    "/Users/kgousset/Library/CloudStorage/OneDrive-Personal/Raw_Data_Files/validation/mzml/ISB18/OR20070924_S_mix7_05.mzML",
+    "/Users/kgousset/Library/CloudStorage/OneDrive-Personal/Raw_Data_Files/validation/mzml/ISB18/OR20070924_S_mix7_06.mzML",
+    "/Users/kgousset/Library/CloudStorage/OneDrive-Personal/Raw_Data_Files/validation/mzml/ISB18/OR20070924_S_mix7_07.mzML",
+    "/Users/kgousset/Library/CloudStorage/OneDrive-Personal/Raw_Data_Files/validation/mzml/ISB18/OR20070924_S_mix7_08.mzML",
+    "/Users/kgousset/Library/CloudStorage/OneDrive-Personal/Raw_Data_Files/validation/mzml/ISB18/OR20070924_S_mix7_09.mzML",
+    "/Users/kgousset/Library/CloudStorage/OneDrive-Personal/Raw_Data_Files/validation/mzml/ISB18/OR20070924_S_mix7_10.mzML"
+  ],
+  "output_root": "/Users/kgousset/Library/CloudStorage/OneDrive-Personal/Search_Data_Files/SAGE_DECOYFREE/VALIDATION/NATIVE_WORKFLOW/ISB18/PHASE3_SHARED_POOL_PARITY_FINAL_2026-08-06",
+  "entrapment": {
+    "database_mode": "frozen_legacy",
+    "foreign_fastas": [],
+    "output_fasta": "/Users/kgousset/Library/CloudStorage/OneDrive-Personal/FASTA_Files/FASTA/target_entrapment/ISB18_foreign_species_entrapment_protein.fasta",
+    "frozen_legacy_fasta": "/Users/kgousset/Library/CloudStorage/OneDrive-Personal/FASTA_Files/FASTA/target_entrapment/ISB18_foreign_species_entrapment_protein.fasta",
+    "seed": 2000,
+    "protein_fold": 1
+  },
+  "models": [
+    {
+      "model": "moments",
+      "candidate_windows": [
+        { "min_rank": 8, "max_rank": 18 },
+        { "min_rank": 9, "max_rank": 18 },
+        { "min_rank": 10, "max_rank": 18 }
+      ],
+      "ms2rescore": "never"
+    },
+    {
+      "model": "msfdr1_smix",
+      "ms2rescore": "never"
+    }
+  ],
+  "validation": {
+    "null_window_validation_scope": "level4",
+    "use_generated_entrapment_ratios": true,
+    "fdr_threshold": 0.01,
+    "maximum_parity_fraction_difference": 0.003,
+    "dataset_role": "development",
+    "parity_pairs": [
+      {
+        "baseline_method": "legacy_moments",
+        "native_method": "moments",
+        "stages": ["optimized"],
+        "maximum_fraction_difference": 0.003
+      }
+    ],
+    "additional_runs": [
+      {
+        "method": "legacy_moments",
+        "stage": "optimized",
+        "results": "/Users/kgousset/Library/CloudStorage/OneDrive-Personal/Search_Data_Files/SAGE_DECOYFREE/VALIDATION/ISB18/DECOYFREE/MOMENTS/results.sage.tsv",
+        "mode": "decoy_free",
+        "expected_search_space": "+Ent"
+      }
+    ]
+  },
+  "resume": true,
+  "annotate_target_matches": false,
+  "artifact_reuse_policy": "dataset_local_only"
+}

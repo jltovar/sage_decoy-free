@@ -155,9 +155,9 @@ impl Default for ExternalPsmFeatures {
 /// The core identification data produced by the search engine.
 /// This struct contains NO FDR information (neither TDC nor DF).
 /// It is the raw material that enters the FDR pipeline.
-#[derive(Serialize, Clone, Debug, Default)]
+#[derive(Serialize, Deserialize, Clone, Debug, Default)]
 pub struct FeatureCore {
-    #[serde(skip_serializing)]
+    #[serde(skip)]
     pub peptide_idx: PeptideIx,
     pub psm_id: usize,
     pub peptide_len: usize,
@@ -1029,10 +1029,10 @@ impl FeatureCore {
     }
 }
 
-#[derive(Serialize, Default, Clone, Debug)]
+#[derive(Serialize, Deserialize, Default, Clone, Debug)]
 pub struct Fragments {
     /// Observed fragment charge state.
-    #[serde(skip_serializing)]
+    #[serde(skip)]
     pub charges: Vec<i32>,
     pub kinds: Vec<Kind>,
     pub fragment_ordinals: Vec<i32>,

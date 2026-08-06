@@ -7,6 +7,16 @@ data/
 *.tsv
 *.gz
 *.json
+!workflow.example.json
+!entrapment.audit.example.json
+!validation/
+!validation/baselines/
+!validation/baselines/*.json
+!validation/manifests/
+!validation/manifests/*.json
+!validation/reports/
+!validation/reports/**/
+!validation/reports/**/*.json
 *.ms2
 *.fasta
 *.fas

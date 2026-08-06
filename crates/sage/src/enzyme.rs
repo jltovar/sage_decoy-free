@@ -31,6 +31,9 @@ pub struct DigestGroup {
 }
 
 pub fn group_digests(mut digests: Vec<Digest>) -> Vec<DigestGroup> {
+    if digests.is_empty() {
+        return Vec::new();
+    }
     let mut groups = Vec::new();
     digests.sort_unstable_by(|a, b| {
         a.position
@@ -348,6 +351,11 @@ mod test {
     use std::collections::HashSet;
 
     use super::*;
+
+    #[test]
+    fn group_empty_digest_set_is_empty() {
+        assert!(group_digests(Vec::new()).is_empty());
+    }
 
     #[test]
     fn hash_digest() {

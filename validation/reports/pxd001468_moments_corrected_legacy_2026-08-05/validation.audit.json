@@ -1,0 +1,575 @@
+{
+  "schema_version": 1,
+  "name": "pxd001468_moments_corrected_legacy_results_audit_2026-08-05",
+  "summaries": [
+    {
+      "method": "moments",
+      "stage": "optimized",
+      "results": "/Users/kgousset/Library/CloudStorage/OneDrive-Personal/Search_Data_Files/SAGE_DECOYFREE/VALIDATION/PXD001468/DECOYFREE/MOMENTS/results.sage.tsv",
+      "mode": "decoy_free",
+      "calibration_stage": null,
+      "complete": true,
+      "search_space": "+Ent",
+      "layer": "raw_q",
+      "psm": {
+        "target": 219304,
+        "entrapment": 11088,
+        "combined_entrapment_fdp": 0.1243173957412718
+      },
+      "peptide": {
+        "target": 27044,
+        "entrapment": 449,
+        "combined_entrapment_fdp": 0.04378321378119997
+      },
+      "protein": {
+        "target": 4397,
+        "entrapment": 12,
+        "combined_entrapment_fdp": 0.005443411204354729
+      },
+      "counting_definition": "rank=1,label=1,non-contaminant,unambiguous target/entrapment mapping; peptide removes bracketed modifications and canonicalizes I/L; protein requires one inferred protein key"
+    },
+    {
+      "method": "moments",
+      "stage": "optimized",
+      "results": "/Users/kgousset/Library/CloudStorage/OneDrive-Personal/Search_Data_Files/SAGE_DECOYFREE/VALIDATION/PXD001468/DECOYFREE/MOMENTS/results.sage.tsv",
+      "mode": "decoy_free",
+      "calibration_stage": null,
+      "complete": true,
+      "search_space": "+Ent",
+      "layer": "level4",
+      "psm": {
+        "target": 185310,
+        "entrapment": 83,
+        "combined_entrapment_fdp": 0.0011564606008335743
+      },
+      "peptide": {
+        "target": 24482,
+        "entrapment": 24,
+        "combined_entrapment_fdp": 0.0026255617701257234
+      },
+      "protein": {
+        "target": 4397,
+        "entrapment": 12,
+        "combined_entrapment_fdp": 0.005443411204354729
+      },
+      "counting_definition": "rank=1,label=1,non-contaminant,unambiguous target/entrapment mapping; peptide removes bracketed modifications and canonicalizes I/L; protein requires one inferred protein key"
+    },
+    {
+      "method": "moments",
+      "stage": "ms2rescore",
+      "results": "/Users/kgousset/Library/CloudStorage/OneDrive-Personal/Search_Data_Files/SAGE_DECOYFREE/VALIDATION/PXD001468/DECOYFREE/MOMENTS/2nd_ms2rescore/results.sage.tsv",
+      "mode": "decoy_free",
+      "calibration_stage": null,
+      "complete": true,
+      "search_space": "+Ent",
+      "layer": "raw_q",
+      "psm": {
+        "target": 250490,
+        "entrapment": 11585,
+        "combined_entrapment_fdp": 0.11418696370019046
+      },
+      "peptide": {
+        "target": 35006,
+        "entrapment": 590,
+        "combined_entrapment_fdp": 0.04443592664418471
+      },
+      "protein": {
+        "target": 5100,
+        "entrapment": 28,
+        "combined_entrapment_fdp": 0.0109204368174727
+      },
+      "counting_definition": "rank=1,label=1,non-contaminant,unambiguous target/entrapment mapping; peptide removes bracketed modifications and canonicalizes I/L; protein requires one inferred protein key"
+    },
+    {
+      "method": "moments",
+      "stage": "ms2rescore",
+      "results": "/Users/kgousset/Library/CloudStorage/OneDrive-Personal/Search_Data_Files/SAGE_DECOYFREE/VALIDATION/PXD001468/DECOYFREE/MOMENTS/2nd_ms2rescore/results.sage.tsv",
+      "mode": "decoy_free",
+      "calibration_stage": null,
+      "complete": true,
+      "search_space": "+Ent",
+      "layer": "level4",
+      "psm": {
+        "target": 217296,
+        "entrapment": 151,
+        "combined_entrapment_fdp": 0.0017937817793529172
+      },
+      "peptide": {
+        "target": 32185,
+        "entrapment": 59,
+        "combined_entrapment_fdp": 0.004905536672951243
+      },
+      "protein": {
+        "target": 5100,
+        "entrapment": 28,
+        "combined_entrapment_fdp": 0.0109204368174727
+      },
+      "counting_definition": "rank=1,label=1,non-contaminant,unambiguous target/entrapment mapping; peptide removes bracketed modifications and canonicalizes I/L; protein requires one inferred protein key"
+    },
+    {
+      "method": "moments",
+      "stage": "target_only",
+      "results": "/Users/kgousset/Library/CloudStorage/OneDrive-Personal/Search_Data_Files/SAGE_DECOYFREE/VALIDATION/PXD001468/DECOYFREE/MOMENTS/3rd_no_ent/results.sage.tsv",
+      "mode": "decoy_free",
+      "calibration_stage": "ms2rescore",
+      "complete": true,
+      "search_space": "No Ent",
+      "layer": "raw_q",
+      "psm": {
+        "target": 255684,
+        "entrapment": 0,
+        "combined_entrapment_fdp": null
+      },
+      "peptide": {
+        "target": 37098,
+        "entrapment": 0,
+        "combined_entrapment_fdp": null
+      },
+      "protein": {
+        "target": 5283,
+        "entrapment": 0,
+        "combined_entrapment_fdp": null
+      },
+      "counting_definition": "rank=1,label=1,non-contaminant,unambiguous target/entrapment mapping; peptide removes bracketed modifications and canonicalizes I/L; protein requires one inferred protein key"
+    },
+    {
+      "method": "moments",
+      "stage": "target_only",
+      "results": "/Users/kgousset/Library/CloudStorage/OneDrive-Personal/Search_Data_Files/SAGE_DECOYFREE/VALIDATION/PXD001468/DECOYFREE/MOMENTS/3rd_no_ent/results.sage.tsv",
+      "mode": "decoy_free",
+      "calibration_stage": "ms2rescore",
+      "complete": true,
+      "search_space": "No Ent",
+      "layer": "level4",
+      "psm": {
+        "target": 221847,
+        "entrapment": 0,
+        "combined_entrapment_fdp": null
+      },
+      "peptide": {
+        "target": 34143,
+        "entrapment": 0,
+        "combined_entrapment_fdp": null
+      },
+      "protein": {
+        "target": 5283,
+        "entrapment": 0,
+        "combined_entrapment_fdp": null
+      },
+      "counting_definition": "rank=1,label=1,non-contaminant,unambiguous target/entrapment mapping; peptide removes bracketed modifications and canonicalizes I/L; protein requires one inferred protein key"
+    },
+    {
+      "method": "tdc_fork",
+      "stage": "optimized",
+      "results": "/Users/kgousset/Library/CloudStorage/OneDrive-Personal/Search_Data_Files/SAGE_DECOYFREE/VALIDATION/PXD001468/DECOY/results.sage.tsv",
+      "mode": "tdc",
+      "calibration_stage": null,
+      "complete": true,
+      "search_space": "+Ent",
+      "layer": "raw_q",
+      "psm": {
+        "target": 382491,
+        "entrapment": 1375,
+        "combined_entrapment_fdp": 0.009252713868532308
+      },
+      "peptide": {
+        "target": 82701,
+        "entrapment": 424,
+        "combined_entrapment_fdp": 0.013674694284315394
+      },
+      "protein": {
+        "target": 8910,
+        "entrapment": 51,
+        "combined_entrapment_fdp": 0.011382658185470372
+      },
+      "counting_definition": "rank=1,label=1,non-contaminant,unambiguous target/entrapment mapping; peptide removes bracketed modifications and canonicalizes I/L; protein requires one inferred protein key"
+    },
+    {
+      "method": "tdc_fork",
+      "stage": "optimized",
+      "results": "/Users/kgousset/Library/CloudStorage/OneDrive-Personal/Search_Data_Files/SAGE_DECOYFREE/VALIDATION/PXD001468/DECOY/results.sage.tsv",
+      "mode": "tdc",
+      "calibration_stage": null,
+      "complete": true,
+      "search_space": "+Ent",
+      "layer": "reportable_q",
+      "psm": {
+        "target": 382491,
+        "entrapment": 1375,
+        "combined_entrapment_fdp": 0.009252713868532308
+      },
+      "peptide": {
+        "target": 82701,
+        "entrapment": 424,
+        "combined_entrapment_fdp": 0.013674694284315394
+      },
+      "protein": {
+        "target": 8910,
+        "entrapment": 51,
+        "combined_entrapment_fdp": 0.011382658185470372
+      },
+      "counting_definition": "rank=1,label=1,non-contaminant,unambiguous target/entrapment mapping; peptide removes bracketed modifications and canonicalizes I/L; protein requires one inferred protein key"
+    },
+    {
+      "method": "tdc_fork",
+      "stage": "target_only",
+      "results": "/Users/kgousset/Library/CloudStorage/OneDrive-Personal/Search_Data_Files/SAGE_DECOYFREE/VALIDATION/PXD001468/DECOY/3rd_no_ent/results.sage.tsv",
+      "mode": "tdc",
+      "calibration_stage": null,
+      "complete": true,
+      "search_space": "No Ent",
+      "layer": "raw_q",
+      "psm": {
+        "target": 404028,
+        "entrapment": 0,
+        "combined_entrapment_fdp": null
+      },
+      "peptide": {
+        "target": 86403,
+        "entrapment": 0,
+        "combined_entrapment_fdp": null
+      },
+      "protein": {
+        "target": 9012,
+        "entrapment": 0,
+        "combined_entrapment_fdp": null
+      },
+      "counting_definition": "rank=1,label=1,non-contaminant,unambiguous target/entrapment mapping; peptide removes bracketed modifications and canonicalizes I/L; protein requires one inferred protein key"
+    },
+    {
+      "method": "tdc_fork",
+      "stage": "target_only",
+      "results": "/Users/kgousset/Library/CloudStorage/OneDrive-Personal/Search_Data_Files/SAGE_DECOYFREE/VALIDATION/PXD001468/DECOY/3rd_no_ent/results.sage.tsv",
+      "mode": "tdc",
+      "calibration_stage": null,
+      "complete": true,
+      "search_space": "No Ent",
+      "layer": "reportable_q",
+      "psm": {
+        "target": 404028,
+        "entrapment": 0,
+        "combined_entrapment_fdp": null
+      },
+      "peptide": {
+        "target": 86403,
+        "entrapment": 0,
+        "combined_entrapment_fdp": null
+      },
+      "protein": {
+        "target": 9012,
+        "entrapment": 0,
+        "combined_entrapment_fdp": null
+      },
+      "counting_definition": "rank=1,label=1,non-contaminant,unambiguous target/entrapment mapping; peptide removes bracketed modifications and canonicalizes I/L; protein requires one inferred protein key"
+    },
+    {
+      "method": "tdc_upstream",
+      "stage": "optimized",
+      "results": "/Users/kgousset/Library/CloudStorage/OneDrive-Personal/Search_Data_Files/SAGE_DECOYFREE/VALIDATION/PXD001468/DECOY/VANILLA/results.sage.tsv",
+      "mode": "tdc",
+      "calibration_stage": null,
+      "complete": true,
+      "search_space": "+Ent",
+      "layer": "raw_q",
+      "psm": {
+        "target": 380989,
+        "entrapment": 1426,
+        "combined_entrapment_fdp": 0.009632315250870086
+      },
+      "peptide": {
+        "target": 82443,
+        "entrapment": 426,
+        "combined_entrapment_fdp": 0.01378164086826126
+      },
+      "protein": {
+        "target": 8908,
+        "entrapment": 48,
+        "combined_entrapment_fdp": 0.010719071013845467
+      },
+      "counting_definition": "rank=1,label=1,non-contaminant,unambiguous target/entrapment mapping; peptide removes bracketed modifications and canonicalizes I/L; protein requires one inferred protein key"
+    },
+    {
+      "method": "tdc_upstream",
+      "stage": "optimized",
+      "results": "/Users/kgousset/Library/CloudStorage/OneDrive-Personal/Search_Data_Files/SAGE_DECOYFREE/VALIDATION/PXD001468/DECOY/VANILLA/results.sage.tsv",
+      "mode": "tdc",
+      "calibration_stage": null,
+      "complete": true,
+      "search_space": "+Ent",
+      "layer": "reportable_q",
+      "psm": {
+        "target": 380989,
+        "entrapment": 1426,
+        "combined_entrapment_fdp": 0.009632315250870086
+      },
+      "peptide": {
+        "target": 82443,
+        "entrapment": 426,
+        "combined_entrapment_fdp": 0.01378164086826126
+      },
+      "protein": {
+        "target": 8908,
+        "entrapment": 48,
+        "combined_entrapment_fdp": 0.010719071013845467
+      },
+      "counting_definition": "rank=1,label=1,non-contaminant,unambiguous target/entrapment mapping; peptide removes bracketed modifications and canonicalizes I/L; protein requires one inferred protein key"
+    },
+    {
+      "method": "tdc_upstream",
+      "stage": "target_only",
+      "results": "/Users/kgousset/Library/CloudStorage/OneDrive-Personal/Search_Data_Files/SAGE_DECOYFREE/VALIDATION/PXD001468/DECOY/VANILLA/3rd_no_ent/results.sage.tsv",
+      "mode": "tdc",
+      "calibration_stage": null,
+      "complete": true,
+      "search_space": "No Ent",
+      "layer": "raw_q",
+      "psm": {
+        "target": 402162,
+        "entrapment": 0,
+        "combined_entrapment_fdp": null
+      },
+      "peptide": {
+        "target": 86123,
+        "entrapment": 0,
+        "combined_entrapment_fdp": null
+      },
+      "protein": {
+        "target": 9025,
+        "entrapment": 0,
+        "combined_entrapment_fdp": null
+      },
+      "counting_definition": "rank=1,label=1,non-contaminant,unambiguous target/entrapment mapping; peptide removes bracketed modifications and canonicalizes I/L; protein requires one inferred protein key"
+    },
+    {
+      "method": "tdc_upstream",
+      "stage": "target_only",
+      "results": "/Users/kgousset/Library/CloudStorage/OneDrive-Personal/Search_Data_Files/SAGE_DECOYFREE/VALIDATION/PXD001468/DECOY/VANILLA/3rd_no_ent/results.sage.tsv",
+      "mode": "tdc",
+      "calibration_stage": null,
+      "complete": true,
+      "search_space": "No Ent",
+      "layer": "reportable_q",
+      "psm": {
+        "target": 402162,
+        "entrapment": 0,
+        "combined_entrapment_fdp": null
+      },
+      "peptide": {
+        "target": 86123,
+        "entrapment": 0,
+        "combined_entrapment_fdp": null
+      },
+      "protein": {
+        "target": 9025,
+        "entrapment": 0,
+        "combined_entrapment_fdp": null
+      },
+      "counting_definition": "rank=1,label=1,non-contaminant,unambiguous target/entrapment mapping; peptide removes bracketed modifications and canonicalizes I/L; protein requires one inferred protein key"
+    }
+  ],
+  "missing_runs": [],
+  "transfer_stability": [
+    {
+      "method": "moments",
+      "from_stage": "ms2rescore",
+      "to_stage": "target_only",
+      "psm_fraction_change": 0.02094378175392092,
+      "peptide_fraction_change": 0.06083579307130651,
+      "protein_fraction_change": 0.03588235294117647,
+      "stable": true
+    },
+    {
+      "method": "tdc_fork",
+      "from_stage": "optimized",
+      "to_stage": "target_only",
+      "psm_fraction_change": 0.056307207228405376,
+      "peptide_fraction_change": 0.04476366670294192,
+      "protein_fraction_change": 0.011447811447811448,
+      "stable": true
+    },
+    {
+      "method": "tdc_upstream",
+      "from_stage": "optimized",
+      "to_stage": "target_only",
+      "psm_fraction_change": 0.055573782970112,
+      "peptide_fraction_change": 0.044636900646507285,
+      "protein_fraction_change": 0.013134261338123036,
+      "stable": true
+    }
+  ],
+  "stage_comparisons": [
+    {
+      "method": "moments",
+      "layer": "raw_q",
+      "from_stage": "optimized",
+      "to_stage": "ms2rescore",
+      "target_psm_change": 31186,
+      "target_peptide_change": 7962,
+      "target_protein_change": 703,
+      "peptide_fdp_change": 0.0006527128629847459
+    },
+    {
+      "method": "moments",
+      "layer": "raw_q",
+      "from_stage": "ms2rescore",
+      "to_stage": "target_only",
+      "target_psm_change": 5194,
+      "target_peptide_change": 2092,
+      "target_protein_change": 183,
+      "peptide_fdp_change": null
+    },
+    {
+      "method": "moments",
+      "layer": "raw_q",
+      "from_stage": "optimized",
+      "to_stage": "target_only",
+      "target_psm_change": 36380,
+      "target_peptide_change": 10054,
+      "target_protein_change": 886,
+      "peptide_fdp_change": null
+    },
+    {
+      "method": "moments",
+      "layer": "level4",
+      "from_stage": "optimized",
+      "to_stage": "ms2rescore",
+      "target_psm_change": 31986,
+      "target_peptide_change": 7703,
+      "target_protein_change": 703,
+      "peptide_fdp_change": 0.0022799749028255194
+    },
+    {
+      "method": "moments",
+      "layer": "level4",
+      "from_stage": "ms2rescore",
+      "to_stage": "target_only",
+      "target_psm_change": 4551,
+      "target_peptide_change": 1958,
+      "target_protein_change": 183,
+      "peptide_fdp_change": null
+    },
+    {
+      "method": "moments",
+      "layer": "level4",
+      "from_stage": "optimized",
+      "to_stage": "target_only",
+      "target_psm_change": 36537,
+      "target_peptide_change": 9661,
+      "target_protein_change": 886,
+      "peptide_fdp_change": null
+    },
+    {
+      "method": "tdc_fork",
+      "layer": "raw_q",
+      "from_stage": "optimized",
+      "to_stage": "target_only",
+      "target_psm_change": 21537,
+      "target_peptide_change": 3702,
+      "target_protein_change": 102,
+      "peptide_fdp_change": null
+    },
+    {
+      "method": "tdc_fork",
+      "layer": "reportable_q",
+      "from_stage": "optimized",
+      "to_stage": "target_only",
+      "target_psm_change": 21537,
+      "target_peptide_change": 3702,
+      "target_protein_change": 102,
+      "peptide_fdp_change": null
+    },
+    {
+      "method": "tdc_upstream",
+      "layer": "raw_q",
+      "from_stage": "optimized",
+      "to_stage": "target_only",
+      "target_psm_change": 21173,
+      "target_peptide_change": 3680,
+      "target_protein_change": 117,
+      "peptide_fdp_change": null
+    },
+    {
+      "method": "tdc_upstream",
+      "layer": "reportable_q",
+      "from_stage": "optimized",
+      "to_stage": "target_only",
+      "target_psm_change": 21173,
+      "target_peptide_change": 3680,
+      "target_protein_change": 117,
+      "peptide_fdp_change": null
+    }
+  ],
+  "expert_quality_gates": [
+    {
+      "model": "moments",
+      "eligible": true,
+      "reasons": [],
+      "validation_stage": "ms2rescore",
+      "validation_layer": "level4",
+      "target_peptides": 32185,
+      "entrapment_peptides": 59,
+      "peptide_fdp": 0.004905536672951243,
+      "underpowered": false,
+      "warnings": []
+    }
+  ],
+  "parity_comparisons": [],
+  "tdc_benchmarks": [
+    {
+      "decoy_free_method": "moments",
+      "tdc_method": "tdc_fork",
+      "stage": "optimized",
+      "layer": "raw_q",
+      "tdc_layer": "raw_q",
+      "psm_yield_difference": -163187,
+      "peptide_yield_difference": -55657,
+      "protein_yield_difference": -4513,
+      "peptide_entrapment_fdp": 0.04378321378119997,
+      "calibration_stage": "optimized",
+      "calibration_constrained": false,
+      "improves_peptide_yield": false
+    },
+    {
+      "decoy_free_method": "moments",
+      "tdc_method": "tdc_fork",
+      "stage": "optimized",
+      "layer": "level4",
+      "tdc_layer": "reportable_q",
+      "psm_yield_difference": -197181,
+      "peptide_yield_difference": -58219,
+      "protein_yield_difference": -4513,
+      "peptide_entrapment_fdp": 0.0026255617701257234,
+      "calibration_stage": "optimized",
+      "calibration_constrained": true,
+      "improves_peptide_yield": false
+    },
+    {
+      "decoy_free_method": "moments",
+      "tdc_method": "tdc_fork",
+      "stage": "target_only",
+      "layer": "raw_q",
+      "tdc_layer": "raw_q",
+      "psm_yield_difference": -148344,
+      "peptide_yield_difference": -49305,
+      "protein_yield_difference": -3729,
+      "peptide_entrapment_fdp": 0.04443592664418471,
+      "calibration_stage": "ms2rescore",
+      "calibration_constrained": false,
+      "improves_peptide_yield": false
+    },
+    {
+      "decoy_free_method": "moments",
+      "tdc_method": "tdc_fork",
+      "stage": "target_only",
+      "layer": "level4",
+      "tdc_layer": "reportable_q",
+      "psm_yield_difference": -182181,
+      "peptide_yield_difference": -52260,
+      "protein_yield_difference": -3729,
+      "peptide_entrapment_fdp": 0.004905536672951243,
+      "calibration_stage": "ms2rescore",
+      "calibration_constrained": true,
+      "improves_peptide_yield": false
+    }
+  ]
+}

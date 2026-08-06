@@ -1,5 +1,12 @@
+pub mod audit;
+pub mod candidate_pool;
+pub mod entrapment;
+pub mod external_feature_cache;
 pub mod external_features;
 pub mod input;
 pub mod output;
+pub mod provenance;
 pub mod runner;
 pub mod telemetry;
+pub mod validation;
+pub mod workflow;

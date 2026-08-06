@@ -1,0 +1,104 @@
+{
+  "schema_version": 1,
+  "dataset": "PXD001468",
+  "model": "moments",
+  "recorded_date": "2026-08-05",
+  "source_commit_when_recorded": "f97b94813730b48c2fc19f9a36e3e3b132a2bcb9",
+  "source_dirty_when_recorded": true,
+  "freeze_status": "partial_complete_tdc_and_metadata_pending_decoyfree_tsv_hydration",
+  "metadata_manifest": "validation/baselines/pxd001468_moments_metadata_2026-08-05.json",
+  "metadata_files_hashed": 19,
+  "metadata_bytes_hashed": 38479192,
+  "partial_manifest": "validation/baselines/pxd001468_moments_partial_2026-08-05.json",
+  "partial_files_hashed": 23,
+  "partial_bytes_hashed": 2080434440,
+  "authoritative_optimizer_selection": {
+    "source": "/Users/kgousset/Library/CloudStorage/OneDrive-Personal/Search_Data_Files/SAGE_DECOYFREE/VALIDATION/PXD001468/DECOYFREE/MOMENTS/best_result.txt",
+    "run_id": "run_026",
+    "min_null_rank": 10,
+    "max_null_rank": 10,
+    "effective_ratios": {
+      "psm": 0.631660497645,
+      "peptide": 0.594913242822,
+      "protein": 1.0
+    },
+    "selected_level4_combined_fdp": {
+      "psm": 0.00115646060083,
+      "peptide": 0.00256851897382,
+      "protein": 0.00545826700022
+    },
+    "level4_counts_reported_by_legacy_optimizer": {
+      "target_psm": 185310,
+      "entrapment_psm": 83,
+      "target_modified_peptide_strings": 26069,
+      "entrapment_modified_peptide_strings": 25,
+      "target_protein": 4385,
+      "entrapment_protein": 12
+    }
+  },
+  "superseded_optimizer_record": {
+    "source": "/Users/kgousset/Library/CloudStorage/OneDrive-Personal/Search_Data_Files/SAGE_DECOYFREE/VALIDATION/PXD001468/DECOYFREE/MOMENTS/best_result copy.txt",
+    "run_id": "run_045",
+    "min_null_rank": 3,
+    "max_null_rank": 9,
+    "reason_not_authoritative": "older selection predating the corrected effective-ratio/FDRBench combined-bound rerun"
+  },
+  "stage_files": [
+    {
+      "stage": "optimized",
+      "path": "/Users/kgousset/Library/CloudStorage/OneDrive-Personal/Search_Data_Files/SAGE_DECOYFREE/VALIDATION/PXD001468/DECOYFREE/MOMENTS/results.sage.tsv",
+      "logical_bytes": 799875821,
+      "modified_local_time": "2026-08-04 05:14:45",
+      "macos_state": "compressed,dataless"
+    },
+    {
+      "stage": "ms2rescore",
+      "path": "/Users/kgousset/Library/CloudStorage/OneDrive-Personal/Search_Data_Files/SAGE_DECOYFREE/VALIDATION/PXD001468/DECOYFREE/MOMENTS/2nd_ms2rescore/results.sage.tsv",
+      "logical_bytes": 924533896,
+      "modified_local_time": "2026-08-04 17:28:40",
+      "macos_state": "compressed,dataless"
+    },
+    {
+      "stage": "target_only",
+      "path": "/Users/kgousset/Library/CloudStorage/OneDrive-Personal/Search_Data_Files/SAGE_DECOYFREE/VALIDATION/PXD001468/DECOYFREE/MOMENTS/3rd_no_ent/results.sage.tsv",
+      "logical_bytes": 915961030,
+      "modified_local_time": "2026-08-05 02:56:25",
+      "macos_state": "compressed,dataless"
+    },
+    {
+      "stage": "tdc_fork_entrapment",
+      "path": "/Users/kgousset/Library/CloudStorage/OneDrive-Personal/Search_Data_Files/SAGE_DECOYFREE/VALIDATION/PXD001468/DECOY/results.sage.tsv",
+      "logical_bytes": 515496061,
+      "modified_local_time": "2026-07-27 15:47:13",
+      "macos_state": "local_and_content_hashed"
+    },
+    {
+      "stage": "tdc_fork_target_only",
+      "path": "/Users/kgousset/Library/CloudStorage/OneDrive-Personal/Search_Data_Files/SAGE_DECOYFREE/VALIDATION/PXD001468/DECOY/3rd_no_ent/results.sage.tsv",
+      "logical_bytes": 503320778,
+      "modified_local_time": "2026-07-27 17:21:18",
+      "macos_state": "local_and_content_hashed"
+    },
+    {
+      "stage": "tdc_upstream_entrapment",
+      "path": "/Users/kgousset/Library/CloudStorage/OneDrive-Personal/Search_Data_Files/SAGE_DECOYFREE/VALIDATION/PXD001468/DECOY/VANILLA/results.sage.tsv",
+      "logical_bytes": 517350686,
+      "modified_local_time": "2026-07-26 09:48:57",
+      "macos_state": "local_and_content_hashed"
+    },
+    {
+      "stage": "tdc_upstream_target_only",
+      "path": "/Users/kgousset/Library/CloudStorage/OneDrive-Personal/Search_Data_Files/SAGE_DECOYFREE/VALIDATION/PXD001468/DECOY/VANILLA/3rd_no_ent/results.sage.tsv",
+      "logical_bytes": 505787723,
+      "modified_local_time": "2026-07-27 08:11:51",
+      "macos_state": "local_and_content_hashed"
+    }
+  ],
+  "also_pending_hydration": [
+    "PXD001468/DECOYFREE/MOMENTS/cumulative_results_long.csv",
+    "PXD001468/DECOYFREE/MOMENTS/cumulative_results_wide.csv",
+    "PXD001468/DECOYFREE/MOMENTS/json/run_026.json",
+    "PXD001468/DECOYFREE/MOMENTS/logs/run_026.log"
+  ],
+  "next_content_freeze": "After OneDrive downloads the listed placeholders, run freeze-baseline again into a new pxd001468_moments_corrected_complete manifest; do not overwrite this metadata snapshot."
+}

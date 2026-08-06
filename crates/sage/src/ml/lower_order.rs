@@ -17,6 +17,7 @@
 //! lower-order LOMs to the rank-1 TNM.
 
 use fnv::FnvHashMap;
+use serde::{Deserialize, Serialize};
 use statrs::consts::EULER_MASCHERONI;
 use statrs::function::gamma::ln_gamma;
 
@@ -623,10 +624,36 @@ pub(crate) struct RankBucket {
 //
 // Default below is MinimalDelta (explicit, no silent interpolation for internal gaps).
 
-#[derive(Clone, Copy, Debug)]
+#[derive(Clone, Copy, Debug, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(rename_all = "snake_case")]
 pub enum ChargeFillMode {
     MinimalDelta,
     ClosestAvailable,
+}
+
+#[derive(Clone, Debug, Serialize, Deserialize, PartialEq)]
+pub struct LowerOrderArtifact {
+    pub schema_version: u32,
+    pub model_version: String,
+    pub params_by_charge: Vec<LowerOrderChargeParameters>,
+    pub charge_fill_mode: ChargeFillMode,
+    pub fitted_charges_sorted: Vec<u8>,
+    pub max_fitted_charge: u8,
+    pub null_rank_min: u32,
+    pub null_rank_max: u32,
+    pub evalue_candidate_count_power: f64,
+    pub evalue_scale: f64,
+    pub tev_transform: String,
+    pub extrapolation_strength: f64,
+    #[serde(default)]
+    pub reference_candidate_counts: Vec<u32>,
+}
+
+#[derive(Clone, Debug, Serialize, Deserialize, PartialEq)]
+pub struct LowerOrderChargeParameters {
+    pub charge: u8,
+    pub mu: f64,
+    pub beta: f64,
 }
 
 // -----------------------------------------------------------------------------
@@ -655,6 +682,92 @@ pub struct LowerOrderModel {
 }
 
 impl LowerOrderModel {
+    pub fn to_artifact(
+        &self,
+        null_rank_min: u32,
+        null_rank_max: u32,
+        evalue_candidate_count_power: f64,
+        evalue_scale: f64,
+        tev_transform: String,
+        extrapolation_strength: f64,
+        mut reference_candidate_counts: Vec<u32>,
+    ) -> LowerOrderArtifact {
+        let mut params_by_charge = self
+            .params_by_charge
+            .iter()
+            .map(|(&charge, &(mu, beta))| LowerOrderChargeParameters { charge, mu, beta })
+            .collect::<Vec<_>>();
+        params_by_charge.sort_by_key(|p| p.charge);
+        reference_candidate_counts.sort_unstable();
+        LowerOrderArtifact {
+            schema_version: 1,
+            model_version: "sage-lower-order-local-lom-extrapolated-v1".to_string(),
+            params_by_charge,
+            charge_fill_mode: self.charge_fill_mode,
+            fitted_charges_sorted: self.fitted_charges_sorted.clone(),
+            max_fitted_charge: self.max_fitted_charge,
+            null_rank_min,
+            null_rank_max,
+            evalue_candidate_count_power,
+            evalue_scale,
+            tev_transform,
+            extrapolation_strength,
+            reference_candidate_counts,
+        }
+    }
+
+    pub fn from_artifact(artifact: &LowerOrderArtifact) -> Result<Self, String> {
+        if artifact.schema_version != 1 {
+            return Err(format!(
+                "unsupported Lower Order artifact schema {}",
+                artifact.schema_version
+            ));
+        }
+        if artifact.params_by_charge.is_empty() {
+            return Err("Lower Order artifact has no fitted charge parameters".to_string());
+        }
+        if artifact.reference_candidate_counts.is_empty() {
+            return Err(
+                "Lower Order artifact has no reference candidate-count distribution".to_string(),
+            );
+        }
+        let mut params_by_charge = FnvHashMap::default();
+        for item in &artifact.params_by_charge {
+            if !item.mu.is_finite() || !item.beta.is_finite() || item.beta <= 0.0 {
+                return Err(format!(
+                    "invalid Lower Order parameters for charge {}",
+                    item.charge
+                ));
+            }
+            if params_by_charge
+                .insert(item.charge, (item.mu, item.beta))
+                .is_some()
+            {
+                return Err(format!(
+                    "duplicate Lower Order parameters for charge {}",
+                    item.charge
+                ));
+            }
+        }
+        let mut fitted_charges_sorted = params_by_charge.keys().copied().collect::<Vec<_>>();
+        fitted_charges_sorted.sort_unstable();
+        let max_fitted_charge = fitted_charges_sorted.last().copied().unwrap_or(0);
+        if artifact.fitted_charges_sorted != fitted_charges_sorted
+            || artifact.max_fitted_charge != max_fitted_charge
+        {
+            return Err(
+                "Lower Order artifact charge metadata does not match its parameters".to_string(),
+            );
+        }
+        Ok(Self {
+            params_by_charge,
+            fallback_params: (f64::NAN, f64::NAN),
+            charge_fill_mode: artifact.charge_fill_mode,
+            fitted_charges_sorted,
+            max_fitted_charge,
+        })
+    }
+
     #[inline]
     fn resolve_params(&self, charge: u8) -> (f64, f64) {
         // Fast path: exact charge fit exists
@@ -1746,5 +1859,25 @@ mod tests {
             err2 < 1e-12,
             "nll_tev_k does not match reconstructed closed-form NLL: got={got:.16e}, closed_form={closed_form_nll:.16e}, err={err2:.3e}"
         );
+    }
+
+    #[test]
+    fn frozen_artifact_round_trip_preserves_fitted_model() {
+        let mut params_by_charge = FnvHashMap::default();
+        params_by_charge.insert(2, (10.0, 2.0));
+        params_by_charge.insert(3, (11.0, 2.5));
+        let model = LowerOrderModel {
+            params_by_charge,
+            fallback_params: (f64::NAN, f64::NAN),
+            charge_fill_mode: ChargeFillMode::MinimalDelta,
+            fitted_charges_sorted: vec![2, 3],
+            max_fitted_charge: 3,
+        };
+        let artifact =
+            model.to_artifact(2, 12, 0.75, 1.0, "NegLogE".into(), 1.0, vec![400, 200, 300]);
+        let restored = LowerOrderModel::from_artifact(&artifact).unwrap();
+        assert_eq!(artifact.reference_candidate_counts, vec![200, 300, 400]);
+        assert_eq!(model.p_value(15.0, 2), restored.p_value(15.0, 2));
+        assert_eq!(model.p_value(15.0, 4), restored.p_value(15.0, 4));
     }
 }

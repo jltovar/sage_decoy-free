@@ -1,0 +1,127 @@
+{
+  "schema_version": 1,
+  "phase": 2,
+  "status": "passed",
+  "source_commit_before_phase_changes": "f97b94813730b48c2fc19f9a36e3e3b132a2bcb9",
+  "working_tree_changes_included": true,
+  "scope": {
+    "optimizer_parity": "ISB18 Moments using the frozen legacy target-plus-entrapment FASTA",
+    "fasta_generation_parity": [
+      "ISB18",
+      "PXD001468"
+    ],
+    "spectral_searches_for_fasta_audits": 0
+  },
+  "optimizer_parity": {
+    "manifest": "validation/manifests/isb18_moments_frozen_optimizer_parity_macos_2026-08-06.json",
+    "frozen_entrapment_input": "/Users/kgousset/Library/CloudStorage/OneDrive-Personal/FASTA_Files/FASTA/target_entrapment/ISB18_foreign_species_entrapment_protein.fasta",
+    "evaluated_windows": 71,
+    "feasible_windows": 54,
+    "selected_window": {
+      "min_rank": 9,
+      "max_rank": 18
+    },
+    "selected_level4_consistent_counts": {
+      "target_psms": 10020,
+      "entrapment_psms": 0,
+      "target_peptides": 325,
+      "entrapment_peptides": 0,
+      "target_proteins": 17,
+      "entrapment_proteins": 0
+    },
+    "legacy_log_counts": {
+      "target_psms": 10589,
+      "target_peptides": 406,
+      "target_proteins": 17,
+      "entrapment_psms": 542,
+      "entrapment_peptides": 5,
+      "entrapment_proteins": 0,
+      "level4_target_psms": 10020,
+      "level4_target_peptides": 401,
+      "level4_entrapment_psms": 0,
+      "level4_entrapment_peptides": 0
+    },
+    "counting_note": "The parity reporter's peptide definition is unique unmodified I/L-canonical sequence. The legacy log's peptide counters retain Sage peptide/peptidoform identity. Raw-q and Level-4 parity are both exact under the shared reporting definition.",
+    "raw_q_fraction_changes": {
+      "psm": 0.0,
+      "peptide": 0.0,
+      "protein": 0.0
+    },
+    "level4_fraction_changes": {
+      "psm": 0.0,
+      "peptide": 0.0,
+      "protein": 0.0
+    },
+    "null_window_evaluations": {
+      "path": "/Users/kgousset/Library/CloudStorage/OneDrive-Personal/Search_Data_Files/SAGE_DECOYFREE/VALIDATION/NATIVE_WORKFLOW/ISB18/PHASE2_MOMENTS_FROZEN_OPTIMIZER_2026-08-06/moments/optimized/null_window_evaluations.json",
+      "sha256": "1daf9cada72ab7b92732054256a338d9d4f2015227223ea690c6298f2f00a1a5"
+    },
+    "parity_report": {
+      "path": "/Users/kgousset/Library/CloudStorage/OneDrive-Personal/Search_Data_Files/SAGE_DECOYFREE/VALIDATION/NATIVE_WORKFLOW/ISB18/PHASE2_MOMENTS_FROZEN_OPTIMIZER_2026-08-06/validation.parity.json",
+      "sha256": "7e600e783f2524305db36b59d14612832d47948dbc019d4f615ef131e1a9e9d1"
+    }
+  },
+  "fasta_generation_parity": {
+    "generator_version": "sage-foreign-entrapment-generation-v3",
+    "selection_algorithm": "fdrbench_0_0_4_java_hashmap_collections_shuffle",
+    "shared_peptide_exclusion_mode": "fdrbench004_compatibility",
+    "exact_byte_match_expected": false,
+    "exact_byte_match_note": "Native Ent_ headers intentionally use Sage's explicit serial/source form. Source accessions, sequences, normalized mappings, and order match the legacy databases.",
+    "isb18": {
+      "manifest": "validation/manifests/isb18_entrapment_native_explicit_audit_macos_2026-08-06.json",
+      "selected_foreign_source_match": true,
+      "selected_accession_set_match": true,
+      "selected_accession_order_match": true,
+      "excluded_shared_peptide_set_match": true,
+      "mapping_match": true,
+      "target_header_order_match": true,
+      "entrapment_header_order_match": true,
+      "ratios": {
+        "protein": 1.0,
+        "peptide": 0.7667638483965015,
+        "peptidoform": 0.7754795035727717
+      },
+      "counts": {
+        "target_proteins": 18,
+        "entrapment_proteins": 18,
+        "target_peptides": 1715,
+        "entrapment_peptides": 1315,
+        "target_peptidoforms": 2659,
+        "entrapment_peptidoforms": 2062
+      },
+      "generation_report_sha256": "eea199ad3c55b3678a1c70a3378389661c1257313428dd849ff839a2c64f7e21",
+      "parity_report_sha256": "ab09475a3f345623b17455acd2a5562b4a7cc2cbc914bafff00fce662c9abce0"
+    },
+    "pxd001468": {
+      "manifest": "validation/manifests/pxd001468_entrapment_native_explicit_audit_macos_2026-08-06.json",
+      "selected_foreign_source_match": true,
+      "selected_accession_set_match": true,
+      "selected_accession_order_match": true,
+      "excluded_shared_peptide_set_match": true,
+      "mapping_match": true,
+      "target_header_order_match": true,
+      "entrapment_header_order_match": true,
+      "ratios": {
+        "protein": 1.0,
+        "peptide": 0.5948800028882344,
+        "peptidoform": 0.6316190823137978
+      },
+      "counts": {
+        "target_proteins": 20405,
+        "entrapment_proteins": 20405,
+        "target_peptides": 2326681,
+        "entrapment_peptides": 1384096,
+        "target_peptidoforms": 3502657,
+        "entrapment_peptidoforms": 2212345
+      },
+      "generation_report_sha256": "3120c4de2e13bfc9413a4fa69e2256ad9bfa6bd5532560be3166566af9840955",
+      "parity_report_sha256": "9d6cec42902a25441ca72321b8c217ba99ca679f2dbedf04cd45a85b5efb1a64"
+    }
+  },
+  "verification": {
+    "workspace_tests_passed": 149,
+    "workspace_tests_failed": 0,
+    "json_validation_passed": true,
+    "git_diff_check_passed": true
+  }
+}

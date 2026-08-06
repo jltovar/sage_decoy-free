@@ -1,0 +1,130 @@
+{
+  "schema_version": 1,
+  "name": "public_validation_development",
+  "dataset_id": "public_validation_dataset",
+  "search_config": "/path/to/base_search.json",
+  "target_fasta": "/path/to/target.fasta",
+  "spectra": [
+    "/path/to/development_01.mzML",
+    "/path/to/development_02.mzML"
+  ],
+  "output_root": "/path/to/native_workflow/development",
+  "entrapment": {
+    "database_mode": "native_generated",
+    "foreign_fastas": [
+      "/path/to/foreign_species_1.fasta",
+    "/path/to/foreign_species_2.fasta"
+  ],
+  "foreign_source_mode": "automatic",
+  "shared_peptide_exclusion_mode": "sage_search_space",
+  "output_fasta": "/path/to/native_workflow/development/target_foreign_entrapment.fasta",
+    "seed": 42,
+    "protein_fold": 1
+  },
+  "models": [
+    {
+      "model": "moments",
+      "candidate_windows": [
+        { "min_rank": 2, "max_rank": 8 },
+        { "min_rank": 5, "max_rank": 12 },
+        { "min_rank": 9, "max_rank": 18 }
+      ],
+      "ms2rescore": "measure"
+    },
+    {
+      "model": "mle",
+      "candidate_windows": [
+        { "min_rank": 2, "max_rank": 10 },
+        { "min_rank": 8, "max_rank": 25 }
+      ],
+      "ms2rescore": "measure"
+    },
+    {
+      "model": "lower_order",
+      "candidate_windows": [
+        { "min_rank": 2, "max_rank": 5 },
+        { "min_rank": 6, "max_rank": 9 }
+      ],
+      "ms2rescore": "measure"
+    },
+    {
+      "model": "msfdr",
+      "candidate_windows": [
+        { "min_rank": 2, "max_rank": 8 },
+        { "min_rank": 9, "max_rank": 13 }
+      ],
+      "ms2rescore": "measure"
+    },
+    {
+      "model": "msfdr1_smix",
+      "ms2rescore": "measure"
+    },
+    {
+      "model": "msfdr2_smix",
+      "candidate_windows": [
+        { "min_rank": 2, "max_rank": 8 },
+        { "min_rank": 9, "max_rank": 17 }
+      ],
+      "ms2rescore": "measure"
+    },
+    {
+      "model": "nokoi",
+      "candidate_windows": [
+        { "min_rank": 2, "max_rank": 7 },
+        { "min_rank": 2, "max_rank": 15 }
+      ],
+      "ms2rescore": "measure"
+    },
+    {
+      "model": "ensemble",
+      "ms2rescore": "measure"
+    }
+  ],
+  "baseline": {
+    "paths": [
+      "/path/to/frozen_reference_results"
+    ],
+    "output_manifest": "/path/to/native_workflow/development/baseline.manifest.json",
+    "status": "corrected_complete"
+  },
+  "validation": {
+    "null_window_validation_scope": "level4",
+    "use_generated_entrapment_ratios": true,
+    "fdr_threshold": 0.01,
+    "maximum_transfer_fraction_loss": 0.20,
+    "minimum_incremental_ensemble_peptides": 1,
+    "minimum_ensemble_experts": 2,
+    "minimum_entrapment_peptides_for_stable_estimate": 3,
+    "maximum_parity_fraction_difference": 0.001,
+    "tdc_reference_method": "tdc_reference",
+    "dataset_role": "development",
+    "diagnostic_only": false,
+    "parity_pairs": [
+      {
+        "baseline_method": "baseline_moments",
+        "native_method": "moments"
+      }
+    ],
+    "additional_runs": [
+      {
+        "method": "baseline_moments",
+        "stage": "optimized",
+        "results": "/path/to/frozen_reference_results/results.sage.tsv",
+        "mode": "decoy_free",
+        "expected_search_space": "+Ent"
+      },
+      {
+        "method": "tdc_reference",
+        "stage": "optimized",
+        "results": "/path/to/tdc_reference/results.sage.tsv",
+        "mode": "tdc",
+        "expected_search_space": "+Ent"
+      }
+    ]
+  },
+  "resume": true,
+  "annotate_target_matches": true,
+  "ensemble_lock": null,
+  "locked_expert_artifacts": {},
+  "artifact_reuse_policy": "dataset_local_only"
+}

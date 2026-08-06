@@ -1,0 +1,72 @@
+{
+  "schema_version": 1,
+  "name": "pxd001468_moments_isb_locked_holdout_2026-08-05",
+  "dataset_id": "PXD001468",
+  "search_config": "/mnt/d/OneDrive/Search_Data_Files/SAGE_DECOYFREE/VALIDATION/PXD001468/DECOYFREE/MOMENTS/validation_PXD001468_ent_decoyfree.json",
+  "target_fasta": "/mnt/d/OneDrive/FASTA_Files/FASTA/validation/PXD001468.fasta",
+  "spectra": [
+    "/mnt/d/Raw_Data_Files/validation/mzml/PXD001468/b1906_293T_proteinID_01A_QE3_122212.mzML",
+    "/mnt/d/Raw_Data_Files/validation/mzml/PXD001468/b1922_293T_proteinID_02A_QE3_122212.mzML",
+    "/mnt/d/Raw_Data_Files/validation/mzml/PXD001468/b1923_293T_proteinID_03A_QE3_122212.mzML",
+    "/mnt/d/Raw_Data_Files/validation/mzml/PXD001468/b1924_293T_proteinID_04A_QE3_122212.mzML",
+    "/mnt/d/Raw_Data_Files/validation/mzml/PXD001468/b1925_293T_proteinID_05A_QE3_122212.mzML",
+    "/mnt/d/Raw_Data_Files/validation/mzml/PXD001468/b1926_293T_proteinID_06A_QE3_122212.mzML",
+    "/mnt/d/Raw_Data_Files/validation/mzml/PXD001468/b1927_293T_proteinID_07A_QE3_122212.mzML",
+    "/mnt/d/Raw_Data_Files/validation/mzml/PXD001468/b1928_293T_proteinID_08A_QE3_122212.mzML",
+    "/mnt/d/Raw_Data_Files/validation/mzml/PXD001468/b1929_293T_proteinID_09A_QE3_122212.mzML",
+    "/mnt/d/Raw_Data_Files/validation/mzml/PXD001468/b1930_293T_proteinID_10A_QE3_122212.mzML",
+    "/mnt/d/Raw_Data_Files/validation/mzml/PXD001468/b1931_293T_proteinID_11A_QE3_122212.mzML",
+    "/mnt/d/Raw_Data_Files/validation/mzml/PXD001468/b1932_293T_proteinID_12A_QE3_122212.mzML",
+    "/mnt/d/Raw_Data_Files/validation/mzml/PXD001468/b1937_293T_proteinID_01B_QE3_122212.mzML",
+    "/mnt/d/Raw_Data_Files/validation/mzml/PXD001468/b1938_293T_proteinID_02B_QE3_122212.mzML",
+    "/mnt/d/Raw_Data_Files/validation/mzml/PXD001468/b1939_293T_proteinID_03B_QE3_122212.mzML",
+    "/mnt/d/Raw_Data_Files/validation/mzml/PXD001468/b1940_293T_proteinID_04B_QE3_122212.mzML",
+    "/mnt/d/Raw_Data_Files/validation/mzml/PXD001468/b1941_293T_proteinID_05B_QE3_122212.mzML",
+    "/mnt/d/Raw_Data_Files/validation/mzml/PXD001468/b1942_293T_proteinID_06B_QE3_122212.mzML",
+    "/mnt/d/Raw_Data_Files/validation/mzml/PXD001468/b1943_293T_proteinID_07B_QE3_122212.mzML",
+    "/mnt/d/Raw_Data_Files/validation/mzml/PXD001468/b1944_293T_proteinID_08B_QE3_122212.mzML",
+    "/mnt/d/Raw_Data_Files/validation/mzml/PXD001468/b1945_293T_proteinID_09B_QE3_122212.mzML",
+    "/mnt/d/Raw_Data_Files/validation/mzml/PXD001468/b1946_293T_proteinID_10B_QE3_122212.mzML",
+    "/mnt/d/Raw_Data_Files/validation/mzml/PXD001468/b1947_293T_proteinID_11B_QE3_122212.mzML",
+    "/mnt/d/Raw_Data_Files/validation/mzml/PXD001468/b1948_293T_proteinID_12B_QE3_122212.mzML"
+  ],
+  "output_root": "/mnt/d/OneDrive/Search_Data_Files/SAGE_DECOYFREE/VALIDATION/NATIVE_WORKFLOW/PXD001468/MOMENTS_ISB_LOCKED_HOLDOUT_2026-08-05",
+  "entrapment": {
+    "database_mode": "frozen_legacy",
+    "foreign_fastas": [],
+    "output_fasta": "/mnt/d/OneDrive/Search_Data_Files/SAGE_DECOYFREE/VALIDATION/NATIVE_WORKFLOW/PXD001468/MOMENTS_ISB_LOCKED_HOLDOUT_2026-08-05/generated/PXD001468_parity_entrapment.fasta",
+    "frozen_legacy_fasta": "/mnt/d/OneDrive/FASTA_Files/FASTA/target_entrapment/PXD001468_foreign_species_entrapment_protein.fasta",
+    "seed": 2000,
+    "protein_fold": 1
+  },
+  "models": [
+    { "model": "moments", "ms2rescore": "never" }
+  ],
+  "validation": {
+    "null_window_validation_scope": "level4",
+    "effective_ratios": { "psm": 0.631660497645, "peptide": 0.594913242822, "protein": 1.0 },
+    "use_generated_entrapment_ratios": true,
+    "fdr_threshold": 0.01,
+    "maximum_transfer_fraction_loss": 0.20,
+    "minimum_incremental_ensemble_peptides": 1,
+    "minimum_ensemble_experts": 2,
+    "minimum_entrapment_peptides_for_stable_estimate": 3,
+    "maximum_parity_fraction_difference": 0.001,
+    "tdc_reference_method": "tdc_fork",
+    "dataset_role": "holdout",
+    "diagnostic_only": true,
+    "parity_pairs": [],
+    "external_parity_evidence": "/REPLACED_AFTER_ISB/validation.parity.json",
+    "additional_runs": [
+      { "method": "tdc_fork", "stage": "optimized", "results": "/mnt/d/OneDrive/Search_Data_Files/SAGE_DECOYFREE/VALIDATION/PXD001468/DECOY/results.sage.tsv", "mode": "tdc", "expected_search_space": "+Ent" },
+      { "method": "tdc_fork", "stage": "target_only", "results": "/mnt/d/OneDrive/Search_Data_Files/SAGE_DECOYFREE/VALIDATION/PXD001468/DECOY/3rd_no_ent/results.sage.tsv", "mode": "tdc", "expected_search_space": "No Ent" }
+    ]
+  },
+  "resume": true,
+  "annotate_target_matches": true,
+  "ensemble_lock": null,
+  "locked_expert_artifacts": {
+    "moments": "/REPLACED_AFTER_ISB/fitted_model_artifacts.json"
+  },
+  "artifact_reuse_policy": "cross_dataset_diagnostic"
+}

@@ -14,10 +14,10 @@ use rand::seq::SliceRandom;
 use rand::thread_rng;
 use rand::SeedableRng;
 use serde::{Deserialize, Serialize};
-use std::cmp::Ordering;
 
 const NOKOI_CROSSFIT_SEED: u64 = 0x5EED_5EED_5EED_5EED;
 
+#[derive(Clone, Debug)]
 pub struct NokoiEvidence {
     pub p_values: Vec<f64>,
     pub peps: Vec<f64>,
@@ -106,7 +106,7 @@ fn soft_threshold(z: f64, threshold: f64) -> f64 {
 }
 
 /// Logistic Regression with L1 Lasso & FISTA Optimization
-#[derive(Clone, Debug)]
+#[derive(Clone, Debug, Serialize, Deserialize)]
 pub struct LogisticRegression {
     pub weights: Vec<f64>,
     pub bias: f64,
@@ -250,10 +250,10 @@ impl LogisticRegression {
     }
 
     /// Train using K-fold Cross Validation to tune L1 Lambda
-    pub fn train_cv(&mut self, data: &[PsmData], config: &NokoiConfig) {
+    pub fn train_cv(&mut self, data: &[PsmData], config: &NokoiConfig) -> f64 {
         let n_samples = data.len();
         if n_samples == 0 {
-            return;
+            return config.l1_lambda;
         }
 
         // Build log-spaced lambda grid from config
@@ -360,83 +360,158 @@ impl LogisticRegression {
             nonzero_features,
             self.weights.len()
         );
+        best_lambda
     }
+}
+
+pub const NOKOI_FEATURE_SCHEMA: [&str; 12] = [
+    "hyperscore",
+    "delta_next",
+    "abs_average_ppm",
+    "abs_delta_rt_model",
+    "abs_delta_ims_model",
+    "charge",
+    "peptide_len",
+    "matched_peaks",
+    "matched_intensity_pct",
+    "isotope_error",
+    "longest_y_pct",
+    "log10_ms2_intensity",
+];
+
+#[derive(Clone, Debug, Serialize, Deserialize)]
+pub struct NokoiNormalization {
+    pub medians: Vec<f64>,
+    pub means: Vec<f64>,
+    pub stds: Vec<f64>,
+}
+
+impl NokoiNormalization {
+    fn apply(&self, values: &mut [f64]) -> bool {
+        if values.len() != self.medians.len()
+            || values.len() != self.means.len()
+            || values.len() != self.stds.len()
+        {
+            return false;
+        }
+        for (index, value) in values.iter_mut().enumerate() {
+            if !value.is_finite() {
+                *value = self.medians[index];
+            }
+            let std = self.stds[index];
+            *value = if std.is_finite() && std > 1e-9 {
+                (*value - self.means[index]) / std
+            } else {
+                0.0
+            };
+        }
+        values.iter().all(|value| value.is_finite())
+    }
+}
+
+#[derive(Clone, Debug, Serialize, Deserialize)]
+pub struct NokoiCalibrationPoint {
+    pub p_value: f64,
+    pub pep: f64,
+}
+
+#[derive(Clone, Debug, Serialize, Deserialize)]
+pub struct NokoiArtifact {
+    pub schema_version: u32,
+    pub model_version: String,
+    pub feature_schema: Vec<String>,
+    pub min_null_rank: u32,
+    pub max_null_rank: u32,
+    pub crossfit_seed: u64,
+    pub k_folds: usize,
+    pub fold_sizes: Vec<usize>,
+    pub config: NokoiConfig,
+    pub selected_l1_lambda: f64,
+    pub final_model: LogisticRegression,
+    pub normalization: NokoiNormalization,
+    pub null_scores_oof: Vec<f64>,
+    pub development_pi0: f64,
+    pub pep_calibration: Vec<NokoiCalibrationPoint>,
+    pub positive_training_count: usize,
+    pub negative_training_count: usize,
+    #[serde(default)]
+    pub reference_candidate_counts: Vec<u32>,
+}
+
+#[derive(Clone, Debug)]
+pub struct NokoiFitResult {
+    pub evidence: NokoiEvidence,
+    pub artifact: NokoiArtifact,
+}
+
+fn normalize_features_portable(data: &mut [PsmData]) -> NokoiNormalization {
+    let n_samples = data.len();
+    if n_samples == 0 {
+        return NokoiNormalization {
+            medians: Vec::new(),
+            means: Vec::new(),
+            stds: Vec::new(),
+        };
+    }
+    let n_features = data[0].features.len();
+    let mut medians = vec![0.0; n_features];
+    for index in 0..n_features {
+        let mut values = data
+            .iter()
+            .map(|sample| sample.features[index])
+            .filter(|value| value.is_finite())
+            .collect::<Vec<_>>();
+        values.sort_by(|left, right| left.total_cmp(right));
+        medians[index] = match values.len() {
+            0 => 0.0,
+            n if n % 2 == 1 => values[n / 2],
+            n => (values[n / 2 - 1] + values[n / 2]) / 2.0,
+        };
+    }
+    for sample in data.iter_mut() {
+        for (index, value) in sample.features.iter_mut().enumerate() {
+            if !value.is_finite() {
+                *value = medians[index];
+            }
+        }
+    }
+    let n = n_samples as f64;
+    let mut means = vec![0.0; n_features];
+    for sample in data.iter() {
+        for (index, value) in sample.features.iter().enumerate() {
+            means[index] += *value;
+        }
+    }
+    for mean in &mut means {
+        *mean /= n;
+    }
+    let mut stds = vec![0.0; n_features];
+    for sample in data.iter() {
+        for (index, value) in sample.features.iter().enumerate() {
+            stds[index] += (*value - means[index]).powi(2);
+        }
+    }
+    for std in &mut stds {
+        *std = (*std / n).sqrt();
+        if !std.is_finite() || *std < 1e-9 {
+            *std = 1.0;
+        }
+    }
+    let normalization = NokoiNormalization {
+        medians,
+        means,
+        stds,
+    };
+    for sample in data {
+        debug_assert!(normalization.apply(&mut sample.features));
+    }
+    normalization
 }
 
 /// Feature preprocessing: median imputation followed by mean/std z-score standardization.
 pub fn normalize_features(data: &mut [PsmData]) -> (Vec<f64>, Vec<f64>) {
-    let n_samples = data.len();
-    if n_samples == 0 {
-        return (Vec::new(), Vec::new());
-    }
-
-    let n_features = data[0].features.len();
-    let n = n_samples as f64;
-
-    let mut means = vec![0.0; n_features];
-    let mut stds = vec![0.0; n_features];
-
-    // 1. Median Imputation
-    let mut medians = vec![0.0; n_features];
-    for j in 0..n_features {
-        let mut vals: Vec<f64> = data
-            .iter()
-            .map(|s| s.features[j])
-            .filter(|v| v.is_finite())
-            .collect();
-
-        if vals.is_empty() {
-            medians[j] = 0.0;
-        } else {
-            vals.sort_by(|a, b| a.partial_cmp(b).unwrap_or(Ordering::Equal));
-            let mid = vals.len() / 2;
-            medians[j] = if vals.len() % 2 == 1 {
-                vals[mid]
-            } else {
-                (vals[mid - 1] + vals[mid]) / 2.0
-            };
-        }
-    }
-
-    for sample in data.iter_mut() {
-        for j in 0..n_features {
-            if !sample.features[j].is_finite() {
-                sample.features[j] = medians[j];
-            }
-        }
-    }
-
-    // 2. Calculate Mean
-    for sample in data.iter() {
-        for (i, x) in sample.features.iter().enumerate() {
-            means[i] += *x;
-        }
-    }
-    for m in means.iter_mut() {
-        *m /= n;
-    }
-
-    // 3. Calculate Std Dev
-    for sample in data.iter() {
-        for (i, x) in sample.features.iter().enumerate() {
-            stds[i] += (x - means[i]).powi(2);
-        }
-    }
-    for (_i, s) in stds.iter_mut().enumerate() {
-        *s = (*s / n).sqrt();
-        if !s.is_finite() || *s < 1e-9 {
-            *s = 1.0;
-        }
-    }
-
-    // 4. Apply Z-Score
-    for sample in data.iter_mut() {
-        for (i, x) in sample.features.iter_mut().enumerate() {
-            *x = (*x - means[i]) / stds[i];
-        }
-    }
-
-    (means, stds)
+    let normalization = normalize_features_portable(data);
+    (normalization.means, normalization.stds)
 }
 
 /// Main entry point: Train model and return probabilities for all features
@@ -743,11 +818,18 @@ pub fn rescore_df(
     Some(probabilities)
 }
 
-/// Decoy-free Nokoi cross-fit entry point:
-/// Returns:
-///  - prob_target_all: P(target) for every PSM index (aligned 1:1 with `features`)
-///  - null_scores_oof: out-of-fold P(target) for indices in `null_indices` (non-circular null dist)
-pub fn rescore_df_crossfit(
+struct NokoiCrossfitTraining {
+    prob_target_all: Vec<f64>,
+    null_scores_oof: Vec<f64>,
+    final_model: LogisticRegression,
+    normalization: NokoiNormalization,
+    selected_l1_lambda: f64,
+    fold_sizes: Vec<usize>,
+    positive_training_count: usize,
+    negative_training_count: usize,
+}
+
+fn train_nokoi_crossfit(
     features: &[DfFeature],
     config: &NokoiConfig,
     min_null_rank: u32,
@@ -755,7 +837,7 @@ pub fn rescore_df_crossfit(
     k_folds: usize,
     is_positive: impl Fn(&DfFeature) -> bool,
     null_indices: &[usize],
-) -> Option<(Vec<f64>, Vec<f64>)> {
+) -> Option<NokoiCrossfitTraining> {
     // ---- 0) Fast fallbacks for empty/low data ----
     if features.is_empty() {
         return None;
@@ -838,7 +920,7 @@ pub fn rescore_df_crossfit(
     let train_one = |pos_idx: &[usize],
                      neg_idx: &[usize],
                      seed: u64|
-     -> Option<(LogisticRegression, Vec<f64>, Vec<f64>)> {
+     -> Option<(LogisticRegression, NokoiNormalization, f64)> {
         // Build labeled PsmData pools
         let mut pos: Vec<PsmData> = Vec::with_capacity(pos_idx.len());
         let mut neg: Vec<PsmData> = Vec::with_capacity(neg_idx.len());
@@ -880,13 +962,13 @@ pub fn rescore_df_crossfit(
         training_data.shuffle(&mut rng);
 
         // Normalize (in-place) and capture means/stds
-        let (means, stds) = normalize_features(&mut training_data);
+        let normalization = normalize_features_portable(&mut training_data);
 
         let n_features = training_data[0].features.len();
         let mut model = LogisticRegression::new(n_features);
-        model.train_cv(&training_data, config);
+        let selected_lambda = model.train_cv(&training_data, config);
 
-        Some((model, means, stds))
+        Some((model, normalization, selected_lambda))
     };
 
     // ---- 3) Cross-fit: out-of-fold predictions for null candidates ----
@@ -920,7 +1002,7 @@ pub fn rescore_df_crossfit(
         }
 
         let seed = NOKOI_CROSSFIT_SEED ^ (fold_i as u64).wrapping_mul(0x9E37_79B9_7F4A_7C15);
-        let (model, means, stds) = match train_one(&positives_idx, &train_neg, seed) {
+        let (model, normalization, _) = match train_one(&positives_idx, &train_neg, seed) {
             Some(x) => x,
             None => {
                 // If a fold cannot train (rare), skip OOF and fail closed later.
@@ -935,12 +1017,8 @@ pub fn rescore_df_crossfit(
         // Predict on heldout (OOF) only
         for &j in *heldout {
             let mut x = extract_features(&features[j].core);
-            for t in 0..x.len() {
-                if stds[t] > 1e-9 {
-                    x[t] = (x[t] - means[t]) / stds[t];
-                } else {
-                    x[t] = 0.0;
-                }
+            if !normalization.apply(&mut x) {
+                return None;
             }
             let p = model.predict(&x);
             null_scores_oof.push(p.clamp(0.0, 1.0));
@@ -958,23 +1036,20 @@ pub fn rescore_df_crossfit(
 
     // ---- 4) Final model for prob_target_all: train on all positives + ALL rank-window negatives ----
     let seed_final = NOKOI_CROSSFIT_SEED ^ 0xF11A_1EED_1234_5678u64;
-    let (model, means, stds) = match train_one(&positives_idx, &negatives_idx, seed_final) {
-        Some(x) => x,
-        None => {
-            log::warn!("Nokoi DF crossfit: final model could not train - failing closed");
-            return None;
-        }
-    };
+    let (model, normalization, selected_l1_lambda) =
+        match train_one(&positives_idx, &negatives_idx, seed_final) {
+            Some(x) => x,
+            None => {
+                log::warn!("Nokoi DF crossfit: final model could not train - failing closed");
+                return None;
+            }
+        };
 
     let mut prob_target_all: Vec<f64> = Vec::with_capacity(features.len());
     for f in features {
         let mut x = extract_features(&f.core);
-        for t in 0..x.len() {
-            if stds[t] > 1e-9 {
-                x[t] = (x[t] - means[t]) / stds[t];
-            } else {
-                x[t] = 0.0;
-            }
+        if !normalization.apply(&mut x) {
+            return None;
         }
         prob_target_all.push(model.predict(&x).clamp(0.0, 1.0));
     }
@@ -996,7 +1071,38 @@ pub fn rescore_df_crossfit(
         return None;
     }
 
-    Some((prob_target_all, null_scores_oof))
+    Some(NokoiCrossfitTraining {
+        prob_target_all,
+        null_scores_oof,
+        final_model: model,
+        normalization,
+        selected_l1_lambda,
+        fold_sizes: folds.iter().map(|fold| fold.len()).collect(),
+        positive_training_count: positives_idx.len(),
+        negative_training_count: negatives_idx.len(),
+    })
+}
+
+/// Backward-compatible cross-fit scores without exposing the portable model.
+pub fn rescore_df_crossfit(
+    features: &[DfFeature],
+    config: &NokoiConfig,
+    min_null_rank: u32,
+    max_null_rank: u32,
+    k_folds: usize,
+    is_positive: impl Fn(&DfFeature) -> bool,
+    null_indices: &[usize],
+) -> Option<(Vec<f64>, Vec<f64>)> {
+    let fitted = train_nokoi_crossfit(
+        features,
+        config,
+        min_null_rank,
+        max_null_rank,
+        k_folds,
+        is_positive,
+        null_indices,
+    )?;
+    Some((fitted.prob_target_all, fitted.null_scores_oof))
 }
 
 /// Convert model scores to upper-tail empirical p-values using the null-score distribution
@@ -1278,4 +1384,213 @@ pub fn build_nokoi_evidence_from_crossfit_null(
     }
 
     NokoiEvidence { p_values, peps }
+}
+
+fn freeze_pep_calibration(p_values: &[f64], peps: &[f64]) -> Vec<NokoiCalibrationPoint> {
+    let mut pairs = p_values
+        .iter()
+        .copied()
+        .zip(peps.iter().copied())
+        .filter(|(p, pep)| p.is_finite() && pep.is_finite())
+        .map(|(p, pep)| (p.clamp(1e-300, 1.0), pep.clamp(1e-300, 1.0)))
+        .collect::<Vec<_>>();
+    pairs.sort_by(|left, right| left.0.total_cmp(&right.0));
+    let mut points: Vec<NokoiCalibrationPoint> = Vec::new();
+    for (p_value, pep) in pairs {
+        if let Some(last) = points.last_mut().filter(|last| last.p_value == p_value) {
+            last.pep = last.pep.max(pep);
+        } else {
+            points.push(NokoiCalibrationPoint { p_value, pep });
+        }
+    }
+    // Local FDR should not improve as the p-value worsens. Enforce that
+    // monotonicity conservatively before persisting the calibration curve.
+    let mut running = 1e-300_f64;
+    for point in &mut points {
+        running = running.max(point.pep);
+        point.pep = running;
+    }
+    points
+}
+
+fn apply_frozen_pep_calibration(
+    p_values: &[f64],
+    points: &[NokoiCalibrationPoint],
+) -> Option<Vec<f64>> {
+    if points.len() < 2
+        || points.iter().any(|point| {
+            !point.p_value.is_finite()
+                || !point.pep.is_finite()
+                || point.p_value <= 0.0
+                || point.p_value > 1.0
+                || point.pep <= 0.0
+                || point.pep > 1.0
+        })
+    {
+        return None;
+    }
+    let mut output = Vec::with_capacity(p_values.len());
+    for &p_value in p_values {
+        let p = p_value.clamp(1e-300, 1.0);
+        let upper = points.partition_point(|point| point.p_value < p);
+        let pep = if upper == 0 {
+            points[0].pep
+        } else if upper >= points.len() {
+            points.last()?.pep
+        } else {
+            let left = &points[upper - 1];
+            let right = &points[upper];
+            let width = right.p_value - left.p_value;
+            if width <= 1e-300 {
+                left.pep.max(right.pep)
+            } else {
+                let weight = ((p - left.p_value) / width).clamp(0.0, 1.0);
+                left.pep + weight * (right.pep - left.pep)
+            }
+        };
+        output.push(pep.clamp(1e-300, 1.0));
+    }
+    Some(output)
+}
+
+pub fn fit_nokoi_artifact(
+    features: &[DfFeature],
+    config: &NokoiConfig,
+    min_null_rank: u32,
+    max_null_rank: u32,
+    k_folds: usize,
+    is_positive: impl Fn(&DfFeature) -> bool,
+    null_indices: &[usize],
+) -> Option<NokoiFitResult> {
+    let fitted = train_nokoi_crossfit(
+        features,
+        config,
+        min_null_rank,
+        max_null_rank,
+        k_folds,
+        is_positive,
+        null_indices,
+    )?;
+    let evidence =
+        build_nokoi_evidence_from_crossfit_null(&fitted.prob_target_all, &fitted.null_scores_oof);
+    let development_pi0 = estimate_pi0_for_nokoi_p_values(&evidence.p_values);
+    let pep_calibration = freeze_pep_calibration(&evidence.p_values, &evidence.peps);
+    if pep_calibration.len() < 2 {
+        return None;
+    }
+    let mut reference_candidate_counts = features
+        .iter()
+        .filter(|feature| feature.core.rank == 1)
+        .map(|feature| feature.core.lo_spectrum_candidate_count)
+        .filter(|&count| count > 0)
+        .collect::<Vec<_>>();
+    reference_candidate_counts.sort_unstable();
+    let artifact = NokoiArtifact {
+        schema_version: 1,
+        model_version: "sage-nokoi-crossfit-portable-v1".into(),
+        feature_schema: NOKOI_FEATURE_SCHEMA
+            .iter()
+            .map(|name| (*name).to_string())
+            .collect(),
+        min_null_rank,
+        max_null_rank,
+        crossfit_seed: NOKOI_CROSSFIT_SEED,
+        k_folds: fitted.fold_sizes.len(),
+        fold_sizes: fitted.fold_sizes,
+        config: config.clone(),
+        selected_l1_lambda: fitted.selected_l1_lambda,
+        final_model: fitted.final_model,
+        normalization: fitted.normalization,
+        null_scores_oof: fitted.null_scores_oof,
+        development_pi0,
+        pep_calibration,
+        positive_training_count: fitted.positive_training_count,
+        negative_training_count: fitted.negative_training_count,
+        reference_candidate_counts,
+    };
+    Some(NokoiFitResult { evidence, artifact })
+}
+
+pub fn apply_nokoi_artifact(
+    features: &[DfFeature],
+    artifact: &NokoiArtifact,
+) -> Option<NokoiEvidence> {
+    if artifact.schema_version != 1
+        || artifact.feature_schema
+            != NOKOI_FEATURE_SCHEMA
+                .iter()
+                .map(|name| (*name).to_string())
+                .collect::<Vec<_>>()
+        || artifact.final_model.weights.len() != NOKOI_FEATURE_SCHEMA.len()
+        || artifact.normalization.medians.len() != NOKOI_FEATURE_SCHEMA.len()
+        || artifact.normalization.means.len() != NOKOI_FEATURE_SCHEMA.len()
+        || artifact.normalization.stds.len() != NOKOI_FEATURE_SCHEMA.len()
+        || artifact.null_scores_oof.len() < 50
+        || artifact.pep_calibration.len() < 2
+        || artifact.k_folds < 2
+        || artifact.fold_sizes.len() != artifact.k_folds
+    {
+        log::error!("Nokoi frozen artifact is incomplete or incompatible");
+        return None;
+    }
+    let mut probabilities = Vec::with_capacity(features.len());
+    for feature in features {
+        let mut values = extract_features(&feature.core);
+        if !artifact.normalization.apply(&mut values) {
+            return None;
+        }
+        let probability = artifact.final_model.predict(&values);
+        if !probability.is_finite() {
+            return None;
+        }
+        probabilities.push(probability.clamp(0.0, 1.0));
+    }
+    let p_values =
+        calc_empirical_p_values_from_null_scores(&probabilities, &artifact.null_scores_oof);
+    let peps = apply_frozen_pep_calibration(&p_values, &artifact.pep_calibration)?;
+    Some(NokoiEvidence { p_values, peps })
+}
+
+#[cfg(test)]
+mod portable_tests {
+    use super::*;
+
+    #[test]
+    fn portable_normalization_imputes_nonfinite_values() {
+        let mut data = vec![
+            PsmData {
+                features: vec![1.0, f64::NAN],
+                label: 0.0,
+                original_idx: 0,
+            },
+            PsmData {
+                features: vec![3.0, 4.0],
+                label: 1.0,
+                original_idx: 1,
+            },
+            PsmData {
+                features: vec![5.0, 6.0],
+                label: 1.0,
+                original_idx: 2,
+            },
+        ];
+        let normalization = normalize_features_portable(&mut data);
+        assert_eq!(normalization.medians, vec![3.0, 5.0]);
+        assert!(data
+            .iter()
+            .flat_map(|row| &row.features)
+            .all(|value| value.is_finite()));
+        let mut new_values = vec![f64::NAN, 5.0];
+        assert!(normalization.apply(&mut new_values));
+        assert!(new_values.iter().all(|value| value.is_finite()));
+    }
+
+    #[test]
+    fn frozen_pep_curve_is_monotone_and_reusable() {
+        let points = freeze_pep_calibration(&[0.01, 0.1, 0.5, 0.9], &[0.02, 0.08, 0.07, 0.8]);
+        assert!(points.windows(2).all(|pair| pair[0].pep <= pair[1].pep));
+        let applied = apply_frozen_pep_calibration(&[0.05, 0.2, 0.8], &points).unwrap();
+        assert!(applied.windows(2).all(|pair| pair[0] <= pair[1]));
+        assert!(applied.iter().all(|value| (0.0..=1.0).contains(value)));
+    }
 }

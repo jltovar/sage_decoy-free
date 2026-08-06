@@ -1,0 +1,102 @@
+[
+  {
+    "method": "moments",
+    "layer": "raw_q",
+    "from_stage": "optimized",
+    "to_stage": "ms2rescore",
+    "target_psm_change": 31186,
+    "target_peptide_change": 7962,
+    "target_protein_change": 703,
+    "peptide_fdp_change": 0.0006527128629847459
+  },
+  {
+    "method": "moments",
+    "layer": "raw_q",
+    "from_stage": "ms2rescore",
+    "to_stage": "target_only",
+    "target_psm_change": 5194,
+    "target_peptide_change": 2092,
+    "target_protein_change": 183,
+    "peptide_fdp_change": null
+  },
+  {
+    "method": "moments",
+    "layer": "raw_q",
+    "from_stage": "optimized",
+    "to_stage": "target_only",
+    "target_psm_change": 36380,
+    "target_peptide_change": 10054,
+    "target_protein_change": 886,
+    "peptide_fdp_change": null
+  },
+  {
+    "method": "moments",
+    "layer": "level4",
+    "from_stage": "optimized",
+    "to_stage": "ms2rescore",
+    "target_psm_change": 31986,
+    "target_peptide_change": 7703,
+    "target_protein_change": 703,
+    "peptide_fdp_change": 0.0022799749028255194
+  },
+  {
+    "method": "moments",
+    "layer": "level4",
+    "from_stage": "ms2rescore",
+    "to_stage": "target_only",
+    "target_psm_change": 4551,
+    "target_peptide_change": 1958,
+    "target_protein_change": 183,
+    "peptide_fdp_change": null
+  },
+  {
+    "method": "moments",
+    "layer": "level4",
+    "from_stage": "optimized",
+    "to_stage": "target_only",
+    "target_psm_change": 36537,
+    "target_peptide_change": 9661,
+    "target_protein_change": 886,
+    "peptide_fdp_change": null
+  },
+  {
+    "method": "tdc_fork",
+    "layer": "raw_q",
+    "from_stage": "optimized",
+    "to_stage": "target_only",
+    "target_psm_change": 21537,
+    "target_peptide_change": 3702,
+    "target_protein_change": 102,
+    "peptide_fdp_change": null
+  },
+  {
+    "method": "tdc_fork",
+    "layer": "reportable_q",
+    "from_stage": "optimized",
+    "to_stage": "target_only",
+    "target_psm_change": 21537,
+    "target_peptide_change": 3702,
+    "target_protein_change": 102,
+    "peptide_fdp_change": null
+  },
+  {
+    "method": "tdc_upstream",
+    "layer": "raw_q",
+    "from_stage": "optimized",
+    "to_stage": "target_only",
+    "target_psm_change": 21173,
+    "target_peptide_change": 3680,
+    "target_protein_change": 117,
+    "peptide_fdp_change": null
+  },
+  {
+    "method": "tdc_upstream",
+    "layer": "reportable_q",
+    "from_stage": "optimized",
+    "to_stage": "target_only",
+    "target_psm_change": 21173,
+    "target_peptide_change": 3680,
+    "target_protein_change": 117,
+    "peptide_fdp_change": null
+  }
+]

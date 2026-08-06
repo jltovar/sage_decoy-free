@@ -1,0 +1,21 @@
+{
+  "schema_version": 1,
+  "search_config": "/Users/kgousset/Library/CloudStorage/OneDrive-Personal/github/sage_decoy-free/validation/configs/pxd001468_moments_macos_execution_2026-08-05.json",
+  "target_fasta": "/Users/kgousset/Library/CloudStorage/OneDrive-Personal/FASTA_Files/FASTA/validation/PXD001468.fasta",
+  "output_directory": "/Users/kgousset/Library/CloudStorage/OneDrive-Personal/Search_Data_Files/SAGE_DECOYFREE/VALIDATION/NATIVE_WORKFLOW/PXD001468/PHASE2_FASTA_EXPLICIT_2026-08-06",
+  "database_mode": "native_generated",
+  "foreign_fastas": [
+    "/Users/kgousset/Library/CloudStorage/OneDrive-Personal/FASTA_Files/FASTA/foreign_entrapment/uniprotkb_proteome_UP000006548_2026_04_12.fasta"
+  ],
+  "output_fasta": "/Users/kgousset/Library/CloudStorage/OneDrive-Personal/Search_Data_Files/SAGE_DECOYFREE/VALIDATION/NATIVE_WORKFLOW/PXD001468/PHASE2_FASTA_EXPLICIT_2026-08-06/PXD001468_native_entrapment.fasta",
+  "foreign_source_mode": "explicit",
+  "shared_peptide_exclusion_mode": "fdrbench004_compatibility",
+  "selected_foreign_fasta": "/Users/kgousset/Library/CloudStorage/OneDrive-Personal/FASTA_Files/FASTA/foreign_entrapment/uniprotkb_proteome_UP000006548_2026_04_12.fasta",
+  "legacy_parity_reference": {
+    "fasta": "/Users/kgousset/Library/CloudStorage/OneDrive-Personal/FASTA_Files/FASTA/target_entrapment/PXD001468_foreign_species_entrapment_protein.fasta",
+    "foreign_fasta": "/Users/kgousset/Library/CloudStorage/OneDrive-Personal/FASTA_Files/FASTA/foreign_entrapment/uniprotkb_proteome_UP000006548_2026_04_12.fasta",
+    "generation_log": "/Users/kgousset/Library/CloudStorage/OneDrive-Personal/FASTA_Files/FASTA/target_entrapment/PXD001468_foreign_species_entrapment_protein.log"
+  },
+  "seed": 2000,
+  "protein_fold": 1
+}

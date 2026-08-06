@@ -126,16 +126,17 @@ Never rely on an implicit or ambiguous “score” definition.
 ============================================================================= */
 
 use crate::database::IndexedDatabase;
-use crate::input::LoStratify;
 use crate::input::{
     BoundedAuxUpdateSpace, DartNullRtModel, DartTrueRtModel, EnsemblePCombiner,
-    EnsemblePepCombiner, FdrSettings, FinalEvidenceSpace, HierarchicalReportingMode, JointMode,
+    EnsemblePepCombiner, ExternalEmpiricalFeatureProfile, ExternalMs2RescoreProfiles, FdrSettings,
+    FinalEvidenceSpace, FrozenGumbelParameters, HierarchicalReportingMode, JointMode,
     LoTevTransform, ModelFit, PCombineCalibrationMode, PeptidePCombine, PhysicalAnchorMode,
     ProteinPCombine, QCovariate, QMethod,
 };
+use crate::input::{LoStratify, NullWindowValidationScope};
 use crate::lfq::{Peak, PrecursorId};
 use crate::ml::lower_order::{
-    fit_decoy_free_model, fit_gumbel_mle, fit_gumbel_moments, LowerOrderModel,
+    fit_decoy_free_model, fit_gumbel_mle, fit_gumbel_moments, LowerOrderArtifact, LowerOrderModel,
 };
 use crate::ml::msfdr::{Msfdr1SmixModel, Msfdr2SmixModel, MsfdrSeededModel};
 use crate::ml::nokoi;
@@ -143,10 +144,67 @@ use crate::ml::stats;
 use crate::scoring::{DfFeature, TdcFeature};
 use fnv::{FnvHashMap, FnvHashSet};
 use rayon::prelude::*;
+use serde::{Deserialize, Serialize};
 use statrs::distribution::{ContinuousCDF, Gumbel};
 use std::borrow::Cow;
+use std::cmp::Ordering;
 use std::collections::HashMap;
 use std::sync::Arc;
+use std::time::Instant;
+
+#[derive(Clone, Debug, Serialize, Deserialize)]
+pub struct NullWindowEvaluation {
+    pub min_rank: u32,
+    pub max_rank: u32,
+    #[serde(default)]
+    pub validation_scope: NullWindowValidationScope,
+    pub target_psms: usize,
+    pub entrapment_psms: usize,
+    pub target_peptides: usize,
+    pub entrapment_peptides: usize,
+    pub target_proteins: usize,
+    pub entrapment_proteins: usize,
+    pub psm_fdp: Option<f64>,
+    pub peptide_fdp: Option<f64>,
+    pub protein_fdp: Option<f64>,
+    pub feasible: bool,
+    pub low_count_warning: bool,
+    pub selected: bool,
+    #[serde(default)]
+    pub elapsed_milliseconds: u64,
+}
+
+#[derive(Clone, Debug)]
+pub struct NullWindowOptimizationResult {
+    pub features: Vec<DfFeature>,
+    pub settings: FdrSettings,
+    pub artifacts: DfRunArtifacts,
+    pub evaluations: Vec<NullWindowEvaluation>,
+}
+
+struct OptimizerLogGuard {
+    previous: log::LevelFilter,
+    changed: bool,
+}
+
+impl OptimizerLogGuard {
+    fn compact(verbose: bool) -> Self {
+        let previous = log::max_level();
+        let changed = !verbose && previous > log::LevelFilter::Warn;
+        if changed {
+            log::set_max_level(log::LevelFilter::Warn);
+        }
+        Self { previous, changed }
+    }
+}
+
+impl Drop for OptimizerLogGuard {
+    fn drop(&mut self) {
+        if self.changed {
+            log::set_max_level(self.previous);
+        }
+    }
+}
 
 #[derive(Clone, Debug)]
 struct Rank1Computed {
@@ -735,13 +793,53 @@ fn build_lo_tev_from_spectrum_tail_components(
     let mut valid = 0usize;
     let mut invalid = 0usize;
 
+    let mut current_candidate_counts = features
+        .iter()
+        .filter(|feature| feature.core.rank == 1)
+        .map(|feature| feature.core.lo_spectrum_candidate_count)
+        .filter(|&count| count > 0)
+        .collect::<Vec<_>>();
+    current_candidate_counts.sort_unstable();
+    let reference_candidate_counts = settings
+        .lower_order_frozen_artifact
+        .as_ref()
+        .map(|artifact| artifact.reference_candidate_counts.as_slice())
+        .filter(|counts| !counts.is_empty());
+
+    let normalized_count = |count: u32| -> f64 {
+        let Some(reference) = reference_candidate_counts else {
+            return count as f64;
+        };
+        if current_candidate_counts.is_empty() {
+            return f64::NAN;
+        }
+        // Deterministic empirical quantile mapping keeps the target-only search
+        // on the candidate-count scale used to fit the frozen +entrapment model.
+        let position = current_candidate_counts.partition_point(|&value| value <= count);
+        let quantile =
+            (position.saturating_sub(1) as f64 + 0.5) / current_candidate_counts.len() as f64;
+        let index = ((quantile * reference.len() as f64).floor() as usize)
+            .min(reference.len().saturating_sub(1));
+        reference[index] as f64
+    };
+
     for (idx, f) in features.iter().enumerate() {
         if f.core.rank < 1 {
             invalid += 1;
             continue;
         }
 
-        let Some(e_value) = lo_constructed_e_value(f, settings) else {
+        let Some(tail_p) = lo_spectrum_tail_p(f) else {
+            invalid += 1;
+            continue;
+        };
+        let candidate_count = normalized_count(f.core.lo_spectrum_candidate_count);
+        let Some(e_value) = lo_e_value_from_tail_and_candidates(
+            tail_p,
+            candidate_count,
+            settings.lo_evalue_candidate_count_power,
+            settings.lo_evalue_scale,
+        ) else {
             invalid += 1;
             continue;
         };
@@ -765,6 +863,13 @@ fn build_lo_tev_from_spectrum_tail_components(
         settings.lo_evalue_scale,
         settings.lo_tev_transform
     );
+    if let Some(reference) = reference_candidate_counts {
+        log::info!(
+            "LO candidate-count transfer normalization: empirical_quantile current_n={} reference_n={}",
+            current_candidate_counts.len(),
+            reference.len()
+        );
+    }
 
     LoTevByIndex {
         by_index,
@@ -956,6 +1061,315 @@ pub fn calculate_entrapment_counts_df(
     counts.peptides = peptide_set.len();
     counts.proteins = protein_set.len();
     counts
+}
+
+fn accepted_target_entrapment_counts(
+    features: &[DfFeature],
+    db: &IndexedDatabase,
+    threshold: f64,
+    validation_scope: NullWindowValidationScope,
+) -> ((usize, usize), (usize, usize), (usize, usize)) {
+    let mut target_psms = 0usize;
+    let mut entrapment_psms = 0usize;
+    let mut target_peptides = FnvHashSet::default();
+    let mut entrapment_peptides = FnvHashSet::default();
+    let mut target_proteins = FnvHashSet::default();
+    let mut entrapment_proteins = FnvHashSet::default();
+
+    for feature in features
+        .iter()
+        .filter(|f| f.core.rank == 1 && f.core.label == 1)
+    {
+        let peptide = &db[feature.core.peptide_idx];
+        let proteins = peptide.proteins(&db.decoy_tag, db.generate_decoys);
+        if is_contam_str(&proteins) {
+            continue;
+        }
+        let mut has_target = false;
+        let mut has_entrapment = false;
+        for protein in proteins.split(';').map(str::trim).filter(|x| !x.is_empty()) {
+            if is_entrapment_str(protein) {
+                has_entrapment = true;
+            } else {
+                has_target = true;
+            }
+        }
+        if has_target == has_entrapment {
+            // Mixed target/entrapment mappings cannot be assigned to either
+            // numerator or denominator. Empty mappings are invalid as well.
+            continue;
+        }
+        let entrapment = has_entrapment;
+        let peptide_key = String::from_utf8_lossy(&peptide.sequence)
+            .chars()
+            .map(|residue| {
+                let residue = residue.to_ascii_uppercase();
+                if residue == 'I' {
+                    'L'
+                } else {
+                    residue
+                }
+            })
+            .collect::<String>();
+        let psm_supported = validation_scope == NullWindowValidationScope::RawQ
+            || feature.decoy_free_peptide_supported_psm.unwrap_or(false);
+        let peptide_supported = validation_scope == NullWindowValidationScope::RawQ
+            || feature
+                .decoy_free_protein_supported_peptide
+                .unwrap_or(false);
+        if feature.decoy_free_q_value.unwrap_or(1.0) <= threshold && psm_supported {
+            if entrapment {
+                entrapment_psms += 1
+            } else {
+                target_psms += 1
+            }
+        }
+        if feature.decoy_free_peptide_q.unwrap_or(1.0) <= threshold && peptide_supported {
+            if entrapment {
+                entrapment_peptides.insert(peptide_key.clone());
+            } else {
+                target_peptides.insert(peptide_key.clone());
+            }
+        }
+        if feature.decoy_free_protein_q.unwrap_or(1.0) <= threshold {
+            if let Some(key) = df_inferred_protein_key_for_feature(feature, db) {
+                if is_entrapment_str(&key) {
+                    entrapment_proteins.insert(key.into_owned());
+                } else if !is_contam_str(&key) {
+                    target_proteins.insert(key.into_owned());
+                }
+            }
+        }
+    }
+    (
+        (target_psms, entrapment_psms),
+        (target_peptides.len(), entrapment_peptides.len()),
+        (target_proteins.len(), entrapment_proteins.len()),
+    )
+}
+
+fn entrapment_fdp(target: usize, entrapment: usize, ratio: f64) -> Option<f64> {
+    let total = target + entrapment;
+    if total == 0 || !ratio.is_finite() || ratio <= 0.0 {
+        return None;
+    }
+    Some((entrapment as f64 * (1.0 + 1.0 / ratio) / total as f64).clamp(0.0, 1.0))
+}
+
+/// Protein-primary ordering used by the frozen shell optimizer. `Greater`
+/// means that `left` is the preferred feasible window.
+fn compare_null_window_evaluations(
+    left: &NullWindowEvaluation,
+    right: &NullWindowEvaluation,
+) -> Ordering {
+    let left_ranks = left.max_rank - left.min_rank + 1;
+    let right_ranks = right.max_rank - right.min_rank + 1;
+    let fdp = |value: Option<f64>| value.unwrap_or(f64::INFINITY);
+
+    left.target_proteins
+        .cmp(&right.target_proteins)
+        .then_with(|| left.target_peptides.cmp(&right.target_peptides))
+        .then_with(|| left.target_psms.cmp(&right.target_psms))
+        // Smaller combined FDP estimates and narrower/lower windows win ties.
+        .then_with(|| fdp(right.protein_fdp).total_cmp(&fdp(left.protein_fdp)))
+        .then_with(|| fdp(right.peptide_fdp).total_cmp(&fdp(left.peptide_fdp)))
+        .then_with(|| fdp(right.psm_fdp).total_cmp(&fdp(left.psm_fdp)))
+        .then_with(|| right_ranks.cmp(&left_ranks))
+        .then_with(|| right.min_rank.cmp(&left.min_rank))
+        .then_with(|| right.max_rank.cmp(&left.max_rank))
+}
+
+/// Evaluate every requested null window from the already-scored candidate set.
+/// No spectra are reread and no database search is repeated.
+pub fn optimize_null_window(
+    psms: &[DfFeature],
+    settings: &FdrSettings,
+    db: &IndexedDatabase,
+) -> Result<NullWindowOptimizationResult, String> {
+    let optimizer = settings
+        .null_window_optimizer
+        .as_ref()
+        .ok_or_else(|| "null-window optimizer was not configured".to_string())?;
+    if optimizer.candidates.is_empty() {
+        return Err("null-window optimizer has no candidates".to_string());
+    }
+    if optimizer.validation_scope == NullWindowValidationScope::Level4
+        && settings.hierarchical_reporting == HierarchicalReportingMode::Off
+    {
+        return Err(
+            "null-window validation_scope=level4 requires hierarchical_reporting to be enabled"
+                .to_string(),
+        );
+    }
+
+    // Lean exact evaluation: retain one compact row per trial, but keep the
+    // expensive feature/artifact payload only for the best feasible trial seen
+    // so far. Every enabled statistical layer still runs exactly as it does in
+    // a normal analysis.
+    let mut evaluations = Vec::with_capacity(optimizer.candidates.len());
+    let mut selected_payload: Option<(usize, FdrSettings)> = None;
+    let compact_log_guard = OptimizerLogGuard::compact(optimizer.verbose_diagnostics);
+    for window in &optimizer.candidates {
+        let evaluation_start = Instant::now();
+        if window.min_rank <= 1 || window.max_rank < window.min_rank {
+            return Err(format!(
+                "invalid null window {}..={}",
+                window.min_rank, window.max_rank
+            ));
+        }
+        let mut candidate_settings = settings.clone();
+        candidate_settings.lower_order_frozen_artifact = None;
+        candidate_settings.null_window_optimizer = None;
+        candidate_settings.precursor_fdr = optimizer.fdr_threshold as f32;
+        candidate_settings.peptide_fdr = optimizer.fdr_threshold as f32;
+        candidate_settings.protein_fdr = optimizer.fdr_threshold as f32;
+        match candidate_settings.model_fit {
+            ModelFit::Moments => {
+                candidate_settings.moments_min_null_rank = window.min_rank;
+                candidate_settings.moments_max_null_rank = window.max_rank;
+            }
+            ModelFit::Mle => {
+                candidate_settings.mle_min_null_rank = window.min_rank;
+                candidate_settings.mle_max_null_rank = window.max_rank;
+            }
+            ModelFit::LowerOrder => {
+                candidate_settings.lower_order_min_null_rank = window.min_rank;
+                candidate_settings.lower_order_max_null_rank = window.max_rank;
+            }
+            ModelFit::Msfdr => {
+                candidate_settings.msfdr_min_null_rank = window.min_rank;
+                candidate_settings.msfdr_max_null_rank = window.max_rank;
+            }
+            ModelFit::Msfdr2Smix => {
+                candidate_settings.msfdr2_smix_min_null_rank = window.min_rank;
+                candidate_settings.msfdr2_smix_max_null_rank = window.max_rank;
+            }
+            ModelFit::Nokoi => {
+                candidate_settings.nokoi_min_null_rank = window.min_rank;
+                candidate_settings.nokoi_max_null_rank = window.max_rank;
+            }
+            ModelFit::Msfdr1Smix => {
+                return Err(
+                    "MSFDR1-SMIX is rank-1-only and cannot optimize a null window".to_string(),
+                )
+            }
+            ModelFit::Ensemble => {
+                return Err(
+                    "Ensemble windows must be optimized and locked per constituent expert"
+                        .to_string(),
+                )
+            }
+        }
+        let (mut features, _artifacts) =
+            run_df_layers_with_artifacts(psms, &candidate_settings, db);
+        let _ = calculate_peptide_q_df(
+            &mut features,
+            db,
+            &candidate_settings,
+            candidate_settings.peptide_fdr,
+        );
+        apply_peptide_q_to_psm_reporting_df(&mut features, &candidate_settings);
+        let _ = calculate_protein_q_df(&mut features, db, &candidate_settings);
+        let _ = apply_hierarchical_reporting_df(&mut features, db, &candidate_settings);
+        let (psm, peptide, protein) = accepted_target_entrapment_counts(
+            &features,
+            db,
+            optimizer.fdr_threshold,
+            optimizer.validation_scope,
+        );
+        let psm_fdp = entrapment_fdp(psm.0, psm.1, optimizer.psm_entrapment_ratio);
+        let peptide_fdp = entrapment_fdp(peptide.0, peptide.1, optimizer.peptide_entrapment_ratio);
+        let protein_fdp = entrapment_fdp(protein.0, protein.1, optimizer.protein_entrapment_ratio);
+        let feasible = [psm_fdp, peptide_fdp, protein_fdp]
+            .into_iter()
+            .all(|fdp| fdp.is_some_and(|x| x <= optimizer.maximum_entrapment_fdp));
+        let low_count_warning = [psm.1, peptide.1, protein.1]
+            .into_iter()
+            .any(|count| count < optimizer.minimum_entrapment_count_for_stable_estimate);
+        let evaluation = NullWindowEvaluation {
+            min_rank: window.min_rank,
+            max_rank: window.max_rank,
+            validation_scope: optimizer.validation_scope,
+            target_psms: psm.0,
+            entrapment_psms: psm.1,
+            target_peptides: peptide.0,
+            entrapment_peptides: peptide.1,
+            target_proteins: protein.0,
+            entrapment_proteins: protein.1,
+            psm_fdp,
+            peptide_fdp,
+            protein_fdp,
+            feasible,
+            low_count_warning,
+            selected: false,
+            elapsed_milliseconds: evaluation_start.elapsed().as_millis() as u64,
+        };
+        let index = evaluations.len();
+        let replace_selected = evaluation.feasible
+            && selected_payload
+                .as_ref()
+                .map(|(selected_index, _)| {
+                    compare_null_window_evaluations(&evaluation, &evaluations[*selected_index])
+                        == Ordering::Greater
+                })
+                .unwrap_or(true);
+        evaluations.push(evaluation);
+        if replace_selected {
+            selected_payload = Some((index, candidate_settings));
+        }
+    }
+    let (selected, settings) = selected_payload
+        .ok_or_else(|| "no null window satisfied all entrapment FDP constraints".to_string())?;
+    evaluations[selected].selected = true;
+    drop(compact_log_guard);
+    // Materialize the winner once with normal diagnostics enabled. This keeps
+    // the grid compact while preserving the ordinary fitted-artifact and
+    // selected-analysis audit trail.
+    let (mut features, artifacts) = run_df_layers_with_artifacts(psms, &settings, db);
+    let _ = calculate_peptide_q_df(&mut features, db, &settings, settings.peptide_fdr);
+    apply_peptide_q_to_psm_reporting_df(&mut features, &settings);
+    let _ = calculate_protein_q_df(&mut features, db, &settings);
+    let _ = apply_hierarchical_reporting_df(&mut features, db, &settings);
+    let rematerialized = accepted_target_entrapment_counts(
+        &features,
+        db,
+        optimizer.fdr_threshold,
+        optimizer.validation_scope,
+    );
+    let selected_row = &evaluations[selected];
+    if rematerialized.0 != (selected_row.target_psms, selected_row.entrapment_psms)
+        || rematerialized.1
+            != (
+                selected_row.target_peptides,
+                selected_row.entrapment_peptides,
+            )
+        || rematerialized.2
+            != (
+                selected_row.target_proteins,
+                selected_row.entrapment_proteins,
+            )
+    {
+        return Err(format!(
+            "selected null window {}..={} was not deterministic when rematerialized",
+            selected_row.min_rank, selected_row.max_rank
+        ));
+    }
+    log::info!(
+        "DF null-window optimizer: evaluated={} selected={}..={} elapsed_ms={} lean_exact=true",
+        evaluations.len(),
+        evaluations[selected].min_rank,
+        evaluations[selected].max_rank,
+        evaluations
+            .iter()
+            .map(|row| row.elapsed_milliseconds)
+            .sum::<u64>()
+    );
+    Ok(NullWindowOptimizationResult {
+        features,
+        settings,
+        artifacts,
+        evaluations,
+    })
 }
 
 pub fn calculate_entrapment_counts_tdc(
@@ -2557,6 +2971,41 @@ struct Engines {
 
     nokoi_p_values: Option<Arc<Vec<f64>>>,
     nokoi_peps: Option<Arc<Vec<f64>>>,
+    nokoi_artifact: Option<nokoi::NokoiArtifact>,
+}
+
+fn validate_lower_order_artifact(
+    artifact: &LowerOrderArtifact,
+    settings: &FdrSettings,
+) -> Result<(), String> {
+    let same = |a: f64, b: f64| (a - b).abs() <= 1e-12 * a.abs().max(b.abs()).max(1.0);
+    if artifact.null_rank_min != settings.lower_order_min_null_rank
+        || artifact.null_rank_max != settings.lower_order_max_null_rank
+    {
+        return Err("null-rank window differs from the locked artifact".to_string());
+    }
+    if !same(
+        artifact.evalue_candidate_count_power,
+        settings.lo_evalue_candidate_count_power,
+    ) || !same(artifact.evalue_scale, settings.lo_evalue_scale)
+        || !same(
+            artifact.extrapolation_strength,
+            settings.lo_tnm_extrapolation_strength,
+        )
+    {
+        return Err(
+            "LO transformation or extrapolation settings differ from the locked artifact"
+                .to_string(),
+        );
+    }
+    let expected_transform = format!("{:?}", settings.lo_tev_transform);
+    if artifact.tev_transform != expected_transform {
+        return Err(format!(
+            "LO TEV transform differs: artifact={} search={expected_transform}",
+            artifact.tev_transform
+        ));
+    }
+    Ok(())
 }
 
 // --- BUILD RANK-NULL POOL ---
@@ -2987,24 +3436,39 @@ fn fit_engines(
 
     // 1) Moments
     let mom_params = if gates.run_mom {
-        let Some(moments_pool) = moments_pool.as_ref() else {
-            log::warn!("Moments unavailable: method-specific null pool could not be built.");
-            return None;
-        };
+        if let Some(frozen) = settings.moments_frozen_parameters.as_ref() {
+            if frozen.schema_version == 1
+                && frozen.min_rank == settings.moments_min_null_rank
+                && frozen.max_rank == settings.moments_max_null_rank
+                && frozen.mu.is_finite()
+                && frozen.beta.is_finite()
+                && frozen.beta > 0.0
+            {
+                log::info!("Moments using frozen fitted parameters; refit=false");
+                Some((frozen.mu, frozen.beta))
+            } else {
+                log::error!("Moments frozen parameters are invalid or incompatible");
+                None
+            }
+        } else {
+            let Some(moments_pool) = moments_pool.as_ref() else {
+                log::warn!("Moments unavailable: method-specific null pool could not be built.");
+                return None;
+            };
 
-        let scores = moments_pool.scores_in_window(
-            settings.moments_min_null_rank,
-            settings.moments_max_null_rank,
-        );
-
-        let fit_scores = if settings.moments_robust_fit {
-            let x = winsorize_scores_for_fit(
-                &scores,
-                settings.moments_winsor_lower_q,
-                settings.moments_winsor_upper_q,
+            let scores = moments_pool.scores_in_window(
+                settings.moments_min_null_rank,
+                settings.moments_max_null_rank,
             );
 
-            log::info!(
+            let fit_scores = if settings.moments_robust_fit {
+                let x = winsorize_scores_for_fit(
+                    &scores,
+                    settings.moments_winsor_lower_q,
+                    settings.moments_winsor_upper_q,
+                );
+
+                log::info!(
                 "Moments robust fit: enabled=true bias_corrected=true raw_n={} fit_n={} winsor_q=[{:.3}, {:.3}]",
                 scores.len(),
                 x.len(),
@@ -3012,37 +3476,38 @@ fn fit_engines(
                 settings.moments_winsor_upper_q
             );
 
-            x
-        } else {
-            scores.clone()
-        };
-
-        if window_ok(
-            "Moments",
-            settings.moments_min_null_rank,
-            settings.moments_max_null_rank,
-            fit_scores.len(),
-        ) {
-            let (mu, beta) = if settings.moments_robust_fit {
-                fit_gumbel_winsorized_moments(
-                    &fit_scores,
-                    settings.moments_winsor_lower_q,
-                    settings.moments_winsor_upper_q,
-                )
+                x
             } else {
-                fit_gumbel_moments(&fit_scores)
+                scores.clone()
             };
-            if mu.is_finite() && beta.is_finite() && beta > 0.0 {
-                Some((mu, beta))
-            } else {
-                log::warn!(
+
+            if window_ok(
+                "Moments",
+                settings.moments_min_null_rank,
+                settings.moments_max_null_rank,
+                fit_scores.len(),
+            ) {
+                let (mu, beta) = if settings.moments_robust_fit {
+                    fit_gumbel_winsorized_moments(
+                        &fit_scores,
+                        settings.moments_winsor_lower_q,
+                        settings.moments_winsor_upper_q,
+                    )
+                } else {
+                    fit_gumbel_moments(&fit_scores)
+                };
+                if mu.is_finite() && beta.is_finite() && beta > 0.0 {
+                    Some((mu, beta))
+                } else {
+                    log::warn!(
                     "Moments fit produced invalid parameters; Moments expert will be unavailable. \
 					 If model_fit=Moments, the selected-model guard will fail closed."
                 );
+                    None
+                }
+            } else {
                 None
             }
-        } else {
-            None
         }
     } else {
         None
@@ -3090,12 +3555,14 @@ fn fit_engines(
             settings.lower_order_max_null_rank,
         );
 
-        if window_ok(
-            "LowerOrder",
-            settings.lower_order_min_null_rank,
-            settings.lower_order_max_null_rank,
-            lo_raw.len(),
-        ) {
+        if settings.lower_order_frozen_artifact.is_some()
+            || window_ok(
+                "LowerOrder",
+                settings.lower_order_min_null_rank,
+                settings.lower_order_max_null_rank,
+                lo_raw.len(),
+            )
+        {
             let lo_fit_data: Vec<(u32, f64, u8)> = lo_raw
                 .into_iter()
                 .filter_map(|(feature_idx, k, _x_raw, charge)| {
@@ -3166,14 +3633,33 @@ fn fit_engines(
 				settings.lo_tnm_extrapolation_strength
 			);
 
-            lo_model = fit_decoy_free_model(
-                &lo_fit_data,
-                &rank1_scores_by_charge,
-                settings.lower_order_min_null_rank,
-                settings.lower_order_max_null_rank,
-                lo_min_count_per_rank,
-                settings.lo_tnm_extrapolation_strength,
-            );
+            lo_model = if let Some(artifact) = settings.lower_order_frozen_artifact.as_ref() {
+                match validate_lower_order_artifact(artifact, settings)
+                    .and_then(|()| LowerOrderModel::from_artifact(artifact))
+                {
+                    Ok(model) => {
+                        log::info!(
+                            "LO using frozen fitted artifact model_version={} charges={:?}; refit=false",
+                            artifact.model_version,
+                            artifact.fitted_charges_sorted
+                        );
+                        Some(model)
+                    }
+                    Err(error) => {
+                        log::error!("LO frozen artifact rejected: {error}");
+                        None
+                    }
+                }
+            } else {
+                fit_decoy_free_model(
+                    &lo_fit_data,
+                    &rank1_scores_by_charge,
+                    settings.lower_order_min_null_rank,
+                    settings.lower_order_max_null_rank,
+                    lo_min_count_per_rank,
+                    settings.lo_tnm_extrapolation_strength,
+                )
+            };
 
             if lo_model.is_none() {
                 log::error!(
@@ -3191,22 +3677,37 @@ fn fit_engines(
 
     // 3) MLE
     let mle_params = if gates.run_mle {
-        let Some(mle_pool) = mle_pool.as_ref() else {
-            log::warn!("MLE unavailable: method-specific null pool could not be built.");
-            return None;
-        };
+        if let Some(frozen) = settings.mle_frozen_parameters.as_ref() {
+            if frozen.schema_version == 1
+                && frozen.min_rank == settings.mle_min_null_rank
+                && frozen.max_rank == settings.mle_max_null_rank
+                && frozen.mu.is_finite()
+                && frozen.beta.is_finite()
+                && frozen.beta > 0.0
+            {
+                log::info!("MLE using frozen fitted parameters; refit=false");
+                Some((frozen.mu, frozen.beta))
+            } else {
+                log::error!("MLE frozen parameters are invalid or incompatible");
+                None
+            }
+        } else {
+            let Some(mle_pool) = mle_pool.as_ref() else {
+                log::warn!("MLE unavailable: method-specific null pool could not be built.");
+                return None;
+            };
 
-        let scores =
-            mle_pool.scores_in_window(settings.mle_min_null_rank, settings.mle_max_null_rank);
+            let scores =
+                mle_pool.scores_in_window(settings.mle_min_null_rank, settings.mle_max_null_rank);
 
-        let fit_scores = if settings.mle_robust_fit {
-            let x = winsorize_scores_for_fit(
-                &scores,
-                settings.mle_winsor_lower_q,
-                settings.mle_winsor_upper_q,
-            );
+            let fit_scores = if settings.mle_robust_fit {
+                let x = winsorize_scores_for_fit(
+                    &scores,
+                    settings.mle_winsor_lower_q,
+                    settings.mle_winsor_upper_q,
+                );
 
-            log::info!(
+                log::info!(
                 "MLE robust preprocessing: enabled=true raw_n={} fit_n={} winsor_q=[{:.3}, {:.3}]",
                 scores.len(),
                 x.len(),
@@ -3214,31 +3715,32 @@ fn fit_engines(
                 settings.mle_winsor_upper_q
             );
 
-            x
-        } else {
-            scores.clone()
-        };
+                x
+            } else {
+                scores.clone()
+            };
 
-        if window_ok(
-            "MLE",
-            settings.mle_min_null_rank,
-            settings.mle_max_null_rank,
-            fit_scores.len(),
-        ) {
-            match fit_gumbel_mle(&fit_scores) {
-                Some((mu, beta)) if mu.is_finite() && beta.is_finite() && beta > 0.0 => {
-                    Some((mu, beta))
-                }
-                _ => {
-                    log::warn!(
-                        "MLE fit produced invalid parameters; MLE expert will be unavailable. \
+            if window_ok(
+                "MLE",
+                settings.mle_min_null_rank,
+                settings.mle_max_null_rank,
+                fit_scores.len(),
+            ) {
+                match fit_gumbel_mle(&fit_scores) {
+                    Some((mu, beta)) if mu.is_finite() && beta.is_finite() && beta > 0.0 => {
+                        Some((mu, beta))
+                    }
+                    _ => {
+                        log::warn!(
+                            "MLE fit produced invalid parameters; MLE expert will be unavailable. \
 						 If model_fit=Mle, the selected-model guard will fail closed."
-                    );
-                    None
+                        );
+                        None
+                    }
                 }
+            } else {
+                None
             }
-        } else {
-            None
         }
     } else {
         None
@@ -3252,74 +3754,90 @@ fn fit_engines(
         .collect();
 
     let msfdr_seeded = if gates.run_msfdr_seeded {
-        let Some(msfdr_seeded_pool) = msfdr_seeded_pool.as_ref() else {
-            log::warn!("MSFDR seeded unavailable: method-specific null pool could not be built.");
-            return None;
-        };
-
-        let seed_pool = msfdr_seeded_pool
-            .scores_in_window(settings.msfdr_min_null_rank, settings.msfdr_max_null_rank);
-        if window_ok(
-            "MSFDR seeded",
-            settings.msfdr_min_null_rank,
-            settings.msfdr_max_null_rank,
-            seed_pool.len(),
-        ) {
-            let m = fit_msfdr_seeded(&rank1_scores, &seed_pool, settings);
-            if let Some(ref model) = m {
-                log_fit_ok("MSFDR seeded", model);
-            } else {
-                log_fit_failed_closed("MSFDR seeded");
-            }
-            m
+        if let Some(model) = settings.msfdr_seeded_frozen_model.as_ref() {
+            log::info!("MSFDR seeded using frozen fitted model; refit=false");
+            Some(model.clone())
         } else {
-            None
+            let Some(msfdr_seeded_pool) = msfdr_seeded_pool.as_ref() else {
+                log::warn!(
+                    "MSFDR seeded unavailable: method-specific null pool could not be built."
+                );
+                return None;
+            };
+
+            let seed_pool = msfdr_seeded_pool
+                .scores_in_window(settings.msfdr_min_null_rank, settings.msfdr_max_null_rank);
+            if window_ok(
+                "MSFDR seeded",
+                settings.msfdr_min_null_rank,
+                settings.msfdr_max_null_rank,
+                seed_pool.len(),
+            ) {
+                let m = fit_msfdr_seeded(&rank1_scores, &seed_pool, settings);
+                if let Some(ref model) = m {
+                    log_fit_ok("MSFDR seeded", model);
+                } else {
+                    log_fit_failed_closed("MSFDR seeded");
+                }
+                m
+            } else {
+                None
+            }
         }
     } else {
         None
     };
 
     let msfdr_1smix = if gates.run_msfdr_1smix {
-        let m = fit_msfdr_1smix(&rank1_scores, settings);
-        if let Some(ref model) = m {
-            log_fit_ok("MSFDR 1smix", model);
+        if let Some(model) = settings.msfdr_1smix_frozen_model.as_ref() {
+            log::info!("MSFDR1-SMIX using frozen fitted model; refit=false rank1_only=true");
+            Some(model.clone())
         } else {
-            log_fit_failed_closed("MSFDR 1smix");
+            let m = fit_msfdr_1smix(&rank1_scores, settings);
+            if let Some(ref model) = m {
+                log_fit_ok("MSFDR 1smix", model);
+            } else {
+                log_fit_failed_closed("MSFDR 1smix");
+            }
+            m
         }
-        m
     } else {
         None
     };
 
     let msfdr_2smix = if gates.run_msfdr_2smix {
-        // MSFDR2 is a joint S1/S2 mixture model. Unlike Moments/MLE/LO,
-        // it should not receive the purified rank-null pool because the
-        // model explicitly includes a correct-in-S2 component (`b`).
-        //
-        // Use raw lower-rank scores directly from features. Also enforce
-        // rank >= 2 because S2 must not contain the rank-1 S1 scores.
-        let effective_min_rank = settings.msfdr2_smix_min_null_rank.max(2);
-        let effective_max_rank = settings.msfdr2_smix_max_null_rank.max(effective_min_rank);
+        if let Some(model) = settings.msfdr_2smix_frozen_model.as_ref() {
+            log::info!("MSFDR2-SMIX using frozen fitted model; refit=false");
+            Some(model.clone())
+        } else {
+            // MSFDR2 is a joint S1/S2 mixture model. Unlike Moments/MLE/LO,
+            // it should not receive the purified rank-null pool because the
+            // model explicitly includes a correct-in-S2 component (`b`).
+            //
+            // Use raw lower-rank scores directly from features. Also enforce
+            // rank >= 2 because S2 must not contain the rank-1 S1 scores.
+            let effective_min_rank = settings.msfdr2_smix_min_null_rank.max(2);
+            let effective_max_rank = settings.msfdr2_smix_max_null_rank.max(effective_min_rank);
 
-        if settings.msfdr2_smix_min_null_rank < 2 {
-            log::warn!(
+            if settings.msfdr2_smix_min_null_rank < 2 {
+                log::warn!(
 				"MSFDR pooled-rank 2smix: requested min rank {} includes S1; using effective S2 min rank {}",
 				settings.msfdr2_smix_min_null_rank,
 				effective_min_rank
 			);
-        }
+            }
 
-        let unpurified_s2_scores: Vec<f64> = features
-            .iter()
-            .filter(|f| {
-                let r = f.core.rank as u32;
-                r >= effective_min_rank && r <= effective_max_rank
-            })
-            .filter_map(|f| tev(f))
-            .filter(|x| x.is_finite())
-            .collect();
+            let unpurified_s2_scores: Vec<f64> = features
+                .iter()
+                .filter(|f| {
+                    let r = f.core.rank as u32;
+                    r >= effective_min_rank && r <= effective_max_rank
+                })
+                .filter_map(|f| tev(f))
+                .filter(|x| x.is_finite())
+                .collect();
 
-        log::info!(
+            log::info!(
 			"DF MSFDR pooled-rank 2smix S2 source: unpurified_features ranks={}..{} n_s1={} n_s2={}",
 			effective_min_rank,
 			effective_max_rank,
@@ -3327,21 +3845,22 @@ fn fit_engines(
 			unpurified_s2_scores.len()
 		);
 
-        if window_ok(
-            "MSFDR pooled-rank 2smix",
-            effective_min_rank,
-            effective_max_rank,
-            unpurified_s2_scores.len(),
-        ) {
-            let m = fit_msfdr_2smix(&rank1_scores, &unpurified_s2_scores, settings);
-            if let Some(ref model) = m {
-                log_fit_ok("MSFDR pooled-rank 2smix", model);
+            if window_ok(
+                "MSFDR pooled-rank 2smix",
+                effective_min_rank,
+                effective_max_rank,
+                unpurified_s2_scores.len(),
+            ) {
+                let m = fit_msfdr_2smix(&rank1_scores, &unpurified_s2_scores, settings);
+                if let Some(ref model) = m {
+                    log_fit_ok("MSFDR pooled-rank 2smix", model);
+                } else {
+                    log_fit_failed_closed("MSFDR pooled-rank 2smix");
+                }
+                m
             } else {
-                log_fit_failed_closed("MSFDR pooled-rank 2smix");
+                None
             }
-            m
-        } else {
-            None
         }
     } else {
         None
@@ -3350,106 +3869,120 @@ fn fit_engines(
     // 5) Nokoi
     let mut nokoi_p_values = None;
     let mut nokoi_peps = None;
+    let mut nokoi_artifact = None;
 
     if gates.run_nokoi {
         log::info!("Running Nokoi Rescoring ...");
-
-        let Some(nokoi_pool) = nokoi_pool.as_ref() else {
-            log::warn!("Nokoi unavailable: method-specific null pool could not be built.");
-            return None;
-        };
-
-        let nokoi_count =
-            nokoi_pool.count_in_window(settings.nokoi_min_null_rank, settings.nokoi_max_null_rank);
-
-        if window_ok(
-            "Nokoi",
-            settings.nokoi_min_null_rank,
-            settings.nokoi_max_null_rank,
-            nokoi_count,
-        ) {
-            let mut rank1_hs: Vec<f64> = work
-                .rank1_indices
-                .iter()
-                .filter_map(|&i| tev(&features[i]))
-                .collect();
-            let threshold = if rank1_hs.len() >= 10 {
-                rank1_hs.sort_by(|a, b| b.total_cmp(a));
-                let top_k = ((rank1_hs.len() as f64) * settings.nokoi_positive_top_fraction).round()
-                    as usize;
-                rank1_hs[top_k.max(5).min(rank1_hs.len()) - 1]
+        if let Some(artifact) = settings.nokoi_frozen_artifact.as_ref() {
+            if artifact.min_null_rank != settings.nokoi_min_null_rank
+                || artifact.max_null_rank != settings.nokoi_max_null_rank
+            {
+                log::error!("Nokoi frozen artifact window is incompatible; failing closed");
+            } else if let Some(evidence) = nokoi::apply_nokoi_artifact(features, artifact) {
+                log::info!(
+                    "Nokoi using frozen portable artifact model_version={}; refit=false",
+                    artifact.model_version
+                );
+                nokoi_p_values = Some(Arc::new(evidence.p_values));
+                nokoi_peps = Some(Arc::new(evidence.peps));
+                nokoi_artifact = Some(artifact.clone());
+            }
+        } else if let Some(nokoi_pool) = nokoi_pool.as_ref() {
+            let nokoi_count = nokoi_pool
+                .count_in_window(settings.nokoi_min_null_rank, settings.nokoi_max_null_rank);
+            if !window_ok(
+                "Nokoi",
+                settings.nokoi_min_null_rank,
+                settings.nokoi_max_null_rank,
+                nokoi_count,
+            ) {
+                log::warn!("Nokoi window is too small; failing closed");
             } else {
-                f64::INFINITY
-            };
+                let mut rank1_hs: Vec<f64> = work
+                    .rank1_indices
+                    .iter()
+                    .filter_map(|&i| tev(&features[i]))
+                    .collect();
+                let threshold = if rank1_hs.len() >= 10 {
+                    rank1_hs.sort_by(|a, b| b.total_cmp(a));
+                    let top_k = ((rank1_hs.len() as f64) * settings.nokoi_positive_top_fraction)
+                        .round() as usize;
+                    rank1_hs[top_k.max(5).min(rank1_hs.len()) - 1]
+                } else {
+                    f64::INFINITY
+                };
 
-            log::info!(
+                log::info!(
                 "Nokoi training split: null_purification_factor={:.3} positive_top_fraction={:.3} positive_threshold={:.6e}",
                 settings.nokoi_null_purification_factor,
                 settings.nokoi_positive_top_fraction,
                 threshold
             );
 
-            let is_positive = |f: &DfFeature| -> bool {
-                if f.core.rank != 1 {
-                    return false;
-                }
-                tev(f).map(|v| v >= threshold).unwrap_or(false)
-            };
+                let is_positive = |f: &DfFeature| -> bool {
+                    if f.core.rank != 1 {
+                        return false;
+                    }
+                    tev(f).map(|v| v >= threshold).unwrap_or(false)
+                };
 
-            let config = nokoi::NokoiConfig {
-                enabled: true,
-                train_fdr: 0.01,
-                learning_rate: 0.1,
-                epochs: 500,
-                patience: 15,
-                l1_lambda: settings.nokoi_l1_lambda_min,
-                l1_lambda_min: settings.nokoi_l1_lambda_min,
-                l1_lambda_max: settings.nokoi_l1_lambda_max,
-                l1_lambda_steps: settings.nokoi_l1_lambda_steps,
-            };
+                let config = nokoi::NokoiConfig {
+                    enabled: true,
+                    train_fdr: 0.01,
+                    learning_rate: 0.1,
+                    epochs: 500,
+                    patience: 15,
+                    l1_lambda: settings.nokoi_l1_lambda_min,
+                    l1_lambda_min: settings.nokoi_l1_lambda_min,
+                    l1_lambda_max: settings.nokoi_l1_lambda_max,
+                    l1_lambda_steps: settings.nokoi_l1_lambda_steps,
+                };
 
-            let nokoi_null_indices = nokoi_pool.feature_indices();
-            if let Some((probs, null_scores_oof)) = nokoi::rescore_df_crossfit(
-                features,
-                &config,
-                settings.nokoi_min_null_rank,
-                settings.nokoi_max_null_rank,
-                settings.nokoi_k_folds,
-                is_positive,
-                &nokoi_null_indices,
-            ) {
-                let nokoi_evidence =
-                    nokoi::build_nokoi_evidence_from_crossfit_null(&probs, &null_scores_oof);
+                let nokoi_null_indices = nokoi_pool.feature_indices();
+                if let Some(fitted) = nokoi::fit_nokoi_artifact(
+                    features,
+                    &config,
+                    settings.nokoi_min_null_rank,
+                    settings.nokoi_max_null_rank,
+                    settings.nokoi_k_folds,
+                    is_positive,
+                    &nokoi_null_indices,
+                ) {
+                    let nokoi_evidence = fitted.evidence;
 
-                if nokoi_evidence.p_values.len() != features.len()
-                    || nokoi_evidence.peps.len() != features.len()
-                {
-                    log::warn!(
+                    if nokoi_evidence.p_values.len() != features.len()
+                        || nokoi_evidence.peps.len() != features.len()
+                    {
+                        log::warn!(
 						"Nokoi disabled: paired evidence length mismatch p_values={} peps={} features={}",
 						nokoi_evidence.p_values.len(),
 						nokoi_evidence.peps.len(),
 						features.len()
 					);
-                } else {
-                    nokoi_p_values = Some(Arc::new(
-                        nokoi_evidence
-                            .p_values
-                            .into_iter()
-                            .map(|p| p.clamp(0.0, 1.0).max(1e-300))
-                            .collect(),
-                    ));
+                    } else {
+                        nokoi_p_values = Some(Arc::new(
+                            nokoi_evidence
+                                .p_values
+                                .into_iter()
+                                .map(|p| p.clamp(0.0, 1.0).max(1e-300))
+                                .collect(),
+                        ));
 
-                    nokoi_peps = Some(Arc::new(
-                        nokoi_evidence
-                            .peps
-                            .into_iter()
-                            .map(|pep| pep.clamp(0.0, 1.0).max(1e-300))
-                            .collect(),
-                    ));
+                        nokoi_peps = Some(Arc::new(
+                            nokoi_evidence
+                                .peps
+                                .into_iter()
+                                .map(|pep| pep.clamp(0.0, 1.0).max(1e-300))
+                                .collect(),
+                        ));
+                        nokoi_artifact = Some(fitted.artifact);
+                    }
+                } else {
+                    log::warn!("Nokoi disabled: crossfit failed.");
                 }
-            } else {
-                log::warn!("Nokoi disabled: crossfit failed.");
             }
+        } else {
+            log::warn!("Nokoi unavailable: method-specific null pool could not be built.");
         }
     }
 
@@ -3494,6 +4027,7 @@ fn fit_engines(
         msfdr_2smix,
         nokoi_p_values,
         nokoi_peps,
+        nokoi_artifact,
     })
 }
 
@@ -8298,7 +8832,6 @@ fn apply_dart_bayes_update(
 /// Positive values increase confidence, negative values decrease confidence.
 /// The returned value is a bounded logit-space shift, not a probability-space
 /// increment. Conversion back to PEP/confidence space happens downstream.
-
 fn compute_physical_shift(f: &DfFeature, rt_sigma: f64) -> f64 {
     let delta = f.core.delta_rt_model as f64;
     let predicted = f.core.predicted_rt as f64;
@@ -9690,11 +10223,58 @@ where
     }
 }
 
-pub fn run_df_layers(
+#[derive(Clone, Debug, Default, Serialize, Deserialize)]
+pub struct FrozenModelMetadata {
+    pub schema_version: u32,
+    pub model_version: String,
+    pub min_null_rank: Option<u32>,
+    pub max_null_rank: Option<u32>,
+    pub rank1_only: bool,
+}
+
+/// Workflow provenance attached by `sage workflow` after a model is fitted.
+///
+/// The core scorer deliberately does not invent this metadata because it does
+/// not know the dataset or workflow manifest. Workflow orchestration stamps the
+/// artifact before it can be reused. Missing provenance therefore fails closed
+/// in the normal dataset-local workflow while direct, non-workflow Sage usage
+/// remains backward compatible.
+#[derive(Clone, Debug, Serialize, Deserialize, PartialEq, Eq)]
+pub struct FittedArtifactProvenance {
+    pub schema_version: u32,
+    pub dataset_id: String,
+    pub dataset_fingerprint: String,
+    pub search_config_sha256: String,
+    pub fit_stage: String,
+    pub model: String,
+}
+
+#[derive(Clone, Debug, Default, Serialize, Deserialize)]
+pub struct DfRunArtifacts {
+    #[serde(default)]
+    pub provenance: Option<FittedArtifactProvenance>,
+    pub moments: Option<FrozenGumbelParameters>,
+    pub mle: Option<FrozenGumbelParameters>,
+    pub lower_order: Option<LowerOrderArtifact>,
+    pub msfdr_seeded: Option<MsfdrSeededModel>,
+    #[serde(default)]
+    pub msfdr_seeded_metadata: Option<FrozenModelMetadata>,
+    pub msfdr_1smix: Option<Msfdr1SmixModel>,
+    #[serde(default)]
+    pub msfdr_1smix_metadata: Option<FrozenModelMetadata>,
+    pub msfdr_2smix: Option<Msfdr2SmixModel>,
+    #[serde(default)]
+    pub msfdr_2smix_metadata: Option<FrozenModelMetadata>,
+    pub nokoi: Option<nokoi::NokoiArtifact>,
+    #[serde(default)]
+    pub external_ms2rescore: Option<ExternalMs2RescoreProfiles>,
+}
+
+pub fn run_df_layers_with_artifacts(
     psms: &[DfFeature],
     settings: &FdrSettings,
     db: &IndexedDatabase,
-) -> Vec<DfFeature> {
+) -> (Vec<DfFeature>, DfRunArtifacts) {
     let mut new_features = psms.to_vec();
 
     log_external_feature_diagnostics(&new_features);
@@ -9768,9 +10348,101 @@ pub fn run_df_layers(
             new_features.par_iter_mut().for_each(|psm| {
                 clear_all_df_outputs(psm, true);
             });
-            return new_features;
+            return (new_features, DfRunArtifacts::default());
         }
     };
+
+    let lower_order_artifact = if let Some(artifact) = settings.lower_order_frozen_artifact.as_ref()
+    {
+        Some(artifact.clone())
+    } else {
+        engines.lo_model.as_ref().map(|model| {
+            let reference_candidate_counts = new_features
+                .iter()
+                .filter(|feature| feature.core.rank == 1)
+                .map(|feature| feature.core.lo_spectrum_candidate_count)
+                .filter(|&count| count > 0)
+                .collect();
+            model.to_artifact(
+                settings.lower_order_min_null_rank,
+                settings.lower_order_max_null_rank,
+                settings.lo_evalue_candidate_count_power,
+                settings.lo_evalue_scale,
+                format!("{:?}", settings.lo_tev_transform),
+                settings.lo_tnm_extrapolation_strength,
+                reference_candidate_counts,
+            )
+        })
+    };
+    let gumbel_artifact = |model_version: &str, min_rank, max_rank, params: Option<(f64, f64)>| {
+        params.map(|(mu, beta)| FrozenGumbelParameters {
+            schema_version: 1,
+            model_version: model_version.to_string(),
+            min_rank,
+            max_rank,
+            mu,
+            beta,
+        })
+    };
+    let moments_artifact = settings.moments_frozen_parameters.clone().or_else(|| {
+        gumbel_artifact(
+            "sage-moments-gumbel-v1",
+            settings.moments_min_null_rank,
+            settings.moments_max_null_rank,
+            engines.mom_params,
+        )
+    });
+    let mle_artifact = settings.mle_frozen_parameters.clone().or_else(|| {
+        gumbel_artifact(
+            "sage-mle-gumbel-v1",
+            settings.mle_min_null_rank,
+            settings.mle_max_null_rank,
+            engines.mle_params,
+        )
+    });
+    let msfdr_seeded_artifact = settings
+        .msfdr_seeded_frozen_model
+        .clone()
+        .or_else(|| engines.msfdr_seeded.clone());
+    let msfdr_1smix_artifact = settings
+        .msfdr_1smix_frozen_model
+        .clone()
+        .or_else(|| engines.msfdr_1smix.clone());
+    let msfdr_2smix_artifact = settings
+        .msfdr_2smix_frozen_model
+        .clone()
+        .or_else(|| engines.msfdr_2smix.clone());
+    let nokoi_artifact = settings
+        .nokoi_frozen_artifact
+        .clone()
+        .or_else(|| engines.nokoi_artifact.clone());
+    let metadata =
+        |model_version: &str, min_null_rank, max_null_rank, rank1_only| FrozenModelMetadata {
+            schema_version: 1,
+            model_version: model_version.into(),
+            min_null_rank,
+            max_null_rank,
+            rank1_only,
+        };
+    let msfdr_seeded_metadata = msfdr_seeded_artifact.as_ref().map(|_| {
+        metadata(
+            "sage-msfdr-seeded-v1",
+            Some(settings.msfdr_min_null_rank),
+            Some(settings.msfdr_max_null_rank),
+            false,
+        )
+    });
+    let msfdr_1smix_metadata = msfdr_1smix_artifact
+        .as_ref()
+        .map(|_| metadata("sage-msfdr-1smix-v1", None, None, true));
+    let msfdr_2smix_metadata = msfdr_2smix_artifact.as_ref().map(|_| {
+        metadata(
+            "sage-msfdr-2smix-v1",
+            Some(settings.msfdr2_smix_min_null_rank),
+            Some(settings.msfdr2_smix_max_null_rank),
+            false,
+        )
+    });
 
     // Diagnostic Logging before moving engines
     let (mom_mu, mom_beta) = engines.mom_params.unwrap_or((f64::NAN, f64::NAN));
@@ -9954,24 +10626,60 @@ pub fn run_df_layers(
     log_peptide_recurrence_separation_diagnostics(&new_features, db);
     log_mass_error_separation_diagnostics(&new_features, db);
 
-    new_features
+    (
+        new_features,
+        DfRunArtifacts {
+            provenance: None,
+            moments: moments_artifact,
+            mle: mle_artifact,
+            lower_order: lower_order_artifact,
+            msfdr_seeded: msfdr_seeded_artifact,
+            msfdr_seeded_metadata,
+            msfdr_1smix: msfdr_1smix_artifact,
+            msfdr_1smix_metadata,
+            msfdr_2smix: msfdr_2smix_artifact,
+            msfdr_2smix_metadata,
+            nokoi: nokoi_artifact,
+            external_ms2rescore: settings.external_ms2rescore_frozen_profiles.clone(),
+        },
+    )
+}
+
+pub fn run_df_layers(
+    psms: &[DfFeature],
+    settings: &FdrSettings,
+    db: &IndexedDatabase,
+) -> Vec<DfFeature> {
+    run_df_layers_with_artifacts(psms, settings, db).0
 }
 
 pub fn apply_external_ms2rescore_bounded_experts(
     features: &mut [DfFeature],
     settings: &FdrSettings,
-) {
+) -> Option<ExternalMs2RescoreProfiles> {
     let cfg = match settings.physical_rescue.bounded_cfg.as_ref() {
         Some(cfg) => cfg,
         None => {
             log::warn!(
                 "external bounded DF experts requested, but physical_rescue.bounded_cfg is missing; no external feature update applied"
             );
-            return;
+            return None;
         }
     };
 
-    let profiles = ExternalMs2RescoreProfiles::learn(features, settings);
+    let profiles = settings
+        .external_ms2rescore_frozen_profiles
+        .clone()
+        .unwrap_or_else(|| ExternalMs2RescoreProfiles::learn(features, settings));
+
+    log::info!(
+        "external empirical profile mode: {}",
+        if settings.external_ms2rescore_frozen_profiles.is_some() {
+            "locked_fitted_artifact"
+        } else {
+            "fit_current_search_space"
+        }
+    );
 
     log::info!(
         "external empirical bounded expert profiles: ms2pip_pcc={} spectral_angle={} fragment_agreement={} deeplc_abs_rt={} ccs_pct={} ccs_abs={}",
@@ -10098,21 +10806,15 @@ pub fn apply_external_ms2rescore_bounded_experts(
         settings.moments_min_null_rank,
         settings.moments_max_null_rank,
     );
-}
 
-#[derive(Clone, Debug)]
-struct ExternalMs2RescoreProfiles {
-    ms2pip_pcc: ExternalEmpiricalFeatureProfile,
-    spectral_angle: ExternalEmpiricalFeatureProfile,
-    fragment_intensity_agreement: ExternalEmpiricalFeatureProfile,
-    deeplc_abs_rt_error: ExternalEmpiricalFeatureProfile,
-    ccs_pct_error: ExternalEmpiricalFeatureProfile,
-    ccs_abs_error: ExternalEmpiricalFeatureProfile,
+    Some(profiles)
 }
 
 impl ExternalMs2RescoreProfiles {
     fn learn(features: &[DfFeature], settings: &FdrSettings) -> Self {
         Self {
+            schema_version: 1,
+            model_version: "sage-external-ms2rescore-profiles-v1".into(),
             ms2pip_pcc: ExternalEmpiricalFeatureProfile::learn(
                 "ms2rescore_ms2pip_pcc",
                 true,
@@ -10161,19 +10863,6 @@ impl ExternalMs2RescoreProfiles {
             ),
         }
     }
-}
-
-#[derive(Clone, Debug)]
-struct ExternalEmpiricalFeatureProfile {
-    name: &'static str,
-    enabled: bool,
-    higher_is_better: bool,
-    good_median: f64,
-    null_median: f64,
-    separation: f64,
-    auc: f64,
-    good_n: usize,
-    null_n: usize,
 }
 
 impl ExternalEmpiricalFeatureProfile {
@@ -10270,30 +10959,32 @@ impl ExternalEmpiricalFeatureProfile {
         }
 
         Self {
-            name,
+            name: name.to_owned(),
             enabled,
             higher_is_better,
-            good_median,
-            null_median,
-            separation,
-            auc,
+            good_median: good_median.is_finite().then_some(good_median),
+            null_median: null_median.is_finite().then_some(null_median),
+            separation: separation.is_finite().then_some(separation),
+            auc: auc.is_finite().then_some(auc),
             good_n,
             null_n,
         }
     }
 
     fn score(&self, x: f64) -> f64 {
-        if !self.enabled || !x.is_finite() || !self.separation.is_finite() || self.separation <= 0.0
-        {
+        let (Some(null_median), Some(separation)) = (self.null_median, self.separation) else {
+            return f64::NAN;
+        };
+        if !self.enabled || !x.is_finite() || separation <= 0.0 {
             return f64::NAN;
         }
 
         let s = if self.higher_is_better {
             // null_median maps to -1; good_median maps to +1.
-            2.0 * ((x - self.null_median) / self.separation) - 1.0
+            2.0 * ((x - null_median) / separation) - 1.0
         } else {
             // null_median maps to -1; good_median maps to +1.
-            2.0 * ((self.null_median - x) / self.separation) - 1.0
+            2.0 * ((null_median - x) / separation) - 1.0
         };
 
         s.clamp(-1.0, 1.0)
@@ -10306,10 +10997,10 @@ impl ExternalEmpiricalFeatureProfile {
 			self.enabled,
 			self.good_n,
 			self.null_n,
-			self.good_median,
-			self.null_median,
-			self.separation,
-			self.auc,
+			self.good_median.unwrap_or(f64::NAN),
+			self.null_median.unwrap_or(f64::NAN),
+			self.separation.unwrap_or(f64::NAN),
+			self.auc.unwrap_or(f64::NAN),
 			self.higher_is_better
 		)
     }
@@ -11820,5 +12511,51 @@ mod tests {
         let fallback = build_rank_null_pool(&source, &fallback_settings, 0.2, "test").unwrap();
         assert!(Arc::ptr_eq(&source.rows, &fallback.source));
         assert_eq!(fallback.len(), 20);
+    }
+
+    #[test]
+    fn null_window_ranking_is_protein_primary_and_deterministic() {
+        let evaluation =
+            |min_rank, max_rank, proteins, peptides, psms, protein_fdp, peptide_fdp, psm_fdp| {
+                NullWindowEvaluation {
+                    min_rank,
+                    max_rank,
+                    validation_scope: NullWindowValidationScope::Level4,
+                    target_psms: psms,
+                    entrapment_psms: 0,
+                    target_peptides: peptides,
+                    entrapment_peptides: 0,
+                    target_proteins: proteins,
+                    entrapment_proteins: 0,
+                    psm_fdp: Some(psm_fdp),
+                    peptide_fdp: Some(peptide_fdp),
+                    protein_fdp: Some(protein_fdp),
+                    feasible: true,
+                    low_count_warning: true,
+                    selected: false,
+                    elapsed_milliseconds: 0,
+                }
+            };
+
+        let more_peptides = evaluation(2, 12, 16, 500, 12_000, 0.0, 0.0, 0.0);
+        let more_proteins = evaluation(9, 18, 17, 401, 10_020, 0.0, 0.0, 0.0);
+        assert_eq!(
+            compare_null_window_evaluations(&more_proteins, &more_peptides),
+            Ordering::Greater
+        );
+
+        let higher_fdp = evaluation(8, 18, 17, 401, 10_020, 0.005, 0.004, 0.003);
+        let lower_fdp = evaluation(9, 18, 17, 401, 10_020, 0.0, 0.0, 0.0);
+        assert_eq!(
+            compare_null_window_evaluations(&lower_fdp, &higher_fdp),
+            Ordering::Greater
+        );
+
+        let wider = evaluation(8, 18, 17, 401, 10_020, 0.0, 0.0, 0.0);
+        let narrower = evaluation(9, 18, 17, 401, 10_020, 0.0, 0.0, 0.0);
+        assert_eq!(
+            compare_null_window_evaluations(&narrower, &wider),
+            Ordering::Greater
+        );
     }
 }

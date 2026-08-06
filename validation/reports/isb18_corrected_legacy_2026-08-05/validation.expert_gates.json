@@ -1,0 +1,102 @@
+[
+  {
+    "model": "lower_order",
+    "eligible": false,
+    "reasons": [
+      "target-only search-space transfer is unstable"
+    ],
+    "validation_stage": "ms2rescore",
+    "validation_layer": "level4",
+    "target_peptides": 294,
+    "entrapment_peptides": 0,
+    "peptide_fdp": 0.0,
+    "underpowered": true,
+    "warnings": [
+      "accepted entrapment peptide count 0 is below the stability minimum 3"
+    ]
+  },
+  {
+    "model": "mle",
+    "eligible": true,
+    "reasons": [],
+    "validation_stage": "ms2rescore",
+    "validation_layer": "level4",
+    "target_peptides": 327,
+    "entrapment_peptides": 0,
+    "peptide_fdp": 0.0,
+    "underpowered": true,
+    "warnings": [
+      "accepted entrapment peptide count 0 is below the stability minimum 3"
+    ]
+  },
+  {
+    "model": "moments",
+    "eligible": true,
+    "reasons": [],
+    "validation_stage": "ms2rescore",
+    "validation_layer": "level4",
+    "target_peptides": 338,
+    "entrapment_peptides": 0,
+    "peptide_fdp": 0.0,
+    "underpowered": true,
+    "warnings": [
+      "accepted entrapment peptide count 0 is below the stability minimum 3"
+    ]
+  },
+  {
+    "model": "msfdr",
+    "eligible": true,
+    "reasons": [],
+    "validation_stage": "ms2rescore",
+    "validation_layer": "level4",
+    "target_peptides": 343,
+    "entrapment_peptides": 0,
+    "peptide_fdp": 0.0,
+    "underpowered": true,
+    "warnings": [
+      "accepted entrapment peptide count 0 is below the stability minimum 3"
+    ]
+  },
+  {
+    "model": "msfdr1_smix",
+    "eligible": true,
+    "reasons": [],
+    "validation_stage": "ms2rescore",
+    "validation_layer": "level4",
+    "target_peptides": 252,
+    "entrapment_peptides": 0,
+    "peptide_fdp": 0.0,
+    "underpowered": true,
+    "warnings": [
+      "accepted entrapment peptide count 0 is below the stability minimum 3"
+    ]
+  },
+  {
+    "model": "msfdr2_smix",
+    "eligible": true,
+    "reasons": [],
+    "validation_stage": "ms2rescore",
+    "validation_layer": "level4",
+    "target_peptides": 313,
+    "entrapment_peptides": 0,
+    "peptide_fdp": 0.0,
+    "underpowered": true,
+    "warnings": [
+      "accepted entrapment peptide count 0 is below the stability minimum 3"
+    ]
+  },
+  {
+    "model": "nokoi",
+    "eligible": true,
+    "reasons": [],
+    "validation_stage": "ms2rescore",
+    "validation_layer": "level4",
+    "target_peptides": 369,
+    "entrapment_peptides": 0,
+    "peptide_fdp": 0.0,
+    "underpowered": true,
+    "warnings": [
+      "accepted entrapment peptide count 0 is below the stability minimum 3"
+    ]
+  }
+]

@@ -1,0 +1,1215 @@
+{
+  "schema_version": 1,
+  "created_unix_seconds": 1785859847,
+  "source_commit": "f97b94813730b48c2fc19f9a36e3e3b132a2bcb9",
+  "source_dirty": true,
+  "status": "complete",
+  "files": [
+    {
+      "path": "/Users/kgousset/Library/CloudStorage/OneDrive-Personal/Search_Data_Files/SAGE_DECOYFREE/VALIDATION/ISB18/DECOY/.DS_Store",
+      "size": 6148,
+      "modified_unix_seconds": 1785771666,
+      "sha256": "4af50c847f8d0b64b5daa9d8e8c7605345df58b0ecf6cb0ce4f7a1b14b8d8c1b"
+    },
+    {
+      "path": "/Users/kgousset/Library/CloudStorage/OneDrive-Personal/Search_Data_Files/SAGE_DECOYFREE/VALIDATION/ISB18/DECOY/3rd_no_ent/results.json",
+      "size": 9432,
+      "modified_unix_seconds": 1784996315,
+      "sha256": "100e855f7d825780597792fde5a02a302b88a4aa89445d81cff18d25c24109a0"
+    },
+    {
+      "path": "/Users/kgousset/Library/CloudStorage/OneDrive-Personal/Search_Data_Files/SAGE_DECOYFREE/VALIDATION/ISB18/DECOY/3rd_no_ent/results.sage.tsv",
+      "size": 17474644,
+      "modified_unix_seconds": 1784996315,
+      "sha256": "13fbf00ccefd7aae974ae728883fc2b801f864c88f38b88c173ec1b2bb0a0d78"
+    },
+    {
+      "path": "/Users/kgousset/Library/CloudStorage/OneDrive-Personal/Search_Data_Files/SAGE_DECOYFREE/VALIDATION/ISB18/DECOY/VANILLA/.DS_Store",
+      "size": 6148,
+      "modified_unix_seconds": 1785771666,
+      "sha256": "ed3fc3d71276ed7442c9061c7f802dba964dcab1c3480f98488074b25f7efcd1"
+    },
+    {
+      "path": "/Users/kgousset/Library/CloudStorage/OneDrive-Personal/Search_Data_Files/SAGE_DECOYFREE/VALIDATION/ISB18/DECOY/VANILLA/3rd_no_ent/results.json",
+      "size": 2994,
+      "modified_unix_seconds": 1784996165,
+      "sha256": "89a3e4107b7e2c89cb7d90207c6b1890d07fc7719dac35cb4694ea62dfdacf63"
+    },
+    {
+      "path": "/Users/kgousset/Library/CloudStorage/OneDrive-Personal/Search_Data_Files/SAGE_DECOYFREE/VALIDATION/ISB18/DECOY/VANILLA/3rd_no_ent/results.sage.tsv",
+      "size": 17552902,
+      "modified_unix_seconds": 1784996164,
+      "sha256": "e37dd137da667a756d09a5c323aac991c284d69a931f90ecdb5ce564699ed79d"
+    },
+    {
+      "path": "/Users/kgousset/Library/CloudStorage/OneDrive-Personal/Search_Data_Files/SAGE_DECOYFREE/VALIDATION/ISB18/DECOY/VANILLA/results.json",
+      "size": 3025,
+      "modified_unix_seconds": 1784996127,
+      "sha256": "71a4627247def161b78b41ac49aa6c89767b76fc33db8c14d7b17c63823d040b"
+    },
+    {
+      "path": "/Users/kgousset/Library/CloudStorage/OneDrive-Personal/Search_Data_Files/SAGE_DECOYFREE/VALIDATION/ISB18/DECOY/VANILLA/results.sage.tsv",
+      "size": 18323713,
+      "modified_unix_seconds": 1784996127,
+      "sha256": "92df2c928d8e795524d3cc2bc0c7f5962058fbd4958412ccc15d8e24462f91fd"
+    },
+    {
+      "path": "/Users/kgousset/Library/CloudStorage/OneDrive-Personal/Search_Data_Files/SAGE_DECOYFREE/VALIDATION/ISB18/DECOY/VANILLA/vanilla_validation_ISB18_ent_decoy.json",
+      "size": 2042,
+      "modified_unix_seconds": 1784654925,
+      "sha256": "b462ac0dcf9303d252bf42ab538c0f57e7bd5bbc12d8f985da20cb92f530ef21"
+    },
+    {
+      "path": "/Users/kgousset/Library/CloudStorage/OneDrive-Personal/Search_Data_Files/SAGE_DECOYFREE/VALIDATION/ISB18/DECOY/VANILLA/vanilla_validation_ISB18_no_ent_decoy.json",
+      "size": 2011,
+      "modified_unix_seconds": 1784995474,
+      "sha256": "a7de619b3cb487421bd9027a81342944831dcc18b37cd4b607a6c269493c5cb9"
+    },
+    {
+      "path": "/Users/kgousset/Library/CloudStorage/OneDrive-Personal/Search_Data_Files/SAGE_DECOYFREE/VALIDATION/ISB18/DECOY/results.json",
+      "size": 9453,
+      "modified_unix_seconds": 1784996195,
+      "sha256": "6110a21234bb1fc683224a7a0b99dabfe420f8d8b44db585f3790157f35739aa"
+    },
+    {
+      "path": "/Users/kgousset/Library/CloudStorage/OneDrive-Personal/Search_Data_Files/SAGE_DECOYFREE/VALIDATION/ISB18/DECOY/results.sage.tsv",
+      "size": 18236926,
+      "modified_unix_seconds": 1784996195,
+      "sha256": "576aab739deba669c8b832be28d234c8e1b9ec0b4c09507a9cef7794f9e67ff7"
+    },
+    {
+      "path": "/Users/kgousset/Library/CloudStorage/OneDrive-Personal/Search_Data_Files/SAGE_DECOYFREE/VALIDATION/ISB18/DECOY/validation_ISB18_ent_decoy.json",
+      "size": 2034,
+      "modified_unix_seconds": 1784654911,
+      "sha256": "841de5c3eb3151a8d3a6e15b6c0d35c14f53860576ae497dd24f3af1887cb88f"
+    },
+    {
+      "path": "/Users/kgousset/Library/CloudStorage/OneDrive-Personal/Search_Data_Files/SAGE_DECOYFREE/VALIDATION/ISB18/DECOY/validation_ISB18_no_ent_decoy.json",
+      "size": 2038,
+      "modified_unix_seconds": 1784995486,
+      "sha256": "f4da1fb1af2a3d72dd8f969b2f19cef552f692ac86040d0b6c14f58095b99059"
+    },
+    {
+      "path": "/Users/kgousset/Library/CloudStorage/OneDrive-Personal/Search_Data_Files/SAGE_DECOYFREE/VALIDATION/ISB18/DECOYFREE/ENSEMBLE/2nd_ms2rescore/results.json",
+      "size": 10602,
+      "modified_unix_seconds": 1785785109,
+      "sha256": "d3c0a2e210a5f45e4c7b0139bae9fcff872ca650ee9a0a73405c06b69e86568c"
+    },
+    {
+      "path": "/Users/kgousset/Library/CloudStorage/OneDrive-Personal/Search_Data_Files/SAGE_DECOYFREE/VALIDATION/ISB18/DECOYFREE/ENSEMBLE/2nd_ms2rescore/results.sage.tsv",
+      "size": 62924446,
+      "modified_unix_seconds": 1785785109,
+      "sha256": "9c59f25ff41bf75e239f551be5a66c227047162cd2e32409af92dcd6f222ffa9"
+    },
+    {
+      "path": "/Users/kgousset/Library/CloudStorage/OneDrive-Personal/Search_Data_Files/SAGE_DECOYFREE/VALIDATION/ISB18/DECOYFREE/ENSEMBLE/2nd_ms2rescore_validation_ISB18_ent_decoyfree.json",
+      "size": 9460,
+      "modified_unix_seconds": 1785772398,
+      "sha256": "0227708f18edc9f5c2fd57d51489fe8b745f68ef3bbe0c288ccdf91fecc8ec5e"
+    },
+    {
+      "path": "/Users/kgousset/Library/CloudStorage/OneDrive-Personal/Search_Data_Files/SAGE_DECOYFREE/VALIDATION/ISB18/DECOYFREE/ENSEMBLE/3rd_no_ent/matched_fragments.sage.tsv",
+      "size": 16461210,
+      "modified_unix_seconds": 1785789680,
+      "sha256": "4f348d4f20b344ac33f1fdfcc0dc7b8876c89b70844e91fe40f533bd8b92c9b6"
+    },
+    {
+      "path": "/Users/kgousset/Library/CloudStorage/OneDrive-Personal/Search_Data_Files/SAGE_DECOYFREE/VALIDATION/ISB18/DECOYFREE/ENSEMBLE/3rd_no_ent/results.json",
+      "size": 10689,
+      "modified_unix_seconds": 1785789680,
+      "sha256": "42f3f5969d4c0d37a90db49be174efaefa2b36a2ad1dd6a38e5cf4cab3470155"
+    },
+    {
+      "path": "/Users/kgousset/Library/CloudStorage/OneDrive-Personal/Search_Data_Files/SAGE_DECOYFREE/VALIDATION/ISB18/DECOYFREE/ENSEMBLE/3rd_no_ent/results.sage.tsv",
+      "size": 62402814,
+      "modified_unix_seconds": 1785789679,
+      "sha256": "ba21dd18e249c2043e309df32d3098296a304ca506bc5c37be034e25543bfe95"
+    },
+    {
+      "path": "/Users/kgousset/Library/CloudStorage/OneDrive-Personal/Search_Data_Files/SAGE_DECOYFREE/VALIDATION/ISB18/DECOYFREE/ENSEMBLE/validation_ISB18_no_ent_decoyfree.json",
+      "size": 9414,
+      "modified_unix_seconds": 1785772401,
+      "sha256": "f50c8c237db35145efca05fdf3bfee4950fa78ff237ffdf86b9e447729afd0cd"
+    },
+    {
+      "path": "/Users/kgousset/Library/CloudStorage/OneDrive-Personal/Search_Data_Files/SAGE_DECOYFREE/VALIDATION/ISB18/DECOYFREE/LOWER_ORDER/2nd_ms2rescore/results.json",
+      "size": 10606,
+      "modified_unix_seconds": 1785691535,
+      "sha256": "07746c0b5231cefd5302fe3524247609c2bc13829f963c057c4a6b2cae4b4cd8"
+    },
+    {
+      "path": "/Users/kgousset/Library/CloudStorage/OneDrive-Personal/Search_Data_Files/SAGE_DECOYFREE/VALIDATION/ISB18/DECOYFREE/LOWER_ORDER/2nd_ms2rescore/results.sage.tsv",
+      "size": 33462561,
+      "modified_unix_seconds": 1785691535,
+      "sha256": "d8b8a2d737cecaea08e32d3e437a8d091927f81d2b95986654f9fb60c131ae21"
+    },
+    {
+      "path": "/Users/kgousset/Library/CloudStorage/OneDrive-Personal/Search_Data_Files/SAGE_DECOYFREE/VALIDATION/ISB18/DECOYFREE/LOWER_ORDER/2nd_ms2rescore_validation_ISB18_ent_decoyfree.json",
+      "size": 9461,
+      "modified_unix_seconds": 1785595674,
+      "sha256": "9935d30e8fe3228dc3777ddf87a35218331f489fa8517da1389373430daa0d19"
+    },
+    {
+      "path": "/Users/kgousset/Library/CloudStorage/OneDrive-Personal/Search_Data_Files/SAGE_DECOYFREE/VALIDATION/ISB18/DECOYFREE/LOWER_ORDER/3rd_no_ent/matched_fragments.sage.tsv",
+      "size": 16459640,
+      "modified_unix_seconds": 1785693143,
+      "sha256": "7b046e7ba67b67245144eb4f02893d8334137fd4e724683810a71b330414bbd4"
+    },
+    {
+      "path": "/Users/kgousset/Library/CloudStorage/OneDrive-Personal/Search_Data_Files/SAGE_DECOYFREE/VALIDATION/ISB18/DECOYFREE/LOWER_ORDER/3rd_no_ent/results.json",
+      "size": 10696,
+      "modified_unix_seconds": 1785693143,
+      "sha256": "9f54e92c34359b7d3e8fb6224c7e44ac80c9d0dd82deda6688b88f1b758da708"
+    },
+    {
+      "path": "/Users/kgousset/Library/CloudStorage/OneDrive-Personal/Search_Data_Files/SAGE_DECOYFREE/VALIDATION/ISB18/DECOYFREE/LOWER_ORDER/3rd_no_ent/results.sage.tsv",
+      "size": 32153352,
+      "modified_unix_seconds": 1785693143,
+      "sha256": "8080508f5aee7739a011cc78f2bd46b590013c074af2f360a449bbeede0c2439"
+    },
+    {
+      "path": "/Users/kgousset/Library/CloudStorage/OneDrive-Personal/Search_Data_Files/SAGE_DECOYFREE/VALIDATION/ISB18/DECOYFREE/LOWER_ORDER/best_result.txt",
+      "size": 1414,
+      "modified_unix_seconds": 1785688797,
+      "sha256": "11b7fd4283ab6baf265bcce79ca3b8121788ef772f1d1abb8000eb72f3db0084"
+    },
+    {
+      "path": "/Users/kgousset/Library/CloudStorage/OneDrive-Personal/Search_Data_Files/SAGE_DECOYFREE/VALIDATION/ISB18/DECOYFREE/LOWER_ORDER/cumulative_results_long.csv",
+      "size": 21735,
+      "modified_unix_seconds": 1785688796,
+      "sha256": "6e0b18fd1bae88f5f150f71095db6fa24c07220b6cf975a1abd93ffc03482764"
+    },
+    {
+      "path": "/Users/kgousset/Library/CloudStorage/OneDrive-Personal/Search_Data_Files/SAGE_DECOYFREE/VALIDATION/ISB18/DECOYFREE/LOWER_ORDER/cumulative_results_wide.csv",
+      "size": 6545,
+      "modified_unix_seconds": 1785688796,
+      "sha256": "0a9119bbdf41a4143776548db156d962caf240c1c0bd8f654d8a01de30c32856"
+    },
+    {
+      "path": "/Users/kgousset/Library/CloudStorage/OneDrive-Personal/Search_Data_Files/SAGE_DECOYFREE/VALIDATION/ISB18/DECOYFREE/LOWER_ORDER/results.json",
+      "size": 10609,
+      "modified_unix_seconds": 1785688797,
+      "sha256": "10dab3661798df5a5101960db14a57343225536fb23adfce6c92cabfd0c8c65a"
+    },
+    {
+      "path": "/Users/kgousset/Library/CloudStorage/OneDrive-Personal/Search_Data_Files/SAGE_DECOYFREE/VALIDATION/ISB18/DECOYFREE/LOWER_ORDER/search_trace.txt",
+      "size": 22636,
+      "modified_unix_seconds": 1785688797,
+      "sha256": "1de8e41226c9b0c2c72c2710792665a825f41b7b8b1755427d0019b50abb231a"
+    },
+    {
+      "path": "/Users/kgousset/Library/CloudStorage/OneDrive-Personal/Search_Data_Files/SAGE_DECOYFREE/VALIDATION/ISB18/DECOYFREE/LOWER_ORDER/validation_ISB18_ent_decoyfree.json",
+      "size": 9447,
+      "modified_unix_seconds": 1785595651,
+      "sha256": "e3cc3f3b2bb38c5cf32edc51ebd534e0cdf44b18773b285841c8687fa75dd19f"
+    },
+    {
+      "path": "/Users/kgousset/Library/CloudStorage/OneDrive-Personal/Search_Data_Files/SAGE_DECOYFREE/VALIDATION/ISB18/DECOYFREE/LOWER_ORDER/validation_ISB18_no_ent_decoyfree.json",
+      "size": 9415,
+      "modified_unix_seconds": 1785595702,
+      "sha256": "e692d3a6dab4583791a7bbead1c6245e0f5444cdb3d8e2eb54c45098606834a3"
+    },
+    {
+      "path": "/Users/kgousset/Library/CloudStorage/OneDrive-Personal/Search_Data_Files/SAGE_DECOYFREE/VALIDATION/ISB18/DECOYFREE/MLE/2nd_ms2rescore/results.json",
+      "size": 10583,
+      "modified_unix_seconds": 1785687979,
+      "sha256": "ebd40f5bfa4f3acf53e93bcb3f81367f6f8017ae6b3614d6a9a48149545e087b"
+    },
+    {
+      "path": "/Users/kgousset/Library/CloudStorage/OneDrive-Personal/Search_Data_Files/SAGE_DECOYFREE/VALIDATION/ISB18/DECOYFREE/MLE/2nd_ms2rescore/results.sage.tsv",
+      "size": 33644467,
+      "modified_unix_seconds": 1785687978,
+      "sha256": "b0aeb769e7d1b98f1598579b6c0cdc8e2008f2ef35a40261771cc1c87549fee4"
+    },
+    {
+      "path": "/Users/kgousset/Library/CloudStorage/OneDrive-Personal/Search_Data_Files/SAGE_DECOYFREE/VALIDATION/ISB18/DECOYFREE/MLE/2nd_ms2rescore_validation_ISB18_ent_decoyfree.json",
+      "size": 9446,
+      "modified_unix_seconds": 1785594944,
+      "sha256": "2165307bf9d4509b6ab02a40322f4dfafb1533ca1913ea1df4976c070331547a"
+    },
+    {
+      "path": "/Users/kgousset/Library/CloudStorage/OneDrive-Personal/Search_Data_Files/SAGE_DECOYFREE/VALIDATION/ISB18/DECOYFREE/MLE/3rd_no_ent/matched_fragments.sage.tsv",
+      "size": 16460147,
+      "modified_unix_seconds": 1785689633,
+      "sha256": "18df2877eef972a5fd13fafad7e6303f4ffeb72143fc18d1184852c1b1cc58e2"
+    },
+    {
+      "path": "/Users/kgousset/Library/CloudStorage/OneDrive-Personal/Search_Data_Files/SAGE_DECOYFREE/VALIDATION/ISB18/DECOYFREE/MLE/3rd_no_ent/results.json",
+      "size": 10665,
+      "modified_unix_seconds": 1785689633,
+      "sha256": "6523e97f4e16244b3045310b6fbf7124bd0c756b72c4ac5b96e51d0f60636db5"
+    },
+    {
+      "path": "/Users/kgousset/Library/CloudStorage/OneDrive-Personal/Search_Data_Files/SAGE_DECOYFREE/VALIDATION/ISB18/DECOYFREE/MLE/3rd_no_ent/results.sage.tsv",
+      "size": 33417354,
+      "modified_unix_seconds": 1785689633,
+      "sha256": "6075ae3c9802759cb0585e86fc0176c14618d2d1c20654cb65e039f58c47e863"
+    },
+    {
+      "path": "/Users/kgousset/Library/CloudStorage/OneDrive-Personal/Search_Data_Files/SAGE_DECOYFREE/VALIDATION/ISB18/DECOYFREE/MLE/best_result.txt",
+      "size": 1408,
+      "modified_unix_seconds": 1785685950,
+      "sha256": "70bb04e72a64019e0b99e442c8bb6e4d04fd14c6084f699e9793efe964aeb25e"
+    },
+    {
+      "path": "/Users/kgousset/Library/CloudStorage/OneDrive-Personal/Search_Data_Files/SAGE_DECOYFREE/VALIDATION/ISB18/DECOYFREE/MLE/cumulative_results_long.csv",
+      "size": 20586,
+      "modified_unix_seconds": 1785685950,
+      "sha256": "236ab39191a1554ef2bd6592ef293fc6ca3d7cdf490fd1c8191dd3119dc7b3a2"
+    },
+    {
+      "path": "/Users/kgousset/Library/CloudStorage/OneDrive-Personal/Search_Data_Files/SAGE_DECOYFREE/VALIDATION/ISB18/DECOYFREE/MLE/cumulative_results_wide.csv",
+      "size": 6743,
+      "modified_unix_seconds": 1785685950,
+      "sha256": "ad302776be1a1ef8f5496c66fde5c9dcf97eecbda45f1b532c1afb175d1d402d"
+    },
+    {
+      "path": "/Users/kgousset/Library/CloudStorage/OneDrive-Personal/Search_Data_Files/SAGE_DECOYFREE/VALIDATION/ISB18/DECOYFREE/MLE/results.json",
+      "size": 10586,
+      "modified_unix_seconds": 1785685950,
+      "sha256": "93ecda140acfef89b5efdc2eade3121fe0ba6ec85c218bec0461c5957afa3981"
+    },
+    {
+      "path": "/Users/kgousset/Library/CloudStorage/OneDrive-Personal/Search_Data_Files/SAGE_DECOYFREE/VALIDATION/ISB18/DECOYFREE/MLE/search_trace.txt",
+      "size": 22543,
+      "modified_unix_seconds": 1785685950,
+      "sha256": "9bad4173b5c186ec306f11eed90561cd1ca60940f510d4a2c6dd602b89ba662a"
+    },
+    {
+      "path": "/Users/kgousset/Library/CloudStorage/OneDrive-Personal/Search_Data_Files/SAGE_DECOYFREE/VALIDATION/ISB18/DECOYFREE/MLE/validation_ISB18_ent_decoyfree.json",
+      "size": 9431,
+      "modified_unix_seconds": 1785594972,
+      "sha256": "ba3d264fd14a71d4495d3d2c0f9b6ff4c78a9a29a042120e5ad37bbd0ab019cd"
+    },
+    {
+      "path": "/Users/kgousset/Library/CloudStorage/OneDrive-Personal/Search_Data_Files/SAGE_DECOYFREE/VALIDATION/ISB18/DECOYFREE/MLE/validation_ISB18_no_ent_decoyfree.json",
+      "size": 9400,
+      "modified_unix_seconds": 1785594954,
+      "sha256": "771484365162dde2fb5c37d096eeb5986c875fcd4907aeb5f1233f1041250f03"
+    },
+    {
+      "path": "/Users/kgousset/Library/CloudStorage/OneDrive-Personal/Search_Data_Files/SAGE_DECOYFREE/VALIDATION/ISB18/DECOYFREE/MOMENTS/2nd_ms2rescore/results.json",
+      "size": 10595,
+      "modified_unix_seconds": 1785776279,
+      "sha256": "3c6971fb6fc2349544d11c3208386b1d550decb5250f850f5744a289396469de"
+    },
+    {
+      "path": "/Users/kgousset/Library/CloudStorage/OneDrive-Personal/Search_Data_Files/SAGE_DECOYFREE/VALIDATION/ISB18/DECOYFREE/MOMENTS/2nd_ms2rescore/results.sage.tsv",
+      "size": 33696449,
+      "modified_unix_seconds": 1785776279,
+      "sha256": "3946c0c5e085e82e4b585003dca73edcbcdc4f45a4c30e814d08a7c1ce6123b7"
+    },
+    {
+      "path": "/Users/kgousset/Library/CloudStorage/OneDrive-Personal/Search_Data_Files/SAGE_DECOYFREE/VALIDATION/ISB18/DECOYFREE/MOMENTS/2nd_ms2rescore_validation_ISB18_ent_decoyfree.json",
+      "size": 9454,
+      "modified_unix_seconds": 1784996014,
+      "sha256": "47344b7a1457efa3a3afc84a98b5fe075492ad095587a912da8dc4178128e02d"
+    },
+    {
+      "path": "/Users/kgousset/Library/CloudStorage/OneDrive-Personal/Search_Data_Files/SAGE_DECOYFREE/VALIDATION/ISB18/DECOYFREE/MOMENTS/3rd_no_ent/matched_fragments.sage.tsv",
+      "size": 16460036,
+      "modified_unix_seconds": 1785780578,
+      "sha256": "294e2862eaea3dca4ffe63bfd6f85f1e2a8414e2994682d8cf14efe6456e0bcc"
+    },
+    {
+      "path": "/Users/kgousset/Library/CloudStorage/OneDrive-Personal/Search_Data_Files/SAGE_DECOYFREE/VALIDATION/ISB18/DECOYFREE/MOMENTS/3rd_no_ent/results.json",
+      "size": 10681,
+      "modified_unix_seconds": 1785780583,
+      "sha256": "6ae8e7e79921170c548a672529e4bd1ccb3e65e56f3423f3a639d04bcf588391"
+    },
+    {
+      "path": "/Users/kgousset/Library/CloudStorage/OneDrive-Personal/Search_Data_Files/SAGE_DECOYFREE/VALIDATION/ISB18/DECOYFREE/MOMENTS/3rd_no_ent/results.sage.tsv",
+      "size": 33486953,
+      "modified_unix_seconds": 1785780571,
+      "sha256": "407844120f906d83d3e3bc5533424e3ab5dd4a0a6516ec2e4c74140464c85a1a"
+    },
+    {
+      "path": "/Users/kgousset/Library/CloudStorage/OneDrive-Personal/Search_Data_Files/SAGE_DECOYFREE/VALIDATION/ISB18/DECOYFREE/MOMENTS/best_result copy.txt",
+      "size": 1415,
+      "modified_unix_seconds": 1784656497,
+      "sha256": "14c51beaef8f97d6bbfa417837f6c74517595f3737d4335d20b7ea75cad18749"
+    },
+    {
+      "path": "/Users/kgousset/Library/CloudStorage/OneDrive-Personal/Search_Data_Files/SAGE_DECOYFREE/VALIDATION/ISB18/DECOYFREE/MOMENTS/best_result.txt",
+      "size": 1415,
+      "modified_unix_seconds": 1785596495,
+      "sha256": "14c51beaef8f97d6bbfa417837f6c74517595f3737d4335d20b7ea75cad18749"
+    },
+    {
+      "path": "/Users/kgousset/Library/CloudStorage/OneDrive-Personal/Search_Data_Files/SAGE_DECOYFREE/VALIDATION/ISB18/DECOYFREE/MOMENTS/cumulative_results_long.csv",
+      "size": 23063,
+      "modified_unix_seconds": 1785596494,
+      "sha256": "000979467b925808a18d5acca944ae6ff9ba631ad5d8d6c58037c1cebe01648a"
+    },
+    {
+      "path": "/Users/kgousset/Library/CloudStorage/OneDrive-Personal/Search_Data_Files/SAGE_DECOYFREE/VALIDATION/ISB18/DECOYFREE/MOMENTS/cumulative_results_wide.csv",
+      "size": 7637,
+      "modified_unix_seconds": 1785596477,
+      "sha256": "0e765ad8184fe5c275e51a5f717d8919da525e390fcc544d520dd6ca982a1111"
+    },
+    {
+      "path": "/Users/kgousset/Library/CloudStorage/OneDrive-Personal/Search_Data_Files/SAGE_DECOYFREE/VALIDATION/ISB18/DECOYFREE/MOMENTS/results.json",
+      "size": 10598,
+      "modified_unix_seconds": 1785596495,
+      "sha256": "809eb5ce588f25fdff2efd7733d356947946304240202fde5332b66d903b36e6"
+    },
+    {
+      "path": "/Users/kgousset/Library/CloudStorage/OneDrive-Personal/Search_Data_Files/SAGE_DECOYFREE/VALIDATION/ISB18/DECOYFREE/MOMENTS/search_trace copy.txt",
+      "size": 25559,
+      "modified_unix_seconds": 1784656497,
+      "sha256": "644ddf505ebc0ca12e6b491dbeff6eb1b694010c027cd0bea81b525eae2fd929"
+    },
+    {
+      "path": "/Users/kgousset/Library/CloudStorage/OneDrive-Personal/Search_Data_Files/SAGE_DECOYFREE/VALIDATION/ISB18/DECOYFREE/MOMENTS/search_trace.txt",
+      "size": 25599,
+      "modified_unix_seconds": 1785596495,
+      "sha256": "bc932eb4904f3ad9b213832de8aaf591701a868dc0bea1ccb8edda8c76a9cc2a"
+    },
+    {
+      "path": "/Users/kgousset/Library/CloudStorage/OneDrive-Personal/Search_Data_Files/SAGE_DECOYFREE/VALIDATION/ISB18/DECOYFREE/MOMENTS/validation_ISB18_ent_decoyfree.json",
+      "size": 9439,
+      "modified_unix_seconds": 1784996000,
+      "sha256": "c6116d95f600a31dedfc9152b9498dc76347f6a318695da99a88f8f17fc78587"
+    },
+    {
+      "path": "/Users/kgousset/Library/CloudStorage/OneDrive-Personal/Search_Data_Files/SAGE_DECOYFREE/VALIDATION/ISB18/DECOYFREE/MOMENTS/validation_ISB18_no_ent_decoyfree.json",
+      "size": 9408,
+      "modified_unix_seconds": 1784996027,
+      "sha256": "0af892e2f0423b3a166d81b3474cf253b1315304ae06e715d4f15710e6f19ffb"
+    },
+    {
+      "path": "/Users/kgousset/Library/CloudStorage/OneDrive-Personal/Search_Data_Files/SAGE_DECOYFREE/VALIDATION/ISB18/DECOYFREE/MSFDR/2nd_ms2rescore/results.json",
+      "size": 10590,
+      "modified_unix_seconds": 1785695170,
+      "sha256": "56096a706499bbdb428b46b0169c3cbbb37c1f6afcdf952d62c513839cdbb49b"
+    },
+    {
+      "path": "/Users/kgousset/Library/CloudStorage/OneDrive-Personal/Search_Data_Files/SAGE_DECOYFREE/VALIDATION/ISB18/DECOYFREE/MSFDR/2nd_ms2rescore/results.sage.tsv",
+      "size": 33731223,
+      "modified_unix_seconds": 1785695170,
+      "sha256": "c88f605d84565f7c7e37b382602c62704698b0ba402eecb957cc04f56ecc8048"
+    },
+    {
+      "path": "/Users/kgousset/Library/CloudStorage/OneDrive-Personal/Search_Data_Files/SAGE_DECOYFREE/VALIDATION/ISB18/DECOYFREE/MSFDR/2nd_ms2rescore_validation_ISB18_ent_decoyfree.json",
+      "size": 9451,
+      "modified_unix_seconds": 1785693285,
+      "sha256": "c156b7b3ac3e272cf3484801151788c680627a7e34a81e5d4f2f71196f1cf93e"
+    },
+    {
+      "path": "/Users/kgousset/Library/CloudStorage/OneDrive-Personal/Search_Data_Files/SAGE_DECOYFREE/VALIDATION/ISB18/DECOYFREE/MSFDR/3rd_no_ent/matched_fragments.sage.tsv",
+      "size": 16458907,
+      "modified_unix_seconds": 1785697827,
+      "sha256": "5e7d27fc705b90aaa99c7cb71388227b8a373a30b951acd30f803e275b087b40"
+    },
+    {
+      "path": "/Users/kgousset/Library/CloudStorage/OneDrive-Personal/Search_Data_Files/SAGE_DECOYFREE/VALIDATION/ISB18/DECOYFREE/MSFDR/3rd_no_ent/results.json",
+      "size": 10674,
+      "modified_unix_seconds": 1785697827,
+      "sha256": "71e038aad013b29c51902ce47c0ca6b3951d2c4c27dde328246ff40afc857f4d"
+    },
+    {
+      "path": "/Users/kgousset/Library/CloudStorage/OneDrive-Personal/Search_Data_Files/SAGE_DECOYFREE/VALIDATION/ISB18/DECOYFREE/MSFDR/3rd_no_ent/results.sage.tsv",
+      "size": 33509801,
+      "modified_unix_seconds": 1785697826,
+      "sha256": "9594eb3b637d009d09e5f8cafe7d48b7833591f94d799bfb5c890708ac95f652"
+    },
+    {
+      "path": "/Users/kgousset/Library/CloudStorage/OneDrive-Personal/Search_Data_Files/SAGE_DECOYFREE/VALIDATION/ISB18/DECOYFREE/MSFDR/best_result.txt",
+      "size": 1409,
+      "modified_unix_seconds": 1785691048,
+      "sha256": "7dc133164df613ea989215a4c72ac0073cc5fe908c5614cdbc8dcf2482224d45"
+    },
+    {
+      "path": "/Users/kgousset/Library/CloudStorage/OneDrive-Personal/Search_Data_Files/SAGE_DECOYFREE/VALIDATION/ISB18/DECOYFREE/MSFDR/cumulative_results_long.csv",
+      "size": 19574,
+      "modified_unix_seconds": 1785691048,
+      "sha256": "74b111637f8df706aeb02e7dd0b413741ca4033b26f906025df3ca928e6d407c"
+    },
+    {
+      "path": "/Users/kgousset/Library/CloudStorage/OneDrive-Personal/Search_Data_Files/SAGE_DECOYFREE/VALIDATION/ISB18/DECOYFREE/MSFDR/cumulative_results_wide.csv",
+      "size": 6840,
+      "modified_unix_seconds": 1785691048,
+      "sha256": "437ad80ff19f036021951c58b5661415fe4cd1c4a901f4b9973131b0c62ae189"
+    },
+    {
+      "path": "/Users/kgousset/Library/CloudStorage/OneDrive-Personal/Search_Data_Files/SAGE_DECOYFREE/VALIDATION/ISB18/DECOYFREE/MSFDR/results.json",
+      "size": 10592,
+      "modified_unix_seconds": 1785691048,
+      "sha256": "44af321fd783ace83f6365d0209e25b1bd37f5359563220f96583a7110371c1d"
+    },
+    {
+      "path": "/Users/kgousset/Library/CloudStorage/OneDrive-Personal/Search_Data_Files/SAGE_DECOYFREE/VALIDATION/ISB18/DECOYFREE/MSFDR/search_trace.txt",
+      "size": 21999,
+      "modified_unix_seconds": 1785691049,
+      "sha256": "697cb8ab9addfa2302de5c67cb8993c1b2b05f7f9981e061719afcbef50cd6b1"
+    },
+    {
+      "path": "/Users/kgousset/Library/CloudStorage/OneDrive-Personal/Search_Data_Files/SAGE_DECOYFREE/VALIDATION/ISB18/DECOYFREE/MSFDR/validation_ISB18_ent_decoyfree.json",
+      "size": 9435,
+      "modified_unix_seconds": 1785595777,
+      "sha256": "b958abbc5d2932c72c6a2cc2ddb8f7c9f5781a9d9520804d22b2352646eef2d0"
+    },
+    {
+      "path": "/Users/kgousset/Library/CloudStorage/OneDrive-Personal/Search_Data_Files/SAGE_DECOYFREE/VALIDATION/ISB18/DECOYFREE/MSFDR/validation_ISB18_no_ent_decoyfree.json",
+      "size": 9405,
+      "modified_unix_seconds": 1785693302,
+      "sha256": "d944b08273c78c042a4a15e5c0399f09be8eb2aabf579e5e67a62f13132647fd"
+    },
+    {
+      "path": "/Users/kgousset/Library/CloudStorage/OneDrive-Personal/Search_Data_Files/SAGE_DECOYFREE/VALIDATION/ISB18/DECOYFREE/MSFDR1_SMIX/2nd_ms2rescore/results.json",
+      "size": 10606,
+      "modified_unix_seconds": 1785702009,
+      "sha256": "5462aeaab0ea0ec52fb12a89397eaf60c8356f321fdd4e5cb90c583845e6dbb2"
+    },
+    {
+      "path": "/Users/kgousset/Library/CloudStorage/OneDrive-Personal/Search_Data_Files/SAGE_DECOYFREE/VALIDATION/ISB18/DECOYFREE/MSFDR1_SMIX/2nd_ms2rescore/results.sage.tsv",
+      "size": 34888159,
+      "modified_unix_seconds": 1785702009,
+      "sha256": "df6da1e03e9ff447c7c15a5b9e79fcb8f41ae77a12da832c08711281a65a33aa"
+    },
+    {
+      "path": "/Users/kgousset/Library/CloudStorage/OneDrive-Personal/Search_Data_Files/SAGE_DECOYFREE/VALIDATION/ISB18/DECOYFREE/MSFDR1_SMIX/2nd_ms2rescore_validation_ISB18_ent_decoyfree.json",
+      "size": 9461,
+      "modified_unix_seconds": 1785690278,
+      "sha256": "f308126c051dec067ab2861e7e274a77932f540bdae1e6df94ece55e514fc5df"
+    },
+    {
+      "path": "/Users/kgousset/Library/CloudStorage/OneDrive-Personal/Search_Data_Files/SAGE_DECOYFREE/VALIDATION/ISB18/DECOYFREE/MSFDR1_SMIX/3rd_no_ent/matched_fragments.sage.tsv",
+      "size": 16461760,
+      "modified_unix_seconds": 1785706677,
+      "sha256": "8ff614c5fe68977f85a246a04cdc057d49fa2e8223f831185634b52270f1822e"
+    },
+    {
+      "path": "/Users/kgousset/Library/CloudStorage/OneDrive-Personal/Search_Data_Files/SAGE_DECOYFREE/VALIDATION/ISB18/DECOYFREE/MSFDR1_SMIX/3rd_no_ent/results.json",
+      "size": 10696,
+      "modified_unix_seconds": 1785706677,
+      "sha256": "774735c97487acf984c7bb449b48b823f9346fa26311a80b1ce90a74f7ea8168"
+    },
+    {
+      "path": "/Users/kgousset/Library/CloudStorage/OneDrive-Personal/Search_Data_Files/SAGE_DECOYFREE/VALIDATION/ISB18/DECOYFREE/MSFDR1_SMIX/3rd_no_ent/results.sage.tsv",
+      "size": 35831602,
+      "modified_unix_seconds": 1785706677,
+      "sha256": "1f3c04454dba09def6da75224071bfe85d35bef744dec12c054d04a383100d95"
+    },
+    {
+      "path": "/Users/kgousset/Library/CloudStorage/OneDrive-Personal/Search_Data_Files/SAGE_DECOYFREE/VALIDATION/ISB18/DECOYFREE/MSFDR1_SMIX/validation_ISB18_no_ent_decoyfree.json",
+      "size": 9415,
+      "modified_unix_seconds": 1785690475,
+      "sha256": "a167cc83393d1530e3fde143d54ee80732ca545a17824e08bd421169b3c00631"
+    },
+    {
+      "path": "/Users/kgousset/Library/CloudStorage/OneDrive-Personal/Search_Data_Files/SAGE_DECOYFREE/VALIDATION/ISB18/DECOYFREE/MSFDR2_SMIX/2nd_ms2rescore/results.json",
+      "size": 10608,
+      "modified_unix_seconds": 1785710558,
+      "sha256": "23c0e1dfc9d315895276fa046c44676a92e0e18345f2b7496bc589760fb806db"
+    },
+    {
+      "path": "/Users/kgousset/Library/CloudStorage/OneDrive-Personal/Search_Data_Files/SAGE_DECOYFREE/VALIDATION/ISB18/DECOYFREE/MSFDR2_SMIX/2nd_ms2rescore/results.sage.tsv",
+      "size": 34368883,
+      "modified_unix_seconds": 1785710558,
+      "sha256": "c9ca3d27e446415edaca8d9a7f441bb10dd1b8199340d4e828ceb74a6263028d"
+    },
+    {
+      "path": "/Users/kgousset/Library/CloudStorage/OneDrive-Personal/Search_Data_Files/SAGE_DECOYFREE/VALIDATION/ISB18/DECOYFREE/MSFDR2_SMIX/2nd_ms2rescore_validation_ISB18_ent_decoyfree.json",
+      "size": 9463,
+      "modified_unix_seconds": 1785696088,
+      "sha256": "efc63b2309bfff328e281a0bd9692568ee4705f9fe7e19a217e06c356aef2b65"
+    },
+    {
+      "path": "/Users/kgousset/Library/CloudStorage/OneDrive-Personal/Search_Data_Files/SAGE_DECOYFREE/VALIDATION/ISB18/DECOYFREE/MSFDR2_SMIX/3rd_no_ent/matched_fragments.sage.tsv",
+      "size": 16462209,
+      "modified_unix_seconds": 1785723343,
+      "sha256": "090db262d9d5f09178d9748866fecb904f36f69a7a63d72465233b1ab71d4ab5"
+    },
+    {
+      "path": "/Users/kgousset/Library/CloudStorage/OneDrive-Personal/Search_Data_Files/SAGE_DECOYFREE/VALIDATION/ISB18/DECOYFREE/MSFDR2_SMIX/3rd_no_ent/results.json",
+      "size": 10698,
+      "modified_unix_seconds": 1785723343,
+      "sha256": "35e9c9a6df995d31beaeebb958a6e8c9ed1b4dfb8e8316d812ce25d22ef3f7d3"
+    },
+    {
+      "path": "/Users/kgousset/Library/CloudStorage/OneDrive-Personal/Search_Data_Files/SAGE_DECOYFREE/VALIDATION/ISB18/DECOYFREE/MSFDR2_SMIX/3rd_no_ent/results.sage.tsv",
+      "size": 34309656,
+      "modified_unix_seconds": 1785723343,
+      "sha256": "8e8db5d96ca09fd825a7a2e32374194494391ce52b94c1d5e05970b7b3a0c3a2"
+    },
+    {
+      "path": "/Users/kgousset/Library/CloudStorage/OneDrive-Personal/Search_Data_Files/SAGE_DECOYFREE/VALIDATION/ISB18/DECOYFREE/MSFDR2_SMIX/best_result.txt",
+      "size": 1421,
+      "modified_unix_seconds": 1785695220,
+      "sha256": "6a2ed006a5cc8dad1f7d1590e6a0a72ed82939644da5709664a0ecc5b8e24826"
+    },
+    {
+      "path": "/Users/kgousset/Library/CloudStorage/OneDrive-Personal/Search_Data_Files/SAGE_DECOYFREE/VALIDATION/ISB18/DECOYFREE/MSFDR2_SMIX/cumulative_results_long.csv",
+      "size": 22568,
+      "modified_unix_seconds": 1785695220,
+      "sha256": "002157045f4202b9f5aad06a69799b7171bb911fbe9f7331dcf9dd74c7918a70"
+    },
+    {
+      "path": "/Users/kgousset/Library/CloudStorage/OneDrive-Personal/Search_Data_Files/SAGE_DECOYFREE/VALIDATION/ISB18/DECOYFREE/MSFDR2_SMIX/cumulative_results_wide.csv",
+      "size": 6956,
+      "modified_unix_seconds": 1785695220,
+      "sha256": "4b013fe8f1c6c2cbbcf140ef9e625fb9ef290ea8e9e934b5d5bc3333b9e96d4f"
+    },
+    {
+      "path": "/Users/kgousset/Library/CloudStorage/OneDrive-Personal/Search_Data_Files/SAGE_DECOYFREE/VALIDATION/ISB18/DECOYFREE/MSFDR2_SMIX/results.json",
+      "size": 10610,
+      "modified_unix_seconds": 1785695220,
+      "sha256": "64673673acbaafcac5c0d0951f16307b9c40e4b614668d69e728078b76f7679c"
+    },
+    {
+      "path": "/Users/kgousset/Library/CloudStorage/OneDrive-Personal/Search_Data_Files/SAGE_DECOYFREE/VALIDATION/ISB18/DECOYFREE/MSFDR2_SMIX/search_trace.txt",
+      "size": 23661,
+      "modified_unix_seconds": 1785695220,
+      "sha256": "d618493aef76b6e32dec2edbef79beaf20064eec1d1f4db9f57b4cd6e4df450a"
+    },
+    {
+      "path": "/Users/kgousset/Library/CloudStorage/OneDrive-Personal/Search_Data_Files/SAGE_DECOYFREE/VALIDATION/ISB18/DECOYFREE/MSFDR2_SMIX/validation_ISB18_ent_decoyfree.json",
+      "size": 9447,
+      "modified_unix_seconds": 1785693500,
+      "sha256": "14cd3c514781ba2d0b9436dfdaa5beabcdc9031e3cd9488684d552e94b2ebe83"
+    },
+    {
+      "path": "/Users/kgousset/Library/CloudStorage/OneDrive-Personal/Search_Data_Files/SAGE_DECOYFREE/VALIDATION/ISB18/DECOYFREE/MSFDR2_SMIX/validation_ISB18_no_ent_decoyfree.json",
+      "size": 9417,
+      "modified_unix_seconds": 1785696104,
+      "sha256": "8c944e4facf2d8caa6ed6830152b3480a4c79604d9c61b6ca8cab5c08b2d5d4e"
+    },
+    {
+      "path": "/Users/kgousset/Library/CloudStorage/OneDrive-Personal/Search_Data_Files/SAGE_DECOYFREE/VALIDATION/ISB18/DECOYFREE/NOKOI/2nd_ms2rescore/results.json",
+      "size": 10590,
+      "modified_unix_seconds": 1785730773,
+      "sha256": "b7b59abd19ef40b57b40b50d113b8142d20c445e264fc9d629ee18b5903ca882"
+    },
+    {
+      "path": "/Users/kgousset/Library/CloudStorage/OneDrive-Personal/Search_Data_Files/SAGE_DECOYFREE/VALIDATION/ISB18/DECOYFREE/NOKOI/2nd_ms2rescore/results.sage.tsv",
+      "size": 33351532,
+      "modified_unix_seconds": 1785730773,
+      "sha256": "89cf85ca1dac48975073de82e90b63019e97a5043ffda637f5e917f956bb2b72"
+    },
+    {
+      "path": "/Users/kgousset/Library/CloudStorage/OneDrive-Personal/Search_Data_Files/SAGE_DECOYFREE/VALIDATION/ISB18/DECOYFREE/NOKOI/2nd_ms2rescore_validation_ISB18_ent_decoyfree.json",
+      "size": 9451,
+      "modified_unix_seconds": 1785698210,
+      "sha256": "2e612d7706ba0bf4e139ad570be5a2c1dbde1245cd1e88e16a5d252bceb1f9a1"
+    },
+    {
+      "path": "/Users/kgousset/Library/CloudStorage/OneDrive-Personal/Search_Data_Files/SAGE_DECOYFREE/VALIDATION/ISB18/DECOYFREE/NOKOI/3rd_no_ent/matched_fragments.sage.tsv",
+      "size": 16462104,
+      "modified_unix_seconds": 1785736518,
+      "sha256": "e9702c08134b197287e694a3f77ef5fe9f54779f912aad8fc8c671c5ac7301b0"
+    },
+    {
+      "path": "/Users/kgousset/Library/CloudStorage/OneDrive-Personal/Search_Data_Files/SAGE_DECOYFREE/VALIDATION/ISB18/DECOYFREE/NOKOI/3rd_no_ent/results.json",
+      "size": 10674,
+      "modified_unix_seconds": 1785736518,
+      "sha256": "b03dca7ce2c4a1b134d00a21a73d280611a1f9c24a8dabd11bec024056563df5"
+    },
+    {
+      "path": "/Users/kgousset/Library/CloudStorage/OneDrive-Personal/Search_Data_Files/SAGE_DECOYFREE/VALIDATION/ISB18/DECOYFREE/NOKOI/3rd_no_ent/results.sage.tsv",
+      "size": 32940718,
+      "modified_unix_seconds": 1785736518,
+      "sha256": "e2689199f4b91764aa47c5a706f2c2106190b3d0205d700f798983d51530e439"
+    },
+    {
+      "path": "/Users/kgousset/Library/CloudStorage/OneDrive-Personal/Search_Data_Files/SAGE_DECOYFREE/VALIDATION/ISB18/DECOYFREE/NOKOI/best_result.txt",
+      "size": 1411,
+      "modified_unix_seconds": 1785698126,
+      "sha256": "8867b61e429b3a9c8916fd27363ecb019eacae672726823c8bd9b1990164a520"
+    },
+    {
+      "path": "/Users/kgousset/Library/CloudStorage/OneDrive-Personal/Search_Data_Files/SAGE_DECOYFREE/VALIDATION/ISB18/DECOYFREE/NOKOI/cumulative_results_long.csv",
+      "size": 29860,
+      "modified_unix_seconds": 1785698125,
+      "sha256": "b91d4d1a07e6be384336b4b3cdb7469a6c654daee3d1f0a89a58352ee6406aa9"
+    },
+    {
+      "path": "/Users/kgousset/Library/CloudStorage/OneDrive-Personal/Search_Data_Files/SAGE_DECOYFREE/VALIDATION/ISB18/DECOYFREE/NOKOI/cumulative_results_wide.csv",
+      "size": 11355,
+      "modified_unix_seconds": 1785698126,
+      "sha256": "a5a66c8e5811618f0f980c818828ad2c9b6370d64ca07437753392c359e3dfaf"
+    },
+    {
+      "path": "/Users/kgousset/Library/CloudStorage/OneDrive-Personal/Search_Data_Files/SAGE_DECOYFREE/VALIDATION/ISB18/DECOYFREE/NOKOI/results.json",
+      "size": 10592,
+      "modified_unix_seconds": 1785698126,
+      "sha256": "04e6dd1d4e714c9d445762ca589631a1e7ff2dc1a94cb64176a57e6ef8779e94"
+    },
+    {
+      "path": "/Users/kgousset/Library/CloudStorage/OneDrive-Personal/Search_Data_Files/SAGE_DECOYFREE/VALIDATION/ISB18/DECOYFREE/NOKOI/search_trace.txt",
+      "size": 31289,
+      "modified_unix_seconds": 1785698126,
+      "sha256": "fa90f865f2bc98beb72d8beeac3852ea595d062d0618a18630d1f10e3023184f"
+    },
+    {
+      "path": "/Users/kgousset/Library/CloudStorage/OneDrive-Personal/Search_Data_Files/SAGE_DECOYFREE/VALIDATION/ISB18/DECOYFREE/NOKOI/validation_ISB18_ent_decoyfree.json",
+      "size": 9435,
+      "modified_unix_seconds": 1785694481,
+      "sha256": "f51e62bf6fdc0e45aad74ec7b9711ee25f5a55103fb510efc88f50376fa1bfab"
+    },
+    {
+      "path": "/Users/kgousset/Library/CloudStorage/OneDrive-Personal/Search_Data_Files/SAGE_DECOYFREE/VALIDATION/ISB18/DECOYFREE/NOKOI/validation_ISB18_no_ent_decoyfree.json",
+      "size": 9405,
+      "modified_unix_seconds": 1785698214,
+      "sha256": "a7beb1b93bc6bb0a7d01e1fe561ee58e9f4749b5dc277f127dcc047e2f42f36c"
+    },
+    {
+      "path": "/Users/kgousset/Library/CloudStorage/OneDrive-Personal/Search_Data_Files/SAGE_DECOYFREE/VALIDATION/fig2_plots/ISB18/.DS_Store",
+      "size": 6148,
+      "modified_unix_seconds": 1785793110,
+      "sha256": "4c90075dfae00df6593582feb922c80f98b21b2bb3941a48c486e76f74929ba7"
+    },
+    {
+      "path": "/Users/kgousset/Library/CloudStorage/OneDrive-Personal/Search_Data_Files/SAGE_DECOYFREE/VALIDATION/fig2_plots/ISB18/Figure2A_Mirror_Lower_Order.png",
+      "size": 151311,
+      "modified_unix_seconds": 1785790760,
+      "sha256": "229997c66f0162fdf863c632428c449ef4cc8aea163217bddb31703a71bd1fdc"
+    },
+    {
+      "path": "/Users/kgousset/Library/CloudStorage/OneDrive-Personal/Search_Data_Files/SAGE_DECOYFREE/VALIDATION/fig2_plots/ISB18/Figure2A_Mirror_MLE.png",
+      "size": 149899,
+      "modified_unix_seconds": 1785790761,
+      "sha256": "f98daf54d0eff3ab26cbbf34f9d179aa7d91483b1b4c7429f7b25aa25edd5811"
+    },
+    {
+      "path": "/Users/kgousset/Library/CloudStorage/OneDrive-Personal/Search_Data_Files/SAGE_DECOYFREE/VALIDATION/fig2_plots/ISB18/Figure2A_Mirror_MSFDR.png",
+      "size": 149618,
+      "modified_unix_seconds": 1785790762,
+      "sha256": "5222cdabf46126ddc03fee8ab5393e6bbddd3c97e676d77dd17ea7ad961db4b1"
+    },
+    {
+      "path": "/Users/kgousset/Library/CloudStorage/OneDrive-Personal/Search_Data_Files/SAGE_DECOYFREE/VALIDATION/fig2_plots/ISB18/Figure2A_Mirror_MSFDR2_SMIX.png",
+      "size": 154257,
+      "modified_unix_seconds": 1785790763,
+      "sha256": "a5ad03e8442ae216330c730669ffec01fe18f22714f85dbfacc09ff529918ac3"
+    },
+    {
+      "path": "/Users/kgousset/Library/CloudStorage/OneDrive-Personal/Search_Data_Files/SAGE_DECOYFREE/VALIDATION/fig2_plots/ISB18/Figure2A_Mirror_Moments.png",
+      "size": 152034,
+      "modified_unix_seconds": 1785790761,
+      "sha256": "2998750309da3b41168bef4eac373d8ec14ed899cf6e8cbb9a5eae0ca1adee77"
+    },
+    {
+      "path": "/Users/kgousset/Library/CloudStorage/OneDrive-Personal/Search_Data_Files/SAGE_DECOYFREE/VALIDATION/fig2_plots/ISB18/Figure2A_Mirror_NOKOI.png",
+      "size": 151798,
+      "modified_unix_seconds": 1785790764,
+      "sha256": "b00c15fc6c0d6859113dbe206c8b78625e7c74336e35b9f7889b5ff75eada5c7"
+    },
+    {
+      "path": "/Users/kgousset/Library/CloudStorage/OneDrive-Personal/Search_Data_Files/SAGE_DECOYFREE/VALIDATION/fig2_plots/ISB18/Figure2B(i)_Peptide_Unique_Lower_Order.png",
+      "size": 63057,
+      "modified_unix_seconds": 1785790764,
+      "sha256": "88e13ebb97977e6d4ca160996337f30cb7e59a963e76f79c4c5ef65c27d29964"
+    },
+    {
+      "path": "/Users/kgousset/Library/CloudStorage/OneDrive-Personal/Search_Data_Files/SAGE_DECOYFREE/VALIDATION/fig2_plots/ISB18/Figure2B(i)_Peptide_Unique_MLE.png",
+      "size": 59739,
+      "modified_unix_seconds": 1785790765,
+      "sha256": "02043ab73acd23142880b91677f2c0303411bf544431b8a5013403aa0ddb6e82"
+    },
+    {
+      "path": "/Users/kgousset/Library/CloudStorage/OneDrive-Personal/Search_Data_Files/SAGE_DECOYFREE/VALIDATION/fig2_plots/ISB18/Figure2B(i)_Peptide_Unique_MSFDR.png",
+      "size": 62273,
+      "modified_unix_seconds": 1785790767,
+      "sha256": "40eda72ad7ed1c1a0ef5a159c9c6c6a0f76829080039b2b4222713cf5065fcac"
+    },
+    {
+      "path": "/Users/kgousset/Library/CloudStorage/OneDrive-Personal/Search_Data_Files/SAGE_DECOYFREE/VALIDATION/fig2_plots/ISB18/Figure2B(i)_Peptide_Unique_MSFDR2_SMIX.png",
+      "size": 65151,
+      "modified_unix_seconds": 1785790768,
+      "sha256": "e420958658c741eb840bd25709edb4e32d3c15e620ce642c338648e0cba34691"
+    },
+    {
+      "path": "/Users/kgousset/Library/CloudStorage/OneDrive-Personal/Search_Data_Files/SAGE_DECOYFREE/VALIDATION/fig2_plots/ISB18/Figure2B(i)_Peptide_Unique_Moments.png",
+      "size": 62321,
+      "modified_unix_seconds": 1785790766,
+      "sha256": "63dd5fd149a45840806e9faf3fdbad1ceaac9305cd58afb0b58f9c41acfc0d5f"
+    },
+    {
+      "path": "/Users/kgousset/Library/CloudStorage/OneDrive-Personal/Search_Data_Files/SAGE_DECOYFREE/VALIDATION/fig2_plots/ISB18/Figure2B(i)_Peptide_Unique_NOKOI.png",
+      "size": 58622,
+      "modified_unix_seconds": 1785790768,
+      "sha256": "f4b64ace8a82560ab6807d9c38afe1f11477cd0b2d239fd2d7dad82ce589d8e2"
+    },
+    {
+      "path": "/Users/kgousset/Library/CloudStorage/OneDrive-Personal/Search_Data_Files/SAGE_DECOYFREE/VALIDATION/fig2_plots/ISB18/Figure2B(ii)_Protein_Unique_Lower_Order.png",
+      "size": 47882,
+      "modified_unix_seconds": 1785790765,
+      "sha256": "35541226e23a0c7d2debbb82d2708a22e38c2f764be184caf43cb9c4cc8db76c"
+    },
+    {
+      "path": "/Users/kgousset/Library/CloudStorage/OneDrive-Personal/Search_Data_Files/SAGE_DECOYFREE/VALIDATION/fig2_plots/ISB18/Figure2B(ii)_Protein_Unique_MLE.png",
+      "size": 45160,
+      "modified_unix_seconds": 1785790765,
+      "sha256": "af285416e1c73bba6325e191cae535af2fab033c33ce6d773e3d3c06bcd9a6a7"
+    },
+    {
+      "path": "/Users/kgousset/Library/CloudStorage/OneDrive-Personal/Search_Data_Files/SAGE_DECOYFREE/VALIDATION/fig2_plots/ISB18/Figure2B(ii)_Protein_Unique_MSFDR.png",
+      "size": 47308,
+      "modified_unix_seconds": 1785790767,
+      "sha256": "15bad2109a097b68e4870be7a3d256d4597b3b44b38b67d035ac8ba7a1397368"
+    },
+    {
+      "path": "/Users/kgousset/Library/CloudStorage/OneDrive-Personal/Search_Data_Files/SAGE_DECOYFREE/VALIDATION/fig2_plots/ISB18/Figure2B(ii)_Protein_Unique_MSFDR2_SMIX.png",
+      "size": 49624,
+      "modified_unix_seconds": 1785790768,
+      "sha256": "f5af780d6ac98a45b9106f258a8e354192d18e7c6063183be30a2f050accc808"
+    },
+    {
+      "path": "/Users/kgousset/Library/CloudStorage/OneDrive-Personal/Search_Data_Files/SAGE_DECOYFREE/VALIDATION/fig2_plots/ISB18/Figure2B(ii)_Protein_Unique_Moments.png",
+      "size": 47505,
+      "modified_unix_seconds": 1785790766,
+      "sha256": "019565e31aa6a862a97132ad88c82a91b8fea2120f77f9e8289edce3e70a9cef"
+    },
+    {
+      "path": "/Users/kgousset/Library/CloudStorage/OneDrive-Personal/Search_Data_Files/SAGE_DECOYFREE/VALIDATION/fig2_plots/ISB18/Figure2B(ii)_Protein_Unique_NOKOI.png",
+      "size": 44589,
+      "modified_unix_seconds": 1785790769,
+      "sha256": "9d3055bb68a29aac3e392194a5a9f48a67eb0e9f3bf8330a026df30190cdc102"
+    },
+    {
+      "path": "/Users/kgousset/Library/CloudStorage/OneDrive-Personal/Search_Data_Files/SAGE_DECOYFREE/VALIDATION/fig2_plots/ISB18/Figure2B(iii)_Peptide_1pctFDR_Lower_Order.png",
+      "size": 60577,
+      "modified_unix_seconds": 1785790765,
+      "sha256": "f21cac201a6e2c58e627aee3fbb283aa543f6b5a57e2f56292e1d8a222c5cd23"
+    },
+    {
+      "path": "/Users/kgousset/Library/CloudStorage/OneDrive-Personal/Search_Data_Files/SAGE_DECOYFREE/VALIDATION/fig2_plots/ISB18/Figure2B(iii)_Peptide_1pctFDR_MLE.png",
+      "size": 58490,
+      "modified_unix_seconds": 1785790766,
+      "sha256": "03bfe97cb54aee5de1453e86a690244dade586ccc464e3d732cfc04e7a2bac1b"
+    },
+    {
+      "path": "/Users/kgousset/Library/CloudStorage/OneDrive-Personal/Search_Data_Files/SAGE_DECOYFREE/VALIDATION/fig2_plots/ISB18/Figure2B(iii)_Peptide_1pctFDR_MSFDR.png",
+      "size": 60714,
+      "modified_unix_seconds": 1785790767,
+      "sha256": "7f09a64fd2700b99e427e84d31e341f3788d2dcbb3372400199c2e475e55bc1f"
+    },
+    {
+      "path": "/Users/kgousset/Library/CloudStorage/OneDrive-Personal/Search_Data_Files/SAGE_DECOYFREE/VALIDATION/fig2_plots/ISB18/Figure2B(iii)_Peptide_1pctFDR_MSFDR2_SMIX.png",
+      "size": 64356,
+      "modified_unix_seconds": 1785790768,
+      "sha256": "bc7f2594966b0d7d7e5e760b8b6578253c5e644d21eac691a3fa0637e30ce723"
+    },
+    {
+      "path": "/Users/kgousset/Library/CloudStorage/OneDrive-Personal/Search_Data_Files/SAGE_DECOYFREE/VALIDATION/fig2_plots/ISB18/Figure2B(iii)_Peptide_1pctFDR_Moments.png",
+      "size": 61698,
+      "modified_unix_seconds": 1785790766,
+      "sha256": "b488158a53e072990cfaa7b84e96dc9c57ff93e1ebe4bb8b96933c53249edc53"
+    },
+    {
+      "path": "/Users/kgousset/Library/CloudStorage/OneDrive-Personal/Search_Data_Files/SAGE_DECOYFREE/VALIDATION/fig2_plots/ISB18/Figure2B(iii)_Peptide_1pctFDR_NOKOI.png",
+      "size": 57430,
+      "modified_unix_seconds": 1785790769,
+      "sha256": "e62e04b43fa58689edac44855c5ce0a0ab60041055249a964f640f34cef2c496"
+    },
+    {
+      "path": "/Users/kgousset/Library/CloudStorage/OneDrive-Personal/Search_Data_Files/SAGE_DECOYFREE/VALIDATION/fig2_plots/ISB18/Figure2B(iv)_Protein_1pctFDR_Lower_Order.png",
+      "size": 31444,
+      "modified_unix_seconds": 1785790765,
+      "sha256": "31278f1e581c947a019916e74679154c0ed359750c43b32469e2cee9b5f8e9f3"
+    },
+    {
+      "path": "/Users/kgousset/Library/CloudStorage/OneDrive-Personal/Search_Data_Files/SAGE_DECOYFREE/VALIDATION/fig2_plots/ISB18/Figure2B(iv)_Protein_1pctFDR_MLE.png",
+      "size": 29327,
+      "modified_unix_seconds": 1785790766,
+      "sha256": "4a4209fd87826a9252eb72ccb0e0a78ccce70600a6cc1d910d32ef98b3b7038b"
+    },
+    {
+      "path": "/Users/kgousset/Library/CloudStorage/OneDrive-Personal/Search_Data_Files/SAGE_DECOYFREE/VALIDATION/fig2_plots/ISB18/Figure2B(iv)_Protein_1pctFDR_MSFDR.png",
+      "size": 30903,
+      "modified_unix_seconds": 1785790767,
+      "sha256": "9e496efe0483e5b5c5013dca35de1ef24a59147662a5f59f655fa67ad549f9ad"
+    },
+    {
+      "path": "/Users/kgousset/Library/CloudStorage/OneDrive-Personal/Search_Data_Files/SAGE_DECOYFREE/VALIDATION/fig2_plots/ISB18/Figure2B(iv)_Protein_1pctFDR_MSFDR2_SMIX.png",
+      "size": 32429,
+      "modified_unix_seconds": 1785790768,
+      "sha256": "20696dc7e401caa2c46adc5f6e7cf29db5824263b5179046896ee38a3274b47d"
+    },
+    {
+      "path": "/Users/kgousset/Library/CloudStorage/OneDrive-Personal/Search_Data_Files/SAGE_DECOYFREE/VALIDATION/fig2_plots/ISB18/Figure2B(iv)_Protein_1pctFDR_Moments.png",
+      "size": 45538,
+      "modified_unix_seconds": 1785790767,
+      "sha256": "d3fdbaf598688ab84dcb83b4e7eeb65c29aed1e1393d4662be994fbe2c70f70b"
+    },
+    {
+      "path": "/Users/kgousset/Library/CloudStorage/OneDrive-Personal/Search_Data_Files/SAGE_DECOYFREE/VALIDATION/fig2_plots/ISB18/Figure2B(iv)_Protein_1pctFDR_NOKOI.png",
+      "size": 30527,
+      "modified_unix_seconds": 1785790769,
+      "sha256": "6c48e8f14b309d8a7107fea3fa5530b6fc8a2f11fcdda1109f7a8944b5a05381"
+    },
+    {
+      "path": "/Users/kgousset/Library/CloudStorage/OneDrive-Personal/Search_Data_Files/SAGE_DECOYFREE/VALIDATION/fig2_plots/ISB18/Figure2B_Overlap_Summary.csv",
+      "size": 3331,
+      "modified_unix_seconds": 1785790769,
+      "sha256": "e75e924ab2355671881cb368e05834a75c26be4f37f9028a2682ee3eb8178052"
+    },
+    {
+      "path": "/Users/kgousset/Library/CloudStorage/OneDrive-Personal/Search_Data_Files/SAGE_DECOYFREE/VALIDATION/fig2_plots/ISB18/Figure2C_Accepted_IDs_and_PSMs_Summary.csv",
+      "size": 889,
+      "modified_unix_seconds": 1785790770,
+      "sha256": "1d3f81f140786cd28a97ad10ec5d68071b7cbbaf68d764d1ba5d9f5cb6cf710a"
+    },
+    {
+      "path": "/Users/kgousset/Library/CloudStorage/OneDrive-Personal/Search_Data_Files/SAGE_DECOYFREE/VALIDATION/fig2_plots/ISB18/Figure2C_Barplot_Accepted_IDs_and_PSMs.png",
+      "size": 284422,
+      "modified_unix_seconds": 1785790771,
+      "sha256": "71884c72d30389f1898a96dc5b722f70a99704c3e8825af86ff89b7c1d6e27e8"
+    },
+    {
+      "path": "/Users/kgousset/Library/CloudStorage/OneDrive-Personal/Search_Data_Files/SAGE_DECOYFREE/VALIDATION/fig2_plots/ISB18/Figure2D_RT_Mass_Scatter_Lower_Order.png",
+      "size": 1427393,
+      "modified_unix_seconds": 1785790776,
+      "sha256": "861e6e282c8ab9a77433ed72333fcf13bbb51f95e661690845c18057d814b3a9"
+    },
+    {
+      "path": "/Users/kgousset/Library/CloudStorage/OneDrive-Personal/Search_Data_Files/SAGE_DECOYFREE/VALIDATION/fig2_plots/ISB18/Figure2D_RT_Mass_Scatter_MLE.png",
+      "size": 1441047,
+      "modified_unix_seconds": 1785790785,
+      "sha256": "8cf78e9eb1df616dcc576b2347747a610a1056381ed450346881c16a80bb8c4b"
+    },
+    {
+      "path": "/Users/kgousset/Library/CloudStorage/OneDrive-Personal/Search_Data_Files/SAGE_DECOYFREE/VALIDATION/fig2_plots/ISB18/Figure2D_RT_Mass_Scatter_MSFDR.png",
+      "size": 1442645,
+      "modified_unix_seconds": 1785790805,
+      "sha256": "07329db1c6ddf208783483dcfe2f0ed47db435debf40be47a9fc85bfda3c4248"
+    },
+    {
+      "path": "/Users/kgousset/Library/CloudStorage/OneDrive-Personal/Search_Data_Files/SAGE_DECOYFREE/VALIDATION/fig2_plots/ISB18/Figure2D_RT_Mass_Scatter_MSFDR2_SMIX.png",
+      "size": 1446194,
+      "modified_unix_seconds": 1785790819,
+      "sha256": "bc0c93aea33f61026f3c92529663e9a74926601d55254605f0ba24571dd54e9f"
+    },
+    {
+      "path": "/Users/kgousset/Library/CloudStorage/OneDrive-Personal/Search_Data_Files/SAGE_DECOYFREE/VALIDATION/fig2_plots/ISB18/Figure2D_RT_Mass_Scatter_Moments.png",
+      "size": 1441516,
+      "modified_unix_seconds": 1785790794,
+      "sha256": "c8a1a80f4f1fec107c48fe792e82b2a94ae542c040f45ee58e1677e791330687"
+    },
+    {
+      "path": "/Users/kgousset/Library/CloudStorage/OneDrive-Personal/Search_Data_Files/SAGE_DECOYFREE/VALIDATION/fig2_plots/ISB18/Figure2D_RT_Mass_Scatter_NOKOI.png",
+      "size": 1462733,
+      "modified_unix_seconds": 1785790837,
+      "sha256": "047fe87f5c54af403a5764b2c215ca255af3bbc7e29c145f7060fac115ebb69b"
+    },
+    {
+      "path": "/Users/kgousset/Library/CloudStorage/OneDrive-Personal/Search_Data_Files/SAGE_DECOYFREE/VALIDATION/fig2_plots/ISB18/Figure2D_RT_Mass_Scatter_Zoom_Lower_Order.png",
+      "size": 782892,
+      "modified_unix_seconds": 1785790780,
+      "sha256": "8936f1f578bd0438a59ef6b8af5c5b7d83ce8440cb0de2095f79ec954026c597"
+    },
+    {
+      "path": "/Users/kgousset/Library/CloudStorage/OneDrive-Personal/Search_Data_Files/SAGE_DECOYFREE/VALIDATION/fig2_plots/ISB18/Figure2D_RT_Mass_Scatter_Zoom_MLE.png",
+      "size": 799042,
+      "modified_unix_seconds": 1785790789,
+      "sha256": "9d683d2c5c4f38b0c3dd6a2acff81ceae58705f0f4c8d7ba6b131f082fa31302"
+    },
+    {
+      "path": "/Users/kgousset/Library/CloudStorage/OneDrive-Personal/Search_Data_Files/SAGE_DECOYFREE/VALIDATION/fig2_plots/ISB18/Figure2D_RT_Mass_Scatter_Zoom_MSFDR.png",
+      "size": 799381,
+      "modified_unix_seconds": 1785790811,
+      "sha256": "b9ce1defbde43d24dc6e3bb69b6f46ac363e5978899740633c335c811da7c45f"
+    },
+    {
+      "path": "/Users/kgousset/Library/CloudStorage/OneDrive-Personal/Search_Data_Files/SAGE_DECOYFREE/VALIDATION/fig2_plots/ISB18/Figure2D_RT_Mass_Scatter_Zoom_MSFDR2_SMIX.png",
+      "size": 799710,
+      "modified_unix_seconds": 1785790826,
+      "sha256": "86a6b5ce2f84848dad5f2034812c470e54e349fb96b3c21f1fb916e9cb5366d5"
+    },
+    {
+      "path": "/Users/kgousset/Library/CloudStorage/OneDrive-Personal/Search_Data_Files/SAGE_DECOYFREE/VALIDATION/fig2_plots/ISB18/Figure2D_RT_Mass_Scatter_Zoom_Moments.png",
+      "size": 800359,
+      "modified_unix_seconds": 1785790799,
+      "sha256": "89fc79454827d66fc8e725cf28d149eb8777f396e78514734369f5f8b7303270"
+    },
+    {
+      "path": "/Users/kgousset/Library/CloudStorage/OneDrive-Personal/Search_Data_Files/SAGE_DECOYFREE/VALIDATION/fig2_plots/ISB18/Figure2D_RT_Mass_Scatter_Zoom_NOKOI.png",
+      "size": 810637,
+      "modified_unix_seconds": 1785790842,
+      "sha256": "7bbcbfb7afe242108c835bb26fe6bc75ae5124353130c3912869becdc33e351a"
+    },
+    {
+      "path": "/Users/kgousset/Library/CloudStorage/OneDrive-Personal/Search_Data_Files/SAGE_DECOYFREE/VALIDATION/fig2_plots/ISB18/Figure2D_RT_Mass_Summary.csv",
+      "size": 2325,
+      "modified_unix_seconds": 1785790842,
+      "sha256": "9b59a83f6f4c03ac1b14d1a3ccbaeefcc589fe2c052477018f4a9b0ad17d1423"
+    },
+    {
+      "path": "/Users/kgousset/Library/CloudStorage/OneDrive-Personal/Search_Data_Files/SAGE_DECOYFREE/VALIDATION/fig2_plots/ISB18/Figure2E_Peptide_Corr_Lower_Order.png",
+      "size": 318546,
+      "modified_unix_seconds": 1785790843,
+      "sha256": "b37d2289b81504674c511499a24350a467d6d9fd31377e1ba295a7f22f4530dc"
+    },
+    {
+      "path": "/Users/kgousset/Library/CloudStorage/OneDrive-Personal/Search_Data_Files/SAGE_DECOYFREE/VALIDATION/fig2_plots/ISB18/Figure2E_Peptide_Corr_MLE.png",
+      "size": 319335,
+      "modified_unix_seconds": 1785790844,
+      "sha256": "22bc32e86ef07b402e221b53218e5bb2248c91e3f229d30a3627f22e92af4040"
+    },
+    {
+      "path": "/Users/kgousset/Library/CloudStorage/OneDrive-Personal/Search_Data_Files/SAGE_DECOYFREE/VALIDATION/fig2_plots/ISB18/Figure2E_Peptide_Corr_MSFDR.png",
+      "size": 324688,
+      "modified_unix_seconds": 1785790847,
+      "sha256": "11cc7f5bd9790f6521f8bbd90fc4418321178e2eccd68da847d95c9c83ee68c8"
+    },
+    {
+      "path": "/Users/kgousset/Library/CloudStorage/OneDrive-Personal/Search_Data_Files/SAGE_DECOYFREE/VALIDATION/fig2_plots/ISB18/Figure2E_Peptide_Corr_MSFDR2_SMIX.png",
+      "size": 235161,
+      "modified_unix_seconds": 1785790848,
+      "sha256": "3c45d4f4776fd6bcc5eb36316ae1b40682f117ce074a47556f196a24dc67d050"
+    },
+    {
+      "path": "/Users/kgousset/Library/CloudStorage/OneDrive-Personal/Search_Data_Files/SAGE_DECOYFREE/VALIDATION/fig2_plots/ISB18/Figure2E_Peptide_Corr_Moments.png",
+      "size": 324079,
+      "modified_unix_seconds": 1785790845,
+      "sha256": "d22b1dc262cb8f487500d155676f64bf3dea3cb2ed440516f087998fe9d645a8"
+    },
+    {
+      "path": "/Users/kgousset/Library/CloudStorage/OneDrive-Personal/Search_Data_Files/SAGE_DECOYFREE/VALIDATION/fig2_plots/ISB18/Figure2E_Peptide_Corr_NOKOI.png",
+      "size": 317263,
+      "modified_unix_seconds": 1785790849,
+      "sha256": "ff32dbe519c72378400757994dcb165d855b83e2a3e712eafe915f2d7706ada8"
+    },
+    {
+      "path": "/Users/kgousset/Library/CloudStorage/OneDrive-Personal/Search_Data_Files/SAGE_DECOYFREE/VALIDATION/fig2_plots/ISB18/Figure2E_Peptide_Corr_Summary.csv",
+      "size": 681,
+      "modified_unix_seconds": 1785790849,
+      "sha256": "7cf2a213a37cb954559188df1d83b55c7fd0da62495bf987046ded6a7383147c"
+    },
+    {
+      "path": "/Users/kgousset/Library/CloudStorage/OneDrive-Personal/Search_Data_Files/SAGE_DECOYFREE/VALIDATION/fig2_plots/ISB18/Figure2F_Peptide_Rank_Corr_Lower_Order.png",
+      "size": 412262,
+      "modified_unix_seconds": 1785790843,
+      "sha256": "95cd1ca6390cf255dcdf67d1a0ab457b359a1ba8d5a82a7aefd6c30eac71604d"
+    },
+    {
+      "path": "/Users/kgousset/Library/CloudStorage/OneDrive-Personal/Search_Data_Files/SAGE_DECOYFREE/VALIDATION/fig2_plots/ISB18/Figure2F_Peptide_Rank_Corr_MLE.png",
+      "size": 491572,
+      "modified_unix_seconds": 1785790845,
+      "sha256": "98be1c3ada0a324970b269e5bfd49bfaba2d258bb61f4937ce80d2d933c00eb7"
+    },
+    {
+      "path": "/Users/kgousset/Library/CloudStorage/OneDrive-Personal/Search_Data_Files/SAGE_DECOYFREE/VALIDATION/fig2_plots/ISB18/Figure2F_Peptide_Rank_Corr_MSFDR.png",
+      "size": 464891,
+      "modified_unix_seconds": 1785790847,
+      "sha256": "70b689a6a847d8516a8972262bf9d71b85a96e1eae14c7b634a2f27508fed85f"
+    },
+    {
+      "path": "/Users/kgousset/Library/CloudStorage/OneDrive-Personal/Search_Data_Files/SAGE_DECOYFREE/VALIDATION/fig2_plots/ISB18/Figure2F_Peptide_Rank_Corr_MSFDR2_SMIX.png",
+      "size": 191845,
+      "modified_unix_seconds": 1785790848,
+      "sha256": "ef69902cd1c0468b82860c6808e65da8627bad3077b082dc0ba9725e9ff3743e"
+    },
+    {
+      "path": "/Users/kgousset/Library/CloudStorage/OneDrive-Personal/Search_Data_Files/SAGE_DECOYFREE/VALIDATION/fig2_plots/ISB18/Figure2F_Peptide_Rank_Corr_Moments.png",
+      "size": 482393,
+      "modified_unix_seconds": 1785790846,
+      "sha256": "5eece8c230d2b54090ef899f15a6ce09a3c852318e3c73e614a5d10dc657af47"
+    },
+    {
+      "path": "/Users/kgousset/Library/CloudStorage/OneDrive-Personal/Search_Data_Files/SAGE_DECOYFREE/VALIDATION/fig2_plots/ISB18/Figure2F_Peptide_Rank_Corr_NOKOI.png",
+      "size": 464341,
+      "modified_unix_seconds": 1785790849,
+      "sha256": "785e1fdb03492949adbf7e1ad106ef9e2c9e3bc1d471045a0a7e4c15671c29de"
+    },
+    {
+      "path": "/Users/kgousset/Library/CloudStorage/OneDrive-Personal/Search_Data_Files/SAGE_DECOYFREE/VALIDATION/fig2_plots/ISB18/Figure2G(i)_PeptideOverlap_ALL_inclusive_overlap_barplot.png",
+      "size": 129081,
+      "modified_unix_seconds": 1785790852,
+      "sha256": "30bc9bea1c3c4feb4bf89ff70c2879971194073c41989a47a1f01204f8404dc2"
+    },
+    {
+      "path": "/Users/kgousset/Library/CloudStorage/OneDrive-Personal/Search_Data_Files/SAGE_DECOYFREE/VALIDATION/fig2_plots/ISB18/Figure2G(i)_PeptideOverlap_ALL_inclusive_overlap_summary.csv",
+      "size": 216,
+      "modified_unix_seconds": 1785790851,
+      "sha256": "22d9043cfec9c342c0c0c3dedab56ed434519ddf5cb05b219c564a8a3c139961"
+    },
+    {
+      "path": "/Users/kgousset/Library/CloudStorage/OneDrive-Personal/Search_Data_Files/SAGE_DECOYFREE/VALIDATION/fig2_plots/ISB18/Figure2G(i)_PeptideOverlap_ALL_jaccard_results.csv",
+      "size": 357,
+      "modified_unix_seconds": 1785790850,
+      "sha256": "04b235ccef426fea8b11d531c750076b3f564ac27a10f69b9642d0416b759dc8"
+    },
+    {
+      "path": "/Users/kgousset/Library/CloudStorage/OneDrive-Personal/Search_Data_Files/SAGE_DECOYFREE/VALIDATION/fig2_plots/ISB18/Figure2G(i)_PeptideOverlap_ALL_summary_results.table.csv",
+      "size": 7724929,
+      "modified_unix_seconds": 1785790851,
+      "sha256": "4020be7a5d9da4b790a11b1eda981e87fb290b492703824ebcecc9f4c7d15d74"
+    },
+    {
+      "path": "/Users/kgousset/Library/CloudStorage/OneDrive-Personal/Search_Data_Files/SAGE_DECOYFREE/VALIDATION/fig2_plots/ISB18/Figure2G(ii)_PeptideOverlap_TargetOnly_1pctFDR_inclusive_overlap_barplot.png",
+      "size": 144557,
+      "modified_unix_seconds": 1785790852,
+      "sha256": "c89427616e49356c0982802f12ccc537e81c6c11cfbee498648f76fd801036fb"
+    },
+    {
+      "path": "/Users/kgousset/Library/CloudStorage/OneDrive-Personal/Search_Data_Files/SAGE_DECOYFREE/VALIDATION/fig2_plots/ISB18/Figure2G(ii)_PeptideOverlap_TargetOnly_1pctFDR_inclusive_overlap_summary.csv",
+      "size": 208,
+      "modified_unix_seconds": 1785790852,
+      "sha256": "5b61b626d834c01dcaa31d784939135c8ee39c8e055cd9f26d5914e36b69d9c9"
+    },
+    {
+      "path": "/Users/kgousset/Library/CloudStorage/OneDrive-Personal/Search_Data_Files/SAGE_DECOYFREE/VALIDATION/fig2_plots/ISB18/Figure2G(ii)_PeptideOverlap_TargetOnly_1pctFDR_jaccard_results.csv",
+      "size": 843,
+      "modified_unix_seconds": 1785790852,
+      "sha256": "3d331574663b0b9d00b146564ef8f4eeb5a5c2ae33224c3e7b92358902481f35"
+    },
+    {
+      "path": "/Users/kgousset/Library/CloudStorage/OneDrive-Personal/Search_Data_Files/SAGE_DECOYFREE/VALIDATION/fig2_plots/ISB18/Figure2G(ii)_PeptideOverlap_TargetOnly_1pctFDR_summary_results.table.csv",
+      "size": 708348,
+      "modified_unix_seconds": 1785790852,
+      "sha256": "2960562c990e662f7905cf695c6d611f6a1ed8947fa0ce781770c222635300bc"
+    },
+    {
+      "path": "/Users/kgousset/Library/CloudStorage/OneDrive-Personal/Search_Data_Files/SAGE_DECOYFREE/VALIDATION/fig2_plots/ISB18/Figure2G(iii)_PeptideOverlap_EntrapmentOnly_ALL_inclusive_overlap_barplot.png",
+      "size": 133346,
+      "modified_unix_seconds": 1785790853,
+      "sha256": "1b58f82ade957e5cfcd31103bda5fb24921e6ff4fe8783e9479a608355a206c2"
+    },
+    {
+      "path": "/Users/kgousset/Library/CloudStorage/OneDrive-Personal/Search_Data_Files/SAGE_DECOYFREE/VALIDATION/fig2_plots/ISB18/Figure2G(iii)_PeptideOverlap_EntrapmentOnly_ALL_inclusive_overlap_summary.csv",
+      "size": 216,
+      "modified_unix_seconds": 1785790853,
+      "sha256": "25f3af94e467f60f3937350a70a306564d0dbfdc27a7c7cae3a0f249b3e74e75"
+    },
+    {
+      "path": "/Users/kgousset/Library/CloudStorage/OneDrive-Personal/Search_Data_Files/SAGE_DECOYFREE/VALIDATION/fig2_plots/ISB18/Figure2G(iii)_PeptideOverlap_EntrapmentOnly_ALL_jaccard_results.csv",
+      "size": 369,
+      "modified_unix_seconds": 1785790852,
+      "sha256": "df64aedfa81e2f81e710d7c3c7bb1551f187c9e95514d9de0fb143c623be9f32"
+    },
+    {
+      "path": "/Users/kgousset/Library/CloudStorage/OneDrive-Personal/Search_Data_Files/SAGE_DECOYFREE/VALIDATION/fig2_plots/ISB18/Figure2G(iii)_PeptideOverlap_EntrapmentOnly_ALL_summary_results.table.csv",
+      "size": 3220706,
+      "modified_unix_seconds": 1785790853,
+      "sha256": "dfbd7efd8e61e92d5225b53ff90f18efbbfba18b723f9a1642108a2648295d19"
+    },
+    {
+      "path": "/Users/kgousset/Library/CloudStorage/OneDrive-Personal/Search_Data_Files/SAGE_DECOYFREE/VALIDATION/fig2_plots/ISB18/Figure2H_Entrapment_Peptide_Combined.png",
+      "size": 197922,
+      "modified_unix_seconds": 1785790853,
+      "sha256": "3363115f92c0d39b360566afd5ccd75b0954901a93b0f21027b298007a1b1a46"
+    },
+    {
+      "path": "/Users/kgousset/Library/CloudStorage/OneDrive-Personal/Search_Data_Files/SAGE_DECOYFREE/VALIDATION/fig2_plots/ISB18/Figure2H_peptide_calibration.tsv",
+      "size": 372,
+      "modified_unix_seconds": 1785790853,
+      "sha256": "96fbf9c84567e416f9838f1f1fb3e4520d577e40671a17de6996fc5d5391ec47"
+    },
+    {
+      "path": "/Users/kgousset/Library/CloudStorage/OneDrive-Personal/Search_Data_Files/SAGE_DECOYFREE/VALIDATION/fig2_plots/ISB18/Figure2I_Cumulative_Entrapment_Combined.png",
+      "size": 137100,
+      "modified_unix_seconds": 1785790854,
+      "sha256": "614fa68aa46f5757647b30061bd587b9bbdaa9a196e28a955947fa14aee7d63a"
+    },
+    {
+      "path": "/Users/kgousset/Library/CloudStorage/OneDrive-Personal/Search_Data_Files/SAGE_DECOYFREE/VALIDATION/fig2_plots/ISB18/Figure2J_Discovery_Power.png",
+      "size": 205124,
+      "modified_unix_seconds": 1785790854,
+      "sha256": "1b3fa0ab97d724c296dfda5b36f526293ee254835f3d53e625c366a476e99278"
+    },
+    {
+      "path": "/Users/kgousset/Library/CloudStorage/OneDrive-Personal/Search_Data_Files/SAGE_DECOYFREE/VALIDATION/fig2_plots/ISB18/Figure2K_Protein_Calibration.png",
+      "size": 131580,
+      "modified_unix_seconds": 1785790855,
+      "sha256": "86828901d71381b9f28d59065dfffea8cdadf30fe1159369fd141e0a59a922ab"
+    },
+    {
+      "path": "/Users/kgousset/Library/CloudStorage/OneDrive-Personal/Search_Data_Files/SAGE_DECOYFREE/VALIDATION/fig2_plots/ISB18/Figure2L_DeltaMass_Model.png",
+      "size": 99684,
+      "modified_unix_seconds": 1785790855,
+      "sha256": "f4ef2cc6be3f8d5c7085c37ba887d99d503f7f7edca2a0937df96650a6f2f15d"
+    },
+    {
+      "path": "/Users/kgousset/Library/CloudStorage/OneDrive-Personal/Search_Data_Files/SAGE_DECOYFREE/VALIDATION/fig2_plots/ISB18/peptide_tables/peptide_table__Lower_Order.tsv",
+      "size": 452586,
+      "modified_unix_seconds": 1785790745,
+      "sha256": "8becd5319ab0f2d7335c14186b58c30618ec3fec7000adb7a24bd382ff63318b"
+    },
+    {
+      "path": "/Users/kgousset/Library/CloudStorage/OneDrive-Personal/Search_Data_Files/SAGE_DECOYFREE/VALIDATION/fig2_plots/ISB18/peptide_tables/peptide_table__MLE.tsv",
+      "size": 434984,
+      "modified_unix_seconds": 1785790752,
+      "sha256": "ae8679060e135c37cd74d09080a0e4d520e232ea5af971e1ddc4cf2c8e3010be"
+    },
+    {
+      "path": "/Users/kgousset/Library/CloudStorage/OneDrive-Personal/Search_Data_Files/SAGE_DECOYFREE/VALIDATION/fig2_plots/ISB18/peptide_tables/peptide_table__MSFDR.tsv",
+      "size": 439058,
+      "modified_unix_seconds": 1785790755,
+      "sha256": "6dd0f67e7433d26f2d039280a35a4caed2ed5e21004fcbf27e20ad3f6c86fbcd"
+    },
+    {
+      "path": "/Users/kgousset/Library/CloudStorage/OneDrive-Personal/Search_Data_Files/SAGE_DECOYFREE/VALIDATION/fig2_plots/ISB18/peptide_tables/peptide_table__MSFDR2_SMIX.tsv",
+      "size": 441865,
+      "modified_unix_seconds": 1785790757,
+      "sha256": "b007f19237594e0ac7ce4fec3037d209261916a90773f4219d36700cca7ee971"
+    },
+    {
+      "path": "/Users/kgousset/Library/CloudStorage/OneDrive-Personal/Search_Data_Files/SAGE_DECOYFREE/VALIDATION/fig2_plots/ISB18/peptide_tables/peptide_table__Moments.tsv",
+      "size": 444868,
+      "modified_unix_seconds": 1785790754,
+      "sha256": "d6718dd03ed693ca7479a79c515779e562b7f700675fcb00aec9ca3d12b3be01"
+    },
+    {
+      "path": "/Users/kgousset/Library/CloudStorage/OneDrive-Personal/Search_Data_Files/SAGE_DECOYFREE/VALIDATION/fig2_plots/ISB18/peptide_tables/peptide_table__NOKOI.tsv",
+      "size": 448034,
+      "modified_unix_seconds": 1785790758,
+      "sha256": "3e3d8018c97c9d983deb315bf6cca01e520dc9890c6582908cb33e682261bbca"
+    },
+    {
+      "path": "/Users/kgousset/Library/CloudStorage/OneDrive-Personal/Search_Data_Files/SAGE_DECOYFREE/VALIDATION/fig2_plots/ISB18/peptide_tables/peptide_table__Sage_TDA.tsv",
+      "size": 379803,
+      "modified_unix_seconds": 1785790741,
+      "sha256": "472eab180b9fd7fadc39cdb111f2e3ff9902be8f368433195f59a319ffa62659"
+    },
+    {
+      "path": "/Users/kgousset/Library/CloudStorage/OneDrive-Personal/Search_Data_Files/SAGE_DECOYFREE/VALIDATION/fig2_plots/ISB18/workflow_comparison/Entrapment_FDP_Raw_vs_Level4.png",
+      "size": 277516,
+      "modified_unix_seconds": 1785792561,
+      "sha256": "9f137454c2280a5c576c7d7eb528a0326e15d116bfe7c282b34c3a33f584f683"
+    },
+    {
+      "path": "/Users/kgousset/Library/CloudStorage/OneDrive-Personal/Search_Data_Files/SAGE_DECOYFREE/VALIDATION/fig2_plots/ISB18/workflow_comparison/Final_NoEnt_Transfer_Delta.csv",
+      "size": 3179,
+      "modified_unix_seconds": 1785792561,
+      "sha256": "2d3697fec7bd10c2e53167e4a2737459effef3155cfeeed4c0e4fe46273b3bbf"
+    },
+    {
+      "path": "/Users/kgousset/Library/CloudStorage/OneDrive-Personal/Search_Data_Files/SAGE_DECOYFREE/VALIDATION/fig2_plots/ISB18/workflow_comparison/Final_NoEnt_Transfer_Delta.png",
+      "size": 128607,
+      "modified_unix_seconds": 1785792561,
+      "sha256": "710761582ebc28b702750490b86c1c1581af79894627b23eaf48d67be7139b06"
+    },
+    {
+      "path": "/Users/kgousset/Library/CloudStorage/OneDrive-Personal/Search_Data_Files/SAGE_DECOYFREE/VALIDATION/fig2_plots/ISB18/workflow_comparison/MS2Rescore_Added_Target_IDs.csv",
+      "size": 746,
+      "modified_unix_seconds": 1785792561,
+      "sha256": "d8c9d6a05ab4f3be3aa776e0def8822d51155282aea9c9edceb842b3b542504f"
+    },
+    {
+      "path": "/Users/kgousset/Library/CloudStorage/OneDrive-Personal/Search_Data_Files/SAGE_DECOYFREE/VALIDATION/fig2_plots/ISB18/workflow_comparison/MS2Rescore_Added_Target_IDs.png",
+      "size": 144529,
+      "modified_unix_seconds": 1785792561,
+      "sha256": "031085a8b845e98f278cfc4c554d94da50591fb9d0d4b244109b4491db010d60"
+    },
+    {
+      "path": "/Users/kgousset/Library/CloudStorage/OneDrive-Personal/Search_Data_Files/SAGE_DECOYFREE/VALIDATION/fig2_plots/ISB18/workflow_comparison/MS2Rescore_Missing_Baselines.csv",
+      "size": 255,
+      "modified_unix_seconds": 1785792561,
+      "sha256": "46e906cad7a99ab3172da000f4cdfd90e069efe400da2787429265646a888544"
+    },
+    {
+      "path": "/Users/kgousset/Library/CloudStorage/OneDrive-Personal/Search_Data_Files/SAGE_DECOYFREE/VALIDATION/fig2_plots/ISB18/workflow_comparison/Workflow_Accepted_ID_Summary.csv",
+      "size": 53592,
+      "modified_unix_seconds": 1785792560,
+      "sha256": "c7a951621a92d9178224ffcf3c73f9f4b4eb9f83a0574a7bb274e99efe798bb2"
+    },
+    {
+      "path": "/Users/kgousset/Library/CloudStorage/OneDrive-Personal/Search_Data_Files/SAGE_DECOYFREE/VALIDATION/fig2_plots/ISB18/workflow_comparison/Workflow_Stage_Target_Identifications.png",
+      "size": 363025,
+      "modified_unix_seconds": 1785792560,
+      "sha256": "04eb8d7ccf0de87f951c284b79ef8647a3df448f8eab3d528291295269175c0b"
+    }
+  ]
+}

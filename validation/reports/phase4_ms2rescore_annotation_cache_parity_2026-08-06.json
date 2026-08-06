@@ -1,0 +1,147 @@
+{
+  "schema_version": 1,
+  "phase": 4,
+  "status": "passed",
+  "source_commit_before_phase_changes": "f97b94813730b48c2fc19f9a36e3e3b132a2bcb9",
+  "working_tree_changes_included": true,
+  "phase1_through_phase3_mirror_baseline_commit": "8438c32",
+  "scope": {
+    "architecture": "MS2Rescore annotations are cached separately from the immutable native candidate pool",
+    "identity": "strict search fingerprint plus ordered stable candidate IDs, preliminary score/q/PEP calibration input, rank depth, generator settings, mapped spectrum hashes, wrapper and Python hashes, detected package versions, and schema",
+    "join": "sage-candidate-id-v1 only; process-local psm_id is never durable cache identity",
+    "target_only_boundary": "the target-only Sage search remains fresh and receives a distinct annotation cache",
+    "invalidation": "missing cache generates; identity mismatch, count mismatch, duplicate IDs, schema mismatch, or payload hash mismatch fails closed",
+    "cleanup": "workflow-managed transient input/config/output files are removed after a new cache is durably written unless an external output directory is explicitly requested"
+  },
+  "isb18_fixed_window_validation": {
+    "manifest": "validation/manifests/isb18_phase4_ms2rescore_cache_parity_macos_2026-08-06.json",
+    "runtime_output_root": "/Users/kgousset/Documents/Codex/2026-07-21/github-plugin-github-openai-curated-remote/outputs/phase4_isb18_parity",
+    "frozen_entrapment_input": "/Users/kgousset/Library/CloudStorage/OneDrive-Personal/FASTA_Files/FASTA/target_entrapment/ISB18_foreign_species_entrapment_protein.fasta",
+    "selected_window": {
+      "min_rank": 9,
+      "max_rank": 18
+    },
+    "fitted_moments": {
+      "mu": 11.165249648662108,
+      "beta": 1.9328009791851344
+    },
+    "native_candidate_pool": {
+      "search_fingerprint": "6d5d7c560f9ea2ae97163aac06a2ca7857a69e318153e6e11d27a2522df4980c",
+      "candidate_count": 793793,
+      "retained_rank_depth": 50,
+      "reused_by_ms2rescore_stage": true
+    },
+    "entrapment_annotation_cache": {
+      "annotation_fingerprint": "37fac097ff8c9f9462f91e64f29ccea379cf881292159c9c7ea3fbd65327a647",
+      "candidate_count": 793793,
+      "joined_count": 793793,
+      "compressed_payload_bytes": 50676464,
+      "payload_sha256": "e6f225af0040671221687b8d36fccd08733127baf89b2fe57f5f2cbb5eb34426",
+      "first_pass_reused": false,
+      "second_pass_reused": true
+    },
+    "target_only_annotation_cache": {
+      "annotation_fingerprint": "a0dba9687d830256c63b564007c9cdad48419b9df21ecdb04bdd4f0d478438cf",
+      "search_fingerprint": "6e0b1bbc943f135f679404f258ee1992346cf51a04068bdad7619dc37b275760",
+      "candidate_count": 752722,
+      "joined_count": 752722,
+      "compressed_payload_bytes": 47877468,
+      "payload_sha256": "e81c44e7a2073a969e4db6d035facaa08381fd8e109f9abc7c1ed6c122ea801c",
+      "first_pass_reused": false,
+      "second_pass_reused": true
+    }
+  },
+  "parity": {
+    "optimized_vs_frozen_legacy": {
+      "raw_q_fraction_changes": {
+        "psm": 0.0,
+        "peptide": 0.0,
+        "protein": 0.0
+      },
+      "level4_fraction_changes": {
+        "psm": 0.0,
+        "peptide": 0.0,
+        "protein": 0.0
+      },
+      "within_tolerance": true
+    },
+    "ms2rescore_vs_frozen_legacy": {
+      "raw_q_counts": {
+        "legacy_target_psms": 10508,
+        "phase4_target_psms": 10506,
+        "legacy_target_peptides": 339,
+        "phase4_target_peptides": 339,
+        "legacy_target_proteins": 17,
+        "phase4_target_proteins": 17
+      },
+      "level4_counts": {
+        "legacy_target_psms": 10480,
+        "phase4_target_psms": 10478,
+        "legacy_target_peptides": 338,
+        "phase4_target_peptides": 338,
+        "legacy_target_proteins": 17,
+        "phase4_target_proteins": 17
+      },
+      "maximum_observed_fraction_difference": 0.00019083969465648855,
+      "within_0_3_percent_tolerance": true
+    },
+    "target_only_vs_pre_cache_native_locked": {
+      "raw_q_counts": {
+        "baseline_target_psms": 10478,
+        "phase4_target_psms": 10470,
+        "baseline_target_peptides": 320,
+        "phase4_target_peptides": 319,
+        "baseline_target_proteins": 17,
+        "phase4_target_proteins": 17
+      },
+      "level4_counts": {
+        "baseline_target_psms": 10449,
+        "phase4_target_psms": 10441,
+        "baseline_target_peptides": 319,
+        "phase4_target_peptides": 318,
+        "baseline_target_proteins": 17,
+        "phase4_target_proteins": 17
+      },
+      "maximum_observed_fraction_difference": 0.003134796238244514,
+      "within_0_5_percent_tolerance": true
+    },
+    "known_legacy_target_only_gap": {
+      "within_tolerance": false,
+      "legacy_level4_target_psms": 13201,
+      "phase4_level4_target_psms": 10441,
+      "legacy_level4_target_peptides": 366,
+      "phase4_level4_target_peptides": 318,
+      "interpretation": "This gap predates Phase 4. The pre-cache native locked-artifact run already produced 10449 Level-4 PSMs and 319 peptides. It remains an explicit target-only calibration/recurrence investigation and is not attributed to annotation caching."
+    }
+  },
+  "performance": {
+    "first_entrapment_annotation_generation_seconds": 1504,
+    "first_target_only_search_plus_annotation_generation_seconds": 1404,
+    "exact_three_stage_cache_hit_rerun_seconds_approx": 75,
+    "external_generator_invocations_on_cache_hit_rerun": 0,
+    "temporary_files_present_after_verified_cleanup": 0
+  },
+  "verification": {
+    "workspace_unit_and_integration_tests_passed": 157,
+    "workspace_unit_and_integration_tests_failed": 0,
+    "doctests_passed": true,
+    "release_build_passed": true,
+    "cargo_fmt_check_passed": true,
+    "git_diff_check_passed": true,
+    "real_isb_workflow_exit_code": 0,
+    "cache_hit_workflow_exit_code": 0,
+    "validation_parity_sha256": "66da17e8f9a50eba41e8b67460586e68ec0a951818ce0047a3c4c35ff7f59cab",
+    "validation_summary_sha256": "10d7c961c8bcc1f771b7522927b0f9af6ce3b5a6b8e1e47b21a6c34725b8ac20",
+    "workflow_ms2rescore_annotations_sha256": "91c80a4dcd3913700859359d26e23c3a445eb136cf2ff22fd602714400746057"
+  },
+  "scientific_release_gate": {
+    "changed_by_phase4": false,
+    "eligible_for_statistical_default_change": false,
+    "reasons": [
+      "the ISB run is a development parity run, not a holdout",
+      "the legacy versus locked-artifact target-only discrepancy remains unresolved",
+      "a matched TDC benchmark was not part of this engineering phase"
+    ],
+    "interpretation": "These gates do not block use of the Phase 4 annotation cache. They block declaring a new statistical default or treating the target-only locked-artifact behavior as legacy-equivalent."
+  }
+}

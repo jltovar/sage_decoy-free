@@ -1,0 +1,18 @@
+{
+  "schema_version": 1,
+  "search_config": "/path/to/search.json",
+  "target_fasta": "/path/to/target.fasta",
+  "output_directory": "/path/to/entrapment_audit",
+  "database_mode": "native_generated",
+  "foreign_fastas": [
+    "/path/to/foreign_species_1.fasta",
+    "/path/to/foreign_species_2.fasta"
+  ],
+  "output_fasta": "/path/to/entrapment_audit/target_entrapment.fasta",
+  "foreign_source_mode": "automatic",
+  "shared_peptide_exclusion_mode": "sage_search_space",
+  "selected_foreign_fasta": null,
+  "legacy_parity_reference": null,
+  "seed": 2000,
+  "protein_fold": 1
+}

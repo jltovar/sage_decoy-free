@@ -1,0 +1,76 @@
+{
+  "schema_version": 1,
+  "dataset": "ISB18",
+  "frozen_on": "2026-08-04",
+  "source_repository_head_when_frozen": "f97b94813730b48c2fc19f9a36e3e3b132a2bcb9",
+  "source_tree_dirty_when_frozen": true,
+  "status": "corrected_searches_complete_with_known_comparison_gaps",
+  "effective_entrapment_ratios": {
+    "psm": 0.7760240511,
+    "peptide": 0.7667638484,
+    "protein": 1.0
+  },
+  "optimizer_validation_scope": "level4",
+  "models": [
+    {
+      "model": "moments",
+      "selected_window": { "min_rank": 9, "max_rank": 18 },
+      "optimized": true,
+      "ms2rescore": true,
+      "target_only": true
+    },
+    {
+      "model": "mle",
+      "selected_window": { "min_rank": 8, "max_rank": 25 },
+      "optimized": true,
+      "ms2rescore": true,
+      "target_only": true
+    },
+    {
+      "model": "lower_order",
+      "selected_window": { "min_rank": 6, "max_rank": 9 },
+      "optimized": true,
+      "ms2rescore": true,
+      "target_only": true
+    },
+    {
+      "model": "msfdr",
+      "selected_window": { "min_rank": 9, "max_rank": 13 },
+      "optimized": true,
+      "ms2rescore": true,
+      "target_only": true
+    },
+    {
+      "model": "msfdr1_smix",
+      "selected_window": null,
+      "rank1_only": true,
+      "optimized": false,
+      "ms2rescore": true,
+      "target_only": true,
+      "known_gap": "pre-MS2Rescore +entrapment result is missing"
+    },
+    {
+      "model": "msfdr2_smix",
+      "selected_window": { "min_rank": 9, "max_rank": 17 },
+      "optimized": true,
+      "ms2rescore": true,
+      "target_only": true
+    },
+    {
+      "model": "nokoi",
+      "selected_window": { "min_rank": 2, "max_rank": 15 },
+      "optimized": true,
+      "ms2rescore": true,
+      "target_only": true
+    },
+    {
+      "model": "ensemble",
+      "selected_window": null,
+      "constituent_windows_locked_independently": true,
+      "optimized": false,
+      "ms2rescore": true,
+      "target_only": true,
+      "known_gap": "pre-MS2Rescore +entrapment result is missing"
+    }
+  ]
+}

@@ -1,0 +1,25 @@
+{
+  "schema_version": 1,
+  "name": "pxd001468_moments_corrected_legacy_results_audit_2026-08-05",
+  "output_root": "/Users/kgousset/Library/CloudStorage/OneDrive-Personal/github/sage_decoy-free/validation/reports/pxd001468_moments_corrected_legacy_2026-08-05",
+  "effective_ratios": {
+    "psm": 0.631660497645,
+    "peptide": 0.594913242822,
+    "protein": 1.0
+  },
+  "fdr_threshold": 0.01,
+  "maximum_transfer_fraction_loss": 0.20,
+  "minimum_entrapment_peptides_for_stable_estimate": 3,
+  "validation_layer": "level4",
+  "maximum_parity_fraction_difference": 0.001,
+  "tdc_reference_method": "tdc_fork",
+  "runs": [
+    { "method": "moments", "stage": "optimized", "results": "/Users/kgousset/Library/CloudStorage/OneDrive-Personal/Search_Data_Files/SAGE_DECOYFREE/VALIDATION/PXD001468/DECOYFREE/MOMENTS/results.sage.tsv", "mode": "decoy_free", "expected_search_space": "+Ent" },
+    { "method": "moments", "stage": "ms2rescore", "results": "/Users/kgousset/Library/CloudStorage/OneDrive-Personal/Search_Data_Files/SAGE_DECOYFREE/VALIDATION/PXD001468/DECOYFREE/MOMENTS/2nd_ms2rescore/results.sage.tsv", "mode": "decoy_free", "expected_search_space": "+Ent" },
+    { "method": "moments", "stage": "target_only", "results": "/Users/kgousset/Library/CloudStorage/OneDrive-Personal/Search_Data_Files/SAGE_DECOYFREE/VALIDATION/PXD001468/DECOYFREE/MOMENTS/3rd_no_ent/results.sage.tsv", "mode": "decoy_free", "expected_search_space": "No Ent", "calibration_stage": "ms2rescore" },
+    { "method": "tdc_fork", "stage": "optimized", "results": "/Users/kgousset/Library/CloudStorage/OneDrive-Personal/Search_Data_Files/SAGE_DECOYFREE/VALIDATION/PXD001468/DECOY/results.sage.tsv", "mode": "tdc", "expected_search_space": "+Ent" },
+    { "method": "tdc_fork", "stage": "target_only", "results": "/Users/kgousset/Library/CloudStorage/OneDrive-Personal/Search_Data_Files/SAGE_DECOYFREE/VALIDATION/PXD001468/DECOY/3rd_no_ent/results.sage.tsv", "mode": "tdc", "expected_search_space": "No Ent" },
+    { "method": "tdc_upstream", "stage": "optimized", "results": "/Users/kgousset/Library/CloudStorage/OneDrive-Personal/Search_Data_Files/SAGE_DECOYFREE/VALIDATION/PXD001468/DECOY/VANILLA/results.sage.tsv", "mode": "tdc", "expected_search_space": "+Ent" },
+    { "method": "tdc_upstream", "stage": "target_only", "results": "/Users/kgousset/Library/CloudStorage/OneDrive-Personal/Search_Data_Files/SAGE_DECOYFREE/VALIDATION/PXD001468/DECOY/VANILLA/3rd_no_ent/results.sage.tsv", "mode": "tdc", "expected_search_space": "No Ent" }
+  ]
+}

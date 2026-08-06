@@ -1,0 +1,14 @@
+[
+  {
+    "model": "moments",
+    "eligible": true,
+    "reasons": [],
+    "validation_stage": "ms2rescore",
+    "validation_layer": "level4",
+    "target_peptides": 32185,
+    "entrapment_peptides": 59,
+    "peptide_fdp": 0.004905536672951243,
+    "underpowered": false,
+    "warnings": []
+  }
+]

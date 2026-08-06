@@ -1,0 +1,58 @@
+[
+  {
+    "decoy_free_method": "moments",
+    "tdc_method": "tdc_fork",
+    "stage": "optimized",
+    "layer": "raw_q",
+    "tdc_layer": "raw_q",
+    "psm_yield_difference": -163187,
+    "peptide_yield_difference": -55657,
+    "protein_yield_difference": -4513,
+    "peptide_entrapment_fdp": 0.04378321378119997,
+    "calibration_stage": "optimized",
+    "calibration_constrained": false,
+    "improves_peptide_yield": false
+  },
+  {
+    "decoy_free_method": "moments",
+    "tdc_method": "tdc_fork",
+    "stage": "optimized",
+    "layer": "level4",
+    "tdc_layer": "reportable_q",
+    "psm_yield_difference": -197181,
+    "peptide_yield_difference": -58219,
+    "protein_yield_difference": -4513,
+    "peptide_entrapment_fdp": 0.0026255617701257234,
+    "calibration_stage": "optimized",
+    "calibration_constrained": true,
+    "improves_peptide_yield": false
+  },
+  {
+    "decoy_free_method": "moments",
+    "tdc_method": "tdc_fork",
+    "stage": "target_only",
+    "layer": "raw_q",
+    "tdc_layer": "raw_q",
+    "psm_yield_difference": -148344,
+    "peptide_yield_difference": -49305,
+    "protein_yield_difference": -3729,
+    "peptide_entrapment_fdp": 0.04443592664418471,
+    "calibration_stage": "ms2rescore",
+    "calibration_constrained": false,
+    "improves_peptide_yield": false
+  },
+  {
+    "decoy_free_method": "moments",
+    "tdc_method": "tdc_fork",
+    "stage": "target_only",
+    "layer": "level4",
+    "tdc_layer": "reportable_q",
+    "psm_yield_difference": -182181,
+    "peptide_yield_difference": -52260,
+    "protein_yield_difference": -3729,
+    "peptide_entrapment_fdp": 0.004905536672951243,
+    "calibration_stage": "ms2rescore",
+    "calibration_constrained": true,
+    "improves_peptide_yield": false
+  }
+]

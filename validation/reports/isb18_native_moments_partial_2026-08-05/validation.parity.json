@@ -1,0 +1,42 @@
+[
+  {
+    "baseline_method": "legacy_moments",
+    "native_method": "moments",
+    "stage": "optimized",
+    "layer": "raw_q",
+    "psm_fraction_change": 0.0003981287946650742,
+    "peptide_fraction_change": 0.0,
+    "protein_fraction_change": 0.0,
+    "within_tolerance": true
+  },
+  {
+    "baseline_method": "legacy_moments",
+    "native_method": "moments",
+    "stage": "optimized",
+    "layer": "level4",
+    "psm_fraction_change": 0.000499001996007984,
+    "peptide_fraction_change": 0.0,
+    "protein_fraction_change": 0.0,
+    "within_tolerance": true
+  },
+  {
+    "baseline_method": "legacy_moments",
+    "native_method": "moments",
+    "stage": "ms2rescore",
+    "layer": "raw_q",
+    "psm_fraction_change": 0.0026646364674533687,
+    "peptide_fraction_change": 0.0,
+    "protein_fraction_change": 0.0,
+    "within_tolerance": true
+  },
+  {
+    "baseline_method": "legacy_moments",
+    "native_method": "moments",
+    "stage": "ms2rescore",
+    "layer": "level4",
+    "psm_fraction_change": 0.002767175572519084,
+    "peptide_fraction_change": 0.0,
+    "protein_fraction_change": 0.0,
+    "within_tolerance": true
+  }
+]

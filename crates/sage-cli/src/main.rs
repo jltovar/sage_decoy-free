@@ -1,7 +1,11 @@
 use clap::{value_parser, Arg, Command, ValueHint};
 use rayon::ThreadPoolBuilder;
+use sage_cli::audit::execute_validation_audit;
+use sage_cli::entrapment::execute_entrapment_audit;
 use sage_cli::input::Input;
+use sage_cli::provenance::{freeze_baseline, write_json_atomic};
 use sage_cli::runner::Runner;
+use sage_cli::workflow::execute_workflow;
 
 fn main() -> anyhow::Result<()> {
     env_logger::Builder::default()
@@ -15,7 +19,7 @@ fn main() -> anyhow::Result<()> {
 		.about("\u{1F52E} Sage \u{1F9D9} - Proteomics searching so fast—and now decoy-free—it feels like magic!")
 		.arg(
 			Arg::new("parameters")
-				.required(true)
+				.required(false)
 				.value_parser(clap::builder::NonEmptyStringValueParser::new())
 				.help("Path to configuration parameters (JSON file)")
 				.value_hint(ValueHint::FilePath),
@@ -29,6 +33,67 @@ fn main() -> anyhow::Result<()> {
                      configuration file.",
                 )
                 .value_hint(ValueHint::FilePath),
+        )
+        .subcommand(
+            Command::new("workflow")
+                .about("Run or plan a resumable Sage Decoy-Free validation workflow")
+                .arg(
+                    Arg::new("manifest")
+                        .required(true)
+                        .value_parser(clap::builder::NonEmptyStringValueParser::new())
+                        .value_hint(ValueHint::FilePath)
+                        .help("Path to a Sage Decoy-Free workflow manifest"),
+                )
+                .arg(
+                    Arg::new("plan-only")
+                        .long("plan-only")
+                        .action(clap::ArgAction::SetTrue)
+                        .help("Validate and materialize the workflow plan without running searches"),
+                ),
+        )
+        .subcommand(
+            Command::new("audit-entrapment")
+                .about("Generate or inspect an entrapment FASTA without running spectral searches")
+                .arg(
+                    Arg::new("manifest")
+                        .required(true)
+                        .value_parser(clap::builder::NonEmptyStringValueParser::new())
+                        .value_hint(ValueHint::FilePath)
+                        .help("Path to an entrapment audit manifest"),
+                ),
+        )
+        .subcommand(
+            Command::new("freeze-baseline")
+                .about("Freeze hashes and source provenance for corrected validation results")
+                .arg(
+                    Arg::new("output")
+                        .required(true)
+                        .long("output")
+                        .value_hint(ValueHint::FilePath),
+                )
+                .arg(
+                    Arg::new("paths")
+                        .required(true)
+                        .num_args(1..)
+                        .value_hint(ValueHint::AnyPath),
+                )
+                .arg(
+                    Arg::new("status")
+                        .long("status")
+                        .default_value("complete")
+                        .help("Scientific status recorded in the frozen manifest"),
+                ),
+        )
+        .subcommand(
+            Command::new("validate-results")
+                .about("Audit completed Sage result tables without rerunning searches")
+                .arg(
+                    Arg::new("manifest")
+                        .required(true)
+                        .value_parser(clap::builder::NonEmptyStringValueParser::new())
+                        .value_hint(ValueHint::FilePath)
+                        .help("Path to a validation audit manifest"),
+                ),
         )
         .arg(
             Arg::new("fasta")
@@ -115,7 +180,81 @@ fn main() -> anyhow::Result<()> {
     let parallel = matches
         .get_one::<u16>("batch-size")
         .copied()
-        .unwrap_or_else(|| num_cpus::get() as u16 / 2) as usize;
+        .unwrap_or_else(|| (num_cpus::get() as u16 / 2).max(1)) as usize;
+
+    if let Some(("audit-entrapment", audit_matches)) = matches.subcommand() {
+        let manifest = audit_matches
+            .get_one::<String>("manifest")
+            .expect("required entrapment audit manifest");
+        let report = execute_entrapment_audit(std::path::Path::new(manifest))?;
+        log::info!(
+            "entrapment audit complete: protein_ratio={} peptide_ratio={} peptidoform_ratio={}",
+            report.database.measured().protein_ratio,
+            report.database.measured().peptide_ratio,
+            report.database.measured().peptidoform_ratio
+        );
+        return Ok(());
+    }
+
+    if let Some(("workflow", workflow_matches)) = matches.subcommand() {
+        let manifest = workflow_matches
+            .get_one::<String>("manifest")
+            .expect("required workflow manifest");
+        let plan_only = workflow_matches
+            .get_one::<bool>("plan-only")
+            .copied()
+            .unwrap_or(false);
+        let source_repo = std::env::current_dir()?;
+        let state = execute_workflow(
+            std::path::Path::new(manifest),
+            &source_repo,
+            parallel,
+            plan_only,
+        )?;
+        log::info!(
+            "workflow complete: stages={} validation_summaries={} pending_gates={}",
+            state.stages.len(),
+            state.validation.len(),
+            state.pending_validation_gates.len()
+        );
+        return Ok(());
+    }
+    if let Some(("freeze-baseline", baseline_matches)) = matches.subcommand() {
+        let output = baseline_matches
+            .get_one::<String>("output")
+            .expect("required baseline output");
+        let paths = baseline_matches
+            .get_many::<String>("paths")
+            .expect("required baseline paths")
+            .map(std::path::PathBuf::from)
+            .collect::<Vec<_>>();
+        let status = baseline_matches
+            .get_one::<String>("status")
+            .expect("defaulted baseline status");
+        let source_repo = std::env::current_dir()?;
+        let frozen = freeze_baseline(&paths, &source_repo, status)?;
+        write_json_atomic(std::path::Path::new(output), &frozen)?;
+        log::info!("frozen baseline files={}", frozen.files.len());
+        return Ok(());
+    }
+    if let Some(("validate-results", audit_matches)) = matches.subcommand() {
+        let manifest = audit_matches
+            .get_one::<String>("manifest")
+            .expect("required validation audit manifest");
+        let report = execute_validation_audit(std::path::Path::new(manifest))?;
+        log::info!(
+            "validation audit complete: summaries={} missing={} tdc_comparisons={}",
+            report.summaries.len(),
+            report.missing_runs.len(),
+            report.tdc_benchmarks.len()
+        );
+        return Ok(());
+    }
+
+    anyhow::ensure!(
+        matches.get_one::<String>("parameters").is_some(),
+        "a search parameter JSON or the `workflow` subcommand is required"
+    );
 
     let parquet = matches.get_one::<bool>("parquet").copied().unwrap_or(false);
     let send_telemetry = matches

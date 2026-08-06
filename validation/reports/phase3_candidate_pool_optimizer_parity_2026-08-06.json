@@ -1,0 +1,125 @@
+{
+  "schema_version": 1,
+  "phase": 3,
+  "status": "passed",
+  "source_commit_before_phase_changes": "f97b94813730b48c2fc19f9a36e3e3b132a2bcb9",
+  "working_tree_changes_included": true,
+  "scope": {
+    "architecture": "one immutable native candidate pool per strict search fingerprint, shared across compatible statistical analyses",
+    "fallback": "search-affecting configuration changes produce a different fingerprint and therefore a separate pool",
+    "optimizer": "exact lean null-window evaluation with compact metrics and one full rematerialization of the selected window",
+    "phase4_boundary": "stable candidate identifiers are available for a future separately cached MS2Rescore annotation layer",
+    "target_only_boundary": "target-only searches remain fresh searches in Phase 3"
+  },
+  "candidate_pool": {
+    "manifest": "/Users/kgousset/Library/CloudStorage/OneDrive-Personal/Search_Data_Files/SAGE_DECOYFREE/VALIDATION/NATIVE_WORKFLOW/ISB18/PHASE3_SHARED_POOL_PARITY_FINAL_2026-08-06/candidate_pools/6d5d7c560f9ea2ae97163aac06a2ca7857a69e318153e6e11d27a2522df4980c/candidate_pool.json",
+    "payload": "/Users/kgousset/Library/CloudStorage/OneDrive-Personal/Search_Data_Files/SAGE_DECOYFREE/VALIDATION/NATIVE_WORKFLOW/ISB18/PHASE3_SHARED_POOL_PARITY_FINAL_2026-08-06/candidate_pools/6d5d7c560f9ea2ae97163aac06a2ca7857a69e318153e6e11d27a2522df4980c/candidate_pool.bin.zst",
+    "search_fingerprint": "6d5d7c560f9ea2ae97163aac06a2ca7857a69e318153e6e11d27a2522df4980c",
+    "payload_sha256": "ea78fd603d570fcdfe0c4e76cc7472b7f1af7d2954090060f11dbcd6ebad1e5b",
+    "compressed_payload_bytes": 102641638,
+    "candidate_count": 793793,
+    "retained_rank_depth": 50,
+    "stable_candidate_id_schema": "sage-candidate-id-v1",
+    "moments": {
+      "analysis_fingerprint": "185e67ab094376b68a3b9e495738fb6061f5be69de8f1205db8dad884ffd9dfb",
+      "reused": false
+    },
+    "msfdr1_smix": {
+      "analysis_fingerprint": "fff6ec3021d4a463daa43c5c36a5a8abf23ed7674e19f16cb8cf4aa6f02b6a2f",
+      "reused": true,
+      "rank_policy": "rank-1-only"
+    },
+    "observed_search_time_avoided_for_second_analysis_milliseconds": 29300
+  },
+  "optimizer_parity": {
+    "manifest": "validation/manifests/isb18_phase3_shared_pool_parity_macos_2026-08-06.json",
+    "frozen_entrapment_input": "/Users/kgousset/Library/CloudStorage/OneDrive-Personal/FASTA_Files/FASTA/target_entrapment/ISB18_foreign_species_entrapment_protein.fasta",
+    "selected_window": {
+      "min_rank": 9,
+      "max_rank": 18
+    },
+    "evaluated_windows": [
+      {
+        "min_rank": 8,
+        "max_rank": 18,
+        "elapsed_milliseconds": 2260,
+        "feasible": true,
+        "selected": false
+      },
+      {
+        "min_rank": 9,
+        "max_rank": 18,
+        "elapsed_milliseconds": 1775,
+        "feasible": true,
+        "selected": true
+      },
+      {
+        "min_rank": 10,
+        "max_rank": 18,
+        "elapsed_milliseconds": 1692,
+        "feasible": false,
+        "selected": false
+      }
+    ],
+    "selected_level4_consistent_counts": {
+      "target_psms": 10020,
+      "entrapment_psms": 0,
+      "target_peptides": 325,
+      "entrapment_peptides": 0,
+      "target_proteins": 17,
+      "entrapment_proteins": 0
+    },
+    "legacy_log_counts": {
+      "target_psms": 10589,
+      "target_peptides": 406,
+      "target_proteins": 17,
+      "entrapment_psms": 542,
+      "entrapment_peptides": 5,
+      "entrapment_proteins": 0,
+      "level4_target_psms": 10020,
+      "level4_target_peptides": 401,
+      "level4_entrapment_psms": 0,
+      "level4_entrapment_peptides": 0
+    },
+    "raw_q_fraction_changes_from_frozen_legacy": {
+      "psm": 0.0,
+      "peptide": 0.0,
+      "protein": 0.0
+    },
+    "level4_fraction_changes_from_frozen_legacy": {
+      "psm": 0.0,
+      "peptide": 0.0,
+      "protein": 0.0
+    },
+    "fitted_model_artifact_sha256": "af3f2a2bec1ab0ffa4497b9048117085dc0fcacec0ebbe779c8b2cb3668d7a8d",
+    "fitted_model_artifact_is_byte_identical_to_phase2": true,
+    "results_tsv_without_process_local_psm_id_sha256": "3b2eb82eb62ad9451885eebfc0fbcd9a78518f8bae5f2dffb70c032ad033cc43",
+    "results_tsv_without_process_local_psm_id_is_byte_identical_to_phase2": true,
+    "counting_note": "The parity reporter uses unique unmodified I/L-canonical peptide sequence, while the legacy log retains Sage peptide/peptidoform identity. Both definitions reproduce their frozen counts. The only TSV byte difference is the explicitly process-local psm_id column."
+  },
+  "resume_validation": {
+    "completed_stages_resumed": 4,
+    "wall_time_seconds": 2.94,
+    "new_spectrum_searches": 0
+  },
+  "verification": {
+    "workspace_unit_and_integration_tests_passed": 153,
+    "workspace_unit_and_integration_tests_failed": 0,
+    "doctests_passed": true,
+    "cargo_fmt_check_passed": true,
+    "git_diff_check_passed": true,
+    "real_isb_workflow_exit_code": 0,
+    "resume_workflow_exit_code": 0,
+    "validation_parity_sha256": "7e600e783f2524305db36b59d14612832d47948dbc019d4f615ef131e1a9e9d1",
+    "workflow_candidate_pools_sha256": "0707347badeaf29a8b49fc6019abb99816747b1fdf77e16b88a1fcfbfa5b76d7"
+  },
+  "scientific_release_gate": {
+    "changed_by_phase3": false,
+    "eligible_for_statistical_default_change": false,
+    "reasons": [
+      "the ISB run is a development parity run, not a holdout",
+      "a matched TDC benchmark was not part of this engineering phase"
+    ],
+    "interpretation": "These expected scientific gates do not block use of the Phase 3 candidate-sharing and optimizer machinery; they block declaring a new statistical default."
+  }
+}
