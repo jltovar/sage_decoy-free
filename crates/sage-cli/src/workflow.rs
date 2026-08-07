@@ -404,6 +404,10 @@ fn concrete_target_only_policies(
     }
 }
 
+fn allow_target_candidate_pool_reuse(annotate_target_matches: bool, policy_index: usize) -> bool {
+    !annotate_target_matches || policy_index > 0
+}
+
 impl WorkflowManifest {
     pub fn load(path: &Path) -> Result<Self> {
         let bytes = std::fs::read(path)
@@ -1937,7 +1941,14 @@ pub fn execute_workflow(
                 policy,
                 release_candidate,
                 window_provenance: window_provenance.clone(),
-                allow_candidate_pool_reuse: index > 0,
+                // The target FASTA creates a strict fingerprint distinct from
+                // +entrapment. Reuse that exact target population across
+                // models/policies unless matched-fragment output requires a
+                // fresh search payload that the immutable pool omits.
+                allow_candidate_pool_reuse: allow_target_candidate_pool_reuse(
+                    manifest.annotate_target_matches,
+                    index,
+                ),
             };
             let target_only = run_search_stage(
                 &manifest,
@@ -2409,6 +2420,10 @@ mod tests {
                 (TargetOnlyCalibrationPolicy::ReuseDatasetArtifact, false),
             ]
         );
+        assert!(allow_target_candidate_pool_reuse(false, 0));
+        assert!(allow_target_candidate_pool_reuse(false, 1));
+        assert!(!allow_target_candidate_pool_reuse(true, 0));
+        assert!(allow_target_candidate_pool_reuse(true, 1));
         std::fs::remove_dir_all(directory).unwrap();
     }
 

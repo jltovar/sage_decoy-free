@@ -1,0 +1,269 @@
+{
+  "schema_version": 1,
+  "phase": 6,
+  "title": "Frozen ISB model-by-model parity",
+  "date": "2026-08-07",
+  "source_commit": "aec5f2f15207bded8ae2165e136f021366765166",
+  "status": "core_parity_passed_with_explicit_model_deferrals",
+  "scope": "Engineering parity on the frozen ISB18 development dataset. This is sufficient to continue to the required Phase 7 PXD Moments parity, but it is not evidence for a statistical default change.",
+  "inputs": {
+    "manifest": "validation/manifests/isb18_phase6_model_parity_macos_2026-08-06.json",
+    "manifest_sha256": "58591cca1b2aaa4422dea078f942125bb264e1c550fce4b8dfd801b487a4262d",
+    "legacy_root": "/Users/kgousset/Library/CloudStorage/OneDrive-Personal/Search_Data_Files/SAGE_DECOYFREE/VALIDATION/ISB18/DECOYFREE",
+    "native_root": "/Users/kgousset/Library/CloudStorage/OneDrive-Personal/Search_Data_Files/SAGE_DECOYFREE/VALIDATION/NATIVE_WORKFLOW/ISB18/PHASE6_MODEL_PARITY_2026-08-06",
+    "frozen_entrapment_fasta": "/Users/kgousset/Library/CloudStorage/OneDrive-Personal/FASTA_Files/FASTA/target_entrapment/ISB18_foreign_species_entrapment_protein.fasta",
+    "target_fasta": "/Users/kgousset/Library/CloudStorage/OneDrive-Personal/FASTA_Files/FASTA/validation/ISB18.fasta",
+    "spectral_files": 9,
+    "ratios": {
+      "protein": 1.0,
+      "peptide": 0.7667638483965015,
+      "peptidoform_psm": 0.7754795035727717
+    }
+  },
+  "workflow_execution": {
+    "stages_complete": 22,
+    "stages_planned": 22,
+    "validation_summaries": 84,
+    "missing_runs": 0,
+    "candidate_pools": {
+      "plus_entrapment": {
+        "candidate_count": 793793,
+        "retained_rank_depth": 50
+      },
+      "target_only": {
+        "candidate_count": 752722,
+        "retained_rank_depth": 50
+      },
+      "strict_search_fingerprints": 2
+    },
+    "resume_check": {
+      "elapsed_seconds": 10.105931125,
+      "completed_stages_resumed": 22,
+      "new_searches": 0,
+      "result": "passed"
+    }
+  },
+  "grid_parity": {
+    "counting_definition": "Level 4; rank 1, label 1, non-contaminant, unambiguous target/entrapment mapping; peptide removes bracketed modifications and canonicalizes I/L; protein requires one inferred protein key",
+    "comparator": "tools/compare_null_window_evaluations.py",
+    "comparator_sha256": "2b091268b20c15b64d04300725d0c42cda21a64f125e15e85b2c747477ea3caa",
+    "models": {
+      "moments": {
+        "status": "passed",
+        "legacy_points": 71,
+        "matched_points": 71,
+        "exact_count_points": 71,
+        "feasibility_match_points": 71,
+        "maximum_absolute_fdp_difference": 0.0,
+        "selected_window": "9-18"
+      },
+      "mle": {
+        "status": "passed",
+        "legacy_points": 66,
+        "matched_points": 66,
+        "exact_count_points": 66,
+        "feasibility_match_points": 66,
+        "maximum_absolute_fdp_difference": 0.0,
+        "selected_window": "8-25"
+      },
+      "lower_order": {
+        "status": "passed",
+        "legacy_points": 67,
+        "matched_points": 67,
+        "exact_count_points": 67,
+        "feasibility_match_points": 67,
+        "maximum_absolute_fdp_difference": 0.0,
+        "selected_window": "6-9"
+      },
+      "msfdr": {
+        "status": "passed_before_ms2rescore_annotation",
+        "legacy_points": 59,
+        "matched_points": 59,
+        "exact_count_points": 59,
+        "feasibility_match_points": 59,
+        "maximum_absolute_fdp_difference": 0.0,
+        "selected_window": "9-13"
+      },
+      "msfdr1_smix": {
+        "status": "passed",
+        "rank1_only": true,
+        "selected_window": "1-1"
+      },
+      "msfdr2_smix": {
+        "status": "passed_before_ms2rescore_annotation",
+        "legacy_points": 69,
+        "matched_points": 69,
+        "exact_count_points": 69,
+        "feasibility_match_points": 69,
+        "maximum_absolute_fdp_difference": 0.0,
+        "selected_window": "9-17"
+      },
+      "nokoi": {
+        "status": "failed_deferred",
+        "legacy_points": 75,
+        "matched_points": 75,
+        "exact_count_points": 1,
+        "feasibility_match_points": 49,
+        "legacy_selected_window": "2-15",
+        "native_selected_window": "2-12",
+        "maximum_absolute_count_fraction_difference": 1.0,
+        "maximum_absolute_fdp_difference": 1.0
+      }
+    }
+  },
+  "fitted_parameter_parity": {
+    "moments": "matched frozen legacy parameters within double precision",
+    "mle": "matched frozen legacy parameters within double precision",
+    "lower_order": "matched frozen legacy parameters and complete candidate-count distribution",
+    "msfdr": "matched frozen legacy parameters within double precision",
+    "msfdr1_smix": "matched frozen legacy rank-1 mixture parameters within double precision",
+    "msfdr2_smix": "matched frozen legacy parameters within double precision",
+    "nokoi": "did not match the frozen fit or selected window"
+  },
+  "level4_target_count_parity": {
+    "format": [
+      "legacy_psms",
+      "native_psms",
+      "legacy_peptides",
+      "native_peptides",
+      "legacy_proteins",
+      "native_proteins"
+    ],
+    "moments": {
+      "optimized": [10020, 10020, 325, 325, 17, 17],
+      "ms2rescore": [10480, 10478, 338, 338, 17, 17],
+      "target_only_refit": [13201, 13201, 366, 366, 17, 17]
+    },
+    "mle": {
+      "optimized": [10178, 10178, 327, 327, 17, 17],
+      "ms2rescore": [10178, 10178, 327, 327, 17, 17],
+      "target_only_refit": [12641, 12641, 342, 342, 17, 17]
+    },
+    "lower_order": {
+      "optimized": [6223, 6223, 294, 294, 18, 18],
+      "ms2rescore": [6223, 6223, 294, 294, 18, 18],
+      "target_only_refit": [558, 558, 44, 44, 10, 10],
+      "target_only_artifact_reuse_diagnostic": {
+        "native_counts": [6479, 291, 17],
+        "release_candidate": false
+      }
+    },
+    "msfdr": {
+      "optimized": [9737, 9737, 332, 332, 17, 17],
+      "ms2rescore": [10141, 9737, 343, 332, 17, 17],
+      "target_only_refit": [12479, 11996, 359, 348, 17, 17]
+    },
+    "msfdr1_smix": {
+      "ms2rescore": [4279, 4279, 252, 252, 16, 16],
+      "target_only_refit": [4389, 4389, 245, 245, 16, 16]
+    },
+    "msfdr2_smix": {
+      "optimized": [5761, 5761, 310, 310, 17, 17],
+      "ms2rescore": [5896, 5761, 313, 310, 17, 17],
+      "target_only_refit": [5917, 5767, 296, 294, 17, 17]
+    },
+    "nokoi": {
+      "optimized": [10030, 4830, 364, 274, 17, 17],
+      "ms2rescore": [10396, 4830, 369, 274, 17, 17],
+      "target_only_refit": [11141, 0, 347, 0, 17, 0]
+    }
+  },
+  "target_only_policy_decisions": {
+    "default": "refit_with_locked_window",
+    "moments": "passed exact target-only parity",
+    "mle": "passed exact target-only parity",
+    "lower_order": "refit_with_locked_window passed exact parity; reuse_dataset_artifact is non-release and unsafe because candidate-count normalization changes materially",
+    "msfdr1_smix": "passed exact target-only parity",
+    "cross_dataset_artifact_reuse": "not permitted"
+  },
+  "ms2rescore_annotation_diagnosis": {
+    "candidate_identity": "41118 of 41118 rank-1 identities matched",
+    "hyperscore_maximum_absolute_difference": 1.78e-15,
+    "seeded_mixture_behavior": "MSFDR and MSFDR2-SMIX fits and unannotated outputs match, but regenerated macOS MS2PIP/DeepLC features differ from the frozen Linux environment and downstream identification counts exceed the allowed platform tolerance.",
+    "rank1_external_feature_differences": {
+      "ms2pip_pcc_rows": 13440,
+      "ms2pip_pcc_maximum_absolute_difference": 1.0307,
+      "spectral_angle_rows": 13502,
+      "spectral_angle_maximum_absolute_difference": 0.9193,
+      "deeplc_absolute_rt_rows": 36399,
+      "deeplc_absolute_rt_maximum_difference": 8.4967
+    },
+    "decision": "Defer annotated MSFDR and MSFDR2-SMIX from release eligibility until the annotation environment is reproduced or platform robustness is repaired. The discrepancy is not attributed to a search-space, grid, or fitted-distribution mismatch."
+  },
+  "nokoi_artifact_audit": {
+    "present": [
+      "feature schema and ordering",
+      "normalization means, medians, and standard deviations",
+      "cross-validation seed, fold count, and fold sizes",
+      "selected L1 regularization",
+      "final weights and intercept",
+      "frozen out-of-fold null-score distribution",
+      "development pi0 and PEP calibration mapping",
+      "candidate-count distribution",
+      "dataset, search, candidate-schema, model, and configuration provenance"
+    ],
+    "missing_or_insufficient": [
+      "fold-specific weights and intercepts",
+      "explicit fold-membership or reconstruction rule",
+      "explicit positive and null training rules rather than counts alone",
+      "complete Grenander calibration state",
+      "source-code hashes"
+    ],
+    "native_fit": {
+      "selected_l1_lambda": 0.2859938296617458,
+      "nonzero_features": 6,
+      "total_features": 12,
+      "out_of_fold_null_scores": 259415
+    },
+    "decision": "Nokoi is explicitly deferred from the first refactor release and must not be silently retrained in target-only mode."
+  },
+  "ensemble_decision": {
+    "production_ensemble_assembled": false,
+    "reason": "Ensemble is deferred to Phase 8 and cannot be assembled from experts that have not passed their dataset-local parity and portability gates.",
+    "eligible_core_experts": [
+      "moments",
+      "mle",
+      "msfdr1_smix"
+    ],
+    "excluded_or_deferred": {
+      "lower_order": "artifact-reuse target-only transfer is unstable even though refit parity is exact",
+      "msfdr": "annotated parity exceeds tolerance",
+      "msfdr2_smix": "annotated parity exceeds tolerance",
+      "nokoi": "fit, window, portability, and target-only parity failed"
+    }
+  },
+  "release_decision": {
+    "ready_for_phase7_pxd_moments": true,
+    "all_isb_models_release_ready": false,
+    "eligible_for_statistical_default_change": false,
+    "default_change_gate_reasons": [
+      "ISB18 is a development dataset, not a holdout",
+      "one or more parity comparisons exceed tolerance",
+      "one or more target-only transfers are unstable",
+      "a matched TDC benchmark is absent"
+    ]
+  },
+  "verification": {
+    "workflow_exit": "passed",
+    "workflow_resume": "passed",
+    "all_grid_comparisons_executed": true,
+    "manifest_json": "passed",
+    "rust_workspace_tests": {
+      "passed": 162,
+      "failed": 0
+    },
+    "rust_doctests": "passed",
+    "python_tests": {
+      "passed": 13,
+      "failed": 0
+    },
+    "comparator_tests": {
+      "passed": 4,
+      "failed": 0
+    },
+    "release_build": "passed",
+    "cargo_fmt_check": "passed",
+    "git_diff_check": "passed",
+    "python_compile": "passed"
+  }
+}

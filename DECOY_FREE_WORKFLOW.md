@@ -158,10 +158,17 @@ table, wrapper configuration, and feature-rich TSV; direct one-off searches with
 their historical temporary-file behavior, as do configurations that explicitly request an
 external output directory.
 
-The target-only stage remains a fresh target-FASTA Sage search, especially when matched-fragment
-annotation is requested. If MS2Rescore is selected for that stage, its external annotations are
-still independently cacheable under the target-only search fingerprint. No annotation cache can
-cross a FASTA, dataset, candidate calibration, generator environment, or rank-depth boundary.
+On macOS, the MS2PIP/XGBoost environment must be able to load `libomp.dylib`. Verify this with an
+`import xgboost` using the configured Python executable before a long workflow. If LLVM provides
+OpenMP outside the loader's default path, launch Sage with `DYLD_LIBRARY_PATH` set to LLVM's `lib`
+directory; this affects runtime loading only and does not weaken the annotation fingerprint.
+
+The target-only stage remains a distinct target-FASTA candidate population. It performs a fresh
+search when no exact pool exists or when matched-fragment annotation is requested; otherwise the
+immutable target-only pool can be reused. If MS2Rescore is selected for that stage, its external
+annotations are still independently cacheable under the target-only search fingerprint. No
+annotation cache can cross a FASTA, dataset, candidate calibration, generator environment, or
+rank-depth boundary.
 
 ## Phase 5: explicit target-only calibration
 
@@ -184,14 +191,15 @@ the source dataset, model, +entrapment stage, selected ranks, source artifact ha
 fingerprint, and candidate-ID schema. Fitted nuisance-state provenance remains in
 `fitted_model_artifacts.json`; it is not conflated with window provenance.
 
-The first target-only interpretation always performs a fresh target-FASTA spectrum search and
-writes its own immutable candidate pool and, when needed, MS2Rescore annotation cache. Under
-`compare_both`, the second interpretation reuses that exact target-only candidate pool, so the
-policy comparison cannot be confounded by a second spectrum search. Its MS2Rescore annotation
-cache is reused only when the preliminary calibration inputs are identical; otherwise Phase 4's
+The target FASTA produces a strict search fingerprint distinct from +entrapment. If no exact
+target-only pool exists, the first interpretation performs a fresh spectrum search and writes one;
+subsequent models and `compare_both` interpretations reuse that exact target population. Thus the
+policy comparison cannot be confounded by a second spectrum search. An MS2Rescore annotation cache
+is reused only when the preliminary calibration inputs are identical; otherwise Phase 4's
 fingerprint correctly generates a policy-specific annotation set. If matched-fragment output is
-requested, it is materialized for the first (refit/release) interpretation; immutable candidate
-pools deliberately do not persist fragment payloads for the diagnostic second stage.
+requested, the release interpretation performs a fresh search because immutable candidate pools
+deliberately do not persist fragment payloads; the diagnostic second stage remains unannotated and
+may reuse the pool.
 
 Legacy validation manifests with a stage named `target_only` remain readable. For engineering
 parity, that legacy name maps only to `target_only_refit_with_locked_window`, because the frozen
@@ -208,6 +216,12 @@ The default `refit_with_locked_window` interpretation instead refits Nokoi in th
 candidate space and must be evaluated during model-specific parity. A separate holdout
 dataset fits its own Nokoi model and null window under the same predeclared procedure. Missing,
 cross-dataset, incompatible, or incomplete artifacts fail closed.
+
+The Phase 6 ISB audit found that this is not yet a complete portable artifact for release. It does
+not retain fold-specific weights/intercepts, an explicit fold-membership reconstruction rule,
+complete training-rule and Grenander state, or source hashes. Its native frozen-grid result also
+selected `2-12` rather than legacy `2-15`. Nokoi is therefore explicitly deferred; target-only
+must not silently retrain it for the first refactor release.
 
 ## Development, holdout, and artifact scope
 
@@ -240,6 +254,29 @@ This normalization is intentionally auditable and must first pass the complete I
 same-dataset target-only tests before Lower Order is restored as an Ensemble default. A costly
 PXD001468 Lower Order run is optional and will be considered only after PXD001468 Moments parity.
 
+Phase 6 established exact ISB grid, MS2Rescore, and target-only parity for
+`refit_with_locked_window`. The diagnostic `reuse_dataset_artifact` interpretation did not match:
+it produced 6,479 Level-4 PSMs, 291 peptides, and 17 proteins instead of the legacy/refit
+558/44/10. Lower Order remains excluded from the production Ensemble until that normalization
+behavior is repaired; the exact refit result does not make artifact reuse release-eligible.
+
+## Phase 6: frozen ISB parity status
+
+The frozen ISB run completed all 22 planned stages and an exact resume reused all stages in about
+10 seconds with no new searches. Moments (`9-18`), MLE (`8-25`), Lower Order (`6-9`), seeded
+MSFDR (`9-13`), and MSFDR2-SMIX (`9-17`) reproduced every visited legacy grid point. MSFDR1-SMIX
+remained fixed at rank `1-1`. Moments, MLE, Lower Order under refit semantics, and MSFDR1-SMIX
+also passed the applicable downstream count comparisons; the Moments MS2Rescore result differed
+by only two PSMs with exact peptide and protein counts.
+
+Seeded MSFDR and MSFDR2-SMIX matched their unannotated fits but exceeded downstream tolerance
+after regenerating MS2PIP/DeepLC features on macOS. Candidate identities and hyperscores matched;
+the external features did not match the frozen Linux environment. These annotated variants are
+deferred until their environment can be reproduced or their platform robustness is repaired.
+Nokoi failed the frozen fit, selected-window, and target-only checks and is deferred as described
+above. The production Ensemble is not assembled from these incomplete experts. Full evidence is
+recorded in `validation/reports/phase6_isb_model_parity_2026-08-07.json`.
+
 ## Outputs and resumption
 
 Each stage has a resolved search configuration and a hash checkpoint. A completed stage is reused
@@ -266,6 +303,26 @@ match. Important workflow reports include:
 - `validation.release_gate.json`
 - `ensemble.lock.json`
 - `workflow.state.json`
+
+For frozen FDRBench parity, compare every visited null window under the same canonical counting
+definition rather than comparing only the winner or the legacy log's modification-sensitive
+peptide counter:
+
+```bash
+python3 tools/compare_null_window_evaluations.py \
+  LEGACY/cumulative_results_long.csv \
+  NATIVE/optimized/null_window_evaluations.json \
+  --legacy-results-root LEGACY/outdirs \
+  --psm-ratio 0.7754795035727717 \
+  --peptide-ratio 0.7667638483965015 \
+  --protein-ratio 1.0 \
+  --expected-window 9-18 \
+  --output null-window-parity.json
+```
+
+Both the legacy long and transposed wide cumulative CSV layouts are accepted. Supplying the
+legacy results root recalculates PSM, unmodified I/L-canonical peptide, protein, FDP, and Level-4
+counts directly from each frozen result table.
 
 Concrete target-only results are written under
 `MODEL/target_only/refit_with_locked_window/` and/or
