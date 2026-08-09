@@ -1,6 +1,6 @@
 use crate::candidate_pool::{
-    content_sha256, search_fingerprint, CandidatePoolRequest, CandidatePoolUsage,
-    CANDIDATE_ID_SCHEMA,
+    content_sha256, search_fingerprint, verify_usage as verify_candidate_pool_usage,
+    CandidatePoolRequest, CandidatePoolUsage, CANDIDATE_ID_SCHEMA,
 };
 use crate::entrapment::{
     compare_generated_to_legacy, entrapment_generation_input_sha256, generate_foreign_entrapment,
@@ -16,11 +16,11 @@ use crate::input::Input;
 use crate::provenance::{freeze_baseline, sha256_file, write_json_atomic, BaselineManifest};
 use crate::runner::Runner;
 use crate::validation::{
-    accepted_target_peptides, expert_quality_gates, is_target_only_stage, parity_comparisons,
-    stage_comparisons, summarize_run, tdc_benchmark_comparisons, transfer_stability,
-    EffectiveRatios, ExpertQualityGate, ParityComparison, ParityPair, RunValidationSummary,
-    StageComparison, TargetOnlyCalibrationPolicy, TdcBenchmarkComparison, ValidationMode,
-    ValidationRun,
+    accepted_target_peptides, expert_quality_gates, is_target_only_stage, missing_parity_evidence,
+    parity_comparisons, stage_comparisons, summarize_run, tdc_benchmark_comparisons,
+    transfer_stability, EffectiveRatios, ExpertQualityGate, InvalidValidationRun, ParityComparison,
+    ParityPair, RunValidationSummary, StageComparison, TargetOnlyCalibrationPolicy,
+    TdcBenchmarkComparison, ValidationMode, ValidationRun,
 };
 use anyhow::{Context, Result};
 use sage_core::decoy_free_fdr::{DfRunArtifacts, FittedArtifactProvenance};
@@ -88,9 +88,9 @@ pub struct ModelWorkflow {
     /// Phase 8 release control. This can exclude a known-nonportable or
     /// platform-sensitive expert, but it cannot force an expert past the normal
     /// quality gates.
-    #[serde(default)]
+    #[serde(default, skip_serializing_if = "is_auto_ensemble_participation")]
     pub ensemble_participation: EnsembleParticipation,
-    #[serde(default)]
+    #[serde(default, skip_serializing_if = "Option::is_none")]
     pub ensemble_exclusion_reason: Option<String>,
 }
 
@@ -328,12 +328,18 @@ struct TargetOnlyStageContext {
 
 #[derive(Clone, Debug, Serialize, Deserialize)]
 pub struct StageRecord {
+    #[serde(default = "default_schema")]
+    pub schema_version: u32,
     pub stage: String,
     pub model: String,
     pub input_hash: String,
     pub status: String,
     pub results: PathBuf,
     pub config_snapshot: PathBuf,
+    #[serde(default)]
+    pub results_sha256: String,
+    #[serde(default)]
+    pub config_snapshot_sha256: String,
     pub external_features_enabled: bool,
     pub calibration_mode: String,
     #[serde(default)]
@@ -370,6 +376,8 @@ pub struct WorkflowState {
     pub ms2rescore_annotation_caches: Vec<ExternalAnnotationCacheUsage>,
     pub validation: Vec<RunValidationSummary>,
     pub missing_runs: Vec<ValidationRun>,
+    #[serde(default)]
+    pub invalid_runs: Vec<InvalidValidationRun>,
     pub stage_comparisons: Vec<StageComparison>,
     pub ensemble_expert_gates: Vec<ExpertQualityGate>,
     pub parity_comparisons: Vec<ParityComparison>,
@@ -381,13 +389,34 @@ pub struct WorkflowState {
 
 #[derive(Clone, Debug, Serialize, Deserialize)]
 pub struct ReleaseGate {
+    #[serde(default = "default_release_gate_status")]
+    pub status: ReleaseGateStatus,
     pub eligible_for_statistical_default_change: bool,
     pub reasons: Vec<String>,
+    #[serde(default)]
+    pub not_evaluable_reasons: Vec<String>,
+    #[serde(default)]
+    pub not_eligible_reasons: Vec<String>,
     pub calibrated_tdc_improvements: usize,
+}
+
+#[derive(Clone, Copy, Debug, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(rename_all = "snake_case")]
+pub enum ReleaseGateStatus {
+    Eligible,
+    NotEligible,
+    NotEvaluable,
+}
+
+fn default_release_gate_status() -> ReleaseGateStatus {
+    ReleaseGateStatus::NotEvaluable
 }
 
 fn default_true() -> bool {
     true
+}
+fn is_auto_ensemble_participation(value: &EnsembleParticipation) -> bool {
+    *value == EnsembleParticipation::Auto
 }
 fn default_schema() -> u32 {
     1
@@ -1532,6 +1561,41 @@ fn hash_stage(
     Ok(format!("{:x}", hasher.finalize()))
 }
 
+fn stage_checkpoint_identity_matches(
+    record: &StageRecord,
+    input_hash: &str,
+    stage: &str,
+    model: &ModelFit,
+    dataset: &DatasetIdentity,
+    results: &Path,
+    config_snapshot: &Path,
+    target_only_policy: Option<TargetOnlyCalibrationPolicy>,
+) -> bool {
+    record.status == "complete"
+        && record.input_hash == input_hash
+        && record.stage == stage
+        && record.model == model_slug(model)
+        && record.dataset_id == dataset.dataset_id
+        && record.dataset_fingerprint == dataset.fingerprint
+        && record.results == results
+        && record.config_snapshot == config_snapshot
+        && results.is_file()
+        && config_snapshot.is_file()
+        && record.target_only_calibration_policy == target_only_policy
+}
+
+fn stage_output_hashes_match(record: &StageRecord) -> Result<bool> {
+    if record.results_sha256.is_empty()
+        || record.config_snapshot_sha256.is_empty()
+        || !record.results.is_file()
+        || !record.config_snapshot.is_file()
+    {
+        return Ok(false);
+    }
+    Ok(sha256_file(&record.results)? == record.results_sha256
+        && sha256_file(&record.config_snapshot)? == record.config_snapshot_sha256)
+}
+
 fn run_search_stage(
     manifest: &WorkflowManifest,
     dataset: &DatasetIdentity,
@@ -1589,24 +1653,90 @@ fn run_search_stage(
     let checkpoint = output_directory.join("workflow.stage.json");
 
     if manifest.resume && results.is_file() && checkpoint.is_file() {
-        let old: StageRecord = serde_json::from_slice(&std::fs::read(&checkpoint)?)?;
-        if old.input_hash == input_hash && old.status == "complete" {
-            let cache_ready = if external {
-                if let Some(usage) = old.ms2rescore_annotation_cache.as_ref() {
-                    verify_annotation_cache_usage(usage)?;
+        let mut old: StageRecord = serde_json::from_slice(&std::fs::read(&checkpoint)?)?;
+        anyhow::ensure!(
+            matches!(old.schema_version, 1 | 2),
+            "unsupported workflow stage checkpoint schema {}",
+            old.schema_version
+        );
+        if old.input_hash == input_hash {
+            let identity_ready = stage_checkpoint_identity_matches(
+                &old,
+                &input_hash,
+                stage,
+                &model.model,
+                dataset,
+                &results,
+                &config_snapshot,
+                target_only.map(|context| context.policy),
+            );
+            if !identity_ready {
+                log::warn!(
+                    "workflow: completed stage identity changed for {} / {}; rebuilding",
+                    model_slug(&model.model),
+                    stage
+                );
+            }
+            let mut upgraded_legacy_checkpoint = false;
+            if identity_ready && old.schema_version == 1 {
+                // Phase 1-8 checkpoints predate durable output hashes. Migrate
+                // an otherwise fully matching checkpoint once; all later
+                // resumes verify the recorded result/configuration bytes.
+                if old.results_sha256.is_empty() && old.config_snapshot_sha256.is_empty() {
+                    old.results_sha256 = sha256_file(&results)?;
+                    old.config_snapshot_sha256 = sha256_file(&config_snapshot)?;
+                }
+                if !old.results_sha256.is_empty() && !old.config_snapshot_sha256.is_empty() {
+                    old.schema_version = 2;
+                    upgraded_legacy_checkpoint = true;
+                }
+            }
+            let outputs_ready = identity_ready && stage_output_hashes_match(&old)?;
+            if identity_ready && !outputs_ready {
+                log::warn!(
+                    "workflow: completed stage output hash changed for {} / {}; rebuilding",
+                    model_slug(&model.model),
+                    stage
+                );
+            }
+            let pool_ready = if outputs_ready {
+                if let Some(usage) = old.candidate_pool.as_ref() {
+                    verify_candidate_pool_usage(usage)?;
                     true
                 } else {
                     log::info!(
-                        "workflow: completed legacy stage {} / {} has no Phase 4 annotation cache; rebuilding",
+                        "workflow: completed legacy stage {} / {} has no candidate-pool provenance; rebuilding",
                         model_slug(&model.model),
                         stage
                     );
                     false
                 }
             } else {
-                true
+                false
+            };
+            let cache_ready = if external {
+                if pool_ready {
+                    if let Some(usage) = old.ms2rescore_annotation_cache.as_ref() {
+                        verify_annotation_cache_usage(usage)?;
+                        true
+                    } else {
+                        log::info!(
+                        "workflow: completed legacy stage {} / {} has no Phase 4 annotation cache; rebuilding",
+                        model_slug(&model.model),
+                        stage
+                    );
+                        false
+                    }
+                } else {
+                    false
+                }
+            } else {
+                pool_ready
             };
             if cache_ready {
+                if upgraded_legacy_checkpoint {
+                    write_json_atomic(&checkpoint, &old)?;
+                }
                 log::info!(
                     "workflow: resuming completed stage {} / {}",
                     model_slug(&model.model),
@@ -1718,12 +1848,15 @@ fn run_search_stage(
     write_json_atomic(&config_snapshot, &parameters)?;
 
     let mut record = StageRecord {
+        schema_version: 2,
         stage: stage.into(),
         model: model_slug(&model.model).into(),
         input_hash,
         status: if plan_only { "planned" } else { "running" }.into(),
         results,
         config_snapshot: config_snapshot.clone(),
+        results_sha256: String::new(),
+        config_snapshot_sha256: String::new(),
         external_features_enabled: external,
         calibration_mode: match target_only.map(|context| context.policy) {
             Some(TargetOnlyCalibrationPolicy::RefitWithLockedWindow) => {
@@ -1842,6 +1975,8 @@ fn run_search_stage(
         .as_ref()
         .map(|provenance| provenance.dataset_fingerprint.clone());
     record.status = "complete".into();
+    record.results_sha256 = sha256_file(&record.results)?;
+    record.config_snapshot_sha256 = sha256_file(&record.config_snapshot)?;
     write_json_atomic(&checkpoint, &record)?;
     Ok(record)
 }
@@ -2322,17 +2457,27 @@ pub fn execute_workflow(
         }
     }));
     let mut validation = Vec::new();
+    let mut invalid_runs = Vec::new();
     let missing_runs = runs
         .iter()
         .filter(|run| !run.results.is_file())
         .cloned()
         .collect::<Vec<_>>();
     for run in &runs {
-        validation.extend(summarize_run(
+        if !run.results.is_file() {
+            continue;
+        }
+        match summarize_run(
             run,
             &manifest.validation.effective_ratios,
             manifest.validation.fdr_threshold,
-        )?);
+        ) {
+            Ok(rows) => validation.extend(rows),
+            Err(error) => invalid_runs.push(InvalidValidationRun {
+                run: run.clone(),
+                error: format!("{error:#}"),
+            }),
+        }
     }
     let stability = transfer_stability(
         &validation,
@@ -2352,11 +2497,12 @@ pub fn execute_workflow(
             .minimum_entrapment_peptides_for_stable_estimate,
         expert_gate_layer,
     );
-    let mut parity = parity_comparisons(
+    let local_parity = parity_comparisons(
         &validation,
         &manifest.validation.parity_pairs,
         manifest.validation.maximum_parity_fraction_difference,
     );
+    let mut parity = local_parity.clone();
     if let Some(path) = manifest.validation.external_parity_evidence.as_ref() {
         let external: Vec<ParityComparison> = serde_json::from_slice(
             &std::fs::read(path)
@@ -2375,45 +2521,145 @@ pub fn execute_workflow(
         manifest.validation.tdc_reference_method.as_deref(),
         manifest.validation.fdr_threshold,
     );
-    let mut release_reasons = Vec::new();
+    let mut not_evaluable_reasons = Vec::new();
+    let mut not_eligible_reasons = Vec::new();
     if manifest.validation.dataset_role != ValidationDatasetRole::Holdout {
-        release_reasons.push("dataset is development, not holdout".into());
+        not_eligible_reasons.push("dataset is development, not holdout".into());
     }
     if manifest.validation.diagnostic_only
         || manifest.artifact_reuse_policy == ArtifactReusePolicy::CrossDatasetDiagnostic
     {
-        release_reasons.push("workflow is diagnostic-only and cannot be release evidence".into());
+        not_eligible_reasons
+            .push("workflow is diagnostic-only and cannot be release evidence".into());
     }
     if manifest.validation.parity_pairs.is_empty() {
-        release_reasons.push("dataset-local baseline/native parity comparison is missing".into());
-    } else if parity.is_empty() {
-        release_reasons.push("baseline/native parity comparison is missing".into());
-    } else if manifest.validation.parity_pairs.iter().any(|pair| {
-        !parity.iter().any(|comparison| {
-            comparison.baseline_method == pair.baseline_method
-                && comparison.native_method == pair.native_method
-        })
-    }) {
-        release_reasons.push("one or more declared parity pairs have no matched results".into());
-    } else if parity.iter().any(|comparison| !comparison.within_tolerance) {
-        release_reasons.push("one or more parity comparisons exceed tolerance".into());
+        not_evaluable_reasons
+            .push("dataset-local baseline/native parity comparison is missing".into());
+    } else {
+        not_evaluable_reasons.extend(missing_parity_evidence(
+            &manifest.validation.parity_pairs,
+            &local_parity,
+        ));
+        if local_parity
+            .iter()
+            .any(|comparison| !comparison.within_tolerance)
+        {
+            not_eligible_reasons
+                .push("one or more dataset-local parity comparisons exceed tolerance".into());
+        }
     }
     if !missing_runs.is_empty() {
-        release_reasons.push("required validation runs are missing".into());
+        not_evaluable_reasons.push("required validation runs are missing".into());
     }
-    if stability
-        .iter()
-        .any(|comparison| comparison.release_candidate && !comparison.stable)
+    if !invalid_runs.is_empty() {
+        not_evaluable_reasons.push("one or more validation runs are invalid or unreadable".into());
+    }
+    if baseline
+        .as_ref()
+        .is_some_and(|baseline| baseline.status != "complete" || baseline.files.is_empty())
     {
-        release_reasons.push("one or more search-space transfers are unstable".into());
+        not_evaluable_reasons.push("the frozen baseline is incomplete or empty".into());
+    }
+    let native_methods = manifest
+        .models
+        .iter()
+        .filter(|model| model.enabled && model.model != ModelFit::Ensemble)
+        .map(|model| model_slug(&model.model))
+        .collect::<BTreeSet<_>>();
+    if stability.iter().any(|comparison| {
+        native_methods.contains(comparison.method.as_str())
+            && comparison.release_candidate
+            && !comparison.stable
+    }) {
+        not_eligible_reasons.push("one or more search-space transfers are unstable".into());
+    }
+    let release_target_rows = validation
+        .iter()
+        .filter(|row| {
+            matches!(row.mode, ValidationMode::DecoyFree)
+                && row.release_candidate
+                && is_target_only_stage(&row.stage)
+                && row.layer == expert_gate_layer
+                && native_methods.contains(row.method.as_str())
+        })
+        .collect::<Vec<_>>();
+    for target in &release_target_rows {
+        if target.calibration_stage.is_none() {
+            not_evaluable_reasons.push(format!(
+                "{} / {} has no target-only calibration provenance",
+                target.method, target.stage
+            ));
+        }
+        if !stability.iter().any(|comparison| {
+            comparison.method == target.method
+                && comparison.to_stage == target.stage
+                && comparison.release_candidate
+        }) {
+            not_evaluable_reasons.push(format!(
+                "{} / {} has no evaluable target-only transfer comparison",
+                target.method, target.stage
+            ));
+        }
+        match ensemble_gates
+            .iter()
+            .find(|gate| gate.model == target.method)
+        {
+            None => not_evaluable_reasons.push(format!(
+                "{} has no calibration quality-gate result",
+                target.method
+            )),
+            Some(gate) => {
+                for reason in &gate.reasons {
+                    if reason.contains("missing") {
+                        not_evaluable_reasons.push(format!("{}: {reason}", target.method));
+                    } else {
+                        not_eligible_reasons.push(format!("{}: {reason}", target.method));
+                    }
+                }
+            }
+        }
     }
     if manifest.validation.tdc_reference_method.is_none() || tdc_benchmarks.is_empty() {
-        release_reasons.push("a matched TDC benchmark is missing".into());
-    } else if !tdc_benchmarks
-        .iter()
-        .any(|comparison| comparison.release_candidate && comparison.improves_peptide_yield)
+        not_evaluable_reasons.push("a matched TDC benchmark is missing".into());
+    } else {
+        for target in &release_target_rows {
+            let comparison = tdc_benchmarks.iter().find(|comparison| {
+                comparison.decoy_free_method == target.method
+                    && comparison.stage == target.stage
+                    && comparison.layer == target.layer
+                    && comparison.release_candidate
+            });
+            match comparison {
+                None => not_evaluable_reasons.push(format!(
+                    "{} / {} has no matched TDC comparison",
+                    target.method, target.stage
+                )),
+                Some(comparison) if !comparison.calibration_constrained => {
+                    if comparison.peptide_entrapment_fdp.is_none() {
+                        not_evaluable_reasons.push(format!(
+                            "{} / {} has no evaluable entrapment calibration for its TDC comparison",
+                            target.method, target.stage
+                        ));
+                    } else {
+                        not_eligible_reasons.push(format!(
+                            "{} / {} exceeds the entrapment calibration threshold",
+                            target.method, target.stage
+                        ));
+                    }
+                }
+                Some(_) => {}
+            }
+        }
+    }
+    if manifest.validation.tdc_reference_method.is_some()
+        && !tdc_benchmarks.is_empty()
+        && !tdc_benchmarks.iter().any(|comparison| {
+            native_methods.contains(comparison.decoy_free_method.as_str())
+                && comparison.release_candidate
+                && comparison.improves_peptide_yield
+        })
     {
-        release_reasons.push(
+        not_eligible_reasons.push(
             "no calibrated Decoy-Free result improves peptide yield over the matched TDC".into(),
         );
     }
@@ -2421,19 +2667,57 @@ pub fn execute_workflow(
         .models
         .iter()
         .any(|model| model.enabled && model.model == ModelFit::Ensemble);
+    let ensemble_candidate_methods = manifest
+        .models
+        .iter()
+        .filter(|model| {
+            model.enabled
+                && model.model != ModelFit::Ensemble
+                && model.ensemble_participation == EnsembleParticipation::Auto
+        })
+        .map(|model| model_slug(&model.model))
+        .collect::<BTreeSet<_>>();
     if ensemble_requested
-        && ensemble_gates.iter().filter(|gate| gate.eligible).count()
+        && ensemble_gates
+            .iter()
+            .filter(|gate| {
+                ensemble_candidate_methods.contains(gate.model.as_str()) && gate.eligible
+            })
+            .count()
             < manifest.validation.minimum_ensemble_experts
     {
-        release_reasons.push("too few experts passed the Ensemble quality gates".into());
+        not_evaluable_reasons.push("too few experts passed the Ensemble quality gates".into());
     }
     let calibrated_tdc_improvements = tdc_benchmarks
         .iter()
-        .filter(|comparison| comparison.release_candidate && comparison.improves_peptide_yield)
+        .filter(|comparison| {
+            native_methods.contains(comparison.decoy_free_method.as_str())
+                && comparison.release_candidate
+                && comparison.improves_peptide_yield
+        })
         .count();
+    not_evaluable_reasons.sort();
+    not_evaluable_reasons.dedup();
+    not_eligible_reasons.sort();
+    not_eligible_reasons.dedup();
+    let status = if !not_evaluable_reasons.is_empty() {
+        ReleaseGateStatus::NotEvaluable
+    } else if !not_eligible_reasons.is_empty() {
+        ReleaseGateStatus::NotEligible
+    } else {
+        ReleaseGateStatus::Eligible
+    };
+    let reasons = not_evaluable_reasons
+        .iter()
+        .chain(&not_eligible_reasons)
+        .cloned()
+        .collect();
     let release_gate = ReleaseGate {
-        eligible_for_statistical_default_change: release_reasons.is_empty(),
-        reasons: release_reasons,
+        status,
+        eligible_for_statistical_default_change: status == ReleaseGateStatus::Eligible,
+        reasons,
+        not_evaluable_reasons,
+        not_eligible_reasons,
         calibrated_tdc_improvements,
     };
     write_json_atomic(
@@ -2455,6 +2739,10 @@ pub fn execute_workflow(
     write_json_atomic(
         &manifest.output_root.join("validation.missing_runs.json"),
         &missing_runs,
+    )?;
+    write_json_atomic(
+        &manifest.output_root.join("validation.invalid_runs.json"),
+        &invalid_runs,
     )?;
     write_json_atomic(
         &manifest
@@ -2499,7 +2787,7 @@ pub fn execute_workflow(
         &ms2rescore_annotation_caches,
     )?;
     let state = WorkflowState {
-        schema_version: 1,
+        schema_version: 2,
         manifest_hash,
         dataset,
         entrapment,
@@ -2510,6 +2798,7 @@ pub fn execute_workflow(
         ms2rescore_annotation_caches,
         validation,
         missing_runs,
+        invalid_runs,
         stage_comparisons: comparisons,
         ensemble_expert_gates: ensemble_gates,
         parity_comparisons: parity,
@@ -2678,10 +2967,78 @@ mod tests {
     fn explicit_ensemble_exclusion_requires_a_reason() {
         let directory = test_directory("ensemble-exclusion-reason");
         let mut manifest = minimal_manifest(&directory, ValidationDatasetRole::Development);
+        let legacy_compatible = serde_json::to_value(&manifest.models[0]).unwrap();
+        assert!(legacy_compatible.get("ensemble_participation").is_none());
+        assert!(legacy_compatible.get("ensemble_exclusion_reason").is_none());
         manifest.models[0].ensemble_participation = EnsembleParticipation::Excluded;
         assert!(manifest.validate().is_err());
         manifest.models[0].ensemble_exclusion_reason = Some("parity evidence is incomplete".into());
         manifest.validate().unwrap();
+        let excluded = serde_json::to_value(&manifest.models[0]).unwrap();
+        assert_eq!(excluded["ensemble_participation"], "excluded");
+        std::fs::remove_dir_all(directory).unwrap();
+    }
+
+    #[test]
+    fn interrupted_and_modified_stage_checkpoints_are_not_resumed() {
+        let directory = test_directory("stage-resume-integrity");
+        let results = directory.join("results.sage.tsv");
+        let config = directory.join("workflow.search.resolved.json");
+        std::fs::write(&results, b"results\n").unwrap();
+        std::fs::write(&config, b"{}\n").unwrap();
+        let dataset = DatasetIdentity {
+            schema_version: 1,
+            dataset_id: "dataset".into(),
+            fingerprint: "dataset-fingerprint".into(),
+            target_fasta_sha256: "fasta".into(),
+            spectra_sha256: vec!["spectra".into()],
+            search_config_sha256: "config".into(),
+        };
+        let mut record = StageRecord {
+            schema_version: 2,
+            stage: "optimized".into(),
+            model: "moments".into(),
+            input_hash: "input".into(),
+            status: "running".into(),
+            results: results.clone(),
+            config_snapshot: config.clone(),
+            results_sha256: sha256_file(&results).unwrap(),
+            config_snapshot_sha256: sha256_file(&config).unwrap(),
+            external_features_enabled: false,
+            calibration_mode: "fit_current_search_space".into(),
+            dataset_id: dataset.dataset_id.clone(),
+            dataset_fingerprint: dataset.fingerprint.clone(),
+            artifact_fit_dataset_fingerprint: None,
+            candidate_pool: None,
+            ms2rescore_annotation_cache: None,
+            target_only_calibration_policy: None,
+            release_candidate: true,
+            window_provenance: None,
+        };
+        assert!(!stage_checkpoint_identity_matches(
+            &record,
+            "input",
+            "optimized",
+            &ModelFit::Moments,
+            &dataset,
+            &results,
+            &config,
+            None,
+        ));
+        record.status = "complete".into();
+        assert!(stage_checkpoint_identity_matches(
+            &record,
+            "input",
+            "optimized",
+            &ModelFit::Moments,
+            &dataset,
+            &results,
+            &config,
+            None,
+        ));
+        assert!(stage_output_hashes_match(&record).unwrap());
+        std::fs::write(&results, b"modified\n").unwrap();
+        assert!(!stage_output_hashes_match(&record).unwrap());
         std::fs::remove_dir_all(directory).unwrap();
     }
 

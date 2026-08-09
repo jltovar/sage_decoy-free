@@ -347,6 +347,48 @@ is in `validation/reports/phase8_secondary_model_repairs_2026-08-08.json`.
 No additional PXD model search was run for Phase 8. PXD Moments remains the only required PXD
 parity run for this refactor.
 
+## Phase 9: final release evaluation and resumption integrity
+
+The final release gate has three explicit outcomes:
+
+- `eligible`: all required evidence is evaluable and every release criterion passes;
+- `not_eligible`: the evidence is complete, but at least one scientific or engineering criterion
+  fails; or
+- `not_evaluable`: required evidence is missing, invalid, unreadable, or cannot be linked to its
+  declared calibration source.
+
+Missing result files and malformed tables are collected in `validation.missing_runs.json` and
+`validation.invalid_runs.json`; they no longer abort before an audit can describe the problem.
+External parity evidence remains supplementary and cannot replace a declared dataset-local
+baseline/native comparison. Every declared parity stage/layer must have a local comparison.
+Likewise, a target-only result must identify an existing calibration stage and have an explicit
+transfer comparison. The validator never falls back to another calibration stage when the
+declared source is absent.
+
+All validation layers now carry four consistently defined identification counts:
+
+- PSM: a distinct rank-1, label-1 result-table PSM identity;
+- peptide: the unmodified sequence with bracketed modifications removed and I/L canonicalized;
+- peptidoform: the sequence with bracketed modification annotations retained and unmodified I/L
+  canonicalized; and
+- protein: one unambiguous inferred protein key.
+
+Contaminants and ambiguous target/entrapment mappings are excluded from all four definitions.
+Peptidoform FDP uses the measured peptidoform ratio already stored as the workflow's PSM ratio.
+
+Stage checkpoint schema 2 hashes both the result table and resolved search configuration. A cache
+hit also verifies candidate-pool schema, identity, capability, count, and payload hash; annotated
+stages additionally verify the separate MS2Rescore annotation cache. A checkpoint left `running`
+by interruption is never resumed as complete, and a changed durable output invalidates the stage.
+Compatible schema-1 checkpoints are migrated once after their existing dataset, input, output,
+candidate-pool, and annotation identities pass.
+
+Phase 9 cache-hit validation resumed all 22 frozen ISB stages twice with zero new searches, then
+resumed the three required PXD Moments stages with zero new searches. All 25 checkpoints were
+migrated to hashed outputs; both workflows reported zero missing and zero invalid runs. PXD kept
+all six declared parity comparisons within tolerance. Full evidence is recorded in
+`validation/reports/phase9_release_finalization_2026-08-09.json`.
+
 ## Outputs and resumption
 
 Each stage has a resolved search configuration and a hash checkpoint. A completed stage is reused
@@ -367,6 +409,7 @@ match. Important workflow reports include:
 - `validation.stage_comparisons.json`
 - `validation.transfer_stability.json`
 - `validation.missing_runs.json`
+- `validation.invalid_runs.json`
 - `validation.ensemble_expert_gates.json`
 - `validation.parity.json`
 - `validation.tdc_benchmarks.json`
