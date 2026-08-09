@@ -1,0 +1,145 @@
+{
+  "schema_version": 1,
+  "phase": 9,
+  "title": "Final release evaluation, validation definitions, and resumption integrity",
+  "date": "2026-08-09",
+  "starting_commit": "5b53ee1a4517f1a524ce6517f244063c971ff50b",
+  "branch": "codex/phase9-finalize",
+  "status": "core_refactor_complete_ready_for_fork_only_draft_pr",
+  "scope": "Finalize the reproducible Decoy-Free engineering/parity refactor after required ISB model-by-model and independent PXD001468 Moments parity. This phase does not claim that Decoy-Free is ready to replace a statistical default.",
+  "release_gate_semantics": {
+    "eligible": "All required evidence is evaluable and all release criteria pass.",
+    "not_eligible": "Evidence is complete, but one or more scientific or engineering criteria fail.",
+    "not_evaluable": "Required evidence is missing, invalid, unreadable, or cannot be linked to its declared calibration source.",
+    "compatibility": "eligible_for_statistical_default_change remains as a compatibility boolean and is true only when status is eligible.",
+    "fail_closed_changes": [
+      "Missing result files are recorded in validation.missing_runs.json instead of aborting before reporting.",
+      "Malformed or unreadable result tables are recorded in validation.invalid_runs.json.",
+      "Every declared dataset-local parity stage/layer must have a comparison; external evidence cannot replace it.",
+      "A declared target-only calibration stage must exist; validation and TDC comparisons never fall back to a different stage.",
+      "Every release-candidate target-only result must have an evaluable transfer comparison and calibration quality gate.",
+      "Matched TDC evidence must exist before a workflow can be evaluated for a statistical default change.",
+      "Frozen baselines declared complete must be nonempty."
+    ]
+  },
+  "identification_definitions": {
+    "common_filters": "rank=1, label=1, non-contaminant, and unambiguous target/entrapment mapping",
+    "psm": "Distinct result-table PSM identity passing the stage/layer PSM threshold.",
+    "peptide": "Unmodified sequence after removing bracketed modifications and canonicalizing I/L.",
+    "peptidoform": "Sequence retaining bracketed modification annotations while canonicalizing unmodified I/L; uses the measured peptidoform ratio already represented by the workflow PSM ratio.",
+    "protein": "One unambiguous inferred protein key.",
+    "coverage": "All four counts are present in run summaries, parity comparisons, stage comparisons, target-only transfer, and matched TDC comparisons."
+  },
+  "checkpoint_and_cache_integrity": {
+    "workflow_state_schema": 2,
+    "stage_checkpoint_schema": 2,
+    "stage_output_hashes": [
+      "results.sage.tsv SHA-256",
+      "resolved search configuration SHA-256"
+    ],
+    "resume_identity": [
+      "stage input hash",
+      "dataset ID and content fingerprint",
+      "model and stage",
+      "target-only calibration policy",
+      "result/configuration paths and hashes",
+      "candidate-pool schema, stable-ID schema, search fingerprint, capability, count, and payload hash",
+      "MS2Rescore annotation-cache identity and payload integrity for annotated stages"
+    ],
+    "interruption_behavior": "A checkpoint with status running is not resumed as complete.",
+    "modified_output_behavior": "A result or configuration hash mismatch invalidates the stage rather than silently resuming it.",
+    "legacy_migration": "Compatible Phase 1-8 checkpoints are migrated once after their existing identities and durable caches pass verification."
+  },
+  "end_to_end_resume_validation": {
+    "isb18": {
+      "manifest": "validation/manifests/isb18_phase6_model_parity_macos_2026-08-06.json",
+      "manifest_sha256": "58591cca1b2aaa4422dea078f942125bb264e1c550fce4b8dfd801b487a4262d",
+      "stages_resumed": 22,
+      "new_spectrum_searches": 0,
+      "new_external_feature_generations": 0,
+      "schema2_checkpoints_with_output_hashes": 22,
+      "missing_runs": 0,
+      "invalid_runs": 0,
+      "final_cache_hit_seconds": 19.35,
+      "release_gate_status": "not_evaluable",
+      "not_evaluable_reason": "A matched TDC benchmark is missing.",
+      "engineering_note": "ISB18 is the development parity dataset; its known Lower Order/Nokoi transfer and deferred-model results remain explicit and are not relabeled passed."
+    },
+    "pxd001468_moments": {
+      "manifest": "validation/manifests/pxd001468_phase7_moments_parity_macos_2026-08-07.json",
+      "manifest_sha256": "81b714ae15fa7ed2580161db650e6e7274a8b243343b1ed306af07897cb2fbce",
+      "stages_resumed": 3,
+      "new_spectrum_searches": 0,
+      "new_external_feature_generations": 0,
+      "schema2_checkpoints_with_output_hashes": 3,
+      "missing_runs": 0,
+      "invalid_runs": 0,
+      "declared_parity_comparisons": 6,
+      "parity_comparisons_within_tolerance": 6,
+      "final_cache_hit_seconds_approximate": 111,
+      "release_gate_status": "not_evaluable",
+      "not_evaluable_reason": "A matched TDC benchmark is missing.",
+      "engineering_parity_status": "passed and unchanged"
+    },
+    "total_hashed_checkpoints": 25
+  },
+  "tests_added_or_extended": [
+    "Missing and invalid audit inputs produce an evaluable=false report and durable evidence files.",
+    "Every declared parity stage/layer requires local evidence.",
+    "A missing declared calibration source cannot fall back to optimized or MS2Rescore.",
+    "Unmodified peptide and modification-retaining peptidoform counts are distinct and deterministic.",
+    "Candidate-pool workflow usage rejects a modified payload.",
+    "Running checkpoints and modified outputs are not eligible for resume.",
+    "Phase 8 default Ensemble fields remain serialization-compatible with frozen stage fingerprints."
+  ],
+  "verification": {
+    "cargo_fmt_check": "passed",
+    "cargo_test_workspace": {
+      "status": "passed",
+      "tests": 170,
+      "failures": 0,
+      "includes_doctests": true
+    },
+    "python_unittest_discovery": {
+      "status": "passed",
+      "tests": 14,
+      "failures": 0
+    },
+    "cargo_clippy_workspace_all_targets": "completed with existing warning debt; -D warnings is not a release gate for this branch and currently reports longstanding lints across Sage core and CLI",
+    "release_build": "passed",
+    "json_validation": "passed",
+    "git_diff_check": "passed",
+    "frozen_manifests_unchanged": true
+  },
+  "deferred_models": {
+    "policy": "validation/policies/phase8_isb_ensemble_expert_policy_2026-08-08.json",
+    "lower_order": "Artifact-reuse transfer remains unstable; refit parity remains valid.",
+    "msfdr": "Annotated parity remains deferred pending environment reproduction or platform-robustness repair.",
+    "msfdr2_smix": "Annotated parity remains deferred pending environment reproduction or platform-robustness repair.",
+    "nokoi": "Portable artifact v1 and frozen parity remain incomplete.",
+    "ensemble": "Optional and evaluable only when enough dataset-local experts pass all automatic gates."
+  },
+  "pxd_scope": {
+    "required_models": [
+      "moments"
+    ],
+    "additional_models_run": [],
+    "decision": "No additional PXD model is required for this refactor."
+  },
+  "publication_scope": {
+    "repository": "jltovar/sage_decoy-free",
+    "head_branch": "codex/phase9-finalize",
+    "base_branch": "decoy-free",
+    "draft": true,
+    "upstream_repository": "lazear/sage",
+    "upstream_actions_permitted": false
+  },
+  "final_decision": {
+    "phases_1_through_9_complete": true,
+    "required_isb_parity_complete": true,
+    "required_pxd_moments_parity_complete": true,
+    "core_refactor_ready_for_draft_pr": true,
+    "eligible_for_statistical_default_change": false,
+    "biological_or_statistical_optimization_in_scope": false
+  }
+}

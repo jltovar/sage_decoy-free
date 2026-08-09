@@ -141,6 +141,19 @@ and incremental-yield checks can still reject any expert. If too few experts pas
 writes an `evaluable: false` Ensemble lock and skips Ensemble without invalidating completed
 individual-model stages.
 
+Phase 9 makes release evaluation three-state: `eligible`, `not_eligible`, or `not_evaluable`.
+Missing files, invalid result tables, absent declared parity evidence, missing target-only
+calibration provenance, incomplete transfer comparisons, and absent matched TDC evidence are
+reported as `not_evaluable`; they are never silently treated as stable or passed. A complete but
+failed calibration, parity, transfer, or yield criterion is `not_eligible`. Validation now reports
+PSMs, unmodified I/L-canonical peptides, modification-retaining I/L-canonical peptidoforms, and
+single-key proteins consistently across summaries, parity, transfer, stage, and TDC comparisons.
+
+Completed stage checkpoints now include hashes of both `results.sage.tsv` and the resolved search
+configuration. Resume verifies those hashes plus candidate-pool and MS2Rescore annotation-cache
+integrity. Interrupted (`running`) stages or modified outputs are rebuilt; compatible Phase 1-8
+checkpoints are migrated once without another spectrum search.
+
 
 ## Practical implication
 

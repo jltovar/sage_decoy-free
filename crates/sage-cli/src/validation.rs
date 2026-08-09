@@ -67,6 +67,12 @@ pub struct ValidationRun {
 }
 
 #[derive(Clone, Debug, Serialize, Deserialize)]
+pub struct InvalidValidationRun {
+    pub run: ValidationRun,
+    pub error: String,
+}
+
+#[derive(Clone, Debug, Serialize, Deserialize)]
 pub struct EffectiveRatios {
     pub psm: f64,
     pub peptide: f64,
@@ -83,7 +89,7 @@ impl Default for EffectiveRatios {
     }
 }
 
-#[derive(Clone, Debug, Serialize, Deserialize)]
+#[derive(Clone, Debug, Default, Serialize, Deserialize)]
 pub struct IdentificationCount {
     pub target: usize,
     pub entrapment: usize,
@@ -107,6 +113,8 @@ pub struct RunValidationSummary {
     pub layer: String,
     pub psm: IdentificationCount,
     pub peptide: IdentificationCount,
+    #[serde(default)]
+    pub peptidoform: IdentificationCount,
     pub protein: IdentificationCount,
     pub counting_definition: String,
 }
@@ -144,6 +152,29 @@ fn canonical_peptide(peptide: &str) -> String {
                 output.push(if upper == 'I' { 'L' } else { upper });
             }
             _ => {}
+        }
+    }
+    output
+}
+
+fn canonical_peptidoform(peptide: &str) -> String {
+    let mut output = String::new();
+    let mut bracket_depth = 0_u32;
+    for character in peptide.trim().chars() {
+        match character {
+            '[' => {
+                bracket_depth += 1;
+                output.push(character);
+            }
+            ']' => {
+                bracket_depth = bracket_depth.saturating_sub(1);
+                output.push(character);
+            }
+            _ if bracket_depth == 0 && character.is_ascii_alphabetic() => {
+                let upper = character.to_ascii_uppercase();
+                output.push(if upper == 'I' { 'L' } else { upper });
+            }
+            _ => output.push(character),
         }
     }
     output
@@ -304,6 +335,8 @@ pub fn summarize_run(
         ent_psm: BTreeSet<String>,
         target_peptide: BTreeSet<String>,
         ent_peptide: BTreeSet<String>,
+        target_peptidoform: BTreeSet<String>,
+        ent_peptidoform: BTreeSet<String>,
         target_protein: BTreeSet<String>,
         ent_protein: BTreeSet<String>,
     }
@@ -327,7 +360,9 @@ pub fn summarize_run(
         };
         let protein = protein_key(protein_text);
         has_entrapment |= entrapment;
-        let peptide = canonical_peptide(row.get(peptide).unwrap_or(""));
+        let peptide_text = row.get(peptide).unwrap_or("");
+        let peptide = canonical_peptide(peptide_text);
+        let peptidoform = canonical_peptidoform(peptide_text);
         if peptide.is_empty() {
             continue;
         }
@@ -358,6 +393,11 @@ pub fn summarize_run(
                     sets.ent_peptide.insert(peptide.clone());
                 } else {
                     sets.target_peptide.insert(peptide.clone());
+                }
+                if entrapment {
+                    sets.ent_peptidoform.insert(peptidoform.clone());
+                } else {
+                    sets.target_peptidoform.insert(peptidoform.clone());
                 }
             }
             if protein_ok {
@@ -408,6 +448,11 @@ pub fn summarize_run(
             entrapment: sets.ent_peptide.len(),
             combined_entrapment_fdp: None,
         };
+        let mut peptidoform = IdentificationCount {
+            target: sets.target_peptidoform.len(),
+            entrapment: sets.ent_peptidoform.len(),
+            combined_entrapment_fdp: None,
+        };
         let mut protein = IdentificationCount {
             target: sets.target_protein.len(),
             entrapment: sets.ent_protein.len(),
@@ -415,6 +460,8 @@ pub fn summarize_run(
         };
         psm.combined_entrapment_fdp = combined_fdp(&psm, ratios.psm, has_entrapment);
         peptide.combined_entrapment_fdp = combined_fdp(&peptide, ratios.peptide, has_entrapment);
+        peptidoform.combined_entrapment_fdp =
+            combined_fdp(&peptidoform, ratios.psm, has_entrapment);
         protein.combined_entrapment_fdp = combined_fdp(&protein, ratios.protein, has_entrapment);
         RunValidationSummary {
             method: run.method.clone(),
@@ -429,8 +476,9 @@ pub fn summarize_run(
             layer: layer.into(),
             psm,
             peptide,
+            peptidoform,
             protein,
-            counting_definition: "rank=1,label=1,non-contaminant,unambiguous target/entrapment mapping; peptide removes bracketed modifications and canonicalizes I/L; protein requires one inferred protein key"
+            counting_definition: "rank=1,label=1,non-contaminant,unambiguous target/entrapment mapping; PSM is a distinct result-table PSM identity; peptide removes bracketed modifications and canonicalizes I/L; peptidoform retains bracketed modification annotations while canonicalizing unmodified I/L; protein requires one inferred protein key"
                 .into(),
         }
     };
@@ -450,6 +498,8 @@ pub struct TransferStability {
     pub to_stage: String,
     pub psm_fraction_change: Option<f64>,
     pub peptide_fraction_change: Option<f64>,
+    #[serde(default)]
+    pub peptidoform_fraction_change: Option<f64>,
     pub protein_fraction_change: Option<f64>,
     pub stable: bool,
     #[serde(default)]
@@ -466,6 +516,8 @@ pub struct StageComparison {
     pub to_stage: String,
     pub target_psm_change: i64,
     pub target_peptide_change: i64,
+    #[serde(default)]
+    pub target_peptidoform_change: i64,
     pub target_protein_change: i64,
     pub peptide_fdp_change: Option<f64>,
 }
@@ -497,6 +549,8 @@ pub struct ParityComparison {
     pub layer: String,
     pub psm_fraction_change: Option<f64>,
     pub peptide_fraction_change: Option<f64>,
+    #[serde(default)]
+    pub peptidoform_fraction_change: Option<f64>,
     pub protein_fraction_change: Option<f64>,
     pub within_tolerance: bool,
 }
@@ -533,10 +587,16 @@ pub fn parity_comparisons(
             }) {
                 let psm = fraction(baseline.psm.target, native.psm.target);
                 let peptide = fraction(baseline.peptide.target, native.peptide.target);
+                let peptidoform = fraction(baseline.peptidoform.target, native.peptidoform.target);
                 let protein = fraction(baseline.protein.target, native.protein.target);
                 let within_tolerance = [
                     (baseline.psm.target, native.psm.target, psm),
                     (baseline.peptide.target, native.peptide.target, peptide),
+                    (
+                        baseline.peptidoform.target,
+                        native.peptidoform.target,
+                        peptidoform,
+                    ),
                     (baseline.protein.target, native.protein.target, protein),
                 ]
                 .into_iter()
@@ -554,6 +614,7 @@ pub fn parity_comparisons(
                     layer: baseline.layer.clone(),
                     psm_fraction_change: psm,
                     peptide_fraction_change: peptide,
+                    peptidoform_fraction_change: peptidoform,
                     protein_fraction_change: protein,
                     within_tolerance,
                 });
@@ -561,6 +622,55 @@ pub fn parity_comparisons(
         }
     }
     output
+}
+
+pub fn missing_parity_evidence(
+    pairs: &[ParityPair],
+    comparisons: &[ParityComparison],
+) -> Vec<String> {
+    let mut reasons = Vec::new();
+    for pair in pairs {
+        let pair_comparisons = comparisons
+            .iter()
+            .filter(|comparison| {
+                comparison.baseline_method == pair.baseline_method
+                    && comparison.native_method == pair.native_method
+            })
+            .collect::<Vec<_>>();
+        let required_stages = if pair.stages.is_empty() {
+            vec![None]
+        } else {
+            pair.stages.iter().map(Some).collect()
+        };
+        let required_layers = if pair.layers.is_empty() {
+            vec![None]
+        } else {
+            pair.layers.iter().map(Some).collect()
+        };
+        for stage in &required_stages {
+            for layer in &required_layers {
+                if !pair_comparisons.iter().any(|comparison| {
+                    stage.is_none_or(|stage| comparison.stage == *stage)
+                        && layer.is_none_or(|layer| comparison.layer == *layer)
+                }) {
+                    reasons.push(format!(
+                        "declared dataset-local parity evidence is missing for {} -> {}{}{}",
+                        pair.baseline_method,
+                        pair.native_method,
+                        stage
+                            .map(|stage| format!(" stage={stage}"))
+                            .unwrap_or_default(),
+                        layer
+                            .map(|layer| format!(" layer={layer}"))
+                            .unwrap_or_default()
+                    ));
+                }
+            }
+        }
+    }
+    reasons.sort();
+    reasons.dedup();
+    reasons
 }
 
 #[derive(Clone, Debug, Serialize, Deserialize)]
@@ -572,6 +682,8 @@ pub struct TdcBenchmarkComparison {
     pub tdc_layer: String,
     pub psm_yield_difference: i64,
     pub peptide_yield_difference: i64,
+    #[serde(default)]
+    pub peptidoform_yield_difference: i64,
     pub protein_yield_difference: i64,
     pub peptide_entrapment_fdp: Option<f64>,
     pub calibration_stage: Option<String>,
@@ -619,25 +731,22 @@ pub fn tdc_benchmark_comparisons(
             let peptide_difference = decoy_free.peptide.target as i64 - tdc.peptide.target as i64;
             let calibration = if is_target_only_stage(&decoy_free.stage) {
                 let requested = decoy_free.calibration_stage.as_deref();
-                requested
-                    .and_then(|stage| {
+                match requested {
+                    Some(stage) => summaries.iter().find(|row| {
+                        row.method == decoy_free.method
+                            && row.stage == stage
+                            && row.layer == decoy_free.layer
+                            && matches!(row.mode, ValidationMode::DecoyFree)
+                    }),
+                    None => ["ms2rescore", "optimized"].into_iter().find_map(|stage| {
                         summaries.iter().find(|row| {
                             row.method == decoy_free.method
                                 && row.stage == stage
                                 && row.layer == decoy_free.layer
                                 && matches!(row.mode, ValidationMode::DecoyFree)
                         })
-                    })
-                    .or_else(|| {
-                        ["ms2rescore", "optimized"].into_iter().find_map(|stage| {
-                            summaries.iter().find(|row| {
-                                row.method == decoy_free.method
-                                    && row.stage == stage
-                                    && row.layer == decoy_free.layer
-                                    && matches!(row.mode, ValidationMode::DecoyFree)
-                            })
-                        })
-                    })
+                    }),
+                }
             } else {
                 Some(decoy_free)
             };
@@ -651,6 +760,8 @@ pub fn tdc_benchmark_comparisons(
                 tdc_layer: tdc.layer.clone(),
                 psm_yield_difference: decoy_free.psm.target as i64 - tdc.psm.target as i64,
                 peptide_yield_difference: peptide_difference,
+                peptidoform_yield_difference: decoy_free.peptidoform.target as i64
+                    - tdc.peptidoform.target as i64,
                 protein_yield_difference: decoy_free.protein.target as i64
                     - tdc.protein.target as i64,
                 peptide_entrapment_fdp: calibration_fdp,
@@ -706,6 +817,8 @@ pub fn stage_comparisons(summaries: &[RunValidationSummary]) -> Vec<StageCompari
                         target_psm_change: to.psm.target as i64 - from.psm.target as i64,
                         target_peptide_change: to.peptide.target as i64
                             - from.peptide.target as i64,
+                        target_peptidoform_change: to.peptidoform.target as i64
+                            - from.peptidoform.target as i64,
                         target_protein_change: to.protein.target as i64
                             - from.protein.target as i64,
                         peptide_fdp_change: match (
@@ -752,34 +865,37 @@ pub fn expert_quality_gates(
     methods
         .into_iter()
         .map(|method| {
-            let selected_stage = summaries
+            let release_target = summaries
                 .iter()
                 .find(|row| {
                     row.method == method
                         && is_target_only_stage(&row.stage)
                         && row.layer == validation_layer
                         && row.release_candidate
-                })
-                .and_then(|row| row.calibration_stage.as_deref());
-            let best = selected_stage
-                .and_then(|stage| {
+                });
+            let selected_stage = release_target.and_then(|row| row.calibration_stage.as_deref());
+            let best = if release_target.is_some() {
+                selected_stage.and_then(|stage| {
                     summaries.iter().find(|row| {
                         row.method == method
                             && row.stage == stage
                             && row.layer == validation_layer
                     })
                 })
-                .or_else(|| {
-                    ["ms2rescore", "optimized"].into_iter().find_map(|stage| {
-                        summaries.iter().find(|row| {
-                            row.method == method
-                                && row.stage == stage
-                                && row.layer == validation_layer
-                        })
+            } else {
+                ["ms2rescore", "optimized"].into_iter().find_map(|stage| {
+                    summaries.iter().find(|row| {
+                        row.method == method
+                            && row.stage == stage
+                            && row.layer == validation_layer
                     })
-                });
+                })
+            };
             let mut reasons = Vec::new();
             let mut warnings = Vec::new();
+            if release_target.is_some() && selected_stage.is_none() {
+                reasons.push("target-only calibration provenance is missing".into());
+            }
             if best.is_none() {
                 reasons.push(format!("missing {validation_layer} entrapment validation"));
             }
@@ -789,8 +905,12 @@ pub fn expert_quality_gates(
             if target_peptides == 0 {
                 reasons.push("no accepted target peptides".into());
             }
-            if !fdp.is_some_and(|value| value <= maximum_fdp) {
-                reasons.push("peptide entrapment FDP is missing or above threshold".into());
+            match fdp {
+                None => reasons.push("peptide entrapment FDP is missing".into()),
+                Some(value) if value > maximum_fdp => {
+                    reasons.push("peptide entrapment FDP is above threshold".into())
+                }
+                Some(_) => {}
             }
             if entrapment_peptides < minimum_entrapment_peptides {
                 warnings.push(format!(
@@ -836,23 +956,27 @@ pub fn transfer_stability(
         |from: usize, to: usize| (from > 0).then_some((to as f64 - from as f64) / from as f64);
     let mut output = Vec::new();
     for (method, rows) in by_method {
-        let from = rows
-            .iter()
-            .find(|row| row.stage == "ms2rescore")
-            .or_else(|| rows.iter().find(|row| row.stage == "optimized"));
         let targets = rows
             .iter()
             .filter(|row| is_target_only_stage(&row.stage))
             .copied()
             .collect::<Vec<_>>();
         for to in targets {
+            let from = match to.calibration_stage.as_deref() {
+                Some(stage) => rows.iter().find(|row| row.stage == stage),
+                None => rows
+                    .iter()
+                    .find(|row| row.stage == "ms2rescore")
+                    .or_else(|| rows.iter().find(|row| row.stage == "optimized")),
+            };
             let Some(from) = from else {
                 continue;
             };
             let psm = fraction(from.psm.target, to.psm.target);
             let peptide = fraction(from.peptide.target, to.peptide.target);
+            let peptidoform = fraction(from.peptidoform.target, to.peptidoform.target);
             let protein = fraction(from.protein.target, to.protein.target);
-            let stable = [psm, peptide, protein]
+            let stable = [psm, peptide, peptidoform, protein]
                 .into_iter()
                 .flatten()
                 .all(|change| change >= -maximum_fraction_loss);
@@ -862,6 +986,7 @@ pub fn transfer_stability(
                 to_stage: to.stage.clone(),
                 psm_fraction_change: psm,
                 peptide_fraction_change: peptide,
+                peptidoform_fraction_change: peptidoform,
                 protein_fraction_change: protein,
                 stable,
                 target_only_calibration_policy: to.target_only_calibration_policy,
@@ -903,6 +1028,7 @@ mod tests {
             layer: layer.into(),
             psm: count.clone(),
             peptide: count.clone(),
+            peptidoform: count.clone(),
             protein: count,
             counting_definition: "test".into(),
         }
@@ -951,6 +1077,29 @@ mod tests {
         assert_eq!(result.len(), 1);
         assert_eq!(result[0].stage, "optimized");
         assert!(result[0].within_tolerance);
+    }
+
+    #[test]
+    fn every_declared_parity_stage_and_layer_requires_local_evidence() {
+        let pair = ParityPair {
+            baseline_method: "baseline".into(),
+            native_method: "native".into(),
+            stages: vec!["optimized".into(), "ms2rescore".into()],
+            layers: vec!["level4".into()],
+            maximum_fraction_difference: None,
+        };
+        let comparisons = parity_comparisons(
+            &[
+                summary("baseline", "optimized", "level4", 100, 0),
+                summary("native", "optimized", "level4", 100, 0),
+            ],
+            std::slice::from_ref(&pair),
+            0.001,
+        );
+        let missing = missing_parity_evidence(&[pair], &comparisons);
+        assert_eq!(missing.len(), 1);
+        assert!(missing[0].contains("stage=ms2rescore"));
+        assert!(missing[0].contains("layer=level4"));
     }
 
     #[test]
@@ -1106,5 +1255,69 @@ mod tests {
         assert!(comparisons[0].calibration_constrained);
         assert!(comparisons[0].improves_peptide_yield);
         assert_eq!(comparisons[0].peptide_yield_difference, 5);
+    }
+
+    #[test]
+    fn missing_declared_calibration_never_falls_back_to_another_stage() {
+        let optimized = summary("moments", "optimized", "level4", 100, 0);
+        let mut target_only = summary("moments", "target_only", "level4", 110, 0);
+        target_only.calibration_stage = Some("missing_calibration".into());
+        let mut tdc = summary("tdc", "target_only", "reportable_q", 105, 0);
+        tdc.mode = ValidationMode::Tdc;
+
+        let summaries = [optimized, target_only, tdc];
+        let gates = expert_quality_gates(&summaries, &[], 0.01, 3, "level4");
+        assert!(!gates[0].eligible);
+        assert!(gates[0]
+            .reasons
+            .iter()
+            .any(|reason| reason.contains("missing level4 entrapment validation")));
+        assert!(transfer_stability(&summaries, 0.20).is_empty());
+
+        let comparisons = tdc_benchmark_comparisons(&summaries, Some("tdc"), 0.01);
+        assert_eq!(comparisons.len(), 1);
+        assert!(!comparisons[0].calibration_constrained);
+        assert!(comparisons[0].calibration_stage.is_none());
+    }
+
+    #[test]
+    fn summaries_count_unmodified_peptides_and_peptidoforms_separately() {
+        let path = std::env::temp_dir().join(format!(
+            "sage-peptidoform-summary-{}-{}.tsv",
+            std::process::id(),
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .unwrap()
+                .as_nanos()
+        ));
+        std::fs::write(
+            &path,
+            "psm_id\trank\tlabel\tproteins\tpeptide\tdecoy_free_q_value\tdecoy_free_peptide_q\tdecoy_free_protein_q\tdecoy_free_protein_supported_peptide\tdecoy_free_peptide_supported_psm\n\
+             p1\t1\t1\tTarget_A\tPEPTIDE\t0.001\t0.001\t0.001\ttrue\ttrue\n\
+             p2\t1\t1\tTarget_A\tPEPTI[+15.99]DE\t0.001\t0.001\t0.001\ttrue\ttrue\n\
+             e1\t1\t1\tEnt_A\tPEPTIDE\t0.001\t0.001\t0.001\ttrue\ttrue\n",
+        )
+        .unwrap();
+        let rows = summarize_run(
+            &ValidationRun {
+                method: "moments".into(),
+                stage: "optimized".into(),
+                results: path.clone(),
+                mode: ValidationMode::DecoyFree,
+                expected_search_space: Some("+Ent".into()),
+                calibration_stage: None,
+                target_only_calibration_policy: None,
+                release_candidate: true,
+            },
+            &EffectiveRatios::default(),
+            0.01,
+        )
+        .unwrap();
+        let level4 = rows.iter().find(|row| row.layer == "level4").unwrap();
+        assert_eq!(level4.peptide.target, 1);
+        assert_eq!(level4.peptidoform.target, 2);
+        assert_eq!(level4.peptidoform.entrapment, 1);
+        assert!(level4.counting_definition.contains("peptidoform retains"));
+        std::fs::remove_file(path).unwrap();
     }
 }

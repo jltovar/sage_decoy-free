@@ -99,6 +99,52 @@ pub struct CandidatePoolUsage {
     pub retained_rank_depth: usize,
 }
 
+/// Verify the durable identity and payload integrity recorded in a completed
+/// workflow stage before resuming it without rebuilding the database/search.
+pub fn verify_usage(usage: &CandidatePoolUsage) -> Result<()> {
+    anyhow::ensure!(
+        usage.manifest.is_file(),
+        "candidate-pool manifest is missing: {}",
+        usage.manifest.display()
+    );
+    let manifest: CandidatePoolManifest = serde_json::from_slice(&std::fs::read(&usage.manifest)?)
+        .with_context(|| {
+            format!(
+                "invalid candidate-pool manifest {}",
+                usage.manifest.display()
+            )
+        })?;
+    anyhow::ensure!(
+        manifest.schema_version == CANDIDATE_POOL_SCHEMA_VERSION
+            && manifest.stable_candidate_id_schema == CANDIDATE_ID_SCHEMA,
+        "candidate-pool schema is incompatible"
+    );
+    anyhow::ensure!(
+        manifest.search_fingerprint.digest == usage.search_fingerprint
+            && !usage.analysis_fingerprint.is_empty(),
+        "candidate-pool fingerprint does not match workflow usage"
+    );
+    anyhow::ensure!(
+        manifest.candidate_count == usage.candidate_count
+            && manifest.capabilities.retained_rank_depth >= usage.retained_rank_depth,
+        "candidate-pool capability or count does not match workflow usage"
+    );
+    let expected_payload = usage
+        .manifest
+        .parent()
+        .unwrap_or_else(|| Path::new("."))
+        .join(&manifest.payload_file);
+    anyhow::ensure!(
+        expected_payload == usage.payload && usage.payload.is_file(),
+        "candidate-pool payload path is missing or inconsistent"
+    );
+    anyhow::ensure!(
+        sha256_file(&usage.payload)? == manifest.payload_sha256,
+        "candidate-pool payload hash mismatch"
+    );
+    Ok(())
+}
+
 /// One immutable search candidate plus the stable key that Phase 4 can use to
 /// attach cached MS2Rescore annotations without relying on process-local PSM
 /// numbering.
@@ -582,6 +628,16 @@ mod tests {
         let directory = pool_directory(&root, &fingerprint);
         let manifest =
             write_pool(&directory, &fingerprint, &[], &IndexedDatabase::default()).unwrap();
+        let usage = CandidatePoolUsage {
+            search_fingerprint: fingerprint.digest.clone(),
+            analysis_fingerprint: "analysis-digest".into(),
+            manifest: manifest_path(&directory),
+            payload: directory.join(&manifest.payload_file),
+            reused: true,
+            candidate_count: manifest.candidate_count,
+            retained_rank_depth: manifest.capabilities.retained_rank_depth,
+        };
+        verify_usage(&usage).unwrap();
         assert!(inspect_compatible_pool(&directory, &fingerprint, 50)
             .unwrap()
             .is_some());
@@ -593,6 +649,7 @@ mod tests {
         assert!(features.is_empty());
 
         std::fs::write(directory.join(manifest.payload_file), b"corrupt").unwrap();
+        assert!(verify_usage(&usage).is_err());
         assert!(inspect_compatible_pool(&directory, &fingerprint, 18)
             .unwrap()
             .is_none());
