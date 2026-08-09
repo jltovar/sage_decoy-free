@@ -114,6 +114,22 @@ match. A changed model/window calibration receives a different annotation cache,
 DeepLC behavior. See [`DECOY_FREE_WORKFLOW.md`](DECOY_FREE_WORKFLOW.md) for fingerprint,
 capability, integrity, and fail-closed rules.
 
+### Phase 5-7 calibration and parity status
+
+Target-only calibration is now explicit. The default `refit_with_locked_window` policy keeps the
+dataset-local window selected with entrapment and refits nuisance parameters in the target-only
+candidate space; `reuse_dataset_artifact` reuses the complete same-dataset fit, and `compare_both`
+keeps both interpretations separate. Cross-dataset artifact reuse remains prohibited by default.
+
+Frozen ISB model-by-model parity and the required independent PXD001468 Moments parity have been
+completed. PXD evaluated all 47 valid frozen Moments windows and selected the exact legacy
+`10-10` window. Optimized counts were exact, MS2Rescore and target-only counts were within the
+predeclared 0.5% platform tolerance, and an end-to-end cache-hit rerun performed no new spectrum
+search or external feature generation. PXD Moments is the only required PXD model for this
+refactor; additional PXD models are optional. See [`DECOY_FREE_WORKFLOW.md`](DECOY_FREE_WORKFLOW.md)
+and `validation/reports/phase7_pxd001468_moments_parity_2026-08-08.json` for the caveats and full
+evidence.
+
 
 ## Practical implication
 

@@ -71,6 +71,11 @@ class CompareNullWindowEvaluationsTests(unittest.TestCase):
                 0.01, (3, 5), 0.0, 0.0,
             )
             self.assertTrue(report["passed"])
+            self.assertEqual(report["summary"]["legacy_trace_rows"], 2)
+            self.assertEqual(
+                report["summary"]["excluded_invalid_rank1_rows"],
+                [{"run_id": "setup", "min_rank": 1, "max_rank": 1}],
+            )
             self.assertEqual(report["summary"]["legacy_visited_windows"], 1)
             self.assertEqual(report["summary"]["exact_count_rows"], 1)
 
@@ -176,6 +181,52 @@ class CompareNullWindowEvaluationsTests(unittest.TestCase):
             self.assertTrue(report["passed"])
             self.assertEqual(report["summary"]["fdp_comparable_rows"], 0)
             self.assertTrue(report["summary"]["required_fdp_values_available"])
+
+    def test_legacy_peptidoform_counters_can_be_retained_as_diagnostic_only(self):
+        with tempfile.TemporaryDirectory() as temporary:
+            root = Path(temporary)
+            legacy = root / "legacy.csv"
+            fields = [
+                "run_id", "min_null_rank", "max_null_rank", "target_psm", "ent_psm",
+                "target_peptide", "ent_peptide", "target_protein", "ent_protein",
+                "level4_target_psm", "level4_ent_psm", "level4_target_peptide",
+                "level4_ent_peptide", "feasible",
+            ]
+            with legacy.open("w", newline="") as handle:
+                writer = csv.DictWriter(handle, fieldnames=fields)
+                writer.writeheader()
+                writer.writerow({
+                    "run_id": "run", "min_null_rank": 10, "max_null_rank": 10,
+                    "target_psm": 100, "ent_psm": 1, "target_peptide": 25,
+                    "ent_peptide": 2, "target_protein": 10, "ent_protein": 0,
+                    "level4_target_psm": 100, "level4_ent_psm": 1,
+                    "level4_target_peptide": 25, "level4_ent_peptide": 2,
+                    "feasible": 1,
+                })
+            native = root / "native.json"
+            native.write_text(json.dumps([{
+                "min_rank": 10, "max_rank": 10, "validation_scope": "level4",
+                "target_psms": 100, "entrapment_psms": 1,
+                "target_peptides": 20, "entrapment_peptides": 1,
+                "target_proteins": 10, "entrapment_proteins": 0,
+                "psm_fdp": 2 / 101, "peptide_fdp": 2 / 21,
+                "protein_fdp": 0.0, "feasible": True, "selected": True,
+            }]))
+            report = compare(
+                legacy, native, None,
+                {"psm": 1.0, "peptide": 1.0, "protein": 1.0},
+                0.2, (10, 10), 0.0, 0.0,
+                frozenset({"target_peptides", "entrapment_peptides", "peptide_fdp"}),
+            )
+            self.assertTrue(report["passed"])
+            self.assertEqual(report["summary"]["exact_count_rows"], 0)
+            self.assertEqual(report["summary"]["exact_comparable_count_rows"], 1)
+            self.assertGreater(
+                report["summary"]["maximum_absolute_fdp_difference"], 0.0
+            )
+            self.assertEqual(
+                report["summary"]["maximum_absolute_comparable_fdp_difference"], 0.0
+            )
 
 
 if __name__ == "__main__":

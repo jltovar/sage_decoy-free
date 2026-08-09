@@ -1,0 +1,222 @@
+{
+  "schema_version": 1,
+  "phase": 7,
+  "title": "Independent PXD001468 Moments parity",
+  "date": "2026-08-08",
+  "starting_commit": "53d75830146b6bf911f7c733752fb4d0836f0614",
+  "status": "engineering_parity_passed_with_post_ms2rescore_protein_fdp_caveat",
+  "scope": "Required PXD001468 Moments-only holdout parity. Additional PXD models remain optional and were not run.",
+  "inputs": {
+    "manifest": "validation/manifests/pxd001468_phase7_moments_parity_macos_2026-08-07.json",
+    "manifest_sha256": "81b714ae15fa7ed2580161db650e6e7274a8b243343b1ed306af07897cb2fbce",
+    "legacy_root": "/Users/kgousset/Library/CloudStorage/OneDrive-Personal/Search_Data_Files/SAGE_DECOYFREE/VALIDATION/PXD001468/DECOYFREE/MOMENTS",
+    "native_root": "/Users/kgousset/Library/CloudStorage/OneDrive-Personal/Search_Data_Files/SAGE_DECOYFREE/VALIDATION/NATIVE_WORKFLOW/PXD001468/PHASE7_MOMENTS_PARITY_2026-08-07",
+    "target_fasta_sha256": "3e17f8a0538151f9ed267c542ed911945881cf8e877af89489a85e238dbf2141",
+    "frozen_entrapment_fasta_sha256": "71c13d87887cdda7fdc9ee482af3ef6068d8e18ce57ec9168382f12a0a88de53",
+    "spectral_files": 24,
+    "ratios": {
+      "protein": 1.0,
+      "peptide": 0.5948800028882344,
+      "peptidoform_psm": 0.6316190823137978
+    },
+    "entrapment_proteins": {
+      "target": 20405,
+      "foreign": 20405
+    }
+  },
+  "grid_parity": {
+    "report": "validation/reports/phase7_pxd001468_moments_null_window_parity_2026-08-08.json",
+    "report_sha256": "6f6cf0e5969d6bacb9500e36d75f5b0184f458bef3ded0409f3e307e3c7b5dcb",
+    "comparator": "tools/compare_null_window_evaluations.py",
+    "comparator_sha256": "cdbe2aea87bc42f4d34390bd7e6e70ef9aaa09bc9f8c6d59ccb967e7931d59c2",
+    "legacy_trace_rows": 53,
+    "excluded_invalid_rank1_setup_rows": 6,
+    "legacy_valid_windows": 47,
+    "native_evaluated_windows": 47,
+    "matched_windows": 47,
+    "exact_comparable_count_rows": 47,
+    "feasibility_match_rows": 47,
+    "maximum_absolute_comparable_count_fraction_difference": 0.0,
+    "maximum_absolute_comparable_fdp_difference": 0.0,
+    "diagnostic_only_legacy_fields": [
+      "target_peptides",
+      "entrapment_peptides",
+      "peptide_fdp"
+    ],
+    "diagnostic_reason": "The frozen cumulative CSV uses modification-sensitive Sage peptide/peptidoform identity; final stage parity uses canonical unmodified I/L-normalized peptide counts.",
+    "legacy_selected_window": "10-10",
+    "native_selected_window": "10-10",
+    "selected_window_match": true
+  },
+  "fitted_state": {
+    "optimized": {
+      "window": "10-10",
+      "mu": 22.870412058498125,
+      "beta": 3.570166191931442,
+      "search_fingerprint": "af9e873e35f4588cd566469d04b319354c55259250fbfc09f43c06e895e5d58b"
+    },
+    "ms2rescore": {
+      "window": "10-10",
+      "mu": 22.870412058498125,
+      "beta": 3.570166191931442,
+      "search_fingerprint": "af9e873e35f4588cd566469d04b319354c55259250fbfc09f43c06e895e5d58b"
+    },
+    "target_only_refit_with_locked_window": {
+      "window": "10-10",
+      "mu": 22.8878688278851,
+      "beta": 3.5577291878462964,
+      "search_fingerprint": "164d80e02f30ed998c45d6f9c94713327891bc27ac77ccf1545fbb52d34ea8c2",
+      "window_source_stage": "ms2rescore",
+      "window_source_dataset": "PXD001468"
+    }
+  },
+  "candidate_pools": {
+    "plus_entrapment": {
+      "fingerprint": "af9e873e35f4588cd566469d04b319354c55259250fbfc09f43c06e895e5d58b",
+      "candidate_count": 12033536,
+      "spectrum_count": 1117882,
+      "retained_rank_depth": 50,
+      "payload_sha256": "72bfcd4a888926964053e76e5421d5448d6c9a061e24a81776d8a8bc5548688d"
+    },
+    "target_only": {
+      "fingerprint": "164d80e02f30ed998c45d6f9c94713327891bc27ac77ccf1545fbb52d34ea8c2",
+      "candidate_count": 12181311,
+      "spectrum_count": 1117858,
+      "retained_rank_depth": 50,
+      "payload_sha256": "5a62af639e7d83b2c5eab24d5c70410fbe47b64aaac54a0535a7f3c5ff6ac89d"
+    }
+  },
+  "ms2rescore_annotation_caches": {
+    "plus_entrapment": {
+      "fingerprint": "5fda7a3ea37e061287c55d6967dba956a1c77c9a6b031db259d7a13456d93b17",
+      "requested_candidates": 12033536,
+      "annotations": 12033536,
+      "joined_annotations": 12033536,
+      "payload_sha256": "5d1a285f2ddb11318bc28936aa0d95ff493b0f60adb4b1850f67138a54dde843"
+    },
+    "target_only": {
+      "fingerprint": "51b3cd446ba4d98c6281a571c0b97c37813d73dd5521d96511804d157fb5a6b5",
+      "requested_candidates": 12181311,
+      "annotations": 12181311,
+      "joined_annotations": 12181311,
+      "payload_sha256": "35e71d23d0776f5e868943282926db6fb8668e6dcd41eb4e41b2c566b45d5074"
+    },
+    "stable_id_join": "passed_exactly",
+    "target_only_cache_is_distinct": true
+  },
+  "level4_target_count_parity": {
+    "format": [
+      "legacy_psms",
+      "native_psms",
+      "legacy_peptides",
+      "native_peptides",
+      "legacy_proteins",
+      "native_proteins"
+    ],
+    "optimized": [
+      185310,
+      185310,
+      24482,
+      24482,
+      4397,
+      4397
+    ],
+    "ms2rescore": [
+      217296,
+      216922,
+      32185,
+      32094,
+      5100,
+      5089
+    ],
+    "target_only_refit": [
+      221847,
+      221561,
+      34143,
+      34084,
+      5283,
+      5276
+    ],
+    "maximum_configured_fraction_difference": 0.005,
+    "all_stage_comparisons_within_tolerance": true
+  },
+  "ms2rescore_gain": {
+    "legacy_level4_peptides": 7703,
+    "native_level4_peptides": 7612,
+    "difference": -91,
+    "native_optimized_to_ms2rescore_psm_gain": 31612,
+    "native_optimized_to_ms2rescore_protein_gain": 692,
+    "interpretation": "The native gain closely reproduces the legacy gain; the final MS2Rescore stage peptide count is 0.2827% below legacy and remains within the predeclared 0.5% platform tolerance."
+  },
+  "entrapment_fdp": {
+    "optimized_native_level4": {
+      "psm": 0.0011565070745002248,
+      "peptide": 0.002625653754901829,
+      "protein": 0.005443411204354729
+    },
+    "ms2rescore_legacy_level4": {
+      "psm": 0.0017938538644861222,
+      "peptide": 0.004905708535101916,
+      "protein": 0.0109204368174727
+    },
+    "ms2rescore_native_level4": {
+      "psm": 0.0018326200936163333,
+      "peptide": 0.005086042251043223,
+      "protein": 0.011332551778038297
+    },
+    "caveat": "Both frozen legacy and native post-MS2Rescore protein FDP slightly exceed 1%. This does not invalidate engineering parity, but it blocks interpreting Phase 7 as evidence for a statistical default change."
+  },
+  "target_only_policy": {
+    "policy": "refit_with_locked_window",
+    "window_retuned_on_target_only_outcomes": false,
+    "nuisance_parameters_refit": true,
+    "dataset_local_window_provenance": "passed",
+    "transfer_stable": true,
+    "cross_dataset_artifact_reuse": "not_permitted"
+  },
+  "runtime_and_memory": {
+    "measurement_note": "The expensive run crossed multiple resumable sessions and a Codex credit interruption, so component timings are reported rather than a misleading single uninterrupted wall time.",
+    "plus_entrapment_search_approx_seconds": 3120,
+    "optimizer_evaluation_seconds": 3111.07,
+    "optimizer_total_approx_seconds": 3353,
+    "optimizer_trial_median_seconds": 61.171,
+    "optimizer_trial_maximum_seconds": 289.197,
+    "plus_entrapment_annotation_approx_seconds": 16800,
+    "target_only_search_approx_seconds": 1500,
+    "target_only_annotation_and_final_continuation_seconds": 19110,
+    "observed_candidate_optimizer_peak_rss_gib": 38.6,
+    "observed_target_annotation_python_rss_gib": 19.5,
+    "complete_cache_hit_resume_seconds": 92.2,
+    "complete_cache_hit_resumed_stages": 3,
+    "complete_cache_hit_new_searches": 0,
+    "complete_cache_hit_external_generator_invocations": 0
+  },
+  "release_decision": {
+    "required_pxd_moments_parity": "passed",
+    "additional_pxd_models_required": false,
+    "ready_for_phase8_secondary_repairs": true,
+    "eligible_for_statistical_default_change": false,
+    "pending_generic_gate": "a matched TDC benchmark is missing",
+    "pending_gate_is_phase7_parity_failure": false,
+    "post_ms2rescore_protein_fdp_requires_later_statistical_review": true
+  },
+  "verification": {
+    "workflow_exit": "passed",
+    "workflow_resume": "passed",
+    "all_grid_comparisons_executed": true,
+    "manifest_json": "passed",
+    "null_window_report_json": "passed",
+    "phase7_report_json": "passed",
+    "rust_workspace_tests": {
+      "passed": 163,
+      "failed": 0
+    },
+    "rust_doctests": "passed",
+    "comparator_tests": {
+      "passed": 5,
+      "failed": 0
+    },
+    "release_build": "passed",
+    "cargo_fmt_check": "passed"
+  }
+}

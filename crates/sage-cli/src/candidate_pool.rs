@@ -469,11 +469,18 @@ pub fn load_pool_entries(
             ids.insert(record.stable_id.clone()),
             "duplicate candidate stable-ID"
         );
-        entries.push(CandidatePoolEntry {
-            stable_id: record.stable_id,
-            peptide: record.peptide,
-            core: record.core,
-        });
+        // A pool may retain a deeper population for a later capability (for
+        // example rank-50 MS2Rescore annotations) than the current analysis
+        // needs. Validate every durable record, but materialize only the
+        // requested ranks so a rank-25 optimizer does not repeatedly process
+        // the unused rank-26..50 population.
+        if record.core.rank as usize <= required_rank_depth {
+            entries.push(CandidatePoolEntry {
+                stable_id: record.stable_id,
+                peptide: record.peptide,
+                core: record.core,
+            });
+        }
     }
     Ok((manifest, entries))
 }
@@ -589,6 +596,73 @@ mod tests {
         assert!(inspect_compatible_pool(&directory, &fingerprint, 18)
             .unwrap()
             .is_none());
+        std::fs::remove_dir_all(root).unwrap();
+    }
+
+    #[test]
+    fn pool_load_materializes_only_the_requested_rank_depth() {
+        use sage_core::peptide::Peptide;
+
+        let root = std::env::temp_dir().join(format!(
+            "sage-candidate-pool-rank-depth-test-{}-{}",
+            std::process::id(),
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .unwrap()
+                .as_nanos()
+        ));
+        let fingerprint = SearchFingerprint {
+            schema_version: CANDIDATE_POOL_SCHEMA_VERSION,
+            digest: "rank-depth-search".into(),
+            fasta_sha256: "fasta".into(),
+            spectra: Vec::new(),
+            normalized_search_sha256: "config".into(),
+            retained_rank_depth: 50,
+            candidate_schema: CANDIDATE_ID_SCHEMA.into(),
+        };
+        let directory = pool_directory(&root, &fingerprint);
+        let database = IndexedDatabase {
+            peptides: vec![Peptide {
+                sequence: std::sync::Arc::from(&b"PEPTIDE"[..]),
+                ..Peptide::default()
+            }],
+            ..IndexedDatabase::default()
+        };
+        let features = vec![
+            FeatureCore {
+                spec_id: "scan=1".into(),
+                rank: 1,
+                peptide_idx: PeptideIx(0),
+                ..FeatureCore::default()
+            },
+            FeatureCore {
+                spec_id: "scan=1".into(),
+                rank: 20,
+                peptide_idx: PeptideIx(0),
+                ..FeatureCore::default()
+            },
+            FeatureCore {
+                spec_id: "scan=1".into(),
+                rank: 50,
+                peptide_idx: PeptideIx(0),
+                ..FeatureCore::default()
+            },
+        ];
+        write_pool(&directory, &fingerprint, &features, &database).unwrap();
+
+        let (manifest, through_twenty) =
+            load_pool(&directory, &fingerprint, 20, &database).unwrap();
+        assert_eq!(manifest.candidate_count, 3);
+        assert_eq!(
+            through_twenty
+                .iter()
+                .map(|feature| feature.rank)
+                .collect::<Vec<_>>(),
+            vec![1, 20]
+        );
+        let (_, through_fifty) = load_pool(&directory, &fingerprint, 50, &database).unwrap();
+        assert_eq!(through_fifty.len(), 3);
+
         std::fs::remove_dir_all(root).unwrap();
     }
 

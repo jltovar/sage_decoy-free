@@ -1,0 +1,2719 @@
+{
+  "schema_version": 1,
+  "legacy_csv": "/Users/kgousset/Library/CloudStorage/OneDrive-Personal/Search_Data_Files/SAGE_DECOYFREE/VALIDATION/PXD001468/DECOYFREE/MOMENTS/cumulative_results_wide.csv",
+  "legacy_results_root": null,
+  "native_evaluations": "/Users/kgousset/Library/CloudStorage/OneDrive-Personal/Search_Data_Files/SAGE_DECOYFREE/VALIDATION/NATIVE_WORKFLOW/PXD001468/PHASE7_MOMENTS_PARITY_2026-08-07/moments/optimized/null_window_evaluations.json",
+  "validation_scope": "level4",
+  "counting_definition": "frozen legacy cumulative CSV counters",
+  "effective_ratios": {
+    "psm": 0.6316190823137978,
+    "peptide": 0.5948800028882344,
+    "protein": 1.0
+  },
+  "diagnostic_only_fields": [
+    "entrapment_peptides",
+    "peptide_fdp",
+    "target_peptides"
+  ],
+  "maximum_fdp": 0.01,
+  "expected_selected_window": {
+    "min_rank": 10,
+    "max_rank": 10
+  },
+  "native_selected_windows": [
+    {
+      "min_rank": 10,
+      "max_rank": 10
+    }
+  ],
+  "summary": {
+    "legacy_trace_rows": 53,
+    "excluded_invalid_rank1_rows": [
+      {
+        "run_id": "run_001",
+        "min_rank": 1,
+        "max_rank": 1
+      },
+      {
+        "run_id": "run_002",
+        "min_rank": 1,
+        "max_rank": 3
+      },
+      {
+        "run_id": "run_003",
+        "min_rank": 1,
+        "max_rank": 5
+      },
+      {
+        "run_id": "run_004",
+        "min_rank": 1,
+        "max_rank": 9
+      },
+      {
+        "run_id": "run_005",
+        "min_rank": 1,
+        "max_rank": 25
+      },
+      {
+        "run_id": "run_031",
+        "min_rank": 1,
+        "max_rank": 2
+      }
+    ],
+    "legacy_visited_windows": 47,
+    "native_evaluated_windows": 47,
+    "matched_windows": 47,
+    "missing_native_windows": [],
+    "extra_native_windows": [],
+    "exact_count_rows": 8,
+    "exact_comparable_count_rows": 47,
+    "feasibility_match_rows": 47,
+    "fdp_comparable_rows": 21,
+    "fdp_available_rows": 21,
+    "maximum_absolute_count_fraction_difference": 0.14285714285714285,
+    "maximum_absolute_fdp_difference": 0.010332478404232959,
+    "maximum_absolute_comparable_count_fraction_difference": 0.0,
+    "maximum_absolute_comparable_fdp_difference": 0.0,
+    "grid_matches": true,
+    "selected_window_matches": true,
+    "corrected_feasibility_matches": true,
+    "required_fdp_values_available": true,
+    "within_count_tolerance": true,
+    "within_fdp_tolerance": true
+  },
+  "passed": true,
+  "points": [
+    {
+      "run_id": "run_006",
+      "min_rank": 3,
+      "max_rank": 3,
+      "legacy": {
+        "target_psms": 0,
+        "entrapment_psms": 0,
+        "target_peptides": 0,
+        "entrapment_peptides": 0,
+        "target_proteins": 0,
+        "entrapment_proteins": 0,
+        "psm_fdp": 1.0,
+        "peptide_fdp": 1.0,
+        "protein_fdp": 1.0
+      },
+      "native": {
+        "target_psms": 0,
+        "entrapment_psms": 0,
+        "target_peptides": 0,
+        "entrapment_peptides": 0,
+        "target_proteins": 0,
+        "entrapment_proteins": 0,
+        "psm_fdp": null,
+        "peptide_fdp": null,
+        "protein_fdp": null
+      },
+      "count_differences": {
+        "target_psms": 0,
+        "entrapment_psms": 0,
+        "target_peptides": 0,
+        "entrapment_peptides": 0,
+        "target_proteins": 0,
+        "entrapment_proteins": 0
+      },
+      "count_fraction_differences": {
+        "target_psms": null,
+        "entrapment_psms": null,
+        "target_peptides": null,
+        "entrapment_peptides": null,
+        "target_proteins": null,
+        "entrapment_proteins": null
+      },
+      "fdp_differences": {
+        "psm_fdp": null,
+        "peptide_fdp": null,
+        "protein_fdp": null
+      },
+      "legacy_recorded_feasible": false,
+      "legacy_corrected_feasible": false,
+      "native_feasible": false,
+      "feasibility_matches_corrected_legacy": true,
+      "fdp_comparison_applicable": false,
+      "fdp_values_available": false,
+      "fdp_comparison_satisfied": true,
+      "native_selected": false
+    },
+    {
+      "run_id": "run_007",
+      "min_rank": 3,
+      "max_rank": 5,
+      "legacy": {
+        "target_psms": 0,
+        "entrapment_psms": 0,
+        "target_peptides": 0,
+        "entrapment_peptides": 0,
+        "target_proteins": 0,
+        "entrapment_proteins": 0,
+        "psm_fdp": 1.0,
+        "peptide_fdp": 1.0,
+        "protein_fdp": 1.0
+      },
+      "native": {
+        "target_psms": 0,
+        "entrapment_psms": 0,
+        "target_peptides": 0,
+        "entrapment_peptides": 0,
+        "target_proteins": 0,
+        "entrapment_proteins": 0,
+        "psm_fdp": null,
+        "peptide_fdp": null,
+        "protein_fdp": null
+      },
+      "count_differences": {
+        "target_psms": 0,
+        "entrapment_psms": 0,
+        "target_peptides": 0,
+        "entrapment_peptides": 0,
+        "target_proteins": 0,
+        "entrapment_proteins": 0
+      },
+      "count_fraction_differences": {
+        "target_psms": null,
+        "entrapment_psms": null,
+        "target_peptides": null,
+        "entrapment_peptides": null,
+        "target_proteins": null,
+        "entrapment_proteins": null
+      },
+      "fdp_differences": {
+        "psm_fdp": null,
+        "peptide_fdp": null,
+        "protein_fdp": null
+      },
+      "legacy_recorded_feasible": false,
+      "legacy_corrected_feasible": false,
+      "native_feasible": false,
+      "feasibility_matches_corrected_legacy": true,
+      "fdp_comparison_applicable": false,
+      "fdp_values_available": false,
+      "fdp_comparison_satisfied": true,
+      "native_selected": false
+    },
+    {
+      "run_id": "run_008",
+      "min_rank": 3,
+      "max_rank": 7,
+      "legacy": {
+        "target_psms": 0,
+        "entrapment_psms": 0,
+        "target_peptides": 0,
+        "entrapment_peptides": 0,
+        "target_proteins": 0,
+        "entrapment_proteins": 0,
+        "psm_fdp": 1.0,
+        "peptide_fdp": 1.0,
+        "protein_fdp": 1.0
+      },
+      "native": {
+        "target_psms": 0,
+        "entrapment_psms": 0,
+        "target_peptides": 0,
+        "entrapment_peptides": 0,
+        "target_proteins": 0,
+        "entrapment_proteins": 0,
+        "psm_fdp": null,
+        "peptide_fdp": null,
+        "protein_fdp": null
+      },
+      "count_differences": {
+        "target_psms": 0,
+        "entrapment_psms": 0,
+        "target_peptides": 0,
+        "entrapment_peptides": 0,
+        "target_proteins": 0,
+        "entrapment_proteins": 0
+      },
+      "count_fraction_differences": {
+        "target_psms": null,
+        "entrapment_psms": null,
+        "target_peptides": null,
+        "entrapment_peptides": null,
+        "target_proteins": null,
+        "entrapment_proteins": null
+      },
+      "fdp_differences": {
+        "psm_fdp": null,
+        "peptide_fdp": null,
+        "protein_fdp": null
+      },
+      "legacy_recorded_feasible": false,
+      "legacy_corrected_feasible": false,
+      "native_feasible": false,
+      "feasibility_matches_corrected_legacy": true,
+      "fdp_comparison_applicable": false,
+      "fdp_values_available": false,
+      "fdp_comparison_satisfied": true,
+      "native_selected": false
+    },
+    {
+      "run_id": "run_009",
+      "min_rank": 3,
+      "max_rank": 11,
+      "legacy": {
+        "target_psms": 290,
+        "entrapment_psms": 0,
+        "target_peptides": 7,
+        "entrapment_peptides": 0,
+        "target_proteins": 3,
+        "entrapment_proteins": 0,
+        "psm_fdp": 0.0,
+        "peptide_fdp": 0.0,
+        "protein_fdp": 0.0
+      },
+      "native": {
+        "target_psms": 290,
+        "entrapment_psms": 0,
+        "target_peptides": 6,
+        "entrapment_peptides": 0,
+        "target_proteins": 3,
+        "entrapment_proteins": 0,
+        "psm_fdp": 0.0,
+        "peptide_fdp": 0.0,
+        "protein_fdp": 0.0
+      },
+      "count_differences": {
+        "target_psms": 0,
+        "entrapment_psms": 0,
+        "target_peptides": -1,
+        "entrapment_peptides": 0,
+        "target_proteins": 0,
+        "entrapment_proteins": 0
+      },
+      "count_fraction_differences": {
+        "target_psms": 0.0,
+        "entrapment_psms": null,
+        "target_peptides": -0.14285714285714285,
+        "entrapment_peptides": null,
+        "target_proteins": 0.0,
+        "entrapment_proteins": null
+      },
+      "fdp_differences": {
+        "psm_fdp": 0.0,
+        "peptide_fdp": 0.0,
+        "protein_fdp": 0.0
+      },
+      "legacy_recorded_feasible": true,
+      "legacy_corrected_feasible": true,
+      "native_feasible": true,
+      "feasibility_matches_corrected_legacy": true,
+      "fdp_comparison_applicable": true,
+      "fdp_values_available": true,
+      "fdp_comparison_satisfied": true,
+      "native_selected": false
+    },
+    {
+      "run_id": "run_010",
+      "min_rank": 3,
+      "max_rank": 25,
+      "legacy": {
+        "target_psms": 1221,
+        "entrapment_psms": 0,
+        "target_peptides": 47,
+        "entrapment_peptides": 0,
+        "target_proteins": 19,
+        "entrapment_proteins": 0,
+        "psm_fdp": 0.0,
+        "peptide_fdp": 0.0,
+        "protein_fdp": 0.0
+      },
+      "native": {
+        "target_psms": 1221,
+        "entrapment_psms": 0,
+        "target_peptides": 43,
+        "entrapment_peptides": 0,
+        "target_proteins": 19,
+        "entrapment_proteins": 0,
+        "psm_fdp": 0.0,
+        "peptide_fdp": 0.0,
+        "protein_fdp": 0.0
+      },
+      "count_differences": {
+        "target_psms": 0,
+        "entrapment_psms": 0,
+        "target_peptides": -4,
+        "entrapment_peptides": 0,
+        "target_proteins": 0,
+        "entrapment_proteins": 0
+      },
+      "count_fraction_differences": {
+        "target_psms": 0.0,
+        "entrapment_psms": null,
+        "target_peptides": -0.0851063829787234,
+        "entrapment_peptides": null,
+        "target_proteins": 0.0,
+        "entrapment_proteins": null
+      },
+      "fdp_differences": {
+        "psm_fdp": 0.0,
+        "peptide_fdp": 0.0,
+        "protein_fdp": 0.0
+      },
+      "legacy_recorded_feasible": true,
+      "legacy_corrected_feasible": true,
+      "native_feasible": true,
+      "feasibility_matches_corrected_legacy": true,
+      "fdp_comparison_applicable": true,
+      "fdp_values_available": true,
+      "fdp_comparison_satisfied": true,
+      "native_selected": false
+    },
+    {
+      "run_id": "run_011",
+      "min_rank": 5,
+      "max_rank": 5,
+      "legacy": {
+        "target_psms": 0,
+        "entrapment_psms": 0,
+        "target_peptides": 0,
+        "entrapment_peptides": 0,
+        "target_proteins": 0,
+        "entrapment_proteins": 0,
+        "psm_fdp": 1.0,
+        "peptide_fdp": 1.0,
+        "protein_fdp": 1.0
+      },
+      "native": {
+        "target_psms": 0,
+        "entrapment_psms": 0,
+        "target_peptides": 0,
+        "entrapment_peptides": 0,
+        "target_proteins": 0,
+        "entrapment_proteins": 0,
+        "psm_fdp": null,
+        "peptide_fdp": null,
+        "protein_fdp": null
+      },
+      "count_differences": {
+        "target_psms": 0,
+        "entrapment_psms": 0,
+        "target_peptides": 0,
+        "entrapment_peptides": 0,
+        "target_proteins": 0,
+        "entrapment_proteins": 0
+      },
+      "count_fraction_differences": {
+        "target_psms": null,
+        "entrapment_psms": null,
+        "target_peptides": null,
+        "entrapment_peptides": null,
+        "target_proteins": null,
+        "entrapment_proteins": null
+      },
+      "fdp_differences": {
+        "psm_fdp": null,
+        "peptide_fdp": null,
+        "protein_fdp": null
+      },
+      "legacy_recorded_feasible": false,
+      "legacy_corrected_feasible": false,
+      "native_feasible": false,
+      "feasibility_matches_corrected_legacy": true,
+      "fdp_comparison_applicable": false,
+      "fdp_values_available": false,
+      "fdp_comparison_satisfied": true,
+      "native_selected": false
+    },
+    {
+      "run_id": "run_012",
+      "min_rank": 5,
+      "max_rank": 7,
+      "legacy": {
+        "target_psms": 381,
+        "entrapment_psms": 0,
+        "target_peptides": 11,
+        "entrapment_peptides": 0,
+        "target_proteins": 4,
+        "entrapment_proteins": 0,
+        "psm_fdp": 0.0,
+        "peptide_fdp": 0.0,
+        "protein_fdp": 0.0
+      },
+      "native": {
+        "target_psms": 381,
+        "entrapment_psms": 0,
+        "target_peptides": 10,
+        "entrapment_peptides": 0,
+        "target_proteins": 4,
+        "entrapment_proteins": 0,
+        "psm_fdp": 0.0,
+        "peptide_fdp": 0.0,
+        "protein_fdp": 0.0
+      },
+      "count_differences": {
+        "target_psms": 0,
+        "entrapment_psms": 0,
+        "target_peptides": -1,
+        "entrapment_peptides": 0,
+        "target_proteins": 0,
+        "entrapment_proteins": 0
+      },
+      "count_fraction_differences": {
+        "target_psms": 0.0,
+        "entrapment_psms": null,
+        "target_peptides": -0.09090909090909091,
+        "entrapment_peptides": null,
+        "target_proteins": 0.0,
+        "entrapment_proteins": null
+      },
+      "fdp_differences": {
+        "psm_fdp": 0.0,
+        "peptide_fdp": 0.0,
+        "protein_fdp": 0.0
+      },
+      "legacy_recorded_feasible": true,
+      "legacy_corrected_feasible": true,
+      "native_feasible": true,
+      "feasibility_matches_corrected_legacy": true,
+      "fdp_comparison_applicable": true,
+      "fdp_values_available": true,
+      "fdp_comparison_satisfied": true,
+      "native_selected": false
+    },
+    {
+      "run_id": "run_013",
+      "min_rank": 5,
+      "max_rank": 9,
+      "legacy": {
+        "target_psms": 6230,
+        "entrapment_psms": 0,
+        "target_peptides": 276,
+        "entrapment_peptides": 0,
+        "target_proteins": 110,
+        "entrapment_proteins": 0,
+        "psm_fdp": 0.0,
+        "peptide_fdp": 0.0,
+        "protein_fdp": 0.0
+      },
+      "native": {
+        "target_psms": 6230,
+        "entrapment_psms": 0,
+        "target_peptides": 259,
+        "entrapment_peptides": 0,
+        "target_proteins": 110,
+        "entrapment_proteins": 0,
+        "psm_fdp": 0.0,
+        "peptide_fdp": 0.0,
+        "protein_fdp": 0.0
+      },
+      "count_differences": {
+        "target_psms": 0,
+        "entrapment_psms": 0,
+        "target_peptides": -17,
+        "entrapment_peptides": 0,
+        "target_proteins": 0,
+        "entrapment_proteins": 0
+      },
+      "count_fraction_differences": {
+        "target_psms": 0.0,
+        "entrapment_psms": null,
+        "target_peptides": -0.06159420289855073,
+        "entrapment_peptides": null,
+        "target_proteins": 0.0,
+        "entrapment_proteins": null
+      },
+      "fdp_differences": {
+        "psm_fdp": 0.0,
+        "peptide_fdp": 0.0,
+        "protein_fdp": 0.0
+      },
+      "legacy_recorded_feasible": true,
+      "legacy_corrected_feasible": true,
+      "native_feasible": true,
+      "feasibility_matches_corrected_legacy": true,
+      "fdp_comparison_applicable": true,
+      "fdp_values_available": true,
+      "fdp_comparison_satisfied": true,
+      "native_selected": false
+    },
+    {
+      "run_id": "run_014",
+      "min_rank": 5,
+      "max_rank": 13,
+      "legacy": {
+        "target_psms": 38520,
+        "entrapment_psms": 0,
+        "target_peptides": 2680,
+        "entrapment_peptides": 0,
+        "target_proteins": 840,
+        "entrapment_proteins": 0,
+        "psm_fdp": 0.0,
+        "peptide_fdp": 0.0,
+        "protein_fdp": 0.0
+      },
+      "native": {
+        "target_psms": 38520,
+        "entrapment_psms": 0,
+        "target_peptides": 2518,
+        "entrapment_peptides": 0,
+        "target_proteins": 840,
+        "entrapment_proteins": 0,
+        "psm_fdp": 0.0,
+        "peptide_fdp": 0.0,
+        "protein_fdp": 0.0
+      },
+      "count_differences": {
+        "target_psms": 0,
+        "entrapment_psms": 0,
+        "target_peptides": -162,
+        "entrapment_peptides": 0,
+        "target_proteins": 0,
+        "entrapment_proteins": 0
+      },
+      "count_fraction_differences": {
+        "target_psms": 0.0,
+        "entrapment_psms": null,
+        "target_peptides": -0.06044776119402985,
+        "entrapment_peptides": null,
+        "target_proteins": 0.0,
+        "entrapment_proteins": null
+      },
+      "fdp_differences": {
+        "psm_fdp": 0.0,
+        "peptide_fdp": 0.0,
+        "protein_fdp": 0.0
+      },
+      "legacy_recorded_feasible": true,
+      "legacy_corrected_feasible": true,
+      "native_feasible": true,
+      "feasibility_matches_corrected_legacy": true,
+      "fdp_comparison_applicable": true,
+      "fdp_values_available": true,
+      "fdp_comparison_satisfied": true,
+      "native_selected": false
+    },
+    {
+      "run_id": "run_015",
+      "min_rank": 5,
+      "max_rank": 25,
+      "legacy": {
+        "target_psms": 58179,
+        "entrapment_psms": 0,
+        "target_peptides": 4783,
+        "entrapment_peptides": 0,
+        "target_proteins": 1333,
+        "entrapment_proteins": 0,
+        "psm_fdp": 0.0,
+        "peptide_fdp": 0.0,
+        "protein_fdp": 0.0
+      },
+      "native": {
+        "target_psms": 58179,
+        "entrapment_psms": 0,
+        "target_peptides": 4505,
+        "entrapment_peptides": 0,
+        "target_proteins": 1333,
+        "entrapment_proteins": 0,
+        "psm_fdp": 0.0,
+        "peptide_fdp": 0.0,
+        "protein_fdp": 0.0
+      },
+      "count_differences": {
+        "target_psms": 0,
+        "entrapment_psms": 0,
+        "target_peptides": -278,
+        "entrapment_peptides": 0,
+        "target_proteins": 0,
+        "entrapment_proteins": 0
+      },
+      "count_fraction_differences": {
+        "target_psms": 0.0,
+        "entrapment_psms": null,
+        "target_peptides": -0.05812251724858875,
+        "entrapment_peptides": null,
+        "target_proteins": 0.0,
+        "entrapment_proteins": null
+      },
+      "fdp_differences": {
+        "psm_fdp": 0.0,
+        "peptide_fdp": 0.0,
+        "protein_fdp": 0.0
+      },
+      "legacy_recorded_feasible": true,
+      "legacy_corrected_feasible": true,
+      "native_feasible": true,
+      "feasibility_matches_corrected_legacy": true,
+      "fdp_comparison_applicable": true,
+      "fdp_values_available": true,
+      "fdp_comparison_satisfied": true,
+      "native_selected": false
+    },
+    {
+      "run_id": "run_016",
+      "min_rank": 7,
+      "max_rank": 7,
+      "legacy": {
+        "target_psms": 14132,
+        "entrapment_psms": 0,
+        "target_peptides": 667,
+        "entrapment_peptides": 0,
+        "target_proteins": 249,
+        "entrapment_proteins": 0,
+        "psm_fdp": 0.0,
+        "peptide_fdp": 0.0,
+        "protein_fdp": 0.0
+      },
+      "native": {
+        "target_psms": 14132,
+        "entrapment_psms": 0,
+        "target_peptides": 630,
+        "entrapment_peptides": 0,
+        "target_proteins": 249,
+        "entrapment_proteins": 0,
+        "psm_fdp": 0.0,
+        "peptide_fdp": 0.0,
+        "protein_fdp": 0.0
+      },
+      "count_differences": {
+        "target_psms": 0,
+        "entrapment_psms": 0,
+        "target_peptides": -37,
+        "entrapment_peptides": 0,
+        "target_proteins": 0,
+        "entrapment_proteins": 0
+      },
+      "count_fraction_differences": {
+        "target_psms": 0.0,
+        "entrapment_psms": null,
+        "target_peptides": -0.05547226386806597,
+        "entrapment_peptides": null,
+        "target_proteins": 0.0,
+        "entrapment_proteins": null
+      },
+      "fdp_differences": {
+        "psm_fdp": 0.0,
+        "peptide_fdp": 0.0,
+        "protein_fdp": 0.0
+      },
+      "legacy_recorded_feasible": true,
+      "legacy_corrected_feasible": true,
+      "native_feasible": true,
+      "feasibility_matches_corrected_legacy": true,
+      "fdp_comparison_applicable": true,
+      "fdp_values_available": true,
+      "fdp_comparison_satisfied": true,
+      "native_selected": false
+    },
+    {
+      "run_id": "run_017",
+      "min_rank": 7,
+      "max_rank": 9,
+      "legacy": {
+        "target_psms": 44995,
+        "entrapment_psms": 0,
+        "target_peptides": 3465,
+        "entrapment_peptides": 0,
+        "target_proteins": 1025,
+        "entrapment_proteins": 0,
+        "psm_fdp": 0.0,
+        "peptide_fdp": 0.0,
+        "protein_fdp": 0.0
+      },
+      "native": {
+        "target_psms": 44995,
+        "entrapment_psms": 0,
+        "target_peptides": 3264,
+        "entrapment_peptides": 0,
+        "target_proteins": 1025,
+        "entrapment_proteins": 0,
+        "psm_fdp": 0.0,
+        "peptide_fdp": 0.0,
+        "protein_fdp": 0.0
+      },
+      "count_differences": {
+        "target_psms": 0,
+        "entrapment_psms": 0,
+        "target_peptides": -201,
+        "entrapment_peptides": 0,
+        "target_proteins": 0,
+        "entrapment_proteins": 0
+      },
+      "count_fraction_differences": {
+        "target_psms": 0.0,
+        "entrapment_psms": null,
+        "target_peptides": -0.05800865800865801,
+        "entrapment_peptides": null,
+        "target_proteins": 0.0,
+        "entrapment_proteins": null
+      },
+      "fdp_differences": {
+        "psm_fdp": 0.0,
+        "peptide_fdp": 0.0,
+        "protein_fdp": 0.0
+      },
+      "legacy_recorded_feasible": true,
+      "legacy_corrected_feasible": true,
+      "native_feasible": true,
+      "feasibility_matches_corrected_legacy": true,
+      "fdp_comparison_applicable": true,
+      "fdp_values_available": true,
+      "fdp_comparison_satisfied": true,
+      "native_selected": false
+    },
+    {
+      "run_id": "run_018",
+      "min_rank": 7,
+      "max_rank": 11,
+      "legacy": {
+        "target_psms": 87275,
+        "entrapment_psms": 0,
+        "target_peptides": 8653,
+        "entrapment_peptides": 0,
+        "target_proteins": 2103,
+        "entrapment_proteins": 0,
+        "psm_fdp": 0.0,
+        "peptide_fdp": 0.0,
+        "protein_fdp": 0.0
+      },
+      "native": {
+        "target_psms": 87275,
+        "entrapment_psms": 0,
+        "target_peptides": 8136,
+        "entrapment_peptides": 0,
+        "target_proteins": 2103,
+        "entrapment_proteins": 0,
+        "psm_fdp": 0.0,
+        "peptide_fdp": 0.0,
+        "protein_fdp": 0.0
+      },
+      "count_differences": {
+        "target_psms": 0,
+        "entrapment_psms": 0,
+        "target_peptides": -517,
+        "entrapment_peptides": 0,
+        "target_proteins": 0,
+        "entrapment_proteins": 0
+      },
+      "count_fraction_differences": {
+        "target_psms": 0.0,
+        "entrapment_psms": null,
+        "target_peptides": -0.059748064255171617,
+        "entrapment_peptides": null,
+        "target_proteins": 0.0,
+        "entrapment_proteins": null
+      },
+      "fdp_differences": {
+        "psm_fdp": 0.0,
+        "peptide_fdp": 0.0,
+        "protein_fdp": 0.0
+      },
+      "legacy_recorded_feasible": true,
+      "legacy_corrected_feasible": true,
+      "native_feasible": true,
+      "feasibility_matches_corrected_legacy": true,
+      "fdp_comparison_applicable": true,
+      "fdp_values_available": true,
+      "fdp_comparison_satisfied": true,
+      "native_selected": false
+    },
+    {
+      "run_id": "run_019",
+      "min_rank": 7,
+      "max_rank": 15,
+      "legacy": {
+        "target_psms": 159250,
+        "entrapment_psms": 13,
+        "target_peptides": 20294,
+        "entrapment_peptides": 6,
+        "target_proteins": 3760,
+        "entrapment_proteins": 3,
+        "psm_fdp": 0.00021085892773230235,
+        "peptide_fdp": 0.0007924171295273918,
+        "protein_fdp": 0.0015944724953494552
+      },
+      "native": {
+        "target_psms": 159250,
+        "entrapment_psms": 13,
+        "target_peptides": 19038,
+        "entrapment_peptides": 6,
+        "target_proteins": 3760,
+        "entrapment_proteins": 3,
+        "psm_fdp": 0.00021085892773230235,
+        "peptide_fdp": 0.0008446790448123322,
+        "protein_fdp": 0.0015944724953494552
+      },
+      "count_differences": {
+        "target_psms": 0,
+        "entrapment_psms": 0,
+        "target_peptides": -1256,
+        "entrapment_peptides": 0,
+        "target_proteins": 0,
+        "entrapment_proteins": 0
+      },
+      "count_fraction_differences": {
+        "target_psms": 0.0,
+        "entrapment_psms": 0.0,
+        "target_peptides": -0.06189021385631221,
+        "entrapment_peptides": 0.0,
+        "target_proteins": 0.0,
+        "entrapment_proteins": 0.0
+      },
+      "fdp_differences": {
+        "psm_fdp": 0.0,
+        "peptide_fdp": 5.2261915284940457e-05,
+        "protein_fdp": 0.0
+      },
+      "legacy_recorded_feasible": true,
+      "legacy_corrected_feasible": true,
+      "native_feasible": true,
+      "feasibility_matches_corrected_legacy": true,
+      "fdp_comparison_applicable": true,
+      "fdp_values_available": true,
+      "fdp_comparison_satisfied": true,
+      "native_selected": false
+    },
+    {
+      "run_id": "run_020",
+      "min_rank": 7,
+      "max_rank": 25,
+      "legacy": {
+        "target_psms": 171620,
+        "entrapment_psms": 50,
+        "target_peptides": 21932,
+        "entrapment_peptides": 12,
+        "target_proteins": 3937,
+        "entrapment_proteins": 6,
+        "psm_fdp": 0.0007523832712903932,
+        "peptide_fdp": 0.001466101688790198,
+        "protein_fdp": 0.003043367993913264
+      },
+      "native": {
+        "target_psms": 171620,
+        "entrapment_psms": 50,
+        "target_peptides": 20580,
+        "entrapment_peptides": 11,
+        "target_proteins": 3937,
+        "entrapment_proteins": 6,
+        "psm_fdp": 0.0007523832712903932,
+        "peptide_fdp": 0.0014322337026165684,
+        "protein_fdp": 0.003043367993913264
+      },
+      "count_differences": {
+        "target_psms": 0,
+        "entrapment_psms": 0,
+        "target_peptides": -1352,
+        "entrapment_peptides": -1,
+        "target_proteins": 0,
+        "entrapment_proteins": 0
+      },
+      "count_fraction_differences": {
+        "target_psms": 0.0,
+        "entrapment_psms": 0.0,
+        "target_peptides": -0.06164508480758709,
+        "entrapment_peptides": -0.08333333333333333,
+        "target_proteins": 0.0,
+        "entrapment_proteins": 0.0
+      },
+      "fdp_differences": {
+        "psm_fdp": 0.0,
+        "peptide_fdp": -3.386798617362966e-05,
+        "protein_fdp": 0.0
+      },
+      "legacy_recorded_feasible": true,
+      "legacy_corrected_feasible": true,
+      "native_feasible": true,
+      "feasibility_matches_corrected_legacy": true,
+      "fdp_comparison_applicable": true,
+      "fdp_values_available": true,
+      "fdp_comparison_satisfied": true,
+      "native_selected": false
+    },
+    {
+      "run_id": "run_021",
+      "min_rank": 9,
+      "max_rank": 9,
+      "legacy": {
+        "target_psms": 112428,
+        "entrapment_psms": 0,
+        "target_peptides": 12510,
+        "entrapment_peptides": 0,
+        "target_proteins": 2769,
+        "entrapment_proteins": 0,
+        "psm_fdp": 0.0,
+        "peptide_fdp": 0.0,
+        "protein_fdp": 0.0
+      },
+      "native": {
+        "target_psms": 112428,
+        "entrapment_psms": 0,
+        "target_peptides": 11770,
+        "entrapment_peptides": 0,
+        "target_proteins": 2769,
+        "entrapment_proteins": 0,
+        "psm_fdp": 0.0,
+        "peptide_fdp": 0.0,
+        "protein_fdp": 0.0
+      },
+      "count_differences": {
+        "target_psms": 0,
+        "entrapment_psms": 0,
+        "target_peptides": -740,
+        "entrapment_peptides": 0,
+        "target_proteins": 0,
+        "entrapment_proteins": 0
+      },
+      "count_fraction_differences": {
+        "target_psms": 0.0,
+        "entrapment_psms": null,
+        "target_peptides": -0.05915267785771383,
+        "entrapment_peptides": null,
+        "target_proteins": 0.0,
+        "entrapment_proteins": null
+      },
+      "fdp_differences": {
+        "psm_fdp": 0.0,
+        "peptide_fdp": 0.0,
+        "protein_fdp": 0.0
+      },
+      "legacy_recorded_feasible": true,
+      "legacy_corrected_feasible": true,
+      "native_feasible": true,
+      "feasibility_matches_corrected_legacy": true,
+      "fdp_comparison_applicable": true,
+      "fdp_values_available": true,
+      "fdp_comparison_satisfied": true,
+      "native_selected": false
+    },
+    {
+      "run_id": "run_022",
+      "min_rank": 9,
+      "max_rank": 11,
+      "legacy": {
+        "target_psms": 177451,
+        "entrapment_psms": 74,
+        "target_peptides": 24241,
+        "entrapment_peptides": 22,
+        "target_proteins": 4203,
+        "entrapment_proteins": 11,
+        "psm_fdp": 0.0010768016986339066,
+        "peptide_fdp": 0.0024309544714650093,
+        "protein_fdp": 0.005220692928334125
+      },
+      "native": {
+        "target_psms": 177451,
+        "entrapment_psms": 74,
+        "target_peptides": 22756,
+        "entrapment_peptides": 21,
+        "target_proteins": 4203,
+        "entrapment_proteins": 11,
+        "psm_fdp": 0.0010768016986339066,
+        "peptide_fdp": 0.0024718460312122396,
+        "protein_fdp": 0.005220692928334125
+      },
+      "count_differences": {
+        "target_psms": 0,
+        "entrapment_psms": 0,
+        "target_peptides": -1485,
+        "entrapment_peptides": -1,
+        "target_proteins": 0,
+        "entrapment_proteins": 0
+      },
+      "count_fraction_differences": {
+        "target_psms": 0.0,
+        "entrapment_psms": 0.0,
+        "target_peptides": -0.0612598490161297,
+        "entrapment_peptides": -0.045454545454545456,
+        "target_proteins": 0.0,
+        "entrapment_proteins": 0.0
+      },
+      "fdp_differences": {
+        "psm_fdp": 0.0,
+        "peptide_fdp": 4.089155974723027e-05,
+        "protein_fdp": 0.0
+      },
+      "legacy_recorded_feasible": true,
+      "legacy_corrected_feasible": true,
+      "native_feasible": true,
+      "feasibility_matches_corrected_legacy": true,
+      "fdp_comparison_applicable": true,
+      "fdp_values_available": true,
+      "fdp_comparison_satisfied": true,
+      "native_selected": false
+    },
+    {
+      "run_id": "run_023",
+      "min_rank": 9,
+      "max_rank": 13,
+      "legacy": {
+        "target_psms": 238820,
+        "entrapment_psms": 3564,
+        "target_peptides": 38720,
+        "entrapment_peptides": 327,
+        "target_proteins": 5604,
+        "entrapment_proteins": 152,
+        "psm_fdp": 0.03798370118111355,
+        "peptide_fdp": 0.02245219072534714,
+        "protein_fdp": 0.05281445448227936
+      },
+      "native": {
+        "target_psms": 238820,
+        "entrapment_psms": 3564,
+        "target_peptides": 36387,
+        "entrapment_peptides": 321,
+        "target_proteins": 5604,
+        "entrapment_proteins": 152,
+        "psm_fdp": 0.03798370118111355,
+        "peptide_fdp": 0.023444606721238524,
+        "protein_fdp": 0.05281445448227936
+      },
+      "count_differences": {
+        "target_psms": 0,
+        "entrapment_psms": 0,
+        "target_peptides": -2333,
+        "entrapment_peptides": -6,
+        "target_proteins": 0,
+        "entrapment_proteins": 0
+      },
+      "count_fraction_differences": {
+        "target_psms": 0.0,
+        "entrapment_psms": 0.0,
+        "target_peptides": -0.06025309917355372,
+        "entrapment_peptides": -0.01834862385321101,
+        "target_proteins": 0.0,
+        "entrapment_proteins": 0.0
+      },
+      "fdp_differences": {
+        "psm_fdp": 0.0,
+        "peptide_fdp": 0.0009924159958913832,
+        "protein_fdp": 0.0
+      },
+      "legacy_recorded_feasible": false,
+      "legacy_corrected_feasible": false,
+      "native_feasible": false,
+      "feasibility_matches_corrected_legacy": true,
+      "fdp_comparison_applicable": false,
+      "fdp_values_available": true,
+      "fdp_comparison_satisfied": true,
+      "native_selected": false
+    },
+    {
+      "run_id": "run_024",
+      "min_rank": 9,
+      "max_rank": 17,
+      "legacy": {
+        "target_psms": 310940,
+        "entrapment_psms": 13398,
+        "target_peptides": 59363,
+        "entrapment_peptides": 2805,
+        "target_proteins": 7626,
+        "entrapment_proteins": 1164,
+        "psm_fdp": 0.10671013581955165,
+        "peptide_fdp": 0.12096635991985152,
+        "protein_fdp": 0.26484641638225254
+      },
+      "native": {
+        "target_psms": 310940,
+        "entrapment_psms": 13398,
+        "target_peptides": 55843,
+        "entrapment_peptides": 2767,
+        "target_proteins": 7626,
+        "entrapment_proteins": 1164,
+        "psm_fdp": 0.10671013581955165,
+        "peptide_fdp": 0.12657154469449625,
+        "protein_fdp": 0.26484641638225254
+      },
+      "count_differences": {
+        "target_psms": 0,
+        "entrapment_psms": 0,
+        "target_peptides": -3520,
+        "entrapment_peptides": -38,
+        "target_proteins": 0,
+        "entrapment_proteins": 0
+      },
+      "count_fraction_differences": {
+        "target_psms": 0.0,
+        "entrapment_psms": 0.0,
+        "target_peptides": -0.05929619459932955,
+        "entrapment_peptides": -0.013547237076648842,
+        "target_proteins": 0.0,
+        "entrapment_proteins": 0.0
+      },
+      "fdp_differences": {
+        "psm_fdp": 0.0,
+        "peptide_fdp": 0.0056051847746447225,
+        "protein_fdp": 0.0
+      },
+      "legacy_recorded_feasible": false,
+      "legacy_corrected_feasible": false,
+      "native_feasible": false,
+      "feasibility_matches_corrected_legacy": true,
+      "fdp_comparison_applicable": false,
+      "fdp_values_available": true,
+      "fdp_comparison_satisfied": true,
+      "native_selected": false
+    },
+    {
+      "run_id": "run_025",
+      "min_rank": 9,
+      "max_rank": 25,
+      "legacy": {
+        "target_psms": 303403,
+        "entrapment_psms": 11515,
+        "target_peptides": 55859,
+        "entrapment_peptides": 2158,
+        "target_proteins": 7282,
+        "entrapment_proteins": 925,
+        "psm_fdp": 0.09445609591325914,
+        "peptide_fdp": 0.09972288053518297,
+        "protein_fdp": 0.22541732667235287
+      },
+      "native": {
+        "target_psms": 303403,
+        "entrapment_psms": 11515,
+        "target_peptides": 52532,
+        "entrapment_peptides": 2128,
+        "target_proteins": 7282,
+        "entrapment_proteins": 925,
+        "psm_fdp": 0.09445609591325914,
+        "peptide_fdp": 0.10437599746364215,
+        "protein_fdp": 0.22541732667235287
+      },
+      "count_differences": {
+        "target_psms": 0,
+        "entrapment_psms": 0,
+        "target_peptides": -3327,
+        "entrapment_peptides": -30,
+        "target_proteins": 0,
+        "entrapment_proteins": 0
+      },
+      "count_fraction_differences": {
+        "target_psms": 0.0,
+        "entrapment_psms": 0.0,
+        "target_peptides": -0.0595606795681985,
+        "entrapment_peptides": -0.013901760889712697,
+        "target_proteins": 0.0,
+        "entrapment_proteins": 0.0
+      },
+      "fdp_differences": {
+        "psm_fdp": 0.0,
+        "peptide_fdp": 0.004653116928459183,
+        "protein_fdp": 0.0
+      },
+      "legacy_recorded_feasible": false,
+      "legacy_corrected_feasible": false,
+      "native_feasible": false,
+      "feasibility_matches_corrected_legacy": true,
+      "fdp_comparison_applicable": false,
+      "fdp_values_available": true,
+      "fdp_comparison_satisfied": true,
+      "native_selected": false
+    },
+    {
+      "run_id": "run_026",
+      "min_rank": 10,
+      "max_rank": 10,
+      "legacy": {
+        "target_psms": 185310,
+        "entrapment_psms": 83,
+        "target_peptides": 26069,
+        "entrapment_peptides": 25,
+        "target_proteins": 4385,
+        "entrapment_proteins": 12,
+        "psm_fdp": 0.0011565070745002248,
+        "peptide_fdp": 0.0025686089601386734,
+        "protein_fdp": 0.005458267000227428
+      },
+      "native": {
+        "target_psms": 185310,
+        "entrapment_psms": 83,
+        "target_peptides": 24482,
+        "entrapment_peptides": 24,
+        "target_proteins": 4385,
+        "entrapment_proteins": 12,
+        "psm_fdp": 0.0011565070745002248,
+        "peptide_fdp": 0.002625653754901829,
+        "protein_fdp": 0.005458267000227428
+      },
+      "count_differences": {
+        "target_psms": 0,
+        "entrapment_psms": 0,
+        "target_peptides": -1587,
+        "entrapment_peptides": -1,
+        "target_proteins": 0,
+        "entrapment_proteins": 0
+      },
+      "count_fraction_differences": {
+        "target_psms": 0.0,
+        "entrapment_psms": 0.0,
+        "target_peptides": -0.060876903601979365,
+        "entrapment_peptides": -0.04,
+        "target_proteins": 0.0,
+        "entrapment_proteins": 0.0
+      },
+      "fdp_differences": {
+        "psm_fdp": 0.0,
+        "peptide_fdp": 5.704479476315548e-05,
+        "protein_fdp": 0.0
+      },
+      "legacy_recorded_feasible": true,
+      "legacy_corrected_feasible": true,
+      "native_feasible": true,
+      "feasibility_matches_corrected_legacy": true,
+      "fdp_comparison_applicable": true,
+      "fdp_values_available": true,
+      "fdp_comparison_satisfied": true,
+      "native_selected": true
+    },
+    {
+      "run_id": "run_027",
+      "min_rank": 10,
+      "max_rank": 12,
+      "legacy": {
+        "target_psms": 263193,
+        "entrapment_psms": 5744,
+        "target_peptides": 45482,
+        "entrapment_peptides": 790,
+        "target_proteins": 6226,
+        "entrapment_proteins": 357,
+        "psm_fdp": 0.0551731028628884,
+        "peptide_fdp": 0.04577279818691931,
+        "protein_fdp": 0.10846118790824852
+      },
+      "native": {
+        "target_psms": 263193,
+        "entrapment_psms": 5744,
+        "target_peptides": 42740,
+        "entrapment_peptides": 775,
+        "target_proteins": 6226,
+        "entrapment_proteins": 357,
+        "psm_fdp": 0.0551731028628884,
+        "peptide_fdp": 0.047748678579377576,
+        "protein_fdp": 0.10846118790824852
+      },
+      "count_differences": {
+        "target_psms": 0,
+        "entrapment_psms": 0,
+        "target_peptides": -2742,
+        "entrapment_peptides": -15,
+        "target_proteins": 0,
+        "entrapment_proteins": 0
+      },
+      "count_fraction_differences": {
+        "target_psms": 0.0,
+        "entrapment_psms": 0.0,
+        "target_peptides": -0.06028758629787608,
+        "entrapment_peptides": -0.0189873417721519,
+        "target_proteins": 0.0,
+        "entrapment_proteins": 0.0
+      },
+      "fdp_differences": {
+        "psm_fdp": 0.0,
+        "peptide_fdp": 0.0019758803924582666,
+        "protein_fdp": 0.0
+      },
+      "legacy_recorded_feasible": false,
+      "legacy_corrected_feasible": false,
+      "native_feasible": false,
+      "feasibility_matches_corrected_legacy": true,
+      "fdp_comparison_applicable": false,
+      "fdp_values_available": true,
+      "fdp_comparison_satisfied": true,
+      "native_selected": false
+    },
+    {
+      "run_id": "run_028",
+      "min_rank": 10,
+      "max_rank": 14,
+      "legacy": {
+        "target_psms": 328200,
+        "entrapment_psms": 18185,
+        "target_peptides": 66045,
+        "entrapment_peptides": 4293,
+        "target_proteins": 8250,
+        "entrapment_proteins": 1700,
+        "psm_fdp": 0.13561813323194366,
+        "peptide_fdp": 0.16363248116793241,
+        "protein_fdp": 0.3417085427135678
+      },
+      "native": {
+        "target_psms": 328200,
+        "entrapment_psms": 18185,
+        "target_peptides": 62133,
+        "entrapment_peptides": 4228,
+        "target_proteins": 8250,
+        "entrapment_proteins": 1700,
+        "psm_fdp": 0.13561813323194366,
+        "peptide_fdp": 0.1708129131064149,
+        "protein_fdp": 0.3417085427135678
+      },
+      "count_differences": {
+        "target_psms": 0,
+        "entrapment_psms": 0,
+        "target_peptides": -3912,
+        "entrapment_peptides": -65,
+        "target_proteins": 0,
+        "entrapment_proteins": 0
+      },
+      "count_fraction_differences": {
+        "target_psms": 0.0,
+        "entrapment_psms": 0.0,
+        "target_peptides": -0.05923234158528276,
+        "entrapment_peptides": -0.015140927090612625,
+        "target_proteins": 0.0,
+        "entrapment_proteins": 0.0
+      },
+      "fdp_differences": {
+        "psm_fdp": 0.0,
+        "peptide_fdp": 0.007180431938482473,
+        "protein_fdp": 0.0
+      },
+      "legacy_recorded_feasible": false,
+      "legacy_corrected_feasible": false,
+      "native_feasible": false,
+      "feasibility_matches_corrected_legacy": true,
+      "fdp_comparison_applicable": false,
+      "fdp_values_available": true,
+      "fdp_comparison_satisfied": true,
+      "native_selected": false
+    },
+    {
+      "run_id": "run_029",
+      "min_rank": 10,
+      "max_rank": 18,
+      "legacy": {
+        "target_psms": 378397,
+        "entrapment_psms": 33180,
+        "target_peptides": 85183,
+        "entrapment_peptides": 10010,
+        "target_proteins": 10037,
+        "entrapment_proteins": 3458,
+        "psm_fdp": 0.20825182595396513,
+        "peptide_fdp": 0.28192118112913517,
+        "protein_fdp": 0.5124861059651723
+      },
+      "native": {
+        "target_psms": 378397,
+        "entrapment_psms": 33180,
+        "target_peptides": 80240,
+        "entrapment_peptides": 9817,
+        "target_proteins": 10037,
+        "entrapment_proteins": 3458,
+        "psm_fdp": 0.20825182595396513,
+        "peptide_fdp": 0.2922536595333681,
+        "protein_fdp": 0.5124861059651723
+      },
+      "count_differences": {
+        "target_psms": 0,
+        "entrapment_psms": 0,
+        "target_peptides": -4943,
+        "entrapment_peptides": -193,
+        "target_proteins": 0,
+        "entrapment_proteins": 0
+      },
+      "count_fraction_differences": {
+        "target_psms": 0.0,
+        "entrapment_psms": 0.0,
+        "target_peptides": -0.05802801028374206,
+        "entrapment_peptides": -0.01928071928071928,
+        "target_proteins": 0.0,
+        "entrapment_proteins": 0.0
+      },
+      "fdp_differences": {
+        "psm_fdp": 0.0,
+        "peptide_fdp": 0.010332478404232959,
+        "protein_fdp": 0.0
+      },
+      "legacy_recorded_feasible": false,
+      "legacy_corrected_feasible": false,
+      "native_feasible": false,
+      "feasibility_matches_corrected_legacy": true,
+      "fdp_comparison_applicable": false,
+      "fdp_values_available": true,
+      "fdp_comparison_satisfied": true,
+      "native_selected": false
+    },
+    {
+      "run_id": "run_030",
+      "min_rank": 10,
+      "max_rank": 25,
+      "legacy": {
+        "target_psms": 365970,
+        "entrapment_psms": 28955,
+        "target_peptides": 79215,
+        "entrapment_peptides": 8069,
+        "target_proteins": 9511,
+        "entrapment_proteins": 2899,
+        "psm_fdp": 0.18939672979234148,
+        "peptide_fdp": 0.24784702906332096,
+        "protein_fdp": 0.46720386784850926
+      },
+      "native": {
+        "target_psms": 365970,
+        "entrapment_psms": 28955,
+        "target_peptides": 74600,
+        "entrapment_peptides": 7928,
+        "target_proteins": 9511,
+        "entrapment_proteins": 2899,
+        "psm_fdp": 0.18939672979234148,
+        "peptide_fdp": 0.257549649732477,
+        "protein_fdp": 0.46720386784850926
+      },
+      "count_differences": {
+        "target_psms": 0,
+        "entrapment_psms": 0,
+        "target_peptides": -4615,
+        "entrapment_peptides": -141,
+        "target_proteins": 0,
+        "entrapment_proteins": 0
+      },
+      "count_fraction_differences": {
+        "target_psms": 0.0,
+        "entrapment_psms": 0.0,
+        "target_peptides": -0.05825916808685224,
+        "entrapment_peptides": -0.01747428429793035,
+        "target_proteins": 0.0,
+        "entrapment_proteins": 0.0
+      },
+      "fdp_differences": {
+        "psm_fdp": 0.0,
+        "peptide_fdp": 0.009702620669156059,
+        "protein_fdp": 0.0
+      },
+      "legacy_recorded_feasible": false,
+      "legacy_corrected_feasible": false,
+      "native_feasible": false,
+      "feasibility_matches_corrected_legacy": true,
+      "fdp_comparison_applicable": false,
+      "fdp_values_available": true,
+      "fdp_comparison_satisfied": true,
+      "native_selected": false
+    },
+    {
+      "run_id": "run_032",
+      "min_rank": 2,
+      "max_rank": 2,
+      "legacy": {
+        "target_psms": 0,
+        "entrapment_psms": 0,
+        "target_peptides": 0,
+        "entrapment_peptides": 0,
+        "target_proteins": 0,
+        "entrapment_proteins": 0,
+        "psm_fdp": 1.0,
+        "peptide_fdp": 1.0,
+        "protein_fdp": 1.0
+      },
+      "native": {
+        "target_psms": 0,
+        "entrapment_psms": 0,
+        "target_peptides": 0,
+        "entrapment_peptides": 0,
+        "target_proteins": 0,
+        "entrapment_proteins": 0,
+        "psm_fdp": null,
+        "peptide_fdp": null,
+        "protein_fdp": null
+      },
+      "count_differences": {
+        "target_psms": 0,
+        "entrapment_psms": 0,
+        "target_peptides": 0,
+        "entrapment_peptides": 0,
+        "target_proteins": 0,
+        "entrapment_proteins": 0
+      },
+      "count_fraction_differences": {
+        "target_psms": null,
+        "entrapment_psms": null,
+        "target_peptides": null,
+        "entrapment_peptides": null,
+        "target_proteins": null,
+        "entrapment_proteins": null
+      },
+      "fdp_differences": {
+        "psm_fdp": null,
+        "peptide_fdp": null,
+        "protein_fdp": null
+      },
+      "legacy_recorded_feasible": false,
+      "legacy_corrected_feasible": false,
+      "native_feasible": false,
+      "feasibility_matches_corrected_legacy": true,
+      "fdp_comparison_applicable": false,
+      "fdp_values_available": false,
+      "fdp_comparison_satisfied": true,
+      "native_selected": false
+    },
+    {
+      "run_id": "run_033",
+      "min_rank": 2,
+      "max_rank": 3,
+      "legacy": {
+        "target_psms": 0,
+        "entrapment_psms": 0,
+        "target_peptides": 0,
+        "entrapment_peptides": 0,
+        "target_proteins": 0,
+        "entrapment_proteins": 0,
+        "psm_fdp": 1.0,
+        "peptide_fdp": 1.0,
+        "protein_fdp": 1.0
+      },
+      "native": {
+        "target_psms": 0,
+        "entrapment_psms": 0,
+        "target_peptides": 0,
+        "entrapment_peptides": 0,
+        "target_proteins": 0,
+        "entrapment_proteins": 0,
+        "psm_fdp": null,
+        "peptide_fdp": null,
+        "protein_fdp": null
+      },
+      "count_differences": {
+        "target_psms": 0,
+        "entrapment_psms": 0,
+        "target_peptides": 0,
+        "entrapment_peptides": 0,
+        "target_proteins": 0,
+        "entrapment_proteins": 0
+      },
+      "count_fraction_differences": {
+        "target_psms": null,
+        "entrapment_psms": null,
+        "target_peptides": null,
+        "entrapment_peptides": null,
+        "target_proteins": null,
+        "entrapment_proteins": null
+      },
+      "fdp_differences": {
+        "psm_fdp": null,
+        "peptide_fdp": null,
+        "protein_fdp": null
+      },
+      "legacy_recorded_feasible": false,
+      "legacy_corrected_feasible": false,
+      "native_feasible": false,
+      "feasibility_matches_corrected_legacy": true,
+      "fdp_comparison_applicable": false,
+      "fdp_values_available": false,
+      "fdp_comparison_satisfied": true,
+      "native_selected": false
+    },
+    {
+      "run_id": "run_034",
+      "min_rank": 2,
+      "max_rank": 4,
+      "legacy": {
+        "target_psms": 0,
+        "entrapment_psms": 0,
+        "target_peptides": 0,
+        "entrapment_peptides": 0,
+        "target_proteins": 0,
+        "entrapment_proteins": 0,
+        "psm_fdp": 1.0,
+        "peptide_fdp": 1.0,
+        "protein_fdp": 1.0
+      },
+      "native": {
+        "target_psms": 0,
+        "entrapment_psms": 0,
+        "target_peptides": 0,
+        "entrapment_peptides": 0,
+        "target_proteins": 0,
+        "entrapment_proteins": 0,
+        "psm_fdp": null,
+        "peptide_fdp": null,
+        "protein_fdp": null
+      },
+      "count_differences": {
+        "target_psms": 0,
+        "entrapment_psms": 0,
+        "target_peptides": 0,
+        "entrapment_peptides": 0,
+        "target_proteins": 0,
+        "entrapment_proteins": 0
+      },
+      "count_fraction_differences": {
+        "target_psms": null,
+        "entrapment_psms": null,
+        "target_peptides": null,
+        "entrapment_peptides": null,
+        "target_proteins": null,
+        "entrapment_proteins": null
+      },
+      "fdp_differences": {
+        "psm_fdp": null,
+        "peptide_fdp": null,
+        "protein_fdp": null
+      },
+      "legacy_recorded_feasible": false,
+      "legacy_corrected_feasible": false,
+      "native_feasible": false,
+      "feasibility_matches_corrected_legacy": true,
+      "fdp_comparison_applicable": false,
+      "fdp_values_available": false,
+      "fdp_comparison_satisfied": true,
+      "native_selected": false
+    },
+    {
+      "run_id": "run_035",
+      "min_rank": 3,
+      "max_rank": 4,
+      "legacy": {
+        "target_psms": 0,
+        "entrapment_psms": 0,
+        "target_peptides": 0,
+        "entrapment_peptides": 0,
+        "target_proteins": 0,
+        "entrapment_proteins": 0,
+        "psm_fdp": 1.0,
+        "peptide_fdp": 1.0,
+        "protein_fdp": 1.0
+      },
+      "native": {
+        "target_psms": 0,
+        "entrapment_psms": 0,
+        "target_peptides": 0,
+        "entrapment_peptides": 0,
+        "target_proteins": 0,
+        "entrapment_proteins": 0,
+        "psm_fdp": null,
+        "peptide_fdp": null,
+        "protein_fdp": null
+      },
+      "count_differences": {
+        "target_psms": 0,
+        "entrapment_psms": 0,
+        "target_peptides": 0,
+        "entrapment_peptides": 0,
+        "target_proteins": 0,
+        "entrapment_proteins": 0
+      },
+      "count_fraction_differences": {
+        "target_psms": null,
+        "entrapment_psms": null,
+        "target_peptides": null,
+        "entrapment_peptides": null,
+        "target_proteins": null,
+        "entrapment_proteins": null
+      },
+      "fdp_differences": {
+        "psm_fdp": null,
+        "peptide_fdp": null,
+        "protein_fdp": null
+      },
+      "legacy_recorded_feasible": false,
+      "legacy_corrected_feasible": false,
+      "native_feasible": false,
+      "feasibility_matches_corrected_legacy": true,
+      "fdp_comparison_applicable": false,
+      "fdp_values_available": false,
+      "fdp_comparison_satisfied": true,
+      "native_selected": false
+    },
+    {
+      "run_id": "run_036",
+      "min_rank": 8,
+      "max_rank": 8,
+      "legacy": {
+        "target_psms": 50260,
+        "entrapment_psms": 0,
+        "target_peptides": 4062,
+        "entrapment_peptides": 0,
+        "target_proteins": 1163,
+        "entrapment_proteins": 0,
+        "psm_fdp": 0.0,
+        "peptide_fdp": 0.0,
+        "protein_fdp": 0.0
+      },
+      "native": {
+        "target_psms": 50260,
+        "entrapment_psms": 0,
+        "target_peptides": 3828,
+        "entrapment_peptides": 0,
+        "target_proteins": 1163,
+        "entrapment_proteins": 0,
+        "psm_fdp": 0.0,
+        "peptide_fdp": 0.0,
+        "protein_fdp": 0.0
+      },
+      "count_differences": {
+        "target_psms": 0,
+        "entrapment_psms": 0,
+        "target_peptides": -234,
+        "entrapment_peptides": 0,
+        "target_proteins": 0,
+        "entrapment_proteins": 0
+      },
+      "count_fraction_differences": {
+        "target_psms": 0.0,
+        "entrapment_psms": null,
+        "target_peptides": -0.05760709010339734,
+        "entrapment_peptides": null,
+        "target_proteins": 0.0,
+        "entrapment_proteins": null
+      },
+      "fdp_differences": {
+        "psm_fdp": 0.0,
+        "peptide_fdp": 0.0,
+        "protein_fdp": 0.0
+      },
+      "legacy_recorded_feasible": true,
+      "legacy_corrected_feasible": true,
+      "native_feasible": true,
+      "feasibility_matches_corrected_legacy": true,
+      "fdp_comparison_applicable": true,
+      "fdp_values_available": true,
+      "fdp_comparison_satisfied": true,
+      "native_selected": false
+    },
+    {
+      "run_id": "run_037",
+      "min_rank": 8,
+      "max_rank": 9,
+      "legacy": {
+        "target_psms": 76630,
+        "entrapment_psms": 0,
+        "target_peptides": 7314,
+        "entrapment_peptides": 0,
+        "target_proteins": 1861,
+        "entrapment_proteins": 0,
+        "psm_fdp": 0.0,
+        "peptide_fdp": 0.0,
+        "protein_fdp": 0.0
+      },
+      "native": {
+        "target_psms": 76630,
+        "entrapment_psms": 0,
+        "target_peptides": 6884,
+        "entrapment_peptides": 0,
+        "target_proteins": 1861,
+        "entrapment_proteins": 0,
+        "psm_fdp": 0.0,
+        "peptide_fdp": 0.0,
+        "protein_fdp": 0.0
+      },
+      "count_differences": {
+        "target_psms": 0,
+        "entrapment_psms": 0,
+        "target_peptides": -430,
+        "entrapment_peptides": 0,
+        "target_proteins": 0,
+        "entrapment_proteins": 0
+      },
+      "count_fraction_differences": {
+        "target_psms": 0.0,
+        "entrapment_psms": null,
+        "target_peptides": -0.0587913590374624,
+        "entrapment_peptides": null,
+        "target_proteins": 0.0,
+        "entrapment_proteins": null
+      },
+      "fdp_differences": {
+        "psm_fdp": 0.0,
+        "peptide_fdp": 0.0,
+        "protein_fdp": 0.0
+      },
+      "legacy_recorded_feasible": true,
+      "legacy_corrected_feasible": true,
+      "native_feasible": true,
+      "feasibility_matches_corrected_legacy": true,
+      "fdp_comparison_applicable": true,
+      "fdp_values_available": true,
+      "fdp_comparison_satisfied": true,
+      "native_selected": false
+    },
+    {
+      "run_id": "run_038",
+      "min_rank": 8,
+      "max_rank": 10,
+      "legacy": {
+        "target_psms": 104031,
+        "entrapment_psms": 0,
+        "target_peptides": 11107,
+        "entrapment_peptides": 0,
+        "target_proteins": 2538,
+        "entrapment_proteins": 0,
+        "psm_fdp": 0.0,
+        "peptide_fdp": 0.0,
+        "protein_fdp": 0.0
+      },
+      "native": {
+        "target_psms": 104031,
+        "entrapment_psms": 0,
+        "target_peptides": 10455,
+        "entrapment_peptides": 0,
+        "target_proteins": 2538,
+        "entrapment_proteins": 0,
+        "psm_fdp": 0.0,
+        "peptide_fdp": 0.0,
+        "protein_fdp": 0.0
+      },
+      "count_differences": {
+        "target_psms": 0,
+        "entrapment_psms": 0,
+        "target_peptides": -652,
+        "entrapment_peptides": 0,
+        "target_proteins": 0,
+        "entrapment_proteins": 0
+      },
+      "count_fraction_differences": {
+        "target_psms": 0.0,
+        "entrapment_psms": null,
+        "target_peptides": -0.058701719636265415,
+        "entrapment_peptides": null,
+        "target_proteins": 0.0,
+        "entrapment_proteins": null
+      },
+      "fdp_differences": {
+        "psm_fdp": 0.0,
+        "peptide_fdp": 0.0,
+        "protein_fdp": 0.0
+      },
+      "legacy_recorded_feasible": true,
+      "legacy_corrected_feasible": true,
+      "native_feasible": true,
+      "feasibility_matches_corrected_legacy": true,
+      "fdp_comparison_applicable": true,
+      "fdp_values_available": true,
+      "fdp_comparison_satisfied": true,
+      "native_selected": false
+    },
+    {
+      "run_id": "run_039",
+      "min_rank": 8,
+      "max_rank": 11,
+      "legacy": {
+        "target_psms": 131819,
+        "entrapment_psms": 0,
+        "target_peptides": 15658,
+        "entrapment_peptides": 0,
+        "target_proteins": 3193,
+        "entrapment_proteins": 0,
+        "psm_fdp": 0.0,
+        "peptide_fdp": 0.0,
+        "protein_fdp": 0.0
+      },
+      "native": {
+        "target_psms": 131819,
+        "entrapment_psms": 0,
+        "target_peptides": 14713,
+        "entrapment_peptides": 0,
+        "target_proteins": 3193,
+        "entrapment_proteins": 0,
+        "psm_fdp": 0.0,
+        "peptide_fdp": 0.0,
+        "protein_fdp": 0.0
+      },
+      "count_differences": {
+        "target_psms": 0,
+        "entrapment_psms": 0,
+        "target_peptides": -945,
+        "entrapment_peptides": 0,
+        "target_proteins": 0,
+        "entrapment_proteins": 0
+      },
+      "count_fraction_differences": {
+        "target_psms": 0.0,
+        "entrapment_psms": null,
+        "target_peptides": -0.06035253544513986,
+        "entrapment_peptides": null,
+        "target_proteins": 0.0,
+        "entrapment_proteins": null
+      },
+      "fdp_differences": {
+        "psm_fdp": 0.0,
+        "peptide_fdp": 0.0,
+        "protein_fdp": 0.0
+      },
+      "legacy_recorded_feasible": true,
+      "legacy_corrected_feasible": true,
+      "native_feasible": true,
+      "feasibility_matches_corrected_legacy": true,
+      "fdp_comparison_applicable": true,
+      "fdp_values_available": true,
+      "fdp_comparison_satisfied": true,
+      "native_selected": false
+    },
+    {
+      "run_id": "run_040",
+      "min_rank": 8,
+      "max_rank": 12,
+      "legacy": {
+        "target_psms": 158446,
+        "entrapment_psms": 13,
+        "target_peptides": 20283,
+        "entrapment_peptides": 6,
+        "target_proteins": 3757,
+        "entrapment_proteins": 3,
+        "psm_fdp": 0.0002119287980324858,
+        "peptide_fdp": 0.0007928467509195156,
+        "protein_fdp": 0.0015957446808510637
+      },
+      "native": {
+        "target_psms": 158446,
+        "entrapment_psms": 13,
+        "target_peptides": 19023,
+        "entrapment_peptides": 6,
+        "target_proteins": 3757,
+        "entrapment_proteins": 3,
+        "psm_fdp": 0.0002119287980324858,
+        "peptide_fdp": 0.0008453448804144229,
+        "protein_fdp": 0.0015957446808510637
+      },
+      "count_differences": {
+        "target_psms": 0,
+        "entrapment_psms": 0,
+        "target_peptides": -1260,
+        "entrapment_peptides": 0,
+        "target_proteins": 0,
+        "entrapment_proteins": 0
+      },
+      "count_fraction_differences": {
+        "target_psms": 0.0,
+        "entrapment_psms": 0.0,
+        "target_peptides": -0.06212098801952374,
+        "entrapment_peptides": 0.0,
+        "target_proteins": 0.0,
+        "entrapment_proteins": 0.0
+      },
+      "fdp_differences": {
+        "psm_fdp": 0.0,
+        "peptide_fdp": 5.249812949490731e-05,
+        "protein_fdp": 0.0
+      },
+      "legacy_recorded_feasible": true,
+      "legacy_corrected_feasible": true,
+      "native_feasible": true,
+      "feasibility_matches_corrected_legacy": true,
+      "fdp_comparison_applicable": true,
+      "fdp_values_available": true,
+      "fdp_comparison_satisfied": true,
+      "native_selected": false
+    },
+    {
+      "run_id": "run_041",
+      "min_rank": 8,
+      "max_rank": 13,
+      "legacy": {
+        "target_psms": 182416,
+        "entrapment_psms": 74,
+        "target_peptides": 25236,
+        "entrapment_peptides": 23,
+        "target_proteins": 4303,
+        "entrapment_proteins": 11,
+        "psm_fdp": 0.0010475051868594678,
+        "peptide_fdp": 0.0024412391476063924,
+        "protein_fdp": 0.005099675475197033
+      },
+      "native": {
+        "target_psms": 182416,
+        "entrapment_psms": 74,
+        "target_peptides": 23695,
+        "entrapment_peptides": 22,
+        "target_proteins": 4303,
+        "entrapment_proteins": 11,
+        "psm_fdp": 0.0010475051868594678,
+        "peptide_fdp": 0.002486918595992559,
+        "protein_fdp": 0.005099675475197033
+      },
+      "count_differences": {
+        "target_psms": 0,
+        "entrapment_psms": 0,
+        "target_peptides": -1541,
+        "entrapment_peptides": -1,
+        "target_proteins": 0,
+        "entrapment_proteins": 0
+      },
+      "count_fraction_differences": {
+        "target_psms": 0.0,
+        "entrapment_psms": 0.0,
+        "target_peptides": -0.06106355999365985,
+        "entrapment_peptides": -0.043478260869565216,
+        "target_proteins": 0.0,
+        "entrapment_proteins": 0.0
+      },
+      "fdp_differences": {
+        "psm_fdp": 0.0,
+        "peptide_fdp": 4.5679448386166596e-05,
+        "protein_fdp": 0.0
+      },
+      "legacy_recorded_feasible": true,
+      "legacy_corrected_feasible": true,
+      "native_feasible": true,
+      "feasibility_matches_corrected_legacy": true,
+      "fdp_comparison_applicable": true,
+      "fdp_values_available": true,
+      "fdp_comparison_satisfied": true,
+      "native_selected": false
+    },
+    {
+      "run_id": "run_042",
+      "min_rank": 8,
+      "max_rank": 14,
+      "legacy": {
+        "target_psms": 203451,
+        "entrapment_psms": 198,
+        "target_peptides": 29810,
+        "entrapment_peptides": 72,
+        "target_proteins": 4730,
+        "entrapment_proteins": 34,
+        "psm_fdp": 0.0025115766798874057,
+        "peptide_fdp": 0.006459835779160452,
+        "protein_fdp": 0.014273719563392108
+      },
+      "native": {
+        "target_psms": 203451,
+        "entrapment_psms": 198,
+        "target_peptides": 28017,
+        "entrapment_peptides": 71,
+        "target_proteins": 4730,
+        "entrapment_proteins": 34,
+        "psm_fdp": 0.0025115766798874057,
+        "peptide_fdp": 0.0067769795451665575,
+        "protein_fdp": 0.014273719563392108
+      },
+      "count_differences": {
+        "target_psms": 0,
+        "entrapment_psms": 0,
+        "target_peptides": -1793,
+        "entrapment_peptides": -1,
+        "target_proteins": 0,
+        "entrapment_proteins": 0
+      },
+      "count_fraction_differences": {
+        "target_psms": 0.0,
+        "entrapment_psms": 0.0,
+        "target_peptides": -0.06014760147601476,
+        "entrapment_peptides": -0.013888888888888888,
+        "target_proteins": 0.0,
+        "entrapment_proteins": 0.0
+      },
+      "fdp_differences": {
+        "psm_fdp": 0.0,
+        "peptide_fdp": 0.00031714376600610553,
+        "protein_fdp": 0.0
+      },
+      "legacy_recorded_feasible": false,
+      "legacy_corrected_feasible": false,
+      "native_feasible": false,
+      "feasibility_matches_corrected_legacy": true,
+      "fdp_comparison_applicable": false,
+      "fdp_values_available": true,
+      "fdp_comparison_satisfied": true,
+      "native_selected": false
+    },
+    {
+      "run_id": "run_043",
+      "min_rank": 8,
+      "max_rank": 15,
+      "legacy": {
+        "target_psms": 221290,
+        "entrapment_psms": 1782,
+        "target_peptides": 33883,
+        "entrapment_peptides": 162,
+        "target_proteins": 5129,
+        "entrapment_proteins": 76,
+        "psm_fdp": 0.020636031028284648,
+        "peptide_fdp": 0.01275734553367494,
+        "protein_fdp": 0.02920268972142171
+      },
+      "native": {
+        "target_psms": 221290,
+        "entrapment_psms": 1782,
+        "target_peptides": 31837,
+        "entrapment_peptides": 160,
+        "target_proteins": 5129,
+        "entrapment_proteins": 76,
+        "psm_fdp": 0.020636031028284648,
+        "peptide_fdp": 0.013406313283041994,
+        "protein_fdp": 0.02920268972142171
+      },
+      "count_differences": {
+        "target_psms": 0,
+        "entrapment_psms": 0,
+        "target_peptides": -2046,
+        "entrapment_peptides": -2,
+        "target_proteins": 0,
+        "entrapment_proteins": 0
+      },
+      "count_fraction_differences": {
+        "target_psms": 0.0,
+        "entrapment_psms": 0.0,
+        "target_peptides": -0.06038426349496798,
+        "entrapment_peptides": -0.012345679012345678,
+        "target_proteins": 0.0,
+        "entrapment_proteins": 0.0
+      },
+      "fdp_differences": {
+        "psm_fdp": 0.0,
+        "peptide_fdp": 0.0006489677493670531,
+        "protein_fdp": 0.0
+      },
+      "legacy_recorded_feasible": false,
+      "legacy_corrected_feasible": false,
+      "native_feasible": false,
+      "feasibility_matches_corrected_legacy": true,
+      "fdp_comparison_applicable": false,
+      "fdp_values_available": true,
+      "fdp_comparison_satisfied": true,
+      "native_selected": false
+    },
+    {
+      "run_id": "run_044",
+      "min_rank": 8,
+      "max_rank": 16,
+      "legacy": {
+        "target_psms": 233716,
+        "entrapment_psms": 2990,
+        "target_peptides": 36991,
+        "entrapment_peptides": 252,
+        "target_proteins": 5431,
+        "entrapment_proteins": 119,
+        "psm_fdp": 0.032630629741995654,
+        "peptide_fdp": 0.018140720259781817,
+        "protein_fdp": 0.04288288288288288
+      },
+      "native": {
+        "target_psms": 233716,
+        "entrapment_psms": 2990,
+        "target_peptides": 34770,
+        "entrapment_peptides": 247,
+        "target_proteins": 5431,
+        "entrapment_proteins": 119,
+        "psm_fdp": 0.032630629741995654,
+        "peptide_fdp": 0.018911094274034968,
+        "protein_fdp": 0.04288288288288288
+      },
+      "count_differences": {
+        "target_psms": 0,
+        "entrapment_psms": 0,
+        "target_peptides": -2221,
+        "entrapment_peptides": -5,
+        "target_proteins": 0,
+        "entrapment_proteins": 0
+      },
+      "count_fraction_differences": {
+        "target_psms": 0.0,
+        "entrapment_psms": 0.0,
+        "target_peptides": -0.06004163174826309,
+        "entrapment_peptides": -0.01984126984126984,
+        "target_proteins": 0.0,
+        "entrapment_proteins": 0.0
+      },
+      "fdp_differences": {
+        "psm_fdp": 0.0,
+        "peptide_fdp": 0.0007703740142531515,
+        "protein_fdp": 0.0
+      },
+      "legacy_recorded_feasible": false,
+      "legacy_corrected_feasible": false,
+      "native_feasible": false,
+      "feasibility_matches_corrected_legacy": true,
+      "fdp_comparison_applicable": false,
+      "fdp_values_available": true,
+      "fdp_comparison_satisfied": true,
+      "native_selected": false
+    },
+    {
+      "run_id": "run_045",
+      "min_rank": 9,
+      "max_rank": 10,
+      "legacy": {
+        "target_psms": 143460,
+        "entrapment_psms": 5,
+        "target_peptides": 17637,
+        "entrapment_peptides": 2,
+        "target_proteins": 3434,
+        "entrapment_proteins": 1,
+        "psm_fdp": 9.003006739094678e-05,
+        "peptide_fdp": 0.00030398676662331676,
+        "protein_fdp": 0.0005822416302765648
+      },
+      "native": {
+        "target_psms": 143460,
+        "entrapment_psms": 5,
+        "target_peptides": 16569,
+        "entrapment_peptides": 2,
+        "target_proteins": 3434,
+        "entrapment_proteins": 1,
+        "psm_fdp": 9.003006739094678e-05,
+        "peptide_fdp": 0.00032357869630491123,
+        "protein_fdp": 0.0005822416302765648
+      },
+      "count_differences": {
+        "target_psms": 0,
+        "entrapment_psms": 0,
+        "target_peptides": -1068,
+        "entrapment_peptides": 0,
+        "target_proteins": 0,
+        "entrapment_proteins": 0
+      },
+      "count_fraction_differences": {
+        "target_psms": 0.0,
+        "entrapment_psms": 0.0,
+        "target_peptides": -0.06055451607416227,
+        "entrapment_peptides": 0.0,
+        "target_proteins": 0.0,
+        "entrapment_proteins": 0.0
+      },
+      "fdp_differences": {
+        "psm_fdp": 0.0,
+        "peptide_fdp": 1.9591929681594467e-05,
+        "protein_fdp": 0.0
+      },
+      "legacy_recorded_feasible": true,
+      "legacy_corrected_feasible": true,
+      "native_feasible": true,
+      "feasibility_matches_corrected_legacy": true,
+      "fdp_comparison_applicable": true,
+      "fdp_values_available": true,
+      "fdp_comparison_satisfied": true,
+      "native_selected": false
+    },
+    {
+      "run_id": "run_046",
+      "min_rank": 9,
+      "max_rank": 12,
+      "legacy": {
+        "target_psms": 209917,
+        "entrapment_psms": 1541,
+        "target_peptides": 31472,
+        "entrapment_peptides": 107,
+        "target_proteins": 4901,
+        "entrapment_proteins": 51,
+        "psm_fdp": 0.018825306335736834,
+        "peptide_fdp": 0.00908414477472607,
+        "protein_fdp": 0.02059773828756058
+      },
+      "native": {
+        "target_psms": 209917,
+        "entrapment_psms": 1541,
+        "target_peptides": 29576,
+        "entrapment_peptides": 106,
+        "target_proteins": 4901,
+        "entrapment_proteins": 51,
+        "psm_fdp": 0.018825306335736834,
+        "peptide_fdp": 0.00957439514024797,
+        "protein_fdp": 0.02059773828756058
+      },
+      "count_differences": {
+        "target_psms": 0,
+        "entrapment_psms": 0,
+        "target_peptides": -1896,
+        "entrapment_peptides": -1,
+        "target_proteins": 0,
+        "entrapment_proteins": 0
+      },
+      "count_fraction_differences": {
+        "target_psms": 0.0,
+        "entrapment_psms": 0.0,
+        "target_peptides": -0.06024402643619726,
+        "entrapment_peptides": -0.009345794392523364,
+        "target_proteins": 0.0,
+        "entrapment_proteins": 0.0
+      },
+      "fdp_differences": {
+        "psm_fdp": 0.0,
+        "peptide_fdp": 0.0004902503655219003,
+        "protein_fdp": 0.0
+      },
+      "legacy_recorded_feasible": false,
+      "legacy_corrected_feasible": false,
+      "native_feasible": false,
+      "feasibility_matches_corrected_legacy": true,
+      "fdp_comparison_applicable": false,
+      "fdp_values_available": true,
+      "fdp_comparison_satisfied": true,
+      "native_selected": false
+    },
+    {
+      "run_id": "run_047",
+      "min_rank": 9,
+      "max_rank": 14,
+      "legacy": {
+        "target_psms": 264705,
+        "entrapment_psms": 5831,
+        "target_peptides": 45753,
+        "entrapment_peptides": 808,
+        "target_proteins": 6248,
+        "entrapment_proteins": 365,
+        "psm_fdp": 0.055677728700040036,
+        "peptide_fdp": 0.04652514166133348,
+        "protein_fdp": 0.11038862845909572
+      },
+      "native": {
+        "target_psms": 264705,
+        "entrapment_psms": 5831,
+        "target_peptides": 42997,
+        "entrapment_peptides": 792,
+        "target_proteins": 6248,
+        "entrapment_proteins": 365,
+        "psm_fdp": 0.055677728700040036,
+        "peptide_fdp": 0.04849073831970583,
+        "protein_fdp": 0.11038862845909572
+      },
+      "count_differences": {
+        "target_psms": 0,
+        "entrapment_psms": 0,
+        "target_peptides": -2756,
+        "entrapment_peptides": -16,
+        "target_proteins": 0,
+        "entrapment_proteins": 0
+      },
+      "count_fraction_differences": {
+        "target_psms": 0.0,
+        "entrapment_psms": 0.0,
+        "target_peptides": -0.06023648722488143,
+        "entrapment_peptides": -0.019801980198019802,
+        "target_proteins": 0.0,
+        "entrapment_proteins": 0.0
+      },
+      "fdp_differences": {
+        "psm_fdp": 0.0,
+        "peptide_fdp": 0.0019655966583723497,
+        "protein_fdp": 0.0
+      },
+      "legacy_recorded_feasible": false,
+      "legacy_corrected_feasible": false,
+      "native_feasible": false,
+      "feasibility_matches_corrected_legacy": true,
+      "fdp_comparison_applicable": false,
+      "fdp_values_available": true,
+      "fdp_comparison_satisfied": true,
+      "native_selected": false
+    },
+    {
+      "run_id": "run_048",
+      "min_rank": 9,
+      "max_rank": 15,
+      "legacy": {
+        "target_psms": 286252,
+        "entrapment_psms": 8829,
+        "target_peptides": 51645,
+        "entrapment_peptides": 1500,
+        "target_proteins": 6863,
+        "entrapment_proteins": 665,
+        "psm_fdp": 0.07729186805349053,
+        "peptide_fdp": 0.07567065448022416,
+        "protein_fdp": 0.17667375132837407
+      },
+      "native": {
+        "target_psms": 286252,
+        "entrapment_psms": 8829,
+        "target_peptides": 48562,
+        "entrapment_peptides": 1474,
+        "target_proteins": 6863,
+        "entrapment_proteins": 665,
+        "psm_fdp": 0.07729186805349053,
+        "peptide_fdp": 0.07897934764684268,
+        "protein_fdp": 0.17667375132837407
+      },
+      "count_differences": {
+        "target_psms": 0,
+        "entrapment_psms": 0,
+        "target_peptides": -3083,
+        "entrapment_peptides": -26,
+        "target_proteins": 0,
+        "entrapment_proteins": 0
+      },
+      "count_fraction_differences": {
+        "target_psms": 0.0,
+        "entrapment_psms": 0.0,
+        "target_peptides": -0.05969600154903669,
+        "entrapment_peptides": -0.017333333333333333,
+        "target_proteins": 0.0,
+        "entrapment_proteins": 0.0
+      },
+      "fdp_differences": {
+        "psm_fdp": 0.0,
+        "peptide_fdp": 0.003308693166618526,
+        "protein_fdp": 0.0
+      },
+      "legacy_recorded_feasible": false,
+      "legacy_corrected_feasible": false,
+      "native_feasible": false,
+      "feasibility_matches_corrected_legacy": true,
+      "fdp_comparison_applicable": false,
+      "fdp_values_available": true,
+      "fdp_comparison_satisfied": true,
+      "native_selected": false
+    },
+    {
+      "run_id": "run_049",
+      "min_rank": 9,
+      "max_rank": 16,
+      "legacy": {
+        "target_psms": 302238,
+        "entrapment_psms": 11570,
+        "target_peptides": 56647,
+        "entrapment_peptides": 2264,
+        "target_proteins": 7357,
+        "entrapment_proteins": 959,
+        "psm_fdp": 0.09524295942937212,
+        "peptide_fdp": 0.10303355157037819,
+        "protein_fdp": 0.23063973063973064
+      },
+      "native": {
+        "target_psms": 302238,
+        "entrapment_psms": 11570,
+        "target_peptides": 53273,
+        "entrapment_peptides": 2233,
+        "target_proteins": 7357,
+        "entrapment_proteins": 959,
+        "psm_fdp": 0.09524295942937212,
+        "peptide_fdp": 0.10785677596345054,
+        "protein_fdp": 0.23063973063973064
+      },
+      "count_differences": {
+        "target_psms": 0,
+        "entrapment_psms": 0,
+        "target_peptides": -3374,
+        "entrapment_peptides": -31,
+        "target_proteins": 0,
+        "entrapment_proteins": 0
+      },
+      "count_fraction_differences": {
+        "target_psms": 0.0,
+        "entrapment_psms": 0.0,
+        "target_peptides": -0.059561847935459954,
+        "entrapment_peptides": -0.013692579505300354,
+        "target_proteins": 0.0,
+        "entrapment_proteins": 0.0
+      },
+      "fdp_differences": {
+        "psm_fdp": 0.0,
+        "peptide_fdp": 0.004823224393072353,
+        "protein_fdp": 0.0
+      },
+      "legacy_recorded_feasible": false,
+      "legacy_corrected_feasible": false,
+      "native_feasible": false,
+      "feasibility_matches_corrected_legacy": true,
+      "fdp_comparison_applicable": false,
+      "fdp_values_available": true,
+      "fdp_comparison_satisfied": true,
+      "native_selected": false
+    },
+    {
+      "run_id": "run_050",
+      "min_rank": 10,
+      "max_rank": 11,
+      "legacy": {
+        "target_psms": 225585,
+        "entrapment_psms": 2712,
+        "target_peptides": 35313,
+        "entrapment_peptides": 206,
+        "target_proteins": 5261,
+        "entrapment_proteins": 97,
+        "psm_fdp": 0.030686899725071107,
+        "peptide_fdp": 0.015549095565085573,
+        "protein_fdp": 0.036207540126913025
+      },
+      "native": {
+        "target_psms": 225585,
+        "entrapment_psms": 2712,
+        "target_peptides": 33193,
+        "entrapment_peptides": 203,
+        "target_proteins": 5261,
+        "entrapment_proteins": 97,
+        "psm_fdp": 0.030686899725071107,
+        "peptide_fdp": 0.016296720910036273,
+        "protein_fdp": 0.036207540126913025
+      },
+      "count_differences": {
+        "target_psms": 0,
+        "entrapment_psms": 0,
+        "target_peptides": -2120,
+        "entrapment_peptides": -3,
+        "target_proteins": 0,
+        "entrapment_proteins": 0
+      },
+      "count_fraction_differences": {
+        "target_psms": 0.0,
+        "entrapment_psms": 0.0,
+        "target_peptides": -0.060034548183388554,
+        "entrapment_peptides": -0.014563106796116505,
+        "target_proteins": 0.0,
+        "entrapment_proteins": 0.0
+      },
+      "fdp_differences": {
+        "psm_fdp": 0.0,
+        "peptide_fdp": 0.0007476253449507,
+        "protein_fdp": 0.0
+      },
+      "legacy_recorded_feasible": false,
+      "legacy_corrected_feasible": false,
+      "native_feasible": false,
+      "feasibility_matches_corrected_legacy": true,
+      "fdp_comparison_applicable": false,
+      "fdp_values_available": true,
+      "fdp_comparison_satisfied": true,
+      "native_selected": false
+    },
+    {
+      "run_id": "run_051",
+      "min_rank": 10,
+      "max_rank": 13,
+      "legacy": {
+        "target_psms": 298620,
+        "entrapment_psms": 11188,
+        "target_peptides": 55969,
+        "entrapment_peptides": 2161,
+        "target_proteins": 7289,
+        "entrapment_proteins": 924,
+        "psm_fdp": 0.09328748034969626,
+        "peptide_fdp": 0.09966739022663708,
+        "protein_fdp": 0.22500913186411786
+      },
+      "native": {
+        "target_psms": 298620,
+        "entrapment_psms": 11188,
+        "target_peptides": 52629,
+        "entrapment_peptides": 2131,
+        "target_proteins": 7289,
+        "entrapment_proteins": 924,
+        "psm_fdp": 0.09328748034969626,
+        "peptide_fdp": 0.10433226908742481,
+        "protein_fdp": 0.22500913186411786
+      },
+      "count_differences": {
+        "target_psms": 0,
+        "entrapment_psms": 0,
+        "target_peptides": -3340,
+        "entrapment_peptides": -30,
+        "target_proteins": 0,
+        "entrapment_proteins": 0
+      },
+      "count_fraction_differences": {
+        "target_psms": 0.0,
+        "entrapment_psms": 0.0,
+        "target_peptides": -0.05967589201164931,
+        "entrapment_peptides": -0.013882461823229986,
+        "target_proteins": 0.0,
+        "entrapment_proteins": 0.0
+      },
+      "fdp_differences": {
+        "psm_fdp": 0.0,
+        "peptide_fdp": 0.00466487886078773,
+        "protein_fdp": 0.0
+      },
+      "legacy_recorded_feasible": false,
+      "legacy_corrected_feasible": false,
+      "native_feasible": false,
+      "feasibility_matches_corrected_legacy": true,
+      "fdp_comparison_applicable": false,
+      "fdp_values_available": true,
+      "fdp_comparison_satisfied": true,
+      "native_selected": false
+    },
+    {
+      "run_id": "run_052",
+      "min_rank": 10,
+      "max_rank": 15,
+      "legacy": {
+        "target_psms": 350625,
+        "entrapment_psms": 25117,
+        "target_peptides": 74821,
+        "entrapment_peptides": 6666,
+        "target_proteins": 9089,
+        "entrapment_proteins": 2492,
+        "psm_fdp": 0.1726798077400923,
+        "peptide_fdp": 0.21931867963442173,
+        "protein_fdp": 0.4303600725325965
+      },
+      "native": {
+        "target_psms": 350625,
+        "entrapment_psms": 25117,
+        "target_peptides": 70448,
+        "entrapment_peptides": 6570,
+        "target_proteins": 9089,
+        "entrapment_proteins": 2492,
+        "psm_fdp": 0.1726798077400923,
+        "peptide_fdp": 0.22870295468201754,
+        "protein_fdp": 0.4303600725325965
+      },
+      "count_differences": {
+        "target_psms": 0,
+        "entrapment_psms": 0,
+        "target_peptides": -4373,
+        "entrapment_peptides": -96,
+        "target_proteins": 0,
+        "entrapment_proteins": 0
+      },
+      "count_fraction_differences": {
+        "target_psms": 0.0,
+        "entrapment_psms": 0.0,
+        "target_peptides": -0.058446158164151774,
+        "entrapment_peptides": -0.0144014401440144,
+        "target_proteins": 0.0,
+        "entrapment_proteins": 0.0
+      },
+      "fdp_differences": {
+        "psm_fdp": 0.0,
+        "peptide_fdp": 0.009384275047595814,
+        "protein_fdp": 0.0
+      },
+      "legacy_recorded_feasible": false,
+      "legacy_corrected_feasible": false,
+      "native_feasible": false,
+      "feasibility_matches_corrected_legacy": true,
+      "fdp_comparison_applicable": false,
+      "fdp_values_available": true,
+      "fdp_comparison_satisfied": true,
+      "native_selected": false
+    },
+    {
+      "run_id": "run_053",
+      "min_rank": 10,
+      "max_rank": 16,
+      "legacy": {
+        "target_psms": 366382,
+        "entrapment_psms": 29660,
+        "target_peptides": 80788,
+        "entrapment_peptides": 8578,
+        "target_proteins": 9647,
+        "entrapment_proteins": 3050,
+        "psm_fdp": 0.19346100308404818,
+        "peptide_fdp": 0.257343003272768,
+        "protein_fdp": 0.4804284476648027
+      },
+      "native": {
+        "target_psms": 366382,
+        "entrapment_psms": 29660,
+        "target_peptides": 76085,
+        "entrapment_peptides": 8420,
+        "target_proteins": 9647,
+        "entrapment_proteins": 3050,
+        "psm_fdp": 0.19346100308404818,
+        "peptide_fdp": 0.26713348378123375,
+        "protein_fdp": 0.4804284476648027
+      },
+      "count_differences": {
+        "target_psms": 0,
+        "entrapment_psms": 0,
+        "target_peptides": -4703,
+        "entrapment_peptides": -158,
+        "target_proteins": 0,
+        "entrapment_proteins": 0
+      },
+      "count_fraction_differences": {
+        "target_psms": 0.0,
+        "entrapment_psms": 0.0,
+        "target_peptides": -0.05821409120166361,
+        "entrapment_peptides": -0.01841921193751457,
+        "target_proteins": 0.0,
+        "entrapment_proteins": 0.0
+      },
+      "fdp_differences": {
+        "psm_fdp": 0.0,
+        "peptide_fdp": 0.00979048050846576,
+        "protein_fdp": 0.0
+      },
+      "legacy_recorded_feasible": false,
+      "legacy_corrected_feasible": false,
+      "native_feasible": false,
+      "feasibility_matches_corrected_legacy": true,
+      "fdp_comparison_applicable": false,
+      "fdp_values_available": true,
+      "fdp_comparison_satisfied": true,
+      "native_selected": false
+    }
+  ]
+}

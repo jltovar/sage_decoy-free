@@ -277,6 +277,39 @@ Nokoi failed the frozen fit, selected-window, and target-only checks and is defe
 above. The production Ensemble is not assembled from these incomplete experts. Full evidence is
 recorded in `validation/reports/phase6_isb_model_parity_2026-08-07.json`.
 
+## Phase 7: independent PXD001468 Moments parity status
+
+PXD001468 was optimized as an independent holdout dataset; it did not import ISB18 windows or
+fitted parameters. The native workflow measured protein, peptide, and peptidoform ratios of
+`1.0`, `0.5948800028882344`, and `0.6316190823137978` from the active frozen PXD FASTA. It
+accounted for all 53 frozen legacy trace rows, excluded the same six invalid rank-1 setup probes,
+evaluated all 47 valid windows, matched every comparable count/FDP and feasibility decision, and
+selected the exact legacy window `10-10`.
+
+The optimized Level-4 result was exact: 185,310 target PSMs, 24,482 canonical peptides, and 4,397
+proteins. The native MS2Rescore stage reported 216,922 PSMs, 32,094 peptides, and 5,089 proteins,
+all within the predeclared 0.5% platform tolerance of the frozen 217,296/32,185/5,100 baseline.
+Its Level-4 peptide gain was 7,612 versus the frozen gain of 7,703. Target-only
+`refit_with_locked_window` retained `10-10`, refit only the nuisance state, and reported
+221,561/34,084/5,276 versus 221,847/34,143/5,283; transfer was stable and within tolerance.
+
+Both the +entrapment and target-only MS2Rescore caches joined exactly one annotation per stable
+candidate ID (12,033,536 and 12,181,311 rows, respectively). A complete rerun resumed all three
+stages in about 92 seconds without another spectrum search or Python feature-generation process.
+The optimizer's 47 trial evaluations took 3,111 seconds in aggregate. Peak observed resident
+memory was about 38.6 GiB while loading/evaluating the large candidate pool, so further streaming
+or compact-record work remains a useful engineering optimization.
+
+This is an engineering-parity pass, not evidence for a statistical default change. The generic
+release report still requests a matched TDC benchmark, and both the legacy and native
+post-MS2Rescore protein FDP are slightly above 1% (about 1.09% and 1.13%). Those facts are recorded
+rather than mislabeled as a failed PXD parity run. Full evidence is in
+`validation/reports/phase7_pxd001468_moments_parity_2026-08-08.json` and the complete grid report
+is in `validation/reports/phase7_pxd001468_moments_null_window_parity_2026-08-08.json`.
+
+PXD Moments is the only required PXD model for this refactor. Do not automatically run additional
+PXD models; decide later whether one is scientifically or technically necessary.
+
 ## Outputs and resumption
 
 Each stage has a resolved search configuration and a hash checkpoint. A completed stage is reused

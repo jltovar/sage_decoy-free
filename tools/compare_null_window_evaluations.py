@@ -208,9 +208,14 @@ def compare(
     expected_window: tuple[int, int] | None,
     maximum_count_fraction_difference: float,
     maximum_fdp_difference: float,
+    diagnostic_only_fields: frozenset[str] = frozenset(),
 ) -> dict[str, Any]:
+    legacy_trace_rows = read_legacy_rows(legacy_csv)
+    excluded_rank1_rows = [
+        row for row in legacy_trace_rows if int(row["min_null_rank"]) == 1
+    ]
     legacy_rows = [
-        row for row in read_legacy_rows(legacy_csv) if int(row["min_null_rank"]) > 1
+        row for row in legacy_trace_rows if int(row["min_null_rank"]) > 1
     ]
     native_rows = json.loads(native_json.read_text())
     native_by_window = {
@@ -289,17 +294,35 @@ def compare(
     finite_fraction_differences = [
         abs(value)
         for row in point_rows
-        for value in row["count_fraction_differences"].values()
+        for field, value in row["count_fraction_differences"].items()
         if value is not None and math.isfinite(value)
     ]
     finite_fdp_differences = [
         abs(value)
         for row in point_rows
-        for value in row["fdp_differences"].values()
+        for field, value in row["fdp_differences"].items()
         if value is not None and math.isfinite(value)
+    ]
+    comparable_fraction_differences = [
+        abs(value)
+        for row in point_rows
+        for field, value in row["count_fraction_differences"].items()
+        if field not in diagnostic_only_fields
+        and value is not None
+        and math.isfinite(value)
+    ]
+    comparable_fdp_differences = [
+        abs(value)
+        for row in point_rows
+        for field, value in row["fdp_differences"].items()
+        if field not in diagnostic_only_fields
+        and value is not None
+        and math.isfinite(value)
     ]
     max_count_fraction = max(finite_fraction_differences, default=0.0)
     max_fdp_delta = max(finite_fdp_differences, default=0.0)
+    max_comparable_count_fraction = max(comparable_fraction_differences, default=0.0)
+    max_comparable_fdp_delta = max(comparable_fdp_differences, default=0.0)
     selected_matches = expected_window is None or selected == [expected_window]
     grid_matches = legacy_windows == native_windows
     feasibility_matches = all(
@@ -324,6 +347,7 @@ def compare(
             else "frozen legacy cumulative CSV counters"
         ),
         "effective_ratios": ratios,
+        "diagnostic_only_fields": sorted(diagnostic_only_fields),
         "maximum_fdp": maximum_fdp,
         "expected_selected_window": (
             {"min_rank": expected_window[0], "max_rank": expected_window[1]}
@@ -334,6 +358,15 @@ def compare(
             {"min_rank": window[0], "max_rank": window[1]} for window in selected
         ],
         "summary": {
+            "legacy_trace_rows": len(legacy_trace_rows),
+            "excluded_invalid_rank1_rows": [
+                {
+                    "run_id": row["run_id"],
+                    "min_rank": int(row["min_null_rank"]),
+                    "max_rank": int(row["max_null_rank"]),
+                }
+                for row in excluded_rank1_rows
+            ],
             "legacy_visited_windows": len(legacy_windows),
             "native_evaluated_windows": len(native_windows),
             "matched_windows": len(point_rows),
@@ -349,6 +382,14 @@ def compare(
                 all(delta == 0 for delta in row["count_differences"].values())
                 for row in point_rows
             ),
+            "exact_comparable_count_rows": sum(
+                all(
+                    delta == 0
+                    for field, delta in row["count_differences"].items()
+                    if field not in diagnostic_only_fields
+                )
+                for row in point_rows
+            ),
             "feasibility_match_rows": sum(
                 row["feasibility_matches_corrected_legacy"] for row in point_rows
             ),
@@ -361,20 +402,24 @@ def compare(
             ),
             "maximum_absolute_count_fraction_difference": max_count_fraction,
             "maximum_absolute_fdp_difference": max_fdp_delta,
+            "maximum_absolute_comparable_count_fraction_difference": (
+                max_comparable_count_fraction
+            ),
+            "maximum_absolute_comparable_fdp_difference": max_comparable_fdp_delta,
             "grid_matches": grid_matches,
             "selected_window_matches": selected_matches,
             "corrected_feasibility_matches": feasibility_matches,
             "required_fdp_values_available": fdp_availability_satisfied,
-            "within_count_tolerance": max_count_fraction
+            "within_count_tolerance": max_comparable_count_fraction
             <= maximum_count_fraction_difference,
-            "within_fdp_tolerance": max_fdp_delta <= maximum_fdp_difference,
+            "within_fdp_tolerance": max_comparable_fdp_delta <= maximum_fdp_difference,
         },
         "passed": grid_matches
         and selected_matches
         and feasibility_matches
         and fdp_availability_satisfied
-        and max_count_fraction <= maximum_count_fraction_difference
-        and max_fdp_delta <= maximum_fdp_difference,
+        and max_comparable_count_fraction <= maximum_count_fraction_difference
+        and max_comparable_fdp_delta <= maximum_fdp_difference,
         "points": point_rows,
     }
 
@@ -400,6 +445,15 @@ def main() -> None:
     parser.add_argument("--expected-window", type=parse_window)
     parser.add_argument("--maximum-count-fraction-difference", type=float, default=0.0)
     parser.add_argument("--maximum-fdp-difference", type=float, default=1e-12)
+    parser.add_argument(
+        "--legacy-cumulative-peptides-are-peptidoforms",
+        action="store_true",
+        help=(
+            "retain cumulative-CSV peptide counts/FDPs as diagnostic-only because "
+            "they use Sage peptide/peptidoform identity rather than the canonical "
+            "unmodified I/L-normalized peptide definition"
+        ),
+    )
     parser.add_argument("--output", type=Path)
     args = parser.parse_args()
     report = compare(
@@ -411,6 +465,11 @@ def main() -> None:
         args.expected_window,
         args.maximum_count_fraction_difference,
         args.maximum_fdp_difference,
+        (
+            frozenset({"target_peptides", "entrapment_peptides", "peptide_fdp"})
+            if args.legacy_cumulative_peptides_are_peptidoforms
+            else frozenset()
+        ),
     )
     encoded = json.dumps(report, indent=2) + "\n"
     if args.output:
