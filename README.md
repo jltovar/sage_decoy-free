@@ -1,158 +1,175 @@
-# Sage: Decoy-Free Edition (Experimental)
+# Sage Decoy-Free
 
-> **Experimental research fork.** This is a decoy-free FDR branch of the Sage search engine. APIs, configuration options, output semantics, and statistical behavior may change as the workflow is refined.
+> **Experimental research fork.** This repository adds Decoy-Free false-discovery-rate (FDR)
+> estimation to the Sage search engine. It is not an official Sage release and is not currently
+> validated as a drop-in statistical replacement for conventional target-decoy competition (TDC).
 
-This branch adds an explicit **Decoy-Free (DF) FDR** mode to Sage. It is intended for low-input and ultra-low-input proteomics experiments where conventional target-decoy competition (TDC/TDA) can become statistically coarse or underpowered, especially at the peptide-to-protein inference stage.
+This fork is designed for validation-first analysis of low-input and ultra-low-input proteomics,
+where sparse decoy counts can limit empirical FDR resolution. It provides both direct Decoy-Free
+searches and a native, reproducible workflow that performs the dataset-specific work required to
+evaluate them responsibly.
 
-The central goal is to increase biologically useful identifications, especially proteins, without allowing uncontrolled false identifications. The implementation therefore separates:
+The native workflow can:
 
-1. **Base DF evidence** from fitted score/null models.
+1. select a foreign-species FASTA deterministically;
+2. generate a seeded protein-level 1:1 target-plus-entrapment FASTA with Sage digestion rules;
+3. measure the active FASTA's protein, peptide, and peptidoform ratios rather than using hard-coded
+   ratios from another dataset;
+4. search spectra once per strict search fingerprint and retain an immutable candidate pool;
+5. optimize each model's null-rank window independently from that shared pool;
+6. cache MS2Rescore annotations separately and join them by stable candidate identity;
+7. run a target-only search under an explicit calibration policy;
+8. assemble an optional Ensemble only from dataset-local experts that pass every declared gate;
+9. resume verified stages without silently accepting interrupted, modified, or corrupt outputs; and
+10. emit provenance, parity, transfer, TDC-comparison, validation, and release-gate reports.
+
+The central statistical pipeline still separates:
+
+1. **Base Decoy-Free evidence** from a fitted score/null model.
 2. **Optional physical evidence updates** from retention time (RT) and ion mobility (IMS).
-3. **Optional reproducibility rescue** from expert agreement and cross-run recurrence.
-4. **Reporting-only hierarchical inference**, which can report protein-supported peptides/PSMs without overwriting the active DF q-value streams.
+3. **Optional reproducibility updates** from expert agreement and cross-run recurrence.
+4. **Reporting-only hierarchical inference**, which may identify protein-supported peptides and
+   PSMs without overwriting the active Decoy-Free q-value streams.
 
-The current implementation should be read as a research/statistical validation branch, not as a drop-in replacement for all Sage production workflows. In this fork, some standard Sage output modes may be incomplete or not validated with the decoy-free path, including LFQ, TMT, PIN output, annotate-matches output, and parquet output. Re-validate these modes before relying on them.
+Some standard Sage output paths are not validated with the Decoy-Free workflow, including LFQ,
+TMT, PIN, parquet, and matched-fragment annotation from a reused candidate pool. These modes fail
+closed where the cache lacks the required payload, but they should still be independently validated
+before scientific use.
 
---
 ## Required validation-first workflow
 
-Decoy-free FDR estimation is model- and dataset-dependent. There is no universally correct null-rank window, model-fit choice, or rescue setting that can be assumed to work across datasets. Ultra-low-input proteomics is especially sensitive to these choices because the number of accepted PSMs, peptides, and proteins is small, and a poorly calibrated null model can either suppress true identifications or inflate false discoveries.
+Decoy-Free FDR estimation is model- and dataset-dependent. There is no universal null-rank window,
+fitted artifact, or model choice that can safely be copied between datasets. Every dataset and every
+model must optimize its own window using that dataset's active entrapment FASTA and measured ratios.
 
-For this reason, the decoy-free workflow should be treated as a validation-first, two-run process:
+The analysis still contains two search spaces, but `sage workflow` orchestrates them as one
+resumable workflow:
 
-1. Optimization / validation run with entrapment enabled
-    First, run the dataset against a target-plus-foreign-entrapment FASTA and use the optimization scripts to search null-rank windows and model-fit settings. The goal is not simply to maximize target identifications. The goal is to find the highest-yielding configuration that keeps entrapment identifications controlled, especially at the protein level.
-    
-2. Final production run without entrapment
-    After the null window and model settings have been selected using entrapment validation, rerun the analysis on the intended production FASTA without the foreign-entrapment sequences. The production run should use the validated parameters from the entrapment optimization run.
+1. **Target plus entrapment:** generate or select the entrapment FASTA, search spectra once per
+   strict fingerprint, and choose each model's highest-yield feasible null window.
+2. **Target only:** search the biological target FASTA and apply the chosen target-only calibration
+   policy without using target-only outcomes to retune the entrapment-selected window.
 
-This makes decoy-free analysis more computationally expensive than a single standard TDA/TDC run. The first stage may require many Sage runs across candidate null-rank windows and model fits. This cost is intentional: higher discovery power is only meaningful if it is checked against entrapment or another external validation strategy.
+Candidate windows are evaluated in memory from a shared candidate pool. The workflow does not edit
+JSON repeatedly, launch a new spectrum search for every window, or require a user to copy a selected
+window into another configuration file.
 
-Do not assume that a null-rank window optimized for one dataset, instrument, acquisition method, sample amount, or model fit will transfer to another dataset. A configuration that is well calibrated for one ultra-low-input experiment may be too conservative or too liberal for another. Every new dataset should be validated before decoy-free results are interpreted biologically.
+Do not transfer a window or fitted artifact from one dataset to another for normal analysis.
+Cross-dataset reuse is permitted only when explicitly declared diagnostic-only and can never satisfy
+a release gate.
 
 
-## Entrapment and null-window optimization scripts
+## Current workflow capabilities
 
-This repository includes helper scripts for the validation-first decoy-free workflow.
+### Native entrapment generation
 
-**make_entrapment.sh**
+`sage workflow` replaces the former manual `make_entrapment.sh` step. Given a target FASTA and one
+or more candidate foreign FASTAs, Sage digests each source in its own search space, excludes shared
+peptides, selects proteins deterministically, writes explicit `Ent_` headers, and measures the final
+protein, peptide, and peptidoform ratios.
 
-make_entrapment.sh builds a foreign-species entrapment FASTA using **FDRBench** (https://github.com/Noble-Lab/FDRBench/tree/main/src/main/java/FDR). It combines a target FASTA with a foreign FASTA and labels the foreign entries with an entrapment prefix, such as Ent_, so that Sage output can later separate true target identifications from forward-entrapment identifications.
+Foreign-source selection supports:
 
-The script:
+- `automatic`: choose the source whose measured peptide and peptidoform ratios best approach the
+  requested protein ratio;
+- `explicit`: use only `selected_foreign_fasta`; and
+- `automatic_with_override`: record the automatic recommendation but generate from the declared
+  override.
 
-1. runs the FDRBench JAR using the supplied target and foreign FASTA files;
-2. supports protein-level or peptide-level entrapment generation;
-3. applies digestion parameters such as enzyme, missed cleavages, minimum peptide length, and maximum peptide length;
-4. optionally applies I/L normalization and removal of shared peptides;
-5. post-processes FASTA headers so entrapment entries are consistently labeled;
-6. writes both the raw and final entrapment FASTA plus a log file.
+The production shared-peptide mode is `sage_search_space`. The
+`fdrbench004_compatibility` mode exists only to reproduce frozen FDRBench 0.0.4 behavior during
+legacy engineering comparisons. `make_entrapment.sh` is not part of the current repository and is
+not required for a new workflow.
 
-The resulting FASTA is used only for validation and optimization. It should not be used for the final biological production run unless the purpose of the run is continued entrapment validation.
+To audit FASTA construction without searching spectra:
 
-**optimize_null_window.sh**
+```bash
+sage audit-entrapment entrapment.audit.json
+```
 
-optimize_null_window.sh searches candidate null-rank windows for a selected decoy-free model fit. It repeatedly edits a base Sage JSON file, runs Sage for each candidate window, parses the resulting logs and results.sage.tsv, and records target and entrapment counts at the PSM, peptide, and protein levels.
+See [`entrapment.audit.example.json`](entrapment.audit.example.json) for the audit schema.
 
-The script is designed for entrapment-first optimization. It tracks both raw decoy-free discovery counts and Level 4 hierarchical reporting metrics, including:
+### Shared candidate pool and in-memory optimization
 
-decoy_free_is_entrapment
-decoy_free_protein_supported_peptide
-decoy_free_peptide_supported_psm
+`sage workflow` performs one native spectrum search per strict search fingerprint. Compatible
+models and candidate-window grids reuse a compressed, immutable pre-FDR candidate pool. Changes to
+statistical settings create a new analysis fingerprint and refit the fixed candidates; changes to
+the FASTA, spectra, digestion, modifications, tolerances, scoring, preprocessing, or retained rank
+depth create a different search fingerprint and therefore a different pool.
 
-It writes cumulative result tables and a best-result summary, including:
+The optimizer evaluates every declared candidate window exactly, retains compact metrics for every
+trial, and materializes the winning artifact once with full diagnostics. MSFDR1-SMIX is always
+rank `1-1`. Ensemble does not optimize a combined window: every constituent expert must supply its
+own independently optimized dataset-local window and artifact.
 
-cumulative_results_long.csv
-cumulative_results_wide.csv
-best_result.txt
-search_trace.txt
+### Separate MS2Rescore annotation cache
 
-The current optimizer is protein-primary. By default, feasibility and optimum eligibility are driven by protein-level entrapment control, while Level 4 peptide and PSM counts are used to rank yield among protein-safe configurations. This matches the intended use case for ultra-low-input proteomics, where the primary biological objective is a reliable protein list rather than maximal raw PSM count.
+MS2Rescore annotations are stored outside the immutable Sage candidate pool and joined with
+`sage-candidate-id-v1`, never with a process-local `psm_id`. Cache identity includes the candidate
+population, preliminary calibration values, retained depth, spectra, generator configuration,
+wrapper and Python hashes, detected package versions, and annotation schema. Missing caches are
+generated; corrupt, incomplete, duplicate, or mismatched caches fail closed.
 
-In practical terms, the optimizer asks:
+The target-only FASTA has a different candidate population and therefore uses a distinct candidate
+pool and, when requested, a distinct annotation cache.
 
-Among the null-rank windows that keep entrapment proteins at zero or below the configured threshold, which window gives the best protein-supported peptide and PSM recovery?
+### Explicit target-only calibration
 
-The selected null window should then be copied into the final Sage JSON and used for the production run without entrapment sequences.
+The workflow supports three target-only policies:
 
-### Native Phase 2 workflow
+- `refit_with_locked_window` (default): keep the entrapment-selected window and re-estimate nuisance
+  parameters in the target-only candidate space;
+- `reuse_dataset_artifact`: reuse the complete fitted same-dataset entrapment artifact without
+  refitting; and
+- `compare_both`: produce both interpretations with separate results and provenance.
 
-The Rust workflow now internalizes the FASTA-generation and null-window-optimization boundary.
-These two parts have independent parity gates: optimizer tests can consume the exact frozen legacy
-entrapment FASTA, while `sage audit-entrapment entrapment.audit.json` compares native FASTA
-generation with a `make_entrapment.sh`/FDRBench reference without running a spectral search.
+No policy may use target-only outcomes to retune the window. Cross-dataset artifact reuse is
+prohibited by default.
 
-Native generation supports automatic foreign-source selection, an explicit source, and automatic
-selection with a user override. It records selected accessions, shared-peptide exclusions, source
-mappings, order-sensitive hashes, seed reproducibility, and Sage-measured protein, peptide, and
-peptidoform ratios. Workflow searches require the ratios measured from their own active FASTA;
-hard-coded ratios from another dataset are rejected.
+### Verified resumption
 
-For legacy comparison only, `fdrbench004_compatibility` reproduces FDRBench 0.0.4's length-only
-shared-peptide exclusion and Java seeded selection. New production workflows default to
-`sage_search_space`, which uses the peptides Sage can actually search. See
-[`DECOY_FREE_WORKFLOW.md`](DECOY_FREE_WORKFLOW.md) and
-[`entrapment.audit.example.json`](entrapment.audit.example.json).
+Completed checkpoints hash both `results.sage.tsv` and the resolved search configuration. Resume
+also verifies dataset identity, model and stage identity, target-only policy, candidate-pool schema
+and payload, and MS2Rescore cache integrity. A checkpoint left `running`, a modified output, or an
+incompatible cache is rebuilt rather than silently accepted.
 
-### Native Phase 3 candidate sharing and Phase 4 MS2Rescore caching
+## Validation and model status
 
-`sage workflow` now performs one native spectrum search per strict search fingerprint and persists
-the pre-FDR candidates in a compressed, immutable pool. Compatible model fits and null-window
-grids reuse that pool while receiving separate analysis fingerprints. Statistical changes such as
-q-value methods, covariates, Storey parameters, FDR thresholds, RT/IMS adjustments, rescue gates,
-or null windows therefore trigger a refit but not another spectrum search. FASTA, spectrum,
-digestion/modification, tolerance, scoring, preprocessing, or retained-depth changes select a new
-pool automatically.
+The engineering refactor and its required parity scope are complete. Frozen ISB model-by-model
+comparisons and the independent PXD001468 Moments comparison were completed. PXD contained 53
+legacy trace rows, 47 valid comparable windows, and selected the same `10-10` window; optimized
+counts were exact, while MS2Rescore and target-only counts remained within the predeclared 0.5%
+platform tolerance. PXD Moments was the only required PXD model for this refactor.
 
-The exact lean optimizer retains compact metrics and timing for every trial, drops nonselected
-feature/artifact payloads immediately, and materializes the selected window once with full normal
-diagnostics. Stable candidate IDs now support a separate, compressed MS2Rescore annotation cache.
-The MS2Rescore stage reuses the native candidate pool, while its external annotations remain
-outside that immutable pool and are reused only when the search, preliminary q/PEP calibration
-input, rank depth, generator settings, mapped spectra, wrapper, and Python/package environment all
-match. A changed model/window calibration receives a different annotation cache, preserving exact
-DeepLC behavior. See [`DECOY_FREE_WORKFLOW.md`](DECOY_FREE_WORKFLOW.md) for fingerprint,
-capability, integrity, and fail-closed rules.
+This is engineering parity, not evidence that Decoy-Free should replace TDC as the statistical
+default. The current release evidence is `not_evaluable` for that decision because a matched TDC
+benchmark is absent. In addition, both frozen legacy and native PXD post-MS2Rescore protein FDP
+slightly exceeded 1%; this does not invalidate parity, but it prevents a broader calibration claim.
 
-### Phase 5-8 calibration, parity, and secondary-model status
+| Model | Current workflow status |
+|---|---|
+| Moments | Required ISB and PXD Moments parity complete; still subject to dataset-local runtime gates. |
+| MLE | ISB parity complete; eligible for automatic Ensemble gates. No additional PXD model was required. |
+| MSFDR1-SMIX | Rank-1-only fitted-state, MS2Rescore, and target-only parity complete; eligible for automatic gates. |
+| Lower Order | Refit parity is valid, but complete-artifact reuse transfers unstably; excluded from Ensemble. |
+| MSFDR | Unannotated grid and fitted-state parity passed; annotated parity is deferred because the frozen Linux and regenerated macOS feature environments differ. |
+| MSFDR2-SMIX | Unannotated grid and fitted-state parity passed; annotated parity is deferred for the same environment issue. |
+| Nokoi | Portable artifact and frozen parity are incomplete; diagnostic-only and excluded from Ensemble. |
+| Ensemble | Optional; assembled only when enough dataset-local experts pass provenance, parity, calibration, transfer, fallback, and incremental-yield gates. |
 
-Target-only calibration is now explicit. The default `refit_with_locked_window` policy keeps the
-dataset-local window selected with entrapment and refits nuisance parameters in the target-only
-candidate space; `reuse_dataset_artifact` reuses the complete same-dataset fit, and `compare_both`
-keeps both interpretations separate. Cross-dataset artifact reuse remains prohibited by default.
+Release evaluation has three states:
 
-Frozen ISB model-by-model parity and the required independent PXD001468 Moments parity have been
-completed. PXD evaluated all 47 valid frozen Moments windows and selected the exact legacy
-`10-10` window. Optimized counts were exact, MS2Rescore and target-only counts were within the
-predeclared 0.5% platform tolerance, and an end-to-end cache-hit rerun performed no new spectrum
-search or external feature generation. PXD Moments is the only required PXD model for this
-refactor; additional PXD models are optional. See [`DECOY_FREE_WORKFLOW.md`](DECOY_FREE_WORKFLOW.md)
-and `validation/reports/phase7_pxd001468_moments_parity_2026-08-08.json` for the caveats and full
-evidence.
+- `eligible`: required evidence is evaluable and every criterion passes;
+- `not_eligible`: evidence is complete, but one or more criteria fail; and
+- `not_evaluable`: required evidence is missing, invalid, unreadable, or cannot be linked to its
+  declared calibration source.
 
-Phase 8 makes secondary-model deferrals executable policy. Workflow model entries may set
-`ensemble_participation` to `auto` or `excluded`; an exclusion requires a nonempty
-`ensemble_exclusion_reason`. Lower Order, seeded MSFDR, MSFDR2-SMIX, and Nokoi remain excluded
-for the specific unresolved reasons recorded in
-`validation/policies/phase8_isb_ensemble_expert_policy_2026-08-08.json`. Moments, MLE, and
-rank-1-only MSFDR1-SMIX are eligible for the automatic gates, but are not guaranteed admission.
-Declared frozen parity, artifact/provenance validity, calibration, transfer stability, fallback,
-and incremental-yield checks can still reject any expert. If too few experts pass, the workflow
-writes an `evaluable: false` Ensemble lock and skips Ensemble without invalidating completed
-individual-model stages.
-
-Phase 9 makes release evaluation three-state: `eligible`, `not_eligible`, or `not_evaluable`.
-Missing files, invalid result tables, absent declared parity evidence, missing target-only
-calibration provenance, incomplete transfer comparisons, and absent matched TDC evidence are
-reported as `not_evaluable`; they are never silently treated as stable or passed. A complete but
-failed calibration, parity, transfer, or yield criterion is `not_eligible`. Validation now reports
-PSMs, unmodified I/L-canonical peptides, modification-retaining I/L-canonical peptidoforms, and
-single-key proteins consistently across summaries, parity, transfer, stage, and TDC comparisons.
-
-Completed stage checkpoints now include hashes of both `results.sage.tsv` and the resolved search
-configuration. Resume verifies those hashes plus candidate-pool and MS2Rescore annotation-cache
-integrity. Interrupted (`running`) stages or modified outputs are rebuilt; compatible Phase 1-8
-checkpoints are migrated once without another spectrum search.
+Missing or invalid evidence is never reported as stable or passed. See
+[`DECOY_FREE_WORKFLOW.md`](DECOY_FREE_WORKFLOW.md),
+[`validation/reports/phase9_release_finalization_2026-08-09.json`](validation/reports/phase9_release_finalization_2026-08-09.json),
+and
+[`validation/policies/phase8_isb_ensemble_expert_policy_2026-08-08.json`](validation/policies/phase8_isb_ensemble_expert_policy_2026-08-08.json)
+for the detailed engineering record.
 
 
 ## Practical implication
@@ -187,7 +204,12 @@ The branch also supports bounded physical evidence updates. RT and IMS evidence 
 
 This branch is experimental. The DF code is designed to fail closed whenever the mandatory base model cannot produce a valid rank-1 stream. Optional post-base stages are nonfatal: if RT, IMS, peptide reproducibility rescue, or protein reproducibility rescue cannot produce a valid update, the previous last-good active stream is kept.
 
-Direct one-off Ensemble searches still honor the static enable/disable flags and weights in the search JSON. The native `sage workflow` path adds automatic, fail-closed expert-quality gates and writes a dataset-local expert set for development or holdout validation. Holdout datasets run the same predeclared optimization procedure; they do not import another dataset's selected windows or fitted experts.
+Direct one-off Ensemble searches honor only the static enable/disable flags and weights in the
+search JSON; their code defaults enable all seven experts. They do not apply the workflow's current
+secondary-model exclusions or runtime admission policy automatically. The native `sage workflow`
+path adds the fail-closed expert-quality gates and writes the dataset-local expert set. Holdout
+datasets run the same predeclared optimization procedure; they do not import another dataset's
+selected windows or fitted experts.
 
 Direct one-off searches use configured null-rank windows. The native `sage workflow` path can scan declared candidate windows in memory from one retained candidate set, select the highest-yield feasible window, and lock it for later stages.
 
@@ -201,314 +223,140 @@ For `model_fit = "ensemble"`, `final_evidence_space` must be explicitly set to e
 
 ## Installation and basic usage
 
-This fork is built from source using the Rust toolchain. The Python environment is optional for running Sage itself, but it is necessary for running the validation scripts, plotting, and downstream analysis.
+This fork is built from source with Rust. Python is not required for native Sage searching,
+entrapment generation, null-window optimization, validation reporting, or cache resumption. A
+compatible Python environment is required only when generating MS2Rescore/MS2PIP/DeepLC
+annotations or when using optional analysis and plotting tools.
 
-## Optional: installing `pyenv` on Ubuntu / WSL
-
-Sage itself is built with Rust and does not require Python. A Python environment is useful for validation scripts, plotting, and downstream analysis. One convenient option is `pyenv`.
-
-### 1. Install build dependencies
-
-```bash
-sudo apt-get update
-sudo apt-get install -y \
-  make build-essential libssl-dev zlib1g-dev libbz2-dev \
-  libreadline-dev libsqlite3-dev wget curl llvm \
-  libncursesw5-dev xz-utils tk-dev libxml2-dev \
-  libxmlsec1-dev libffi-dev liblzma-dev
-```
-
-### 2. Install `pyenv`
-
-```bash
-curl https://pyenv.run | bash
-```
-
-### 3. Add `pyenv` to your shell
-
-For Bash/WSL, add the following lines to `~/.bashrc`:
-
-```bash
-export PYENV_ROOT="$HOME/.pyenv"
-export PATH="$PYENV_ROOT/bin:$PATH"
-
-# Initialize pyenv and pyenv-virtualenv.
-eval "$(pyenv init --path)"
-eval "$(pyenv init -)"
-eval "$(pyenv virtualenv-init -)"
-```
-
-Then reload the shell:
-
-```bash
-source ~/.bashrc
-exec "$SHELL"
-```
-
-### 4. Create the Sage validation Python environment
-
-```bash
-pyenv install 3.12.0
-pyenv virtualenv 3.12.0 SAGE_decoy_free_github
-pyenv activate SAGE_decoy_free_github
-```
-
-Confirm Python is active:
-
-```bash
-python --version
-which python
-```
-
-Do not run `sudo apt-get upgrade -y` as part of this README setup unless you intentionally want to upgrade system packages. It is not required for installing `pyenv`.
-
-### 1. Set up the local environment
-
-```bash
-# Optional Python environment for validation/plotting scripts
-pyenv install 3.12.0
-pyenv virtualenv 3.12.0 SAGE_decoy_free_github
-pyenv activate SAGE_decoy_free_github
-
-# Install Rust
-curl --proto '=https' --tlsv1.2 -sSf https://sh.rustup.rs | sh
-source "$HOME/.cargo/env"
-
-# Confirm toolchain
-rustc --version
-cargo --version
-```
-
-### 2. Clone and build the decoy-free fork
+Install Rust using [rustup](https://rustup.rs/) and then clone and build the fork:
 
 ```bash
 git clone https://github.com/jltovar/sage_decoy-free sage_decoy_free_github
 cd sage_decoy_free_github
-
-# Switch to the decoy-free development branch
-git checkout decoy-free
-
-# Format and build
-cargo fmt
+git switch decoy-free
 cargo build --release
-
-# Confirm executable
 ./target/release/sage --help
 ```
 
-After building, the executable is located at:
+The executable is written to:
 
 ```bash
 ./target/release/sage
 ```
 
-A typical absolute path on WSL/Linux is:
-
-```bash
-$HOME/sage_decoy_free_github/target/release/sage
-```
+The repository's declared minimum supported Rust version is exercised by GitHub Actions. Use the
+toolchain declared by the repository rather than assuming an older system Rust installation is
+sufficient.
 
 ---
 
 ## Running Sage
 
-Sage is run by passing a JSON parameter file to the compiled executable:
+For a new dataset, use the native workflow rather than a direct one-off Decoy-Free search. Start
+from [`workflow.example.json`](workflow.example.json) and provide:
+
+- a normal Sage search JSON;
+- the target FASTA;
+- the spectra;
+- one or more candidate foreign-species FASTAs;
+- an output root;
+- each model's candidate-window grid and MS2Rescore policy; and
+- any frozen parity or matched-TDC evidence required by the declared validation scope.
+
+Validate and materialize the plan without searching:
 
 ```bash
-RUST_BACKTRACE=1 SAGE_LOG=trace /path/to/sage /path/to/search_config.json
+./target/release/sage workflow workflow.json --plan-only
 ```
 
-For deeper Rust panic diagnostics, use:
+Run or resume the workflow:
 
 ```bash
-RUST_BACKTRACE=full SAGE_LOG=trace /path/to/sage /path/to/search_config.json
+RUST_BACKTRACE=1 SAGE_LOG=info \
+  ./target/release/sage workflow workflow.json
 ```
 
-### Standard Sage / vanilla TDA-TDC run
+Re-running the same command resumes only stages whose complete identity and durable outputs still
+pass verification.
 
-Use the upstream or vanilla Sage executable when generating a standard TDA/TDC baseline:
+### Workflow outputs
+
+The output root contains the generated FASTA and provenance, immutable candidate pools, separate
+MS2Rescore annotation caches, per-model stage directories, fitted artifacts, and validation
+reports. Important top-level reports include:
+
+```text
+workflow.dataset.json
+workflow.manifest.resolved.json
+workflow.candidate_pools.json
+workflow.ms2rescore_annotations.json
+workflow.state.json
+validation.audit.json
+validation.missing_runs.json
+validation.invalid_runs.json
+validation.stage_comparisons.json
+validation.transfer_stability.json
+validation.parity.json
+validation.tdc_benchmarks.json
+validation.release_gate.json
+```
+
+### Entrapment-only audit
+
+Use the native audit when you want to inspect or compare FASTA construction without loading
+spectra:
 
 ```bash
-RUST_BACKTRACE=1 SAGE_LOG=trace \
-  "$HOME/sage_master/target/release/sage" \
-  /path/to/vanilla_validation_ISB18_ent_decoy.json
+./target/release/sage audit-entrapment entrapment.audit.json
 ```
+
+This is the current replacement for the old external `make_entrapment.sh` workflow. A legacy
+FDRBench reference is optional and should be supplied only when performing an engineering-parity
+audit.
+
+### Direct search mode
+
+The binary still accepts an ordinary Sage search JSON directly:
 
 ```bash
-RUST_BACKTRACE=1 SAGE_LOG=trace \
-  "$HOME/sage_master/target/release/sage" \
-  /path/to/vanilla_validation_PXD001468_ent_decoy.json
+RUST_BACKTRACE=1 SAGE_LOG=info \
+  ./target/release/sage search.json
 ```
 
-### Target-decoy mode using the decoy-free fork
-
-The decoy-free fork can also be run in standard target-decoy mode, depending on the `fdr.mode` value in the JSON file:
-
-```bash
-RUST_BACKTRACE=full SAGE_LOG=trace \
-  $HOME/sage_decoy_free_github/target/release/sage \
-  /path/to/VANILLA_SAGE/validation_ISB18_ent_decoy.json
-```
-
-### Decoy-free model-fit runs
-
-Each decoy-free run is controlled by the `fdr.model_fit` setting in the JSON file. Common model-fit values include:
+Direct TDC searches use `fdr.mode = "tdc"` (the default). Direct Decoy-Free searches use
+`fdr.mode = "decoy_free"` and a `model_fit` value of:
 
 ```text
 moments
 mle
 lower_order
 msfdr
-msfdr_1smix
-msfdr_2smix
+msfdr1_smix
+msfdr2_smix
 nokoi
 ensemble
 ```
 
-Example Moments run:
-
-```bash
-RUST_BACKTRACE=1 SAGE_LOG=trace \
-  $HOME/sage_decoy_free_github/target/release/sage \
-  /path/to/MOMENTS/validation_ISB18_ent_decoyfree.json
-```
-
-Example MLE run:
-
-```bash
-RUST_BACKTRACE=1 SAGE_LOG=trace \
-  $HOME/sage_decoy_free_github/target/release/sage \
-  /path/to/MLE/validation_ISB18_ent_decoyfree.json
-```
-
-Example LowerOrder run:
-
-```bash
-RUST_BACKTRACE=1 SAGE_LOG=trace \
-  $HOME/sage_decoy_free_github/target/release/sage \
-  /path/to/LOWER_ORDER/validation_ISB18_ent_decoyfree.json
-```
-
-Example MSFDR run:
-
-```bash
-RUST_BACKTRACE=1 SAGE_LOG=trace \
-  $HOME/sage_decoy_free_github/target/release/sage \
-  /path/to/MSFDR/validation_ISB18_ent_decoyfree.json
-```
-
-Example NOKOI run:
-
-```bash
-RUST_BACKTRACE=1 SAGE_LOG=trace \
-  $HOME/sage_decoy_free_github/target/release/sage \
-  /path/to//NOKOI/validation_ISB18_ent_decoyfree.json
-```
-
-Example Ensemble run:
-
-```bash
-RUST_BACKTRACE=1 SAGE_LOG=trace \
-  $HOME/sage_decoy_free_github/target/release/sage \
-  /path/to//ENSEMBLE/validation_ISB18_ent_decoyfree.json
-```
-
-The same pattern can be repeated for other validation datasets by changing the JSON path.
-
----
-
-## Validation helper scripts
-
-The repository includes helper scripts for entrapment generation and null-window optimization. These scripts are intended for validation and parameter selection before final production runs.
-
-### Normalize script line endings
-
-If the scripts were edited on Windows, first normalize line endings:
-
-```bash
-sed -i 's/\r$//' /path/to/optimize_null_window.sh
-sed -i 's/\r$//' /path/to/make_entrapment.sh
-```
-
-Then make them executable:
-
-```bash
-chmod +x /path/to/optimize_null_window.sh
-chmod +x /path/to/VALIDATION/make_entrapment.sh
-```
-
----
-
-## Building a foreign-entrapment FASTA
-
-Use `make_entrapment.sh` to build a target-plus-foreign-entrapment FASTA for validation.
-
-Example for ISB18:
-
-```bash
-/path/to/make_entrapment.sh \
-  --dataset isb18 \
-  --target-db /path/to/ISB18.fasta \
-  --foreign-db /path/to/foreign_entrapment/uniprotkb_proteome_UP000008311_2026_04_12.fasta \
-  --output-dir /path/to/target_entrapment \
-  --output-prefix ISB18_foreign_species_entrapment
-```
-
-The resulting FASTA should be used for entrapment validation and null-window optimization. After a model fit and null window are selected, rerun the final production analysis without the foreign-entrapment sequences.
-
----
-
-## Optimizing the null-rank window
-
-Use `optimize_null_window.sh` to search null-rank windows for a given decoy-free model fit. This is the recommended first-pass validation step before running decoy-free mode on a production FASTA.
-
-Example for ISB18 Moments:
-
-```bash
-/path/to/optimize_null_window.sh \
-  --model-fit moments \
-  --base-json /path/to/MOMENTS/validation_ISB18_ent_decoyfree.json \
-  --results-root /path/to/ISB18/DECOYFREE/MOMENTS
-```
-
-The optimizer repeatedly modifies the decoy-free null-window parameters, runs Sage, parses the output, and records target and entrapment recovery. The goal is to find a model-specific null window that maximizes useful target recovery while keeping entrapment controlled, especially at the protein level.
-
-Typical outputs include:
-
-```text
-cumulative_results_long.csv
-cumulative_results_wide.csv
-best_result.txt
-search_trace.txt
-```
-
-Use the selected null-window parameters from `best_result.txt` in the final production JSON.
-
----
-
-## Recommended two-run workflow
-
-Decoy-free analysis should be run as a two-stage workflow:
-
-1. **Entrapment optimization run**  
-   Use a target-plus-entrapment FASTA and run `optimize_null_window.sh` to identify a calibrated model/null-window configuration.
-
-2. **Production run**  
-   Remove the entrapment sequences, keep the validated parameters, and rerun Sage on the intended biological FASTA.
-
-This is more computationally expensive than a single TDA/TDC search, but it is necessary because decoy-free model calibration is dataset-dependent. Higher target recovery is only meaningful if it remains controlled by entrapment or another external validation strategy.
+A direct Decoy-Free search uses the windows and artifacts already present in its search JSON. It
+does not generate an entrapment FASTA, optimize windows, enforce the workflow's dataset-local expert
+policy, or create a release gate. Direct mode is therefore appropriate for replaying a previously
+validated configuration or for diagnostics, not for calibrating a new dataset.
 
 
-## Quick start
+## Direct Decoy-Free configuration example
 
-A minimal DF configuration uses the `fdr` block inside the Sage JSON configuration:
+The native workflow is the recommended starting point for a new dataset. The following `fdr`
+block only demonstrates the syntax for a direct single-model replay after a Moments window has
+already been validated for the same dataset. The `9-18` window shown here is the frozen ISB parity
+value and must not be transferred to another dataset.
 
 ```json
 {
   "fdr": {
     "mode": "decoy_free",
-    "model_fit": "ensemble",
-    "final_evidence_space": "p_value",
+    "model_fit": "moments",
+    "moments_min_null_rank": 9,
+    "moments_max_null_rank": 18,
     "psm_q_method": "storey",
     "peptide_q_method": "storey",
     "protein_q_method": "storey",
@@ -534,9 +382,16 @@ evidence. The setting does not run picked target-decoy group FDR. Leave it off
 
 ---
 
-## Recommended full example configuration
+## Advanced direct-search configuration surface
 
-The following block is a cleaned, code-consistent broad configuration for ultra-low-input validation runs. It uses only fields accepted by the current `FdrOptions` structure. It also shows a conservative ensemble choice in which the two SMIX experts are enabled for diagnostics but assigned zero ensemble weight, because these mixture paths can be conservative or unstable on sparse datasets. This is a **recommendation**, not the code default: if the `ensemble_weight_*` keys are omitted, the current defaults are `1.0`.
+The following block illustrates the broad direct-search configuration surface. It is not a
+workflow manifest, a recommended production configuration, or a validated parameter set for a new
+dataset. In particular, direct Ensemble mode does not run the workflow's automatic expert-quality
+gates. Use [`workflow.example.json`](workflow.example.json) for dataset-local optimization and
+release evaluation.
+
+The example disables experts currently excluded by the documented first-release policy. Even the
+remaining experts require dataset-local runtime gates before an Ensemble result is evaluable.
 
 ```json
 {
@@ -641,27 +496,27 @@ The following block is a cleaned, code-consistent broad configuration for ultra-
 
     "enable_moments": true,
     "enable_mle": true,
-    "enable_lower_order": true,
-    "enable_msfdr_seeded": true,
+    "enable_lower_order": false,
+    "enable_msfdr_seeded": false,
     "enable_msfdr_1smix": true,
-    "enable_msfdr_2smix": true,
-    "enable_nokoi": true,
+    "enable_msfdr_2smix": false,
+    "enable_nokoi": false,
 
     "ensemble_p_combiner": "cauchy",
     "ensemble_cauchy_penalty": 1.0224,
     "ensemble_pep_combiner": "median",
-    "ensemble_pep_trim_frac": 0.5,
+    "ensemble_pep_trim_frac": 0.2,
     "ensemble_pep_quantile": 0.5,
     "ensemble_pep_top_k": 5,
     "ensemble_pep_logit_eps": 1e-6,
 
     "ensemble_weight_moments": 1.0,
     "ensemble_weight_mle": 1.0,
-    "ensemble_weight_lower_order": 1.0,
-    "ensemble_weight_msfdr_seeded": 1.0,
-    "ensemble_weight_msfdr_1smix": 0.0,
+    "ensemble_weight_lower_order": 0.0,
+    "ensemble_weight_msfdr_seeded": 0.0,
+    "ensemble_weight_msfdr_1smix": 1.0,
     "ensemble_weight_msfdr_2smix": 0.0,
-    "ensemble_weight_nokoi": 1.0,
+    "ensemble_weight_nokoi": 0.0,
 
     "physical_rescue": {
       "rt_mode": "bounded_aux",
@@ -749,15 +604,15 @@ The following block is a cleaned, code-consistent broad configuration for ultra-
 
 | Key | Accepted values / type | Current default | Notes |
 |---|---:|---:|---|
-| `mode` | `tdc`, `decoy_free` | `decoy_free` | Selects conventional TDC or DF mode. |
+| `mode` | `tdc`, `decoy_free` | `tdc` | Selects conventional TDC or Decoy-Free mode. |
 | `entrapment_report` | `off`, `auto`, `on` | `auto` | Controls entrapment reporting behavior. |
-| `model_fit` | `moments`, `mle`, `lower_order`, `msfdr`, `msfdr1_smix`, `msfdr2_smix`, `nokoi`, `ensemble` | `ensemble` | Selects the base DF expert or ensemble. |
+| `model_fit` | `moments`, `mle`, `lower_order`, `msfdr`, `msfdr1_smix`, `msfdr2_smix`, `nokoi`, `ensemble` | `ensemble` in Decoy-Free mode | Selects the base Decoy-Free expert or Ensemble. |
 | `final_evidence_space` | `auto`, `p_value`, `pep` | `auto` | Ensemble requires explicit `p_value` or `pep`. |
-| `peptide_p_combine` | `fisher`, `cauchy`, `sidak_min_p`, `best`, `second_best` | `cauchy` | Peptide-level p-value combination. |
-| `protein_p_combine` | `fisher`, `cauchy`, `sidak_min_p`, `best`, `second_best` | `cauchy` | Protein-level p-value combination. |
-| `psm_q_method` | `auto`, `bh`, `storey`, `cummean` | `storey` | PSM-level q-value method. |
-| `peptide_q_method` | `auto`, `bh`, `storey`, `cummean` | `auto` | Peptide-level q-value method. |
-| `protein_q_method` | `auto`, `bh`, `storey`, `cummean` | `auto` | Protein-level q-value method. |
+| `peptide_p_combine` | `fisher`, `cauchy`, `acat`, `sidak_min_p`, `bonferroni_min_p`, `tippett`, `best`, `second_best`, `hmp`, `brown`, `mudholkar_george`, `edgington`, `t_fisher`, `g_fisher`, `ihw`, `exchangeable_e_value`, `vovk_wang_generalized_mean`, `ordmeta_w_fisher`, `mcm`, `cmc` | `cauchy` | Peptide-level p-value combination. Some advanced modes require or use the separate calibration controls described in code. |
+| `protein_p_combine` | Same values as `peptide_p_combine` | `cauchy` | Protein-level p-value combination. |
+| `psm_q_method` | `auto`, `bh`, `storey`, `by`, `bky`, `sfdr`, `covariate_weighted_bh`, `cummean` | `storey` | PSM-level q-value method. `cummean` is only valid for PEP-native evidence. |
+| `peptide_q_method` | Same values as `psm_q_method` | `auto` | Peptide-level q-value method. |
+| `protein_q_method` | Same values as `psm_q_method` | `auto` | Protein-level q-value method. |
 | `precursor_fdr` | float | `0.01` | PSM/precursor threshold. |
 | `peptide_fdr` | float | `0.01` | Peptide threshold. |
 | `protein_fdr` | float | `0.01` | Protein threshold. |
@@ -917,7 +772,12 @@ NOKOI uses lower-ranked null evidence and a rank-1 positive training class.  The
 
 ### Ensemble controls
 
-Ensemble mode combines enabled expert streams.  Explicit model-fit modes ignore the enable flags because the selected model is required to run and fail closed if it cannot produce a valid stream.
+Direct Ensemble mode combines the expert streams enabled in the search JSON. Explicit single-model
+modes ignore these enable flags because the selected model is mandatory and fails closed if it
+cannot produce a valid stream. The defaults below describe direct-search configuration only; they
+do not override `sage workflow` participation policy. The workflow automatically excludes declared
+deferred experts and applies artifact, parity, calibration, transfer, fallback, and yield gates
+before it writes an evaluable `ensemble.lock.json`.
 
 | Key | Type | Current default | Notes |
 |---|---:|---:|---|
@@ -1199,11 +1059,19 @@ These models produce fitted-null tail p-value streams and calibrated local-FDR/P
 
 ### MSFDR variants
 
-The MSFDR family produces fitted or empirical null-survival p-like streams and derived PEP-like streams.  The SMIX variants use mixture-model fitting and can be sensitive to initialization and rank-window choices.
+The MSFDR family produces fitted or empirical null-survival p-like streams and derived PEP-like
+streams. The SMIX variants use mixture-model fitting and can be sensitive to initialization and
+rank-window choices. Seeded MSFDR and MSFDR2-SMIX passed the frozen unannotated engineering grids,
+but their regenerated MS2Rescore feature environment did not meet annotated parity tolerance; they
+remain excluded from production Ensemble participation.
 
 ### NOKOI
 
-NOKOI uses a cross-fit classifier-like approach with lower-rank null evidence and high-scoring rank-1 positives.  It is often powerful but should be audited carefully for early entrapment behavior and for feature-driven overconfidence.
+NOKOI uses a cross-fit classifier-like approach with lower-rank null evidence and high-scoring
+rank-1 positives. Its current v1 artifact does not contain enough state for portable frozen reuse,
+and its frozen parity did not pass. The workflow therefore treats Nokoi as diagnostic-only and
+excludes it from production Ensemble participation rather than silently retraining it under reuse
+semantics.
 
 ### Ensemble
 
@@ -1211,22 +1079,35 @@ The ensemble is designed to combine evidence from multiple experts. Direct searc
 
 ---
 
-## Practical guidance from current validation plots
+## Interpretation of current validation evidence
 
-The current ISB18 validation figures suggest the following practical interpretation:
+The completed validation establishes engineering behavior, not general statistical superiority:
 
-1. **TDA/TDC remains a strong peptide-level benchmark.**  The decoy-free branch should not be described as universally dominating TDA at every level.
-2. **The strongest DF advantage is protein-level inference in ultra-low-input conditions.**  The data show the same unfiltered proteins observed by TDA/TDC and DF, but TDA/TDC reports zero proteins at 1% protein q while DF hierarchical inference reports 16–18 proteins with zero entrapment proteins.
-3. **NOKOI is currently the strongest single candidate model by discovery power and protein recovery, but it needs top-ranked entrapment auditing.**
-4. **Moments and MSFDR are high-power but can be liberal by peptide-level entrapment calibration.**
-5. **MSFDR1_SMIX is underpowered under the current configuration.**
-6. **The equal-weight ensemble is not yet optimal.**  It should be improved with expert QC, adaptive weighting, or outlier rejection.
+1. Frozen ISB model-by-model comparisons exercise the implementation on a development dataset.
+2. The required independent PXD001468 Moments comparison reproduced the legacy selected window and
+   stayed within its predeclared platform tolerances.
+3. Both frozen legacy and native PXD post-MS2Rescore protein FDP slightly exceeded 1%, so parity
+   must not be described as proof of calibrated 1% protein FDR.
+4. A matched TDC benchmark is still absent from the final release evidence. The repository therefore
+   cannot yet evaluate whether Decoy-Free should replace TDC as a statistical default.
+5. Lower Order artifact reuse, annotated MSFDR/MSFDR2-SMIX portability, and Nokoi portability/parity
+   remain explicitly deferred. Ensemble is optional and cannot promote those experts around their
+   gates.
+6. The present evidence does not select a universally best Decoy-Free model. Model suitability must
+   be assessed within each dataset using entrapment calibration and matched comparisons.
 
 ---
 
 ## Known limitations and recommended next improvements
 
-### 1. Dynamic null-window selection
+### 1. Matched TDC release benchmark
+
+The highest-priority missing release evidence is a matched conventional TDC analysis using the same
+dataset, FASTA/search assumptions, thresholds, validation layers, and PSM/peptide/peptidoform/protein
+counting definitions. Until that comparison exists, `not_evaluable` is the correct statistical
+release state.
+
+### 2. Additional null-window diagnostics
 
 The native workflow now scans declared candidate windows without rereading spectra and selects the highest-yield window satisfying PSM, peptide, and protein entrapment-FDP constraints. Further diagnostics can still be added, such as:
 
@@ -1240,7 +1121,7 @@ pi0 stability
 EM convergence stability
 ```
 
-### 2. Ensemble expert QC and outlier rejection
+### 3. Additional Ensemble diagnostics and weighting
 
 The native workflow now vetoes experts with missing/fallback artifacts, failed entrapment calibration, underpowered accepted-entrapment counts, unstable target-only transfer, or no incremental Level-4 peptide yield. Additional diagnostics could include:
 
@@ -1258,7 +1139,7 @@ entrapment behavior when available
 
 Experts could then be retained, downweighted, or assigned weight 0 before ensemble combination.
 
-### 3. Entrapment-guided monotone recalibration
+### 4. Entrapment-guided monotone recalibration
 
 For models that are high-power but liberal, such as some Moments/MSFDR configurations, a monotone recalibration layer could map reported q-values onto entrapment-estimated FDR:
 
@@ -1268,7 +1149,7 @@ q_reported -> q_entrapment_calibrated
 
 Isotonic regression is a natural first implementation because it preserves rank order while correcting calibration.
 
-### 4. Joint physical local-FDR modeling
+### 5. Joint physical local-FDR modeling
 
 RT and delta-mass evidence are currently used through optional bounded stages.  A future model could estimate local FDR over joint physical evidence:
 
@@ -1279,7 +1160,7 @@ lfdr(x) = pi0 * f0(x) / (pi0 * f0(x) + pi1 * f1(x))
 
 This should be bounded and gated in low-input data to prevent overfitting or uncontrolled rescue.
 
-### 5. Clearer public/private field separation
+### 6. Clearer public/private field separation
 
 The final output should eventually avoid transitional internal fields in public TSV output, or mark them clearly as diagnostic-only.  Public documentation should emphasize that only the final active fields and documented stage snapshots are intended for downstream use.
 
@@ -1334,15 +1215,25 @@ peptide-supported PSM flag
 
 ## Recommended publication framing
 
-The safest interpretation of the current data is:
+The current evidence supports a narrow engineering statement:
 
-> Conventional TDA/TDC remains an effective peptide-level benchmark, but in ultra-low-input proteomics it can become count-starved at the protein level.  The decoy-free framework addresses this by replacing sparse decoy counting with continuous evidence modeling and protein-supported hierarchical inference.  In ISB18, TDA/TDC and DF observe the same unfiltered protein set, but TDA/TDC reports zero significant proteins at protein q ≤ 1%, whereas DF reports 16–18 proteins with zero entrapment proteins.  The current challenge is no longer whether DF can recover proteins, but how to make the DF models uniformly calibrated, auditable, and robust across datasets.
+> This experimental Sage fork implements a reproducible, dataset-local Decoy-Free workflow with
+> native protein-level entrapment generation, shared candidate searches, model-specific null-window
+> optimization, separate MS2Rescore annotation caching, explicit target-only calibration, and
+> fail-closed validation. Frozen ISB comparisons and the required independent PXD001468 Moments
+> comparison establish implementation parity within declared tolerances. They do not establish that
+> Decoy-Free is generally better calibrated or more powerful than matched TDC.
+
+Claims about identification gains, biological enrichment, or replacement of the statistical
+default require the missing matched TDC evaluation and any model-specific portability/calibration
+work relevant to the claimed workflow.
 
 ---
 
 ## Unsupported or removed keys
 
-The following keys appeared in earlier configs or drafts but are not accepted by the current uploaded `FdrOptions` structure:
+The following keys appeared in earlier configs or drafts but are not accepted by the current
+`FdrOptions` structure:
 
 ```text
 msfdr1_smix_min_null_rank
@@ -1362,20 +1253,19 @@ msfdr1_pi_clamp_max
 
 ## File-level implementation map
 
-The current uploaded code is organized roughly as follows:
-
 | File | Role |
 |---|---|
-| `input.rs` | JSON configuration surface, enums, defaults, clamping, and resolved `FdrSettings`. |
-| `decoy_free_fdr.rs` | Main DF active-stream pipeline, base model selection, q-value computation, peptide/protein inference, physical rescue, reproducibility rescue, hierarchical reporting. |
-| `lower_order.rs` | LowerOrder Gumbel/TEV/TNM model fitting utilities. |
-| `msfdr.rs` | MSFDR seeded, MSFDR1_SMIX, and MSFDR2_SMIX mixture models. |
-| `nokoi.rs` | NOKOI-style model fitting and scoring. |
-| `retention_model.rs` | RT model fitting and RT error support. |
-| `mobility_model.rs` | IMS/mobility model fitting and mobility error support. |
-| `stats.rs` | Statistical helpers, q-value utilities, p-value combiners, soft caps. |
-| `scoring.rs` | Core feature and DF output-field structures. |
-| `linear_discriminant.rs` | Linear discriminant helper logic. |
+| [`crates/sage-cli/src/workflow.rs`](crates/sage-cli/src/workflow.rs) | Native orchestration, stage checkpoints, calibration policies, Ensemble locks, and release evaluation. |
+| [`crates/sage-cli/src/entrapment.rs`](crates/sage-cli/src/entrapment.rs) | Native foreign-source selection, protein entrapment generation, ratio measurement, and FASTA provenance. |
+| [`crates/sage-cli/src/candidate_pool.rs`](crates/sage-cli/src/candidate_pool.rs) | Immutable candidate-pool persistence, fingerprints, stable IDs, and integrity checks. |
+| [`crates/sage-cli/src/external_feature_cache.rs`](crates/sage-cli/src/external_feature_cache.rs) | Separate MS2Rescore annotation cache and stable-ID joins. |
+| [`crates/sage-cli/src/validation.rs`](crates/sage-cli/src/validation.rs) | Identification counting, parity, transfer, TDC, and expert-quality comparisons. |
+| [`crates/sage/src/input.rs`](crates/sage/src/input.rs) | Search JSON surface, enums, defaults, clamping, and resolved `FdrSettings`. |
+| [`crates/sage/src/decoy_free_fdr.rs`](crates/sage/src/decoy_free_fdr.rs) | Decoy-Free model fitting, active evidence pipeline, null-window evaluation, inference, and reporting. |
+| [`crates/sage/src/ml/lower_order.rs`](crates/sage/src/ml/lower_order.rs) | Lower Order model and portable fitted state. |
+| [`crates/sage/src/ml/msfdr.rs`](crates/sage/src/ml/msfdr.rs) | Seeded MSFDR, MSFDR1-SMIX, and MSFDR2-SMIX models. |
+| [`crates/sage/src/ml/nokoi.rs`](crates/sage/src/ml/nokoi.rs) | Nokoi-style fitting, scoring, and artifact schema. |
+| [`crates/sage/src/ml/stats.rs`](crates/sage/src/ml/stats.rs) | Statistical helpers, q-value utilities, p-value combiners, and soft caps. |
 
 ---
 
@@ -1389,11 +1279,13 @@ The current code supports a large configuration surface, but several improvement
 4. **Entrapment-guided calibration.** Where validation entrapments are available, use monotone recalibration, such as isotonic regression, to map reported q-values onto observed entrapment-estimated FDR.
 5. **Layer-separated output fields.** Future output should preserve base, physical, reproducibility, and final hierarchical evidence separately so that every rescue/demotion is auditable.
 
-The first two items now have conservative workflow implementations as described above; the listed extensions remain future work.
+The workflow already provides exact in-memory window selection and fail-closed expert exclusion;
+the diagnostics and adaptive weighting described here are possible extensions to those conservative
+implementations.
 
 ---
 
-## 5. References
+## References
 
 Core decoy-free and lower-order modeling:
 
@@ -1447,80 +1339,14 @@ Classical combination and FDR methods:
   *PNAS* 2003, 100(16), 9440–9445  
   https://doi.org/10.1073/pnas.1530509100
 
----
+## Upstream Sage and citation
 
-**Happy Hunting!**
+This experimental fork is based on [Sage](https://github.com/lazear/sage). Consult the
+[official Sage documentation](https://sage-docs.vercel.app/docs) for the underlying search engine,
+spectrum processing, supported file formats, and standard TDC workflows. Decoy-Free workflow
+behavior documented in this repository is fork-specific.
 
----
+If you use Sage in a scientific publication, cite:
 
-<img src="figures/logo.png" width="300">
-
-# Sage: proteomics searching so fast it seems like magic
-
-[![Rust](https://github.com/lazear/sage/actions/workflows/rust.yml/badge.svg)](https://github.com/lazear/sage/actions/workflows/rust.yml) [![Anaconda-Server Badge](https://anaconda.org/bioconda/sage-proteomics/badges/version.svg)](https://anaconda.org/bioconda/sage-proteomics)
-
-
-For more information please read [the online documentation!](https://sage-docs.vercel.app/docs)
-
-
-# Introduction
- 
-Sage is, at it's core, a proteomics database search engine - 
-    a tool that transforms raw mass spectra from proteomics experiments into peptide identifications 
-    via database searching & spectral matching. 
-
-However, Sage includes a variety of advanced features that make it a one-stop shop: retention time prediction, quantification (both isobaric & LFQ), peptide-spectrum match rescoring, and FDR control. You can directly use results from Sage without needing to use other tools for these tasks.
-
-Additionally, Sage was designed with cloud computing in mind - massively parallel processing and the ability to directly stream compressed mass spectrometry data to/from AWS S3 enables unprecedented search speeds with minimal cost. 
-
- Sage also runs just as well reading local files from your Mac/PC/Linux device!
-
-## Why use Sage instead of other tools?
-
-Sage is **simple to configure**, **powerful** and **flexible**. 
-It also happens to be well-tested, **mind-boggingly fast**, open-source (MIT-licensed) and free.
-
-## Citation
-
-If you use Sage in a scientific publication, please cite the following paper:
-
-[Sage: An Open-Source Tool for Fast Proteomics Searching and Quantification at Scale](https://doi.org/10.1021/acs.jproteome.3c00486)
-
-
-## Features
-
-- Incredible performance out of the box
-- [Effortlessly cross-platform](https://sage-docs.vercel.app/docs/started#download-the-latest-binary-release) (Linux/MacOS/Windows), effortlessly parallel (uses all of your CPU cores)
-- [Fragment indexing strategy](https://sage-docs.vercel.app/docs/how_it_works) allows for blazing fast narrow and open searches (> 500 Da precursor tolerance)
-- [Isobaric quantification](https://sage-docs.vercel.app/docs/how_it_works#tmt-based) (MS2/MS3-TMT, or custom reporter ions)
-- [Label-free quantification](https://sage-docs.vercel.app/docs/how_it_works#label-free): consider all charge states & isotopologues *a la* FlashLFQ
-- Capable of searching for [chimeric/co-fragmenting spectra](https://sage-docs.vercel.app/docs/configuration/additional)
-- Wide-window (dynamic precursor tolerance) search mode - [enables WWA/PRM/DIA searches](https://sage-docs.vercel.app/docs/configuration/tolerance#wide-window-mode)
-- Retention time prediction models fit to each LC/MS run
-- [PSM rescoring](https://sage-docs.vercel.app/docs/how_it_works#machine-learning-for-psm-rescoring) using built-in linear discriminant analysis (LDA)
-- PEP calculation using a non-parametric model (KDE)
-- FDR calculation using target-decoy competition and picked-peptide & picked-protein approaches
-- Percolator/Mokapot [compatible output](https://sage-docs.vercel.app/docs/configuration#env)
-- Configuration by [JSON file](https://sage-docs.vercel.app/docs/configuration#file)
-- Built-in support for reading gzipped-mzML files
-- Support for reading/writing directly from [AWS S3](https://sage-docs.vercel.app/docs/configuration/aws), Google Cloud, or Azure.
-
-## Interoperability
-
-Sage is well-integrated into the open-source proteomics ecosystem. The following projects support analyzing results from Sage (typically in addition to other tools), or redistribute Sage binaries for use in their pipelines. 
-
-- [SearchGUI](http://compomics.github.io/projects/searchgui): a graphical user interface for running searches
-- [PeptideShaker](http://compomics.github.io/projects/peptide-shaker): visualize peptide-spectrum matches
-- [MS2Rescore](http://compomics.github.io/projects/ms2rescore): AI-assisted rescoring of results
-- [Picked group FDR](https://github.com/kusterlab/picked_group_fdr): scalable protein group FDR for large-scale experiments
-- [sagepy](https://github.com/theGreatHerrLebert/sagepy): Python bindings to the sage-core library
-- [quantms](https://github.com/bigbio/quantms): nextflow pipeline for running searches with Sage
-- [OpenMS](https://github.com/OpenMS/OpenMS): Sage is included as a "TOPP" tool in OpenMS
-- [sager](https://github.com/UCLouvain-CBIO/sager): R package for analyzing results from Sage searches
-- [Sage results to mzIdentML](https://github.com/magnuspalmblad/shic/blob/main/shims/Peptide_identification_in_TSV_to_Peptide_identification_in_mzIdentML.sh): Bash script to convert `results.sage.tsv` files to mzIdentML
-- [i2MassChroQ](http://pappso.inrae.fr/bioinfo/i2masschroq/): a graphical user interface for proteomics analysis
-- [annotator](https://github.com/snijderlab/annotator): a graphical user interface for visualizing peptide-spectrum matches
-- [rustyms](https://github.com/snijderlab/rustyms): a Rust library (with Python bindings) to handle peptides and identified peptide files
-- If your project supports Sage and it's not listed, please open a pull request! If you need help integrating or interfacing with Sage in some way, please reach out.
-
-Check out the (now outdated) [blog post introducing the first version of Sage](https://lazear.github.io/sage/) for more information and full benchmarks!
+[Sage: An Open-Source Tool for Fast Proteomics Searching and Quantification at
+Scale](https://doi.org/10.1021/acs.jproteome.3c00486).
