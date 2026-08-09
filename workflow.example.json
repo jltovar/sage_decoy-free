@@ -26,7 +26,7 @@
     {
       "model": "moments",
       "window_optimizer": {
-        "strategy": "adaptive",
+        "strategy": "landscape_adaptive",
         "min_rank_range": [2, 10],
         "max_rank_range": [2, 25]
       },
@@ -35,7 +35,7 @@
     {
       "model": "mle",
       "window_optimizer": {
-        "strategy": "adaptive",
+        "strategy": "landscape_adaptive",
         "min_rank_range": [2, 10],
         "max_rank_range": [2, 25]
       },
@@ -47,7 +47,7 @@
       "ensemble_participation": "excluded",
       "ensemble_exclusion_reason": "Lower Order artifact-reuse transfer must pass before this expert can join an Ensemble.",
       "window_optimizer": {
-        "strategy": "adaptive",
+        "strategy": "landscape_adaptive",
         "min_rank_range": [2, 10],
         "max_rank_range": [2, 25]
       },
@@ -58,7 +58,7 @@
       "ensemble_participation": "excluded",
       "ensemble_exclusion_reason": "Annotated MSFDR parity is deferred until the feature environment is reproduced or platform robustness is repaired.",
       "window_optimizer": {
-        "strategy": "adaptive",
+        "strategy": "landscape_adaptive",
         "min_rank_range": [2, 10],
         "max_rank_range": [2, 25]
       },
@@ -73,7 +73,7 @@
       "ensemble_participation": "excluded",
       "ensemble_exclusion_reason": "Annotated MSFDR2-SMIX parity is deferred until the feature environment is reproduced or platform robustness is repaired.",
       "window_optimizer": {
-        "strategy": "adaptive",
+        "strategy": "landscape_adaptive",
         "min_rank_range": [2, 10],
         "max_rank_range": [2, 25]
       },
@@ -84,7 +84,7 @@
       "ensemble_participation": "excluded",
       "ensemble_exclusion_reason": "Nokoi v1 is diagnostic-only until its portable artifact and frozen parity are complete.",
       "window_optimizer": {
-        "strategy": "adaptive",
+        "strategy": "landscape_adaptive",
         "min_rank_range": [2, 10],
         "max_rank_range": [2, 25]
       },

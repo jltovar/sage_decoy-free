@@ -1662,10 +1662,389 @@ fn run_adaptive_null_window_search(
     Ok((mode.to_string(), reason))
 }
 
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum LandscapeStatus {
+    Underfit,
+    Feasible,
+    OverFdp,
+}
+
+#[derive(Debug)]
+struct LandscapeSearchOutcome {
+    mode: String,
+    reason: String,
+    global_optimum_guaranteed: bool,
+}
+
+fn landscape_status(evaluation: &NullWindowEvaluation) -> LandscapeStatus {
+    if evaluation.feasible {
+        LandscapeStatus::Feasible
+    } else if evaluation.target_proteins == 0
+        || evaluation.psm_fdp.is_none()
+        || evaluation.peptide_fdp.is_none()
+        || evaluation.protein_fdp.is_none()
+    {
+        LandscapeStatus::Underfit
+    } else {
+        LandscapeStatus::OverFdp
+    }
+}
+
+fn evenly_spaced_ranks(min_rank: u32, max_rank: u32, count: usize) -> Vec<u32> {
+    if count <= 1 || min_rank == max_rank {
+        return vec![max_rank];
+    }
+    let span = u64::from(max_rank - min_rank);
+    let denominator = (count - 1) as u64;
+    let mut ranks = Vec::with_capacity(count);
+    for index in 0..count {
+        let numerator = index as u64 * span;
+        let offset = (numerator + denominator / 2) / denominator;
+        let rank = min_rank + offset as u32;
+        if ranks.last().copied() != Some(rank) {
+            ranks.push(rank);
+        }
+    }
+    ranks
+}
+
+fn observed_landscape_reversal(evaluator: &NullWindowEvaluator<'_>) -> bool {
+    let mut rows: HashMap<u32, Vec<&NullWindowEvaluation>> = HashMap::new();
+    for index in &evaluator.touched {
+        let evaluation = &evaluator.evaluations[*index];
+        rows.entry(evaluation.min_rank)
+            .or_default()
+            .push(evaluation);
+    }
+    rows.values_mut().any(|row| {
+        row.sort_unstable_by_key(|evaluation| evaluation.max_rank);
+        let mut observed_over_fdp = false;
+        for evaluation in row.iter() {
+            match landscape_status(evaluation) {
+                LandscapeStatus::OverFdp => observed_over_fdp = true,
+                LandscapeStatus::Feasible if observed_over_fdp => return true,
+                LandscapeStatus::Underfit | LandscapeStatus::Feasible => {}
+            }
+        }
+        false
+    })
+}
+
+fn evaluate_all_null_windows(
+    evaluator: &mut NullWindowEvaluator<'_>,
+    bounds: NullWindowSearchBounds,
+) -> Result<(), String> {
+    for window in exhaustive_null_windows(bounds) {
+        let _ = evaluator.evaluate(window.min_rank, window.max_rank)?;
+    }
+    Ok(())
+}
+
+fn run_landscape_frontier_search(
+    evaluator: &mut NullWindowEvaluator<'_>,
+    bounds: NullWindowSearchBounds,
+    options: &AdaptiveNullWindowSearchOptions,
+) -> Result<bool, String> {
+    for min_rank in (bounds.min_rank_min..=bounds.min_rank_max).rev() {
+        let row_min = bounds.max_rank_min.max(min_rank);
+        if row_min > bounds.max_rank_max {
+            continue;
+        }
+        let mut known_feasible = evaluator
+            .touched
+            .iter()
+            .copied()
+            .filter(|index| {
+                let evaluation = &evaluator.evaluations[*index];
+                evaluation.min_rank == min_rank && evaluation.feasible
+            })
+            .max_by_key(|index| evaluator.evaluations[*index].max_rank)
+            .map(|index| evaluator.evaluations[index].max_rank);
+
+        if known_feasible.is_none() {
+            let (mut low, mut high) = (row_min, bounds.max_rank_max);
+            while low <= high {
+                let middle = low + (high - low) / 2;
+                let index = evaluator
+                    .evaluate(min_rank, middle)?
+                    .expect("frontier candidate is inside validated bounds");
+                match landscape_status(&evaluator.evaluations[index]) {
+                    LandscapeStatus::Underfit => low = middle.saturating_add(1),
+                    LandscapeStatus::Feasible => {
+                        known_feasible = Some(middle);
+                        break;
+                    }
+                    LandscapeStatus::OverFdp => {
+                        if middle == 0 {
+                            break;
+                        }
+                        high = middle - 1;
+                    }
+                }
+            }
+        }
+        let Some(anchor) = known_feasible else {
+            continue;
+        };
+
+        let (mut low, mut high) = (anchor, bounds.max_rank_max);
+        while low < high {
+            let middle = low + (high - low + 1) / 2;
+            let index = evaluator
+                .evaluate(min_rank, middle)?
+                .expect("frontier candidate is inside validated bounds");
+            match landscape_status(&evaluator.evaluations[index]) {
+                LandscapeStatus::Feasible => low = middle,
+                LandscapeStatus::OverFdp => high = middle - 1,
+                LandscapeStatus::Underfit => return Ok(false),
+            }
+        }
+
+        let first = low.saturating_sub(options.landscape_frontier_predecessors);
+        for max_rank in first..=low {
+            let _ = evaluator.evaluate(min_rank, max_rank)?;
+        }
+        if low < bounds.max_rank_max {
+            let _ = evaluator.evaluate(min_rank, low + 1)?;
+        }
+    }
+    Ok(!observed_landscape_reversal(evaluator))
+}
+
+fn run_landscape_interior_search(
+    evaluator: &mut NullWindowEvaluator<'_>,
+    bounds: NullWindowSearchBounds,
+    options: &AdaptiveNullWindowSearchOptions,
+) -> Result<bool, String> {
+    let mut seeds = evaluator
+        .touched
+        .iter()
+        .copied()
+        .filter(|index| evaluator.evaluations[*index].feasible)
+        .collect::<Vec<_>>();
+    seeds.sort_unstable_by(|left, right| {
+        compare_null_window_evaluations(
+            &evaluator.evaluations[*right],
+            &evaluator.evaluations[*left],
+        )
+    });
+    seeds.truncate(options.landscape_seed_count);
+    if seeds.is_empty() {
+        return Ok(false);
+    }
+
+    let mut centers = Vec::with_capacity(seeds.len());
+    for seed in seeds {
+        let mut current = seed;
+        for _ in 0..options.hill_max_steps {
+            let current_row = evaluator.evaluations[current].clone();
+            let mut best_neighbor = current;
+            for min_delta in -1i64..=1 {
+                for max_delta in -1i64..=1 {
+                    if min_delta == 0 && max_delta == 0 {
+                        continue;
+                    }
+                    let min_rank = current_row.min_rank as i64 + min_delta;
+                    let max_rank = current_row.max_rank as i64 + max_delta;
+                    if min_rank < 0 || max_rank < 0 {
+                        continue;
+                    }
+                    if let Some(index) = evaluator.evaluate(min_rank as u32, max_rank as u32)? {
+                        if evaluator.evaluations[index].feasible
+                            && compare_null_window_evaluations(
+                                &evaluator.evaluations[index],
+                                &evaluator.evaluations[best_neighbor],
+                            ) == Ordering::Greater
+                        {
+                            best_neighbor = index;
+                        }
+                    }
+                }
+            }
+            if best_neighbor == current {
+                break;
+            }
+            current = best_neighbor;
+        }
+        centers.push((
+            evaluator.evaluations[current].min_rank,
+            evaluator.evaluations[current].max_rank,
+        ));
+    }
+
+    let radius = options.landscape_local_radius;
+    for (center_min, center_max) in centers {
+        let min_start = center_min.saturating_sub(radius).max(bounds.min_rank_min);
+        let min_end = center_min.saturating_add(radius).min(bounds.min_rank_max);
+        let max_start = center_max.saturating_sub(radius).max(bounds.max_rank_min);
+        let max_end = center_max.saturating_add(radius).min(bounds.max_rank_max);
+        for min_rank in min_start..=min_end {
+            for max_rank in max_start..=max_end {
+                if min_rank.abs_diff(center_min) + max_rank.abs_diff(center_max) <= radius {
+                    let _ = evaluator.evaluate(min_rank, max_rank)?;
+                }
+            }
+        }
+    }
+    Ok(!observed_landscape_reversal(evaluator))
+}
+
+fn run_landscape_adaptive_null_window_search(
+    evaluator: &mut NullWindowEvaluator<'_>,
+    bounds: NullWindowSearchBounds,
+    options: &AdaptiveNullWindowSearchOptions,
+) -> Result<LandscapeSearchOutcome, String> {
+    if options.landscape_coarse_row_count == 0
+        || options.landscape_coarse_offsets.is_empty()
+        || options.landscape_seed_count == 0
+        || options.hill_max_steps == 0
+        || !options.landscape_min_feasible_row_fraction.is_finite()
+        || !(0.0..=1.0).contains(&options.landscape_min_feasible_row_fraction)
+        || !options.landscape_frontier_edge_fraction.is_finite()
+        || !(0.0..=1.0).contains(&options.landscape_frontier_edge_fraction)
+    {
+        return Err("invalid landscape-adaptive null-window search options".to_string());
+    }
+
+    let rows = evenly_spaced_ranks(
+        bounds.min_rank_min,
+        bounds.min_rank_max,
+        options.landscape_coarse_row_count,
+    );
+    let mut coarse_indices = FnvHashSet::default();
+    for min_rank in &rows {
+        if *min_rank > bounds.max_rank_max {
+            continue;
+        }
+        for offset in &options.landscape_coarse_offsets {
+            let max_rank = min_rank
+                .saturating_add(*offset)
+                .max(bounds.max_rank_min)
+                .min(bounds.max_rank_max)
+                .max(*min_rank);
+            if let Some(index) = evaluator.evaluate(*min_rank, max_rank)? {
+                coarse_indices.insert(index);
+            }
+        }
+        if let Some(index) = evaluator.evaluate(*min_rank, bounds.max_rank_max)? {
+            coarse_indices.insert(index);
+        }
+    }
+
+    let mut coarse_rows: HashMap<u32, Vec<usize>> = HashMap::new();
+    for index in coarse_indices {
+        coarse_rows
+            .entry(evaluator.evaluations[index].min_rank)
+            .or_default()
+            .push(index);
+    }
+    let mut feasible_rows = 0usize;
+    let mut edge_rows = 0usize;
+    let mut over_fdp_seen = false;
+    let mut reversal_seen = false;
+    for indices in coarse_rows.values_mut() {
+        indices.sort_unstable_by_key(|index| evaluator.evaluations[*index].max_rank);
+        let feasible = indices
+            .iter()
+            .copied()
+            .filter(|index| evaluator.evaluations[*index].feasible)
+            .collect::<Vec<_>>();
+        if !feasible.is_empty() {
+            feasible_rows += 1;
+            let row_best = feasible
+                .iter()
+                .copied()
+                .max_by(|left, right| {
+                    compare_null_window_evaluations(
+                        &evaluator.evaluations[*left],
+                        &evaluator.evaluations[*right],
+                    )
+                })
+                .expect("nonempty feasible row");
+            let upper = feasible
+                .iter()
+                .copied()
+                .max_by_key(|index| evaluator.evaluations[*index].max_rank)
+                .expect("nonempty feasible row");
+            edge_rows += usize::from(
+                evaluator.evaluations[row_best].max_rank == evaluator.evaluations[upper].max_rank,
+            );
+        }
+        let mut observed_over = false;
+        for index in indices.iter().copied() {
+            match landscape_status(&evaluator.evaluations[index]) {
+                LandscapeStatus::OverFdp => {
+                    observed_over = true;
+                    over_fdp_seen = true;
+                }
+                LandscapeStatus::Feasible if observed_over => reversal_seen = true,
+                LandscapeStatus::Underfit | LandscapeStatus::Feasible => {}
+            }
+        }
+    }
+
+    let feasible_row_fraction = feasible_rows as f64 / coarse_rows.len().max(1) as f64;
+    let edge_fraction = edge_rows as f64 / feasible_rows.max(1) as f64;
+    let (mut mode, classification_reason) = if reversal_seen
+        || feasible_row_fraction < options.landscape_min_feasible_row_fraction
+    {
+        (
+            "irregular",
+            format!(
+                "coarse probe irregular: rows={} feasible_rows={} feasible_fraction={feasible_row_fraction:.3} reversal={reversal_seen}",
+                coarse_rows.len(), feasible_rows
+            ),
+        )
+    } else if over_fdp_seen && edge_fraction >= options.landscape_frontier_edge_fraction {
+        (
+            "frontier",
+            format!(
+                "coarse probe frontier: rows={} feasible_rows={} edge_fraction={edge_fraction:.3} over_fdp_seen=true",
+                coarse_rows.len(), feasible_rows
+            ),
+        )
+    } else {
+        (
+            "interior",
+            format!(
+                "coarse probe interior: rows={} feasible_rows={} edge_fraction={edge_fraction:.3} over_fdp_seen={over_fdp_seen}",
+                coarse_rows.len(), feasible_rows
+            ),
+        )
+    };
+
+    let assumptions_held = match mode {
+        "frontier" => run_landscape_frontier_search(evaluator, bounds, options)?,
+        "interior" => run_landscape_interior_search(evaluator, bounds, options)?,
+        _ => false,
+    };
+    if mode == "irregular" || !assumptions_held {
+        evaluate_all_null_windows(evaluator, bounds)?;
+        if mode != "irregular" {
+            mode = "irregular_fallback";
+        }
+        return Ok(LandscapeSearchOutcome {
+            mode: mode.to_string(),
+            reason: format!(
+                "{classification_reason}; exhaustive fallback completed because landscape assumptions were irregular or contradicted"
+            ),
+            global_optimum_guaranteed: true,
+        });
+    }
+
+    Ok(LandscapeSearchOutcome {
+        mode: mode.to_string(),
+        reason: classification_reason,
+        global_optimum_guaranteed: false,
+    })
+}
+
 /// Optimize a null window from the already-scored candidate set. Explicit and
-/// exhaustive strategies are exact over their declared universe; adaptive is a
-/// deterministic heuristic that normally visits far fewer windows. No spectra
-/// are reread and no database search is repeated.
+/// exhaustive strategies are exact over their declared universe; adaptive
+/// strategies are deterministic heuristics that normally visit far fewer
+/// windows. Landscape-adaptive search becomes exact when it activates its
+/// exhaustive irregular-surface fail-safe. No spectra are reread and no
+/// database search is repeated.
 pub fn optimize_null_window(
     psms: &[DfFeature],
     settings: &FdrSettings,
@@ -1716,7 +2095,9 @@ pub fn optimize_null_window_resumable(
             }
             (optimizer.candidates.len(), optimizer.candidates.len())
         }
-        NullWindowSearchStrategy::Exhaustive | NullWindowSearchStrategy::Adaptive => {
+        NullWindowSearchStrategy::Exhaustive
+        | NullWindowSearchStrategy::Adaptive
+        | NullWindowSearchStrategy::LandscapeAdaptive => {
             if !optimizer.candidates.is_empty() {
                 return Err(
                     "bounded null-window optimizer cannot also declare explicit candidates"
@@ -1742,7 +2123,8 @@ pub fn optimize_null_window_resumable(
         prior_evaluations,
         &mut checkpoint,
     )?;
-    let (adaptive_mode, adaptive_mode_reason) = match optimizer.strategy {
+    let (adaptive_mode, adaptive_mode_reason, global_optimum_guaranteed) = match optimizer.strategy
+    {
         NullWindowSearchStrategy::Explicit => {
             for window in &optimizer.candidates {
                 if evaluator
@@ -1755,13 +2137,13 @@ pub fn optimize_null_window_resumable(
                     ));
                 }
             }
-            (None, None)
+            (None, None, true)
         }
         NullWindowSearchStrategy::Exhaustive => {
             for window in exhaustive_null_windows(optimizer.bounds.expect("validated bounds")) {
                 let _ = evaluator.evaluate(window.min_rank, window.max_rank)?;
             }
-            (None, None)
+            (None, None, true)
         }
         NullWindowSearchStrategy::Adaptive => {
             let (mode, reason) = run_adaptive_null_window_search(
@@ -1769,7 +2151,19 @@ pub fn optimize_null_window_resumable(
                 optimizer.bounds.expect("validated bounds"),
                 &optimizer.adaptive,
             )?;
-            (Some(mode), Some(reason))
+            (Some(mode), Some(reason), false)
+        }
+        NullWindowSearchStrategy::LandscapeAdaptive => {
+            let outcome = run_landscape_adaptive_null_window_search(
+                &mut evaluator,
+                optimizer.bounds.expect("validated bounds"),
+                &optimizer.adaptive,
+            )?;
+            (
+                Some(outcome.mode),
+                Some(outcome.reason),
+                outcome.global_optimum_guaranteed,
+            )
         }
     };
 
@@ -1839,15 +2233,18 @@ pub fn optimize_null_window_resumable(
         .sum::<u64>();
     let report = NullWindowOptimizationReport {
         schema: "sage-null-window-optimization-v1".to_string(),
-        algorithm_version: "native-window-search-v1".to_string(),
+        algorithm_version: "native-window-search-v2".to_string(),
         strategy: optimizer.strategy,
         bounds: optimizer.bounds,
-        adaptive_options: (optimizer.strategy == NullWindowSearchStrategy::Adaptive)
-            .then(|| optimizer.adaptive.clone()),
+        adaptive_options: matches!(
+            optimizer.strategy,
+            NullWindowSearchStrategy::Adaptive | NullWindowSearchStrategy::LandscapeAdaptive
+        )
+        .then(|| optimizer.adaptive.clone()),
         candidate_universe_size,
         adaptive_mode,
         adaptive_mode_reason,
-        global_optimum_guaranteed: optimizer.strategy != NullWindowSearchStrategy::Adaptive,
+        global_optimum_guaranteed,
         evaluated_window_count: evaluations.len(),
         resumed_evaluation_count: evaluator.resumed_evaluation_count,
         new_evaluation_count: evaluations
@@ -13177,5 +13574,169 @@ mod tests {
         assert_eq!(mode, "hill");
         assert_eq!((best.min_rank, best.max_rank), (9, 18));
         assert!(evaluator.touched.len() < evaluator.evaluations.len());
+    }
+
+    fn synthetic_landscape_evaluation(
+        window: NullWindowCandidate,
+        target_min: u32,
+        target_max: u32,
+        feasible: bool,
+    ) -> NullWindowEvaluation {
+        let distance = window.min_rank.abs_diff(target_min) + window.max_rank.abs_diff(target_max);
+        let proteins = 1_000usize - distance as usize;
+        let fdp = if feasible { 0.0 } else { 0.02 };
+        NullWindowEvaluation {
+            min_rank: window.min_rank,
+            max_rank: window.max_rank,
+            validation_scope: NullWindowValidationScope::RawQ,
+            target_psms: proteins * 10,
+            entrapment_psms: usize::from(!feasible),
+            target_peptides: proteins * 2,
+            entrapment_peptides: usize::from(!feasible),
+            target_proteins: proteins,
+            entrapment_proteins: usize::from(!feasible),
+            psm_fdp: Some(fdp),
+            peptide_fdp: Some(fdp),
+            protein_fdp: Some(fdp),
+            feasible,
+            low_count_warning: true,
+            selected: false,
+            elapsed_milliseconds: 0,
+        }
+    }
+
+    fn landscape_optimizer(bounds: NullWindowSearchBounds) -> NullWindowOptimizerOptions {
+        NullWindowOptimizerOptions {
+            candidates: Vec::new(),
+            strategy: NullWindowSearchStrategy::LandscapeAdaptive,
+            bounds: Some(bounds),
+            adaptive: AdaptiveNullWindowSearchOptions::default(),
+            validation_scope: NullWindowValidationScope::RawQ,
+            fdr_threshold: 0.01,
+            psm_entrapment_ratio: 1.0,
+            peptide_entrapment_ratio: 1.0,
+            protein_entrapment_ratio: 1.0,
+            maximum_entrapment_fdp: 0.01,
+            minimum_entrapment_count_for_stable_estimate: 3,
+            verbose_diagnostics: false,
+        }
+    }
+
+    #[test]
+    fn landscape_adaptive_uses_frontier_search_for_monotone_bounded_surface() {
+        let bounds = NullWindowSearchBounds {
+            min_rank_min: 2,
+            min_rank_max: 10,
+            max_rank_min: 2,
+            max_rank_max: 25,
+        };
+        let optimizer = landscape_optimizer(bounds);
+        let prior = exhaustive_null_windows(bounds)
+            .into_iter()
+            .map(|window| {
+                let feasible = window.max_rank <= window.min_rank + 9;
+                synthetic_landscape_evaluation(window, 9, 18, feasible)
+            })
+            .collect::<Vec<_>>();
+        let settings = FdrSettings::from(FdrOptions::default());
+        let db = IndexedDatabase::default();
+        let mut checkpoint = |_: &[NullWindowEvaluation]| Ok(());
+        let mut evaluator = NullWindowEvaluator::new(
+            &[],
+            &settings,
+            &optimizer,
+            &db,
+            prior.len(),
+            prior,
+            &mut checkpoint,
+        )
+        .unwrap();
+
+        let outcome =
+            run_landscape_adaptive_null_window_search(&mut evaluator, bounds, &optimizer.adaptive)
+                .unwrap();
+        let best = &evaluator.evaluations[evaluator.best_index().unwrap()];
+        assert_eq!(outcome.mode, "frontier");
+        assert!(!outcome.global_optimum_guaranteed);
+        assert_eq!((best.min_rank, best.max_rank), (9, 18));
+        assert!(evaluator.touched.len() < evaluator.evaluations.len());
+    }
+
+    #[test]
+    fn landscape_adaptive_uses_multistart_search_for_interior_surface() {
+        let bounds = NullWindowSearchBounds {
+            min_rank_min: 2,
+            min_rank_max: 10,
+            max_rank_min: 2,
+            max_rank_max: 25,
+        };
+        let optimizer = landscape_optimizer(bounds);
+        let prior = exhaustive_null_windows(bounds)
+            .into_iter()
+            .map(|window| synthetic_landscape_evaluation(window, 9, 17, true))
+            .collect::<Vec<_>>();
+        let settings = FdrSettings::from(FdrOptions::default());
+        let db = IndexedDatabase::default();
+        let mut checkpoint = |_: &[NullWindowEvaluation]| Ok(());
+        let mut evaluator = NullWindowEvaluator::new(
+            &[],
+            &settings,
+            &optimizer,
+            &db,
+            prior.len(),
+            prior,
+            &mut checkpoint,
+        )
+        .unwrap();
+
+        let outcome =
+            run_landscape_adaptive_null_window_search(&mut evaluator, bounds, &optimizer.adaptive)
+                .unwrap();
+        let best = &evaluator.evaluations[evaluator.best_index().unwrap()];
+        assert_eq!(outcome.mode, "interior");
+        assert!(!outcome.global_optimum_guaranteed);
+        assert_eq!((best.min_rank, best.max_rank), (9, 17));
+        assert!(evaluator.touched.len() < evaluator.evaluations.len());
+    }
+
+    #[test]
+    fn landscape_adaptive_exhausts_irregular_surface() {
+        let bounds = NullWindowSearchBounds {
+            min_rank_min: 2,
+            min_rank_max: 10,
+            max_rank_min: 2,
+            max_rank_max: 25,
+        };
+        let optimizer = landscape_optimizer(bounds);
+        let prior = exhaustive_null_windows(bounds)
+            .into_iter()
+            .map(|window| {
+                let feasible = window.max_rank != window.min_rank;
+                synthetic_landscape_evaluation(window, 9, 18, feasible)
+            })
+            .collect::<Vec<_>>();
+        let universe_size = prior.len();
+        let settings = FdrSettings::from(FdrOptions::default());
+        let db = IndexedDatabase::default();
+        let mut checkpoint = |_: &[NullWindowEvaluation]| Ok(());
+        let mut evaluator = NullWindowEvaluator::new(
+            &[],
+            &settings,
+            &optimizer,
+            &db,
+            prior.len(),
+            prior,
+            &mut checkpoint,
+        )
+        .unwrap();
+
+        let outcome =
+            run_landscape_adaptive_null_window_search(&mut evaluator, bounds, &optimizer.adaptive)
+                .unwrap();
+        let best = &evaluator.evaluations[evaluator.best_index().unwrap()];
+        assert_eq!(outcome.mode, "irregular");
+        assert!(outcome.global_optimum_guaranteed);
+        assert_eq!((best.min_rank, best.max_rank), (9, 18));
+        assert_eq!(evaluator.touched.len(), universe_size);
     }
 }

@@ -51,9 +51,9 @@ resumable workflow:
    policy without using target-only outcomes to retune the entrapment-selected window.
 
 Null windows are evaluated in memory from a shared candidate pool. For a new dataset, declare
-compact rank bounds and use the adaptive search; Sage generates and visits windows internally. The
-workflow does not edit JSON repeatedly, launch a new spectrum search for every window, or require a
-user to copy a selected window into another configuration file.
+compact rank bounds and use the landscape-adaptive search; Sage generates and visits windows
+internally. The workflow does not edit JSON repeatedly, launch a new spectrum search for every
+window, or require a user to copy a selected window into another configuration file.
 
 Do not transfer a window or fitted artifact from one dataset to another for normal analysis.
 Cross-dataset reuse is permitted only when explicitly declared diagnostic-only and can never satisfy
@@ -98,11 +98,16 @@ statistical settings create a new analysis fingerprint and refit the fixed candi
 the FASTA, spectra, digestion, modifications, tolerances, scoring, preprocessing, or retained rank
 depth create a different search fingerprint and therefore a different pool.
 
-The optimizer has three interfaces:
+The optimizer has four interfaces:
 
-- `window_optimizer.strategy: "adaptive"` is the recommended new-dataset mode. It performs a
-  deterministic sparse probe, chooses a boundary or hill search, polishes locally, and confirms the
-  frontier around the best visited point. It is a heuristic and does not claim a global optimum.
+- `window_optimizer.strategy: "landscape_adaptive"` is the recommended new-dataset mode. It uses
+  a compact coarse probe to classify the observed surface as `frontier`, `interior`, or
+  `irregular`. Frontier surfaces use row-wise boundary search; interior surfaces use top-three
+  multi-start hill search plus a radius-two diamond polish. Irregular surfaces—and surfaces that
+  contradict their initial classification—automatically fall back to exhaustive evaluation.
+- `window_optimizer.strategy: "adaptive"` preserves the original deterministic sparse-probe
+  heuristic for reproducibility. It does not use the new landscape classifier or exhaustive
+  fail-safe.
 - `window_optimizer.strategy: "exhaustive"` generates every valid window inside the same compact
   bounds and is exact over that bounded universe.
 - `candidate_windows` evaluates an explicit ordered list exactly. It remains useful for frozen
@@ -287,7 +292,7 @@ A normal new-dataset model declaration is short:
 {
   "model": "moments",
   "window_optimizer": {
-    "strategy": "adaptive",
+    "strategy": "landscape_adaptive",
     "min_rank_range": [2, 10],
     "max_rank_range": [2, 25]
   },
@@ -296,9 +301,11 @@ A normal new-dataset model declaration is short:
 ```
 
 The ranges are inclusive. Sage retains candidates through at least the largest allowed `max_rank`
-(and farther when a later MS2Rescore stage requires it), chooses the adaptive path from the observed
-entrapment behavior, and records every window it actually visits. Replace `adaptive` with
-`exhaustive` when proof of the bounded global optimum is worth the additional model-fitting time.
+(and farther when a later MS2Rescore stage requires it), chooses a path from the observed
+entrapment behavior, and records every window it actually visits. A frontier or interior result is
+a deterministic heuristic; an irregular fallback and an explicit `exhaustive` run are exact over
+the bounded universe. Use `exhaustive` directly when proof of the bounded global optimum is
+required regardless of the observed landscape.
 Use `candidate_windows` only when the exact ordered list is itself part of the experiment.
 
 Validate and materialize the plan without searching:

@@ -45,6 +45,10 @@ pub enum NullWindowSearchStrategy {
     /// Use a deterministic sparse probe, boundary/hill search, local polish,
     /// and frontier confirmation scan.
     Adaptive,
+    /// Classify a compact coarse probe as frontier, interior, or irregular;
+    /// then use the corresponding deterministic search with exhaustive
+    /// fail-safe fallback when the observed assumptions break.
+    LandscapeAdaptive,
 }
 
 #[derive(Clone, Copy, Serialize, Deserialize, Debug, PartialEq, Eq)]
@@ -81,6 +85,20 @@ pub struct AdaptiveNullWindowSearchOptions {
     pub frontier_max_back: u32,
     #[serde(default = "default_frontier_max_forward")]
     pub frontier_max_forward: u32,
+    #[serde(default = "default_landscape_coarse_row_count")]
+    pub landscape_coarse_row_count: usize,
+    #[serde(default = "default_landscape_coarse_offsets")]
+    pub landscape_coarse_offsets: Vec<u32>,
+    #[serde(default = "default_landscape_min_feasible_row_fraction")]
+    pub landscape_min_feasible_row_fraction: f64,
+    #[serde(default = "default_landscape_frontier_edge_fraction")]
+    pub landscape_frontier_edge_fraction: f64,
+    #[serde(default = "default_landscape_seed_count")]
+    pub landscape_seed_count: usize,
+    #[serde(default = "default_landscape_local_radius")]
+    pub landscape_local_radius: u32,
+    #[serde(default = "default_landscape_frontier_predecessors")]
+    pub landscape_frontier_predecessors: u32,
 }
 
 impl Default for AdaptiveNullWindowSearchOptions {
@@ -98,6 +116,13 @@ impl Default for AdaptiveNullWindowSearchOptions {
             frontier_min_forward: default_frontier_min_forward(),
             frontier_max_back: default_frontier_max_back(),
             frontier_max_forward: default_frontier_max_forward(),
+            landscape_coarse_row_count: default_landscape_coarse_row_count(),
+            landscape_coarse_offsets: default_landscape_coarse_offsets(),
+            landscape_min_feasible_row_fraction: default_landscape_min_feasible_row_fraction(),
+            landscape_frontier_edge_fraction: default_landscape_frontier_edge_fraction(),
+            landscape_seed_count: default_landscape_seed_count(),
+            landscape_local_radius: default_landscape_local_radius(),
+            landscape_frontier_predecessors: default_landscape_frontier_predecessors(),
         }
     }
 }
@@ -177,6 +202,27 @@ fn default_frontier_max_forward() -> u32 {
 }
 fn default_true() -> bool {
     true
+}
+fn default_landscape_coarse_row_count() -> usize {
+    5
+}
+fn default_landscape_coarse_offsets() -> Vec<u32> {
+    vec![0, 8]
+}
+fn default_landscape_min_feasible_row_fraction() -> f64 {
+    0.40
+}
+fn default_landscape_frontier_edge_fraction() -> f64 {
+    0.70
+}
+fn default_landscape_seed_count() -> usize {
+    3
+}
+fn default_landscape_local_radius() -> u32 {
+    2
+}
+fn default_landscape_frontier_predecessors() -> u32 {
+    2
 }
 
 /// Frozen empirical calibration for one imported MS2Rescore feature.

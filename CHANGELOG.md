@@ -16,6 +16,10 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 - **Protein Inference**: Implemented **Fisher's Method** to aggregate independent peptide probabilities into a single Protein Q-value.
 - **New Output Columns**: `decoy_free_score` (Phred-scaled PEP), `decoy_free_p_value`, `decoy_free_pep`, `decoy_free_q_value`.
 - **Debug Mode**: `model_fit = "ensemble_test"` writes intermediate probability columns (`p_moments`, `p_mle`, `p_lower_order`, `p_msfdr`, `p_nokoi`, `q_nokoi`) to the output for validation.
+- **Landscape-Adaptive Null-Window Search**: New datasets can declare compact rank bounds with
+  `window_optimizer.strategy = "landscape_adaptive"`. Sage classifies a coarse probe as frontier,
+  interior, or irregular, uses a specialized deterministic search, and falls back to exhaustive
+  bounded evaluation when observed landscape assumptions fail.
 
 ### Changed
 - The `fdr` configuration block has been expanded to support `min_null_rank`, `max_null_rank`, `min_null_size`, `model_fit`, `min_storey_n`, and `type`.

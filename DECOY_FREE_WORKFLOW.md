@@ -112,10 +112,13 @@ local `psm_id` values are not cache identity. The separate MS2Rescore annotation
 stable ID.
 
 New datasets normally declare a compact `window_optimizer` with inclusive `min_rank_range` and
-`max_rank_range`. `strategy: adaptive` uses the deterministic native sparse-probe,
-boundary-or-hill, polish, and frontier-confirmation algorithm. It usually evaluates a small subset
-of the bounded universe, so it is explicitly reported as heuristic rather than as proof of the
-global optimum. `strategy: exhaustive` generates and evaluates the complete bounded universe.
+`max_rank_range`. `strategy: landscape_adaptive` uses a compact coarse probe to classify the
+observed surface as frontier, interior, or irregular. It applies row-wise boundary search to a
+frontier, top-three multi-start hill search with diamond polish to an interior surface, and an
+automatic exhaustive fail-safe to irregular or contradicted surfaces. Frontier and interior
+results are reported as heuristic; an exhaustive fallback is exact over the bounded universe.
+`strategy: adaptive` retains the original sparse-probe heuristic for reproducibility, and
+`strategy: exhaustive` always generates and evaluates the complete bounded universe.
 The older `candidate_windows` field remains an exact ordered replay interface for frozen
 experiments; it is not necessary to enumerate windows manually for new datasets.
 

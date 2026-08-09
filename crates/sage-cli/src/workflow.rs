@@ -43,7 +43,8 @@ pub struct NullWindow {
 
 /// Compact, dataset-first window search declaration. Historical validation
 /// manifests may continue to use `candidate_windows` for an exact ordered
-/// replay; new datasets should normally use `strategy=adaptive` with bounds.
+/// replay; new datasets should normally use `strategy=landscape_adaptive` with
+/// bounds.
 #[derive(Clone, Debug, Serialize, Deserialize)]
 pub struct WindowOptimizerWorkflow {
     pub strategy: NullWindowSearchStrategy,
@@ -612,7 +613,7 @@ impl WorkflowManifest {
             if let Some(search) = &model.window_optimizer {
                 anyhow::ensure!(
                     search.strategy != NullWindowSearchStrategy::Explicit,
-                    "window_optimizer supports adaptive or exhaustive; use candidate_windows for explicit replay"
+                    "window_optimizer supports landscape_adaptive, adaptive, or exhaustive; use candidate_windows for explicit replay"
                 );
                 let bounds = search.bounds();
                 anyhow::ensure!(
@@ -623,7 +624,11 @@ impl WorkflowManifest {
                         && bounds.min_rank_min <= bounds.max_rank_max,
                     "invalid window_optimizer rank ranges"
                 );
-                if search.strategy == NullWindowSearchStrategy::Adaptive {
+                if matches!(
+                    search.strategy,
+                    NullWindowSearchStrategy::Adaptive
+                        | NullWindowSearchStrategy::LandscapeAdaptive
+                ) {
                     anyhow::ensure!(
                         search.adaptive.sparse_row_step > 0
                             && search.adaptive.x_stride > 0
@@ -637,6 +642,23 @@ impl WorkflowManifest {
                             && (0.0..=1.0)
                                 .contains(&search.adaptive.sparse_eligible_fraction_for_hill),
                         "invalid adaptive window_optimizer settings"
+                    );
+                }
+                if search.strategy == NullWindowSearchStrategy::LandscapeAdaptive {
+                    anyhow::ensure!(
+                        search.adaptive.landscape_coarse_row_count > 0
+                            && !search.adaptive.landscape_coarse_offsets.is_empty()
+                            && search.adaptive.landscape_seed_count > 0
+                            && search
+                                .adaptive
+                                .landscape_min_feasible_row_fraction
+                                .is_finite()
+                            && (0.0..=1.0)
+                                .contains(&search.adaptive.landscape_min_feasible_row_fraction)
+                            && search.adaptive.landscape_frontier_edge_fraction.is_finite()
+                            && (0.0..=1.0)
+                                .contains(&search.adaptive.landscape_frontier_edge_fraction),
+                        "invalid landscape_adaptive window_optimizer settings"
                     );
                 }
             }
@@ -3091,6 +3113,31 @@ mod tests {
         assert_eq!(
             value["window_optimizer"]["max_rank_range"],
             serde_json::json!([2, 25])
+        );
+        std::fs::remove_dir_all(directory).unwrap();
+    }
+
+    #[test]
+    fn compact_landscape_adaptive_window_optimizer_is_valid_and_serializable() {
+        let directory = test_directory("compact-landscape-adaptive-window-optimizer");
+        let mut manifest = minimal_manifest(&directory, ValidationDatasetRole::Development);
+        manifest.models[0].candidate_windows.clear();
+        manifest.models[0].window_optimizer = Some(WindowOptimizerWorkflow {
+            strategy: NullWindowSearchStrategy::LandscapeAdaptive,
+            min_rank_range: [2, 10],
+            max_rank_range: [2, 25],
+            adaptive: AdaptiveNullWindowSearchOptions::default(),
+        });
+        manifest.validate().unwrap();
+        let value = serde_json::to_value(&manifest.models[0]).unwrap();
+        assert_eq!(value["window_optimizer"]["strategy"], "landscape_adaptive");
+        assert_eq!(
+            value["window_optimizer"]["adaptive"]["landscape_coarse_row_count"],
+            5
+        );
+        assert_eq!(
+            value["window_optimizer"]["adaptive"]["landscape_coarse_offsets"],
+            serde_json::json!([0, 8])
         );
         std::fs::remove_dir_all(directory).unwrap();
     }
