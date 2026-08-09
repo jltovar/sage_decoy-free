@@ -598,10 +598,15 @@ impl WorkflowManifest {
                 anyhow::ensure!(window.min_rank > 1, "rank 1 cannot be a null window");
                 anyhow::ensure!(window.max_rank >= window.min_rank, "invalid null window");
             }
+            let mut explicit_windows = BTreeSet::new();
             for window in &model.candidate_windows {
                 anyhow::ensure!(
                     window.min_rank > 1 && window.max_rank >= window.min_rank,
                     "invalid candidate null window"
+                );
+                anyhow::ensure!(
+                    explicit_windows.insert((window.min_rank, window.max_rank)),
+                    "candidate_windows contains a duplicate null window"
                 );
             }
             if let Some(search) = &model.window_optimizer {
@@ -2013,7 +2018,12 @@ fn run_search_stage(
                 .chain(model.window.iter().map(|window| window.max_rank as usize))
                 .max()
                 .unwrap_or(1);
-            let requested_by_external = external.then_some(
+            // The optimized stage creates the immutable +entrapment pool first.
+            // Retain enough depth for its later MS2Rescore stage now so enabling
+            // annotations cannot force a second native spectrum search.
+            let will_run_external_stage =
+                external || !matches!(model.ms2rescore, Ms2RescorePolicy::Never);
+            let requested_by_external = will_run_external_stage.then_some(
                 runner
                     .parameters
                     .external_features

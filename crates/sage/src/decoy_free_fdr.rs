@@ -192,12 +192,14 @@ pub struct NullWindowOptimizationReport {
     pub algorithm_version: String,
     pub strategy: NullWindowSearchStrategy,
     pub bounds: Option<NullWindowSearchBounds>,
+    pub adaptive_options: Option<AdaptiveNullWindowSearchOptions>,
     pub candidate_universe_size: usize,
     pub adaptive_mode: Option<String>,
     pub adaptive_mode_reason: Option<String>,
     pub global_optimum_guaranteed: bool,
     pub evaluated_window_count: usize,
     pub resumed_evaluation_count: usize,
+    pub new_evaluation_count: usize,
     pub visited_windows: Vec<NullWindowCandidate>,
     pub selected_window: NullWindowCandidate,
     pub total_evaluation_milliseconds: u64,
@@ -1704,6 +1706,14 @@ pub fn optimize_null_window_resumable(
             if optimizer.bounds.is_some() {
                 return Err("explicit null-window optimizer cannot also declare bounds".to_string());
             }
+            let mut unique = FnvHashSet::default();
+            if optimizer
+                .candidates
+                .iter()
+                .any(|window| !unique.insert((window.min_rank, window.max_rank)))
+            {
+                return Err("explicit null-window optimizer contains duplicate windows".to_string());
+            }
             (optimizer.candidates.len(), optimizer.candidates.len())
         }
         NullWindowSearchStrategy::Exhaustive | NullWindowSearchStrategy::Adaptive => {
@@ -1832,12 +1842,17 @@ pub fn optimize_null_window_resumable(
         algorithm_version: "native-window-search-v1".to_string(),
         strategy: optimizer.strategy,
         bounds: optimizer.bounds,
+        adaptive_options: (optimizer.strategy == NullWindowSearchStrategy::Adaptive)
+            .then(|| optimizer.adaptive.clone()),
         candidate_universe_size,
         adaptive_mode,
         adaptive_mode_reason,
         global_optimum_guaranteed: optimizer.strategy != NullWindowSearchStrategy::Adaptive,
         evaluated_window_count: evaluations.len(),
         resumed_evaluation_count: evaluator.resumed_evaluation_count,
+        new_evaluation_count: evaluations
+            .len()
+            .saturating_sub(evaluator.resumed_evaluation_count),
         visited_windows: evaluations
             .iter()
             .map(|row| NullWindowCandidate {
@@ -12738,6 +12753,7 @@ pub fn decoy_free_precursor(
 mod tests {
     use super::*;
     use crate::database::PeptideIx;
+    use crate::input::FdrOptions;
     use crate::peptide::Peptide;
 
     fn test_peak(score: f64) -> (Peak, Vec<f64>) {
@@ -13089,5 +13105,77 @@ mod tests {
         assert!(windows
             .iter()
             .all(|window| window.min_rank <= window.max_rank));
+    }
+
+    #[test]
+    fn adaptive_window_search_follows_a_synthetic_hill_without_fitting_all_windows() {
+        let bounds = NullWindowSearchBounds {
+            min_rank_min: 2,
+            min_rank_max: 10,
+            max_rank_min: 2,
+            max_rank_max: 25,
+        };
+        let optimizer = NullWindowOptimizerOptions {
+            candidates: Vec::new(),
+            strategy: NullWindowSearchStrategy::Adaptive,
+            bounds: Some(bounds),
+            adaptive: AdaptiveNullWindowSearchOptions::default(),
+            validation_scope: NullWindowValidationScope::RawQ,
+            fdr_threshold: 0.01,
+            psm_entrapment_ratio: 1.0,
+            peptide_entrapment_ratio: 1.0,
+            protein_entrapment_ratio: 1.0,
+            maximum_entrapment_fdp: 0.01,
+            minimum_entrapment_count_for_stable_estimate: 3,
+            verbose_diagnostics: false,
+        };
+        let prior = exhaustive_null_windows(bounds)
+            .into_iter()
+            .map(|window| {
+                let distance = window.min_rank.abs_diff(9) + window.max_rank.abs_diff(18);
+                let proteins = 1_000usize - distance as usize;
+                NullWindowEvaluation {
+                    min_rank: window.min_rank,
+                    max_rank: window.max_rank,
+                    validation_scope: NullWindowValidationScope::RawQ,
+                    target_psms: proteins * 10,
+                    entrapment_psms: 0,
+                    target_peptides: proteins * 2,
+                    entrapment_peptides: 0,
+                    target_proteins: proteins,
+                    entrapment_proteins: 0,
+                    psm_fdp: Some(0.0),
+                    peptide_fdp: Some(0.0),
+                    protein_fdp: Some(0.0),
+                    feasible: true,
+                    low_count_warning: true,
+                    selected: false,
+                    elapsed_milliseconds: 0,
+                }
+            })
+            .collect::<Vec<_>>();
+        let settings = FdrSettings::from(FdrOptions::default());
+        let db = IndexedDatabase::default();
+        fn ignore_checkpoint(_: &[NullWindowEvaluation]) -> Result<(), String> {
+            Ok(())
+        }
+        let mut checkpoint = ignore_checkpoint;
+        let mut evaluator = NullWindowEvaluator::new(
+            &[],
+            &settings,
+            &optimizer,
+            &db,
+            prior.len(),
+            prior,
+            &mut checkpoint,
+        )
+        .unwrap();
+
+        let (mode, _) =
+            run_adaptive_null_window_search(&mut evaluator, bounds, &optimizer.adaptive).unwrap();
+        let best = &evaluator.evaluations[evaluator.best_index().unwrap()];
+        assert_eq!(mode, "hill");
+        assert_eq!((best.min_rank, best.max_rank), (9, 18));
+        assert!(evaluator.touched.len() < evaluator.evaluations.len());
     }
 }
