@@ -883,11 +883,8 @@ impl Runner {
                             evaluations: evaluations.to_vec(),
                         };
                         if let Ok(local_path) = checkpoint_url.to_file_path() {
-                            return crate::provenance::write_json_atomic(
-                                &local_path,
-                                &checkpoint,
-                            )
-                            .map_err(|error| error.to_string());
+                            return crate::provenance::write_json_atomic(&local_path, &checkpoint)
+                                .map_err(|error| error.to_string());
                         }
                         let bytes = serde_json::to_vec_pretty(&checkpoint)
                             .map_err(|error| error.to_string())?;

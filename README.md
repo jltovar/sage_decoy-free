@@ -93,7 +93,7 @@ See [`entrapment.audit.example.json`](entrapment.audit.example.json) for the aud
 ### Shared candidate pool and in-memory optimization
 
 `sage workflow` performs one native spectrum search per strict search fingerprint. Compatible
-models and candidate-window grids reuse a compressed, immutable pre-FDR candidate pool. Changes to
+models and bounded or explicit window searches reuse a compressed, immutable pre-FDR candidate pool. Changes to
 statistical settings create a new analysis fingerprint and refit the fixed candidates; changes to
 the FASTA, spectra, digestion, modifications, tolerances, scoring, preprocessing, or retained rank
 depth create a different search fingerprint and therefore a different pool.
@@ -295,11 +295,11 @@ A normal new-dataset model declaration is short:
 }
 ```
 
-The ranges are inclusive. Sage retains candidates through the largest allowed `max_rank`, chooses
-the adaptive path from the observed entrapment behavior, and records every window it actually
-visits. Replace `adaptive` with `exhaustive` when proof of the bounded global optimum is worth the
-additional model-fitting time. Use `candidate_windows` only when the exact ordered list is itself
-part of the experiment.
+The ranges are inclusive. Sage retains candidates through at least the largest allowed `max_rank`
+(and farther when a later MS2Rescore stage requires it), chooses the adaptive path from the observed
+entrapment behavior, and records every window it actually visits. Replace `adaptive` with
+`exhaustive` when proof of the bounded global optimum is worth the additional model-fitting time.
+Use `candidate_windows` only when the exact ordered list is itself part of the experiment.
 
 Validate and materialize the plan without searching:
 

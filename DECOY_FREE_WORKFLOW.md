@@ -206,7 +206,7 @@ The target FASTA produces a strict search fingerprint distinct from +entrapment.
 target-only pool exists, the first interpretation performs a fresh spectrum search and writes one;
 subsequent models and `compare_both` interpretations reuse that exact target population. Thus the
 policy comparison cannot be confounded by a second spectrum search. An MS2Rescore annotation cache
-is reused only when the preliminary calibration inputs are identical; otherwise Phase 4's
+is reused only when the preliminary calibration inputs are identical; otherwise the annotation
 fingerprint correctly generates a policy-specific annotation set. If matched-fragment output is
 requested, the release interpretation performs a fresh search because immutable candidate pools
 deliberately do not persist fragment payloads; the diagnostic second stage remains unannotated and
@@ -228,7 +228,7 @@ candidate space and must be evaluated during model-specific parity. A separate h
 dataset fits its own Nokoi model and null window under the same predeclared procedure. Missing,
 cross-dataset, incompatible, or incomplete artifacts fail closed.
 
-The Phase 6 ISB audit found that this is not yet a complete portable artifact for release. It does
+The frozen ISB audit found that this is not yet a complete portable artifact for release. It does
 not retain fold-specific weights/intercepts, an explicit fold-membership reconstruction rule,
 complete training-rule and Grenander state, or source hashes. Its native frozen-grid result also
 selected `2-12` rather than legacy `2-15`. Nokoi is therefore explicitly deferred; target-only
@@ -265,7 +265,7 @@ This normalization is intentionally auditable and must first pass the complete I
 same-dataset target-only tests before Lower Order is restored as an Ensemble default. A costly
 PXD001468 Lower Order run is optional and will be considered only after PXD001468 Moments parity.
 
-Phase 6 established exact ISB grid, MS2Rescore, and target-only parity for
+The frozen ISB comparison established exact grid, MS2Rescore, and target-only parity for
 `refit_with_locked_window`. The diagnostic `reuse_dataset_artifact` interpretation did not match:
 it produced 6,479 Level-4 PSMs, 291 peptides, and 17 proteins instead of the legacy/refit
 558/44/10. Lower Order remains excluded from the production Ensemble until that normalization
@@ -323,7 +323,7 @@ PXD models; decide later whether one is scientifically or technically necessary.
 
 ## Secondary-model and Ensemble release policy
 
-Phase 8 does not reinterpret the Phase 6 failures as passes. It makes their release consequences
+The secondary-model audit does not reinterpret the frozen parity failures as passes. It makes their release consequences
 explicit and fail-closed. Each individual model may declare `ensemble_participation: auto`, or
 `ensemble_participation: excluded` with a required `ensemble_exclusion_reason`. An automatic model
 must still pass all applicable runtime gates; the field is eligibility for evaluation, not an
@@ -355,7 +355,7 @@ stages. Applying a non-evaluable lock fails closed. The exact initial policy and
 `validation/policies/phase8_isb_ensemble_expert_policy_2026-08-08.json`; implementation evidence
 is in `validation/reports/phase8_secondary_model_repairs_2026-08-08.json`.
 
-No additional PXD model search was run for Phase 8. PXD Moments remains the only required PXD
+No additional PXD model search was run for the secondary-model audit. PXD Moments remains the only required PXD
 parity run for this refactor.
 
 ## Final release evaluation and resumption integrity
@@ -394,7 +394,7 @@ by interruption is never resumed as complete, and a changed durable output inval
 Compatible schema-1 checkpoints are migrated once after their existing dataset, input, output,
 candidate-pool, and annotation identities pass.
 
-Phase 9 cache-hit validation resumed all 22 frozen ISB stages twice with zero new searches, then
+Final cache-hit validation resumed all 22 frozen ISB stages twice with zero new searches, then
 resumed the three required PXD Moments stages with zero new searches. All 25 checkpoints were
 migrated to hashed outputs; both workflows reported zero missing and zero invalid runs. PXD kept
 all six declared parity comparisons within tolerance. Full evidence is recorded in
