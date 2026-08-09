@@ -50,9 +50,10 @@ resumable workflow:
 2. **Target only:** search the biological target FASTA and apply the chosen target-only calibration
    policy without using target-only outcomes to retune the entrapment-selected window.
 
-Candidate windows are evaluated in memory from a shared candidate pool. The workflow does not edit
-JSON repeatedly, launch a new spectrum search for every window, or require a user to copy a selected
-window into another configuration file.
+Null windows are evaluated in memory from a shared candidate pool. For a new dataset, declare
+compact rank bounds and use the adaptive search; Sage generates and visits windows internally. The
+workflow does not edit JSON repeatedly, launch a new spectrum search for every window, or require a
+user to copy a selected window into another configuration file.
 
 Do not transfer a window or fitted artifact from one dataset to another for normal analysis.
 Cross-dataset reuse is permitted only when explicitly declared diagnostic-only and can never satisfy
@@ -97,10 +98,24 @@ statistical settings create a new analysis fingerprint and refit the fixed candi
 the FASTA, spectra, digestion, modifications, tolerances, scoring, preprocessing, or retained rank
 depth create a different search fingerprint and therefore a different pool.
 
-The optimizer evaluates every declared candidate window exactly, retains compact metrics for every
-trial, and materializes the winning artifact once with full diagnostics. MSFDR1-SMIX is always
-rank `1-1`. Ensemble does not optimize a combined window: every constituent expert must supply its
-own independently optimized dataset-local window and artifact.
+The optimizer has three interfaces:
+
+- `window_optimizer.strategy: "adaptive"` is the recommended new-dataset mode. It performs a
+  deterministic sparse probe, chooses a boundary or hill search, polishes locally, and confirms the
+  frontier around the best visited point. It is a heuristic and does not claim a global optimum.
+- `window_optimizer.strategy: "exhaustive"` generates every valid window inside the same compact
+  bounds and is exact over that bounded universe.
+- `candidate_windows` evaluates an explicit ordered list exactly. It remains useful for frozen
+  historical replay; users do not need to enumerate windows for a new dataset.
+
+Every trial retains compact metrics, and the winning artifact is materialized once with full
+diagnostics. `null_window_optimizer.checkpoint.json` is updated after each new trial, allowing an
+interrupted optimization to resume without refitting completed windows. The final
+`null_window_optimization.json` records the algorithm version, strategy, bounds, adaptive-mode
+decision, complete visit order, selected window, timing, and whether the result is exact over the
+declared universe. MSFDR1-SMIX is always rank `1-1`. Ensemble does not optimize a combined window:
+every constituent expert must supply its own independently optimized dataset-local window and
+artifact.
 
 ### Separate MS2Rescore annotation cache
 
@@ -211,7 +226,9 @@ path adds the fail-closed expert-quality gates and writes the dataset-local expe
 datasets run the same predeclared optimization procedure; they do not import another dataset's
 selected windows or fitted experts.
 
-Direct one-off searches use configured null-rank windows. The native `sage workflow` path can scan declared candidate windows in memory from one retained candidate set, select the highest-yield feasible window, and lock it for later stages.
+Direct one-off searches use configured null-rank windows. The native `sage workflow` path can
+search bounded or explicit candidate windows in memory from one retained candidate set, select the
+highest-yield feasible window, and lock it for later stages.
 
 See [`DECOY_FREE_WORKFLOW.md`](DECOY_FREE_WORKFLOW.md) and [`workflow.example.json`](workflow.example.json) for the resumable development/holdout workflow and validation-only audits of completed result tables.
 
@@ -260,8 +277,29 @@ from [`workflow.example.json`](workflow.example.json) and provide:
 - the spectra;
 - one or more candidate foreign-species FASTAs;
 - an output root;
-- each model's candidate-window grid and MS2Rescore policy; and
+- each model's compact adaptive/exhaustive rank bounds (or an explicit frozen replay list) and
+  MS2Rescore policy; and
 - any frozen parity or matched-TDC evidence required by the declared validation scope.
+
+A normal new-dataset model declaration is short:
+
+```json
+{
+  "model": "moments",
+  "window_optimizer": {
+    "strategy": "adaptive",
+    "min_rank_range": [2, 10],
+    "max_rank_range": [2, 25]
+  },
+  "ms2rescore": "always"
+}
+```
+
+The ranges are inclusive. Sage retains candidates through the largest allowed `max_rank`, chooses
+the adaptive path from the observed entrapment behavior, and records every window it actually
+visits. Replace `adaptive` with `exhaustive` when proof of the bounded global optimum is worth the
+additional model-fitting time. Use `candidate_windows` only when the exact ordered list is itself
+part of the experiment.
 
 Validate and materialize the plan without searching:
 
@@ -277,7 +315,8 @@ RUST_BACKTRACE=1 SAGE_LOG=info \
 ```
 
 Re-running the same command resumes only stages whose complete identity and durable outputs still
-pass verification.
+pass verification. If interruption occurs during null-window fitting, the per-trial optimizer
+checkpoint is also reused after its candidate-population and analysis fingerprint is verified.
 
 ### Workflow outputs
 
@@ -300,6 +339,9 @@ validation.parity.json
 validation.tdc_benchmarks.json
 validation.release_gate.json
 ```
+
+Each optimized model stage also contains `null_window_evaluations.json`,
+`null_window_optimization.json`, and `null_window_optimizer.checkpoint.json`.
 
 ### Entrapment-only audit
 
@@ -1109,7 +1151,9 @@ release state.
 
 ### 2. Additional null-window diagnostics
 
-The native workflow now scans declared candidate windows without rereading spectra and selects the highest-yield window satisfying PSM, peptide, and protein entrapment-FDP constraints. Further diagnostics can still be added, such as:
+The native workflow now searches compact bounds adaptively, exhaustively, or by exact explicit
+replay without rereading spectra, then selects the highest-yield visited window satisfying PSM,
+peptide, and protein entrapment-FDP constraints. Further diagnostics can still be added, such as:
 
 ```text
 candidate count per rank
@@ -1279,7 +1323,8 @@ The current code supports a large configuration surface, but several improvement
 4. **Entrapment-guided calibration.** Where validation entrapments are available, use monotone recalibration, such as isotonic regression, to map reported q-values onto observed entrapment-estimated FDR.
 5. **Layer-separated output fields.** Future output should preserve base, physical, reproducibility, and final hierarchical evidence separately so that every rescue/demotion is auditable.
 
-The workflow already provides exact in-memory window selection and fail-closed expert exclusion;
+The workflow already provides exact explicit/exhaustive and deterministic adaptive in-memory window
+selection plus fail-closed expert exclusion;
 the diagnostics and adaptive weighting described here are possible extensions to those conservative
 implementations.
 

@@ -24,7 +24,8 @@ species FASTAs, and a workflow JSON. The workflow will:
 5. construct a seeded protein-level 1:1 entrapment FASTA and write mappings/exclusions/hashes;
 6. search the entrapment database once per strict search fingerprint while retaining all requested
    ranks in an immutable candidate pool shared by compatible models;
-7. evaluate requested null windows in memory from those retained candidates;
+7. search requested null-window bounds adaptively or exhaustively (or replay an explicit frozen
+   list) in memory from those retained candidates;
 8. lock the highest-yield window satisfying PSM, peptide, and protein entrapment-FDP limits;
 9. measure MS2Rescore and retain it only when its configured gain/calibration gates pass;
 10. run the target-only search under an explicit calibration policy, defaulting to a locked
@@ -40,7 +41,7 @@ fit creates or selects its own entrapment FASTA, measures its own ratios, and se
 window. A window or fitted artifact selected on ISB18 is never used as PXD001468's normal search
 configuration. The same rule applies to any future dataset pair.
 
-## Phase 2: FASTA generation and optimizer isolation
+## FASTA generation and optimizer isolation
 
 FASTA-generation parity and null-window optimizer parity are deliberately separate experiments.
 To test the optimizer against a frozen legacy search, set `database_mode` to `frozen_legacy` and
@@ -83,7 +84,7 @@ default) and does not require literal ratio values in the manifest. Sage fills t
 from the active dataset's combined FASTA. Therefore an ISB peptide ratio can never be silently
 reused for PXD.
 
-## Phase 3: shared candidate pool and exact lean optimization
+## Shared candidate pool and resumable null-window optimization
 
 The workflow stores native pre-FDR candidates under
 `OUTPUT_ROOT/candidate_pools/SEARCH_FINGERPRINT/`. The pool is written after native Sage candidate
@@ -107,21 +108,31 @@ reread or rescore spectra.
 
 Every cached record carries a stable SHA-256 candidate ID derived from the search fingerprint,
 spectrum identity, peptidoform, charge, rank, label, precursor mass, and isotope error. Process-
-local `psm_id` values are not cache identity. Phase 4 uses this stable ID for the separate
-MS2Rescore annotation cache.
+local `psm_id` values are not cache identity. The separate MS2Rescore annotation cache uses this
+stable ID.
 
-Null-window grids run in `lean_exact` mode by default. Every enabled statistical and Level-4
-stage is executed for every trial, but INFO-level per-trial diagnostics are suppressed, only a
-compact `NullWindowEvaluation` row is retained per trial, and discarded trials immediately drop
-their feature/artifact payloads. The selected window is materialized once more with normal
-diagnostics and becomes the ordinary fitted artifact. `elapsed_milliseconds` records trial time.
-No approximate or coarse-to-fine statistical search is used.
+New datasets normally declare a compact `window_optimizer` with inclusive `min_rank_range` and
+`max_rank_range`. `strategy: adaptive` uses the deterministic native sparse-probe,
+boundary-or-hill, polish, and frontier-confirmation algorithm. It usually evaluates a small subset
+of the bounded universe, so it is explicitly reported as heuristic rather than as proof of the
+global optimum. `strategy: exhaustive` generates and evaluates the complete bounded universe.
+The older `candidate_windows` field remains an exact ordered replay interface for frozen
+experiments; it is not necessary to enumerate windows manually for new datasets.
+
+Every enabled statistical and Level-4 stage is executed for each visited trial, but INFO-level
+per-trial diagnostics are suppressed, only a compact `NullWindowEvaluation` row is retained, and
+discarded trials immediately drop their feature/artifact payloads. The selected window is
+materialized once more with normal diagnostics and becomes the ordinary fitted artifact.
+`elapsed_milliseconds` records trial time. `null_window_optimizer.checkpoint.json` is written after
+each new fit and reused only when its candidate-population and analysis fingerprint matches.
+`null_window_optimization.json` records the versioned algorithm, declared universe, visit order,
+adaptive decision, selected window, timing, and exactness semantics.
 
 Candidate-pool reuse currently targets identification/statistical stages. A cached pool does not
 contain MS1/TMT data or matched-fragment payloads, so LFQ, TMT, or `--annotate-matches` execution
 fails closed rather than silently emitting incomplete output. The final annotated target-only
-stage remains a fresh target-database search. Phase 4 caches MS2Rescore annotations separately;
-it does not mix them into this immutable native pool.
+stage remains a fresh target-database search. MS2Rescore annotations are cached separately; they
+are not mixed into this immutable native pool.
 
 MSFDR1-SMIX is always rank-1-only. A manifest that gives it a null window is rejected.
 Ensemble windows are not optimized as one combined window; constituent experts must be
@@ -130,7 +141,7 @@ the individual experts and writes `ensemble.lock.json`; manually copying windows
 JSON is no longer required. Native and MS2Rescore artifacts are kept separate so an artifact fit
 after rescoring cannot be used silently in the native comparison.
 
-## Phase 4: separately cached MS2Rescore annotations
+## Separately cached MS2Rescore annotations
 
 An MS2Rescore stage now consumes the same immutable native candidate pool as its optimized stage,
 so Sage does not reread or rescore the spectra. External feature generation still reads the
@@ -170,7 +181,7 @@ annotations are still independently cacheable under the target-only search finge
 annotation cache can cross a FASTA, dataset, candidate calibration, generator environment, or
 rank-depth boundary.
 
-## Phase 5: explicit target-only calibration
+## Explicit target-only calibration
 
 `target_only_calibration_policy` replaces the ambiguous term "locked" and defaults to
 `refit_with_locked_window`. The setting is workflow-wide and can be overridden on an individual
@@ -260,7 +271,7 @@ it produced 6,479 Level-4 PSMs, 291 peptides, and 17 proteins instead of the leg
 558/44/10. Lower Order remains excluded from the production Ensemble until that normalization
 behavior is repaired; the exact refit result does not make artifact reuse release-eligible.
 
-## Phase 6: frozen ISB parity status
+## Frozen ISB parity status
 
 The frozen ISB run completed all 22 planned stages and an exact resume reused all stages in about
 10 seconds with no new searches. Moments (`9-18`), MLE (`8-25`), Lower Order (`6-9`), seeded
@@ -277,7 +288,7 @@ Nokoi failed the frozen fit, selected-window, and target-only checks and is defe
 above. The production Ensemble is not assembled from these incomplete experts. Full evidence is
 recorded in `validation/reports/phase6_isb_model_parity_2026-08-07.json`.
 
-## Phase 7: independent PXD001468 Moments parity status
+## Independent PXD001468 Moments parity status
 
 PXD001468 was optimized as an independent holdout dataset; it did not import ISB18 windows or
 fitted parameters. The native workflow measured protein, peptide, and peptidoform ratios of
@@ -310,7 +321,7 @@ is in `validation/reports/phase7_pxd001468_moments_null_window_parity_2026-08-08
 PXD Moments is the only required PXD model for this refactor. Do not automatically run additional
 PXD models; decide later whether one is scientifically or technically necessary.
 
-## Phase 8: secondary-model and Ensemble release policy
+## Secondary-model and Ensemble release policy
 
 Phase 8 does not reinterpret the Phase 6 failures as passes. It makes their release consequences
 explicit and fail-closed. Each individual model may declare `ensemble_participation: auto`, or
@@ -347,7 +358,7 @@ is in `validation/reports/phase8_secondary_model_repairs_2026-08-08.json`.
 No additional PXD model search was run for Phase 8. PXD Moments remains the only required PXD
 parity run for this refactor.
 
-## Phase 9: final release evaluation and resumption integrity
+## Final release evaluation and resumption integrity
 
 The final release gate has three explicit outcomes:
 

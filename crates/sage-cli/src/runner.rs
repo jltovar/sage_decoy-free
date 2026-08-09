@@ -24,9 +24,37 @@ use sage_core::scoring::Fragments;
 use sage_core::scoring::{DfFeature, FeatureCore, Scorer, TdcFeature};
 use sage_core::spectrum::{ProcessedSpectrum, RawSpectrum, SpectrumProcessor};
 use sage_core::tmt::TmtQuant;
+use sha2::{Digest, Sha256};
 use std::collections::{HashMap, HashSet};
 use std::sync::Arc;
 use std::time::Instant;
+
+#[derive(serde::Serialize, serde::Deserialize)]
+struct NullWindowOptimizerCheckpoint {
+    schema: String,
+    fingerprint: String,
+    evaluations: Vec<sage_core::decoy_free_fdr::NullWindowEvaluation>,
+}
+
+fn null_window_checkpoint_fingerprint(
+    features: &[DfFeature],
+    settings: &sage_core::input::FdrSettings,
+) -> anyhow::Result<String> {
+    let mut hasher = Sha256::new();
+    hasher.update(b"sage-null-window-checkpoint-v1\0");
+    hasher.update(serde_json::to_vec(settings)?);
+    hasher.update((features.len() as u64).to_le_bytes());
+    for feature in features {
+        hasher.update((feature.core.spec_id.len() as u64).to_le_bytes());
+        hasher.update(feature.core.spec_id.as_bytes());
+        hasher.update((feature.core.file_id as u64).to_le_bytes());
+        hasher.update(feature.core.rank.to_le_bytes());
+        hasher.update(feature.core.peptide_idx.0.to_le_bytes());
+        hasher.update(feature.core.hyperscore.to_bits().to_le_bytes());
+        hasher.update(feature.core.poisson_log10_p_value.to_bits().to_le_bytes());
+    }
+    Ok(format!("{:x}", hasher.finalize()))
+}
 
 pub struct Runner {
     pub database: Arc<IndexedDatabase>,
@@ -790,6 +818,8 @@ impl Runner {
 
             let mut fdr_settings = self.parameters.fdr.clone();
             let mut optimizer_evaluations = None;
+            let mut optimizer_report = None;
+            let mut optimizer_checkpoint_path = None;
 
             if self.parameters.write_pin {
                 log::warn!(
@@ -806,16 +836,71 @@ impl Runner {
             // generators such as DeepLC/IM2Deep. MS2Rescore/TIMS2Rescore remains feature-only.
             let mut fitted_artifacts;
             if fdr_settings.null_window_optimizer.is_some() {
-                let optimized = sage_core::decoy_free_fdr::optimize_null_window(
+                let checkpoint_path = self.make_path("null_window_optimizer.checkpoint.json");
+                optimizer_checkpoint_path = Some(checkpoint_path.clone());
+                let checkpoint_fingerprint =
+                    null_window_checkpoint_fingerprint(&features, &fdr_settings)?;
+                let prior_evaluations = checkpoint_path
+                    .to_file_path()
+                    .ok()
+                    .filter(|path| path.is_file())
+                    .map(|path| -> anyhow::Result<_> {
+                        let checkpoint: NullWindowOptimizerCheckpoint =
+                            serde_json::from_slice(&std::fs::read(&path)?)
+                                .with_context(|| format!("invalid optimizer checkpoint {}", path.display()))?;
+                        if checkpoint.schema != "sage-null-window-checkpoint-v1" {
+                            anyhow::bail!(
+                                "unsupported optimizer checkpoint schema in {}",
+                                path.display()
+                            );
+                        }
+                        if checkpoint.fingerprint == checkpoint_fingerprint {
+                            log::info!(
+                                "DF null-window optimizer: resuming {} cached evaluations",
+                                checkpoint.evaluations.len()
+                            );
+                            Ok(checkpoint.evaluations)
+                        } else {
+                            log::info!(
+                                "DF null-window optimizer: checkpoint fingerprint changed; starting a new optimization"
+                            );
+                            Ok(Vec::new())
+                        }
+                    })
+                    .transpose()?
+                    .unwrap_or_default();
+                let checkpoint_url = checkpoint_path.clone();
+                let checkpoint_fingerprint_for_write = checkpoint_fingerprint.clone();
+                let optimized = sage_core::decoy_free_fdr::optimize_null_window_resumable(
                     &features,
                     &fdr_settings,
                     &self.database,
+                    prior_evaluations,
+                    move |evaluations| {
+                        let checkpoint = NullWindowOptimizerCheckpoint {
+                            schema: "sage-null-window-checkpoint-v1".to_string(),
+                            fingerprint: checkpoint_fingerprint_for_write.clone(),
+                            evaluations: evaluations.to_vec(),
+                        };
+                        if let Ok(local_path) = checkpoint_url.to_file_path() {
+                            return crate::provenance::write_json_atomic(
+                                &local_path,
+                                &checkpoint,
+                            )
+                            .map_err(|error| error.to_string());
+                        }
+                        let bytes = serde_json::to_vec_pretty(&checkpoint)
+                            .map_err(|error| error.to_string())?;
+                        sage_cloudpath::write_bytes_sync(&checkpoint_url, bytes)
+                            .map_err(|error| error.to_string())
+                    },
                 )
                 .map_err(anyhow::Error::msg)?;
                 features = optimized.features;
                 fdr_settings = optimized.settings;
                 fitted_artifacts = optimized.artifacts;
                 optimizer_evaluations = Some(optimized.evaluations);
+                optimizer_report = Some(optimized.report);
             } else {
                 let (first_pass_features, artifacts) =
                     sage_core::decoy_free_fdr::run_df_layers_with_artifacts(
@@ -1036,6 +1121,16 @@ impl Runner {
                         .context("serialize null-window evaluations")?;
                     sage_cloudpath::write_bytes_sync(&path, bytes)?;
                     self.parameters.output_paths.push(path);
+                }
+                if let Some(report) = optimizer_report.as_ref() {
+                    let path = self.make_path("null_window_optimization.json");
+                    let bytes = serde_json::to_vec_pretty(report)
+                        .context("serialize null-window optimization report")?;
+                    sage_cloudpath::write_bytes_sync(&path, bytes)?;
+                    self.parameters.output_paths.push(path);
+                }
+                if let Some(path) = optimizer_checkpoint_path.as_ref() {
+                    self.parameters.output_paths.push(path.clone());
                 }
 
                 self.parameters

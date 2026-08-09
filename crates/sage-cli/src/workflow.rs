@@ -25,7 +25,8 @@ use crate::validation::{
 use anyhow::{Context, Result};
 use sage_core::decoy_free_fdr::{DfRunArtifacts, FittedArtifactProvenance};
 use sage_core::input::{
-    FdrMode, FdrOptions, ModelFit, NullWindowCandidate, NullWindowOptimizerOptions,
+    AdaptiveNullWindowSearchOptions, FdrMode, FdrOptions, ModelFit, NullWindowCandidate,
+    NullWindowOptimizerOptions, NullWindowSearchBounds, NullWindowSearchStrategy,
     NullWindowValidationScope,
 };
 use serde::{Deserialize, Serialize};
@@ -38,6 +39,29 @@ use std::sync::Arc;
 pub struct NullWindow {
     pub min_rank: u32,
     pub max_rank: u32,
+}
+
+/// Compact, dataset-first window search declaration. Historical validation
+/// manifests may continue to use `candidate_windows` for an exact ordered
+/// replay; new datasets should normally use `strategy=adaptive` with bounds.
+#[derive(Clone, Debug, Serialize, Deserialize)]
+pub struct WindowOptimizerWorkflow {
+    pub strategy: NullWindowSearchStrategy,
+    pub min_rank_range: [u32; 2],
+    pub max_rank_range: [u32; 2],
+    #[serde(default)]
+    pub adaptive: AdaptiveNullWindowSearchOptions,
+}
+
+impl WindowOptimizerWorkflow {
+    fn bounds(&self) -> NullWindowSearchBounds {
+        NullWindowSearchBounds {
+            min_rank_min: self.min_rank_range[0],
+            min_rank_max: self.min_rank_range[1],
+            max_rank_min: self.max_rank_range[0],
+            max_rank_max: self.max_rank_range[1],
+        }
+    }
 }
 
 #[derive(Clone, Debug, Serialize, Deserialize)]
@@ -73,6 +97,8 @@ pub struct ModelWorkflow {
     pub window: Option<NullWindow>,
     #[serde(default)]
     pub candidate_windows: Vec<NullWindow>,
+    #[serde(default)]
+    pub window_optimizer: Option<WindowOptimizerWorkflow>,
     #[serde(default = "default_true")]
     pub enabled: bool,
     #[serde(default)]
@@ -561,17 +587,59 @@ impl WorkflowManifest {
             }
         }
         for model in &self.models {
+            let window_sources = usize::from(model.window.is_some())
+                + usize::from(!model.candidate_windows.is_empty())
+                + usize::from(model.window_optimizer.is_some());
             anyhow::ensure!(
-                model.window.is_none() || model.candidate_windows.is_empty(),
-                "specify either a locked window or candidate_windows, not both"
+                window_sources <= 1,
+                "specify only one of window, candidate_windows, or window_optimizer"
             );
             if let Some(window) = &model.window {
                 anyhow::ensure!(window.min_rank > 1, "rank 1 cannot be a null window");
                 anyhow::ensure!(window.max_rank >= window.min_rank, "invalid null window");
             }
+            for window in &model.candidate_windows {
+                anyhow::ensure!(
+                    window.min_rank > 1 && window.max_rank >= window.min_rank,
+                    "invalid candidate null window"
+                );
+            }
+            if let Some(search) = &model.window_optimizer {
+                anyhow::ensure!(
+                    search.strategy != NullWindowSearchStrategy::Explicit,
+                    "window_optimizer supports adaptive or exhaustive; use candidate_windows for explicit replay"
+                );
+                let bounds = search.bounds();
+                anyhow::ensure!(
+                    bounds.min_rank_min > 1
+                        && bounds.max_rank_min > 1
+                        && bounds.min_rank_min <= bounds.min_rank_max
+                        && bounds.max_rank_min <= bounds.max_rank_max
+                        && bounds.min_rank_min <= bounds.max_rank_max,
+                    "invalid window_optimizer rank ranges"
+                );
+                if search.strategy == NullWindowSearchStrategy::Adaptive {
+                    anyhow::ensure!(
+                        search.adaptive.sparse_row_step > 0
+                            && search.adaptive.x_stride > 0
+                            && !search.adaptive.sparse_offsets.is_empty()
+                            && search.adaptive.boundary_dead_row_limit > 0
+                            && search.adaptive.hill_max_steps > 0
+                            && search
+                                .adaptive
+                                .sparse_eligible_fraction_for_hill
+                                .is_finite()
+                            && (0.0..=1.0)
+                                .contains(&search.adaptive.sparse_eligible_fraction_for_hill),
+                        "invalid adaptive window_optimizer settings"
+                    );
+                }
+            }
             if model.model == ModelFit::Msfdr1Smix {
                 anyhow::ensure!(
-                    model.window.is_none() && model.candidate_windows.is_empty(),
+                    model.window.is_none()
+                        && model.candidate_windows.is_empty()
+                        && model.window_optimizer.is_none(),
                     "MSFDR1-SMIX is rank-1-only and must not define a null window"
                 );
             }
@@ -622,8 +690,8 @@ impl WorkflowManifest {
                     .filter(|model| model.enabled && model.model != ModelFit::Ensemble)
                 {
                     anyhow::ensure!(
-                        model.candidate_windows.is_empty(),
-                        "a cross-dataset diagnostic cannot both import an artifact and optimize candidate windows"
+                        model.candidate_windows.is_empty() && model.window_optimizer.is_none(),
+                        "a cross-dataset diagnostic cannot both import an artifact and optimize a null window"
                     );
                     anyhow::ensure!(
                         self.locked_expert_artifacts
@@ -1772,7 +1840,24 @@ fn run_search_stage(
         )?;
     }
     apply_window(fdr, &model.model, &model.window);
-    if stage == "optimized" && !model.candidate_windows.is_empty() {
+    if stage == "optimized"
+        && (!model.candidate_windows.is_empty() || model.window_optimizer.is_some())
+    {
+        let (strategy, bounds, adaptive) = model
+            .window_optimizer
+            .as_ref()
+            .map(|search| {
+                (
+                    search.strategy,
+                    Some(search.bounds()),
+                    search.adaptive.clone(),
+                )
+            })
+            .unwrap_or((
+                NullWindowSearchStrategy::Explicit,
+                None,
+                AdaptiveNullWindowSearchOptions::default(),
+            ));
         fdr.null_window_optimizer = Some(NullWindowOptimizerOptions {
             candidates: model
                 .candidate_windows
@@ -1782,6 +1867,9 @@ fn run_search_stage(
                     max_rank: window.max_rank,
                 })
                 .collect(),
+            strategy,
+            bounds,
+            adaptive,
             validation_scope: manifest.validation.null_window_validation_scope,
             fdr_threshold: manifest.validation.fdr_threshold,
             psm_entrapment_ratio: manifest.validation.effective_ratios.psm,
@@ -1916,6 +2004,12 @@ fn run_search_stage(
                 .candidate_windows
                 .iter()
                 .map(|window| window.max_rank as usize)
+                .chain(
+                    model
+                        .window_optimizer
+                        .iter()
+                        .map(|search| search.max_rank_range[1] as usize),
+                )
                 .chain(model.window.iter().map(|window| window.max_rank as usize))
                 .max()
                 .unwrap_or(1);
@@ -2189,7 +2283,7 @@ pub fn execute_workflow(
         stages.push(optimized.clone());
 
         let mut locked_model = model.clone();
-        if !plan_only && !model.candidate_windows.is_empty() {
+        if !plan_only && (!model.candidate_windows.is_empty() || model.window_optimizer.is_some()) {
             let path = model_root.join("optimized/null_window_evaluations.json");
             let evaluations: Vec<sage_core::decoy_free_fdr::NullWindowEvaluation> =
                 serde_json::from_slice(
@@ -2205,6 +2299,7 @@ pub fn execute_workflow(
                 max_rank: selected.max_rank,
             });
             locked_model.candidate_windows.clear();
+            locked_model.window_optimizer = None;
         }
 
         let mut ms2_record = None;
@@ -2908,6 +3003,7 @@ mod tests {
                     min_rank: 2,
                     max_rank: 8,
                 }],
+                window_optimizer: None,
                 enabled: true,
                 ms2rescore: Ms2RescorePolicy::Measure,
                 maximum_raw_fdp_increase: None,
@@ -2951,6 +3047,7 @@ mod tests {
             model: ModelFit::Ensemble,
             window: None,
             candidate_windows: Vec::new(),
+            window_optimizer: None,
             enabled: true,
             ms2rescore: Ms2RescorePolicy::Measure,
             maximum_raw_fdp_increase: None,
@@ -2960,6 +3057,52 @@ mod tests {
             ensemble_exclusion_reason: None,
         });
         manifest.validate().unwrap();
+        std::fs::remove_dir_all(directory).unwrap();
+    }
+
+    #[test]
+    fn compact_adaptive_window_optimizer_is_valid_and_serializable() {
+        let directory = test_directory("compact-adaptive-window-optimizer");
+        let mut manifest = minimal_manifest(&directory, ValidationDatasetRole::Development);
+        manifest.models[0].candidate_windows.clear();
+        manifest.models[0].window_optimizer = Some(WindowOptimizerWorkflow {
+            strategy: NullWindowSearchStrategy::Adaptive,
+            min_rank_range: [2, 10],
+            max_rank_range: [2, 25],
+            adaptive: AdaptiveNullWindowSearchOptions::default(),
+        });
+        manifest.validate().unwrap();
+        let value = serde_json::to_value(&manifest.models[0]).unwrap();
+        assert_eq!(value["window_optimizer"]["strategy"], "adaptive");
+        assert_eq!(
+            value["window_optimizer"]["min_rank_range"],
+            serde_json::json!([2, 10])
+        );
+        assert_eq!(
+            value["window_optimizer"]["max_rank_range"],
+            serde_json::json!([2, 25])
+        );
+        std::fs::remove_dir_all(directory).unwrap();
+    }
+
+    #[test]
+    fn window_optimizer_is_mutually_exclusive_and_rejects_rank_one() {
+        let directory = test_directory("window-optimizer-validation");
+        let mut manifest = minimal_manifest(&directory, ValidationDatasetRole::Development);
+        manifest.models[0].window_optimizer = Some(WindowOptimizerWorkflow {
+            strategy: NullWindowSearchStrategy::Exhaustive,
+            min_rank_range: [2, 10],
+            max_rank_range: [2, 25],
+            adaptive: AdaptiveNullWindowSearchOptions::default(),
+        });
+        assert!(manifest.validate().is_err());
+        manifest.models[0].candidate_windows.clear();
+        manifest.models[0]
+            .window_optimizer
+            .as_mut()
+            .unwrap()
+            .min_rank_range = [1, 10];
+        assert!(manifest.validate().is_err());
         std::fs::remove_dir_all(directory).unwrap();
     }
 
@@ -3397,6 +3540,7 @@ mod tests {
             model,
             window,
             candidate_windows: Vec::new(),
+            window_optimizer: None,
             enabled: true,
             ms2rescore: Ms2RescorePolicy::Never,
             maximum_raw_fdp_increase: None,

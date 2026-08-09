@@ -25,19 +25,20 @@
   "models": [
     {
       "model": "moments",
-      "candidate_windows": [
-        { "min_rank": 2, "max_rank": 8 },
-        { "min_rank": 5, "max_rank": 12 },
-        { "min_rank": 9, "max_rank": 18 }
-      ],
+      "window_optimizer": {
+        "strategy": "adaptive",
+        "min_rank_range": [2, 10],
+        "max_rank_range": [2, 25]
+      },
       "ms2rescore": "measure"
     },
     {
       "model": "mle",
-      "candidate_windows": [
-        { "min_rank": 2, "max_rank": 10 },
-        { "min_rank": 8, "max_rank": 25 }
-      ],
+      "window_optimizer": {
+        "strategy": "adaptive",
+        "min_rank_range": [2, 10],
+        "max_rank_range": [2, 25]
+      },
       "ms2rescore": "measure"
     },
     {
@@ -45,20 +46,22 @@
       "target_only_calibration_policy": "compare_both",
       "ensemble_participation": "excluded",
       "ensemble_exclusion_reason": "Lower Order artifact-reuse transfer must pass before this expert can join an Ensemble.",
-      "candidate_windows": [
-        { "min_rank": 2, "max_rank": 5 },
-        { "min_rank": 6, "max_rank": 9 }
-      ],
+      "window_optimizer": {
+        "strategy": "adaptive",
+        "min_rank_range": [2, 10],
+        "max_rank_range": [2, 25]
+      },
       "ms2rescore": "measure"
     },
     {
       "model": "msfdr",
       "ensemble_participation": "excluded",
       "ensemble_exclusion_reason": "Annotated MSFDR parity is deferred until the feature environment is reproduced or platform robustness is repaired.",
-      "candidate_windows": [
-        { "min_rank": 2, "max_rank": 8 },
-        { "min_rank": 9, "max_rank": 13 }
-      ],
+      "window_optimizer": {
+        "strategy": "adaptive",
+        "min_rank_range": [2, 10],
+        "max_rank_range": [2, 25]
+      },
       "ms2rescore": "measure"
     },
     {
@@ -69,20 +72,22 @@
       "model": "msfdr2_smix",
       "ensemble_participation": "excluded",
       "ensemble_exclusion_reason": "Annotated MSFDR2-SMIX parity is deferred until the feature environment is reproduced or platform robustness is repaired.",
-      "candidate_windows": [
-        { "min_rank": 2, "max_rank": 8 },
-        { "min_rank": 9, "max_rank": 17 }
-      ],
+      "window_optimizer": {
+        "strategy": "adaptive",
+        "min_rank_range": [2, 10],
+        "max_rank_range": [2, 25]
+      },
       "ms2rescore": "measure"
     },
     {
       "model": "nokoi",
       "ensemble_participation": "excluded",
       "ensemble_exclusion_reason": "Nokoi v1 is diagnostic-only until its portable artifact and frozen parity are complete.",
-      "candidate_windows": [
-        { "min_rank": 2, "max_rank": 7 },
-        { "min_rank": 2, "max_rank": 15 }
-      ],
+      "window_optimizer": {
+        "strategy": "adaptive",
+        "min_rank_range": [2, 10],
+        "max_rank_range": [2, 25]
+      },
       "ms2rescore": "measure"
     },
     {

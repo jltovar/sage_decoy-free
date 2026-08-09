@@ -28,10 +28,78 @@ pub enum ModelFit {
     Ensemble,
 }
 
-#[derive(Clone, Serialize, Deserialize, Debug)]
+#[derive(Clone, Copy, Serialize, Deserialize, Debug, PartialEq, Eq, Hash)]
 pub struct NullWindowCandidate {
     pub min_rank: u32,
     pub max_rank: u32,
+}
+
+#[derive(Clone, Copy, Serialize, Deserialize, Debug, Default, PartialEq, Eq)]
+#[serde(rename_all = "snake_case")]
+pub enum NullWindowSearchStrategy {
+    /// Evaluate the exact ordered candidate list supplied by the caller.
+    #[default]
+    Explicit,
+    /// Evaluate every valid contiguous window inside the declared bounds.
+    Exhaustive,
+    /// Use a deterministic sparse probe, boundary/hill search, local polish,
+    /// and frontier confirmation scan.
+    Adaptive,
+}
+
+#[derive(Clone, Copy, Serialize, Deserialize, Debug, PartialEq, Eq)]
+pub struct NullWindowSearchBounds {
+    pub min_rank_min: u32,
+    pub min_rank_max: u32,
+    pub max_rank_min: u32,
+    pub max_rank_max: u32,
+}
+
+#[derive(Clone, Serialize, Deserialize, Debug, PartialEq)]
+pub struct AdaptiveNullWindowSearchOptions {
+    #[serde(default = "default_sparse_row_step")]
+    pub sparse_row_step: u32,
+    #[serde(default = "default_sparse_offsets")]
+    pub sparse_offsets: Vec<u32>,
+    #[serde(default = "default_sparse_eligible_fraction")]
+    pub sparse_eligible_fraction_for_hill: f64,
+    #[serde(default = "default_boundary_dead_row_limit")]
+    pub boundary_dead_row_limit: usize,
+    #[serde(default = "default_adaptive_x_stride")]
+    pub x_stride: u32,
+    #[serde(default = "default_hill_max_steps")]
+    pub hill_max_steps: usize,
+    #[serde(default = "default_hill_polish_radius")]
+    pub hill_polish_radius: u32,
+    #[serde(default = "default_true")]
+    pub frontier_confirmation: bool,
+    #[serde(default = "default_frontier_min_back")]
+    pub frontier_min_back: u32,
+    #[serde(default = "default_frontier_min_forward")]
+    pub frontier_min_forward: u32,
+    #[serde(default = "default_frontier_max_back")]
+    pub frontier_max_back: u32,
+    #[serde(default = "default_frontier_max_forward")]
+    pub frontier_max_forward: u32,
+}
+
+impl Default for AdaptiveNullWindowSearchOptions {
+    fn default() -> Self {
+        Self {
+            sparse_row_step: default_sparse_row_step(),
+            sparse_offsets: default_sparse_offsets(),
+            sparse_eligible_fraction_for_hill: default_sparse_eligible_fraction(),
+            boundary_dead_row_limit: default_boundary_dead_row_limit(),
+            x_stride: default_adaptive_x_stride(),
+            hill_max_steps: default_hill_max_steps(),
+            hill_polish_radius: default_hill_polish_radius(),
+            frontier_confirmation: true,
+            frontier_min_back: default_frontier_min_back(),
+            frontier_min_forward: default_frontier_min_forward(),
+            frontier_max_back: default_frontier_max_back(),
+            frontier_max_forward: default_frontier_max_forward(),
+        }
+    }
 }
 
 #[derive(Clone, Copy, Serialize, Deserialize, Debug, Default, PartialEq, Eq)]
@@ -44,7 +112,14 @@ pub enum NullWindowValidationScope {
 
 #[derive(Clone, Serialize, Deserialize, Debug)]
 pub struct NullWindowOptimizerOptions {
+    #[serde(default)]
     pub candidates: Vec<NullWindowCandidate>,
+    #[serde(default)]
+    pub strategy: NullWindowSearchStrategy,
+    #[serde(default)]
+    pub bounds: Option<NullWindowSearchBounds>,
+    #[serde(default)]
+    pub adaptive: AdaptiveNullWindowSearchOptions,
     #[serde(default)]
     pub validation_scope: NullWindowValidationScope,
     #[serde(default = "default_optimizer_fdr")]
@@ -65,6 +140,43 @@ pub struct NullWindowOptimizerOptions {
     /// normally by the runner.
     #[serde(default)]
     pub verbose_diagnostics: bool,
+}
+
+fn default_sparse_row_step() -> u32 {
+    2
+}
+fn default_sparse_offsets() -> Vec<u32> {
+    vec![0, 2, 4, 8]
+}
+fn default_sparse_eligible_fraction() -> f64 {
+    0.50
+}
+fn default_boundary_dead_row_limit() -> usize {
+    3
+}
+fn default_adaptive_x_stride() -> u32 {
+    2
+}
+fn default_hill_max_steps() -> usize {
+    40
+}
+fn default_hill_polish_radius() -> u32 {
+    2
+}
+fn default_frontier_min_back() -> u32 {
+    2
+}
+fn default_frontier_min_forward() -> u32 {
+    2
+}
+fn default_frontier_max_back() -> u32 {
+    6
+}
+fn default_frontier_max_forward() -> u32 {
+    6
+}
+fn default_true() -> bool {
+    true
 }
 
 /// Frozen empirical calibration for one imported MS2Rescore feature.
