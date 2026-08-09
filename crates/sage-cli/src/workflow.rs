@@ -48,6 +48,18 @@ pub enum Ms2RescorePolicy {
     Always,
 }
 
+#[derive(Clone, Copy, Debug, Default, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(rename_all = "snake_case")]
+pub enum EnsembleParticipation {
+    /// Apply the normal artifact, calibration, transfer, and incremental-yield
+    /// gates when assembling a dataset-local Ensemble.
+    #[default]
+    Auto,
+    /// Keep the individual expert results, but never admit this expert to an
+    /// Ensemble lock. A concrete reason is mandatory in the workflow manifest.
+    Excluded,
+}
+
 impl Default for Ms2RescorePolicy {
     fn default() -> Self {
         Self::Measure
@@ -73,6 +85,13 @@ pub struct ModelWorkflow {
     /// calibration policy (for example, while Lower Order is evaluated).
     #[serde(default)]
     pub target_only_calibration_policy: Option<TargetOnlyCalibrationPolicy>,
+    /// Phase 8 release control. This can exclude a known-nonportable or
+    /// platform-sensitive expert, but it cannot force an expert past the normal
+    /// quality gates.
+    #[serde(default)]
+    pub ensemble_participation: EnsembleParticipation,
+    #[serde(default)]
+    pub ensemble_exclusion_reason: Option<String>,
 }
 
 #[derive(Clone, Debug, Serialize, Deserialize)]
@@ -191,6 +210,8 @@ pub struct EnsembleExpertLock {
     pub calibration_stage: String,
     pub calibration_results: PathBuf,
     pub target_only_results: PathBuf,
+    #[serde(default)]
+    pub target_only_calibration_policy: TargetOnlyCalibrationPolicy,
     pub enabled: bool,
     pub target_peptides: usize,
     pub incremental_target_peptides: usize,
@@ -210,6 +231,12 @@ pub struct EnsembleLock {
     pub dataset_fingerprint: String,
     pub experts: Vec<EnsembleExpertLock>,
     pub minimum_required_experts: usize,
+    /// A non-evaluable Ensemble is a recorded outcome, not a workflow error.
+    /// Individual expert stages remain valid and the core release can proceed.
+    #[serde(default = "default_true")]
+    pub evaluable: bool,
+    #[serde(default)]
+    pub not_evaluable_reasons: Vec<String>,
 }
 
 #[derive(Clone)]
@@ -217,10 +244,13 @@ struct CompletedExpert {
     model: ModelFit,
     window: Option<NullWindow>,
     optimized_artifacts: PathBuf,
+    optimized_results: PathBuf,
     ms2rescore_artifacts: Option<PathBuf>,
+    ms2rescore_results: Option<PathBuf>,
     calibration_stage: String,
     calibration_results: PathBuf,
     target_only_results: PathBuf,
+    target_only_calibration_policy: TargetOnlyCalibrationPolicy,
     calibration_search_fingerprint: String,
 }
 
@@ -516,6 +546,25 @@ impl WorkflowManifest {
                     "MSFDR1-SMIX is rank-1-only and must not define a null window"
                 );
             }
+            match model.ensemble_participation {
+                EnsembleParticipation::Auto => anyhow::ensure!(
+                    model.ensemble_exclusion_reason.is_none(),
+                    "ensemble_exclusion_reason requires ensemble_participation=excluded"
+                ),
+                EnsembleParticipation::Excluded => {
+                    anyhow::ensure!(
+                        model.model != ModelFit::Ensemble,
+                        "exclude individual experts, not the Ensemble model itself"
+                    );
+                    anyhow::ensure!(
+                        model
+                            .ensemble_exclusion_reason
+                            .as_deref()
+                            .is_some_and(|reason| !reason.trim().is_empty()),
+                        "ensemble_participation=excluded requires ensemble_exclusion_reason"
+                    );
+                }
+            }
         }
         if self.validation.dataset_role == ValidationDatasetRole::Holdout {
             if let Some(path) = self.validation.external_parity_evidence.as_ref() {
@@ -658,7 +707,9 @@ fn artifact_contains_model(
     match model {
         ModelFit::Moments => artifacts.moments.is_some(),
         ModelFit::Mle => artifacts.mle.is_some(),
-        ModelFit::LowerOrder => artifacts.lower_order.is_some(),
+        ModelFit::LowerOrder => artifacts.lower_order.as_ref().is_some_and(|artifact| {
+            sage_core::ml::lower_order::LowerOrderModel::from_artifact(artifact).is_ok()
+        }),
         ModelFit::Msfdr => {
             artifacts.msfdr_seeded.is_some()
                 && artifacts
@@ -704,7 +755,12 @@ fn artifact_contains_model(
                                 .is_some_and(|(max, min)| max >= min)
                     })
         }
-        ModelFit::Nokoi => artifacts.nokoi.is_some(),
+        // The current v1 Nokoi artifact is useful diagnostic evidence, but the
+        // Phase 6 audit found that it lacks fold-specific models/membership,
+        // explicit training-rule provenance, complete calibration state, and
+        // source hashes. Do not silently treat it as portable for target-only
+        // reuse or Ensemble assembly.
+        ModelFit::Nokoi => false,
         ModelFit::Ensemble => false,
     }
 }
@@ -784,6 +840,11 @@ fn apply_ensemble_lock(
     policy: &ArtifactReusePolicy,
     reuse_fitted_artifacts: bool,
 ) -> Result<()> {
+    anyhow::ensure!(
+        lock.evaluable,
+        "Ensemble lock is not evaluable: {}",
+        lock.not_evaluable_reasons.join("; ")
+    );
     fdr.enable_moments = Some(false);
     fdr.enable_mle = Some(false);
     fdr.enable_lower_order = Some(false);
@@ -893,14 +954,35 @@ fn build_ensemble_lock(
     for expert in experts {
         let mut reasons = Vec::new();
         let mut warnings = Vec::new();
+        if let Some(configuration) = manifest
+            .models
+            .iter()
+            .find(|configuration| configuration.model == expert.model)
+        {
+            if configuration.ensemble_participation == EnsembleParticipation::Excluded {
+                reasons.push(format!(
+                    "explicit Phase 8 exclusion: {}",
+                    configuration
+                        .ensemble_exclusion_reason
+                        .as_deref()
+                        .unwrap_or("unspecified")
+                ));
+            }
+        }
         if !expert.optimized_artifacts.is_file() {
             reasons.push("optimized fitted artifact is missing".into());
         }
         let artifacts = if expert.optimized_artifacts.is_file() {
-            serde_json::from_slice::<sage_core::decoy_free_fdr::DfRunArtifacts>(&std::fs::read(
-                &expert.optimized_artifacts,
-            )?)
-            .ok()
+            match std::fs::read(&expert.optimized_artifacts).and_then(|bytes| {
+                serde_json::from_slice::<sage_core::decoy_free_fdr::DfRunArtifacts>(&bytes)
+                    .map_err(std::io::Error::other)
+            }) {
+                Ok(artifact) => Some(artifact),
+                Err(error) => {
+                    reasons.push(format!("optimized fitted artifact is unreadable: {error}"));
+                    None
+                }
+            }
         } else {
             None
         };
@@ -957,11 +1039,17 @@ fn build_ensemble_lock(
             target_only_calibration_policy: None,
             release_candidate: true,
         };
-        let summaries = summarize_run(
+        let summaries = match summarize_run(
             &run,
             &manifest.validation.effective_ratios,
             manifest.validation.fdr_threshold,
-        )?;
+        ) {
+            Ok(rows) => rows,
+            Err(error) => {
+                reasons.push(format!("calibration result is unreadable: {error}"));
+                Vec::new()
+            }
+        };
         let gate_layer = match manifest.validation.null_window_validation_scope {
             NullWindowValidationScope::RawQ => "raw_q",
             NullWindowValidationScope::Level4 => "level4",
@@ -1004,24 +1092,37 @@ fn build_ensemble_lock(
             }
         }
         let calibration_peptides = if expert.calibration_results.is_file() {
-            accepted_target_peptides(
+            match accepted_target_peptides(
                 &expert.calibration_results,
                 &ValidationMode::DecoyFree,
                 manifest.validation.fdr_threshold,
                 manifest.validation.null_window_validation_scope
                     == NullWindowValidationScope::Level4,
-            )?
+            ) {
+                Ok(peptides) => peptides,
+                Err(error) => {
+                    reasons.push(format!("calibration peptides are unreadable: {error}"));
+                    BTreeSet::new()
+                }
+            }
         } else {
+            reasons.push("calibration result is missing".into());
             BTreeSet::new()
         };
         let target_peptides = if expert.target_only_results.is_file() {
-            accepted_target_peptides(
+            match accepted_target_peptides(
                 &expert.target_only_results,
                 &ValidationMode::DecoyFree,
                 manifest.validation.fdr_threshold,
                 manifest.validation.null_window_validation_scope
                     == NullWindowValidationScope::Level4,
-            )?
+            ) {
+                Ok(peptides) => peptides,
+                Err(error) => {
+                    reasons.push(format!("target-only peptides are unreadable: {error}"));
+                    BTreeSet::new()
+                }
+            }
         } else {
             reasons.push("target-only result is missing".into());
             BTreeSet::new()
@@ -1034,6 +1135,135 @@ fn build_ensemble_lock(
                     "target-only peptide transfer loss is {:.1}%",
                     -100.0 * change
                 ));
+            }
+        }
+
+        // A declared frozen parity pair is an Ensemble admission gate. Read
+        // errors and missing declared stage/layer comparisons become expert
+        // reasons rather than aborting the already-completed core workflow.
+        let relevant_pairs = manifest
+            .validation
+            .parity_pairs
+            .iter()
+            .filter(|pair| pair.native_method == model_slug(&expert.model))
+            .cloned()
+            .collect::<Vec<_>>();
+        if !relevant_pairs.is_empty() {
+            let mut parity_summaries = Vec::new();
+            let native_runs = [
+                Some(ValidationRun {
+                    method: model_slug(&expert.model).into(),
+                    stage: "optimized".into(),
+                    results: expert.optimized_results.clone(),
+                    mode: ValidationMode::DecoyFree,
+                    expected_search_space: Some("+Ent".into()),
+                    calibration_stage: None,
+                    target_only_calibration_policy: None,
+                    release_candidate: true,
+                }),
+                expert
+                    .ms2rescore_results
+                    .as_ref()
+                    .map(|results| ValidationRun {
+                        method: model_slug(&expert.model).into(),
+                        stage: "ms2rescore".into(),
+                        results: results.clone(),
+                        mode: ValidationMode::DecoyFree,
+                        expected_search_space: Some("+Ent".into()),
+                        calibration_stage: None,
+                        target_only_calibration_policy: None,
+                        release_candidate: true,
+                    }),
+                Some(ValidationRun {
+                    method: model_slug(&expert.model).into(),
+                    stage: expert.target_only_calibration_policy.stage_name().into(),
+                    results: expert.target_only_results.clone(),
+                    mode: ValidationMode::DecoyFree,
+                    expected_search_space: Some("No Ent".into()),
+                    calibration_stage: Some(expert.calibration_stage.clone()),
+                    target_only_calibration_policy: Some(expert.target_only_calibration_policy),
+                    release_candidate: true,
+                }),
+            ];
+            for run in native_runs.into_iter().flatten().chain(
+                manifest
+                    .validation
+                    .additional_runs
+                    .iter()
+                    .filter(|run| {
+                        relevant_pairs
+                            .iter()
+                            .any(|pair| pair.baseline_method == run.method)
+                    })
+                    .cloned(),
+            ) {
+                match summarize_run(
+                    &run,
+                    &manifest.validation.effective_ratios,
+                    manifest.validation.fdr_threshold,
+                ) {
+                    Ok(rows) => parity_summaries.extend(rows),
+                    Err(error) => reasons.push(format!(
+                        "declared parity evidence is unreadable for {} / {}: {error}",
+                        run.method, run.stage
+                    )),
+                }
+            }
+            let comparisons = parity_comparisons(
+                &parity_summaries,
+                &relevant_pairs,
+                manifest.validation.maximum_parity_fraction_difference,
+            );
+            for pair in &relevant_pairs {
+                let required_layers = if pair.layers.is_empty() {
+                    vec![gate_layer]
+                } else {
+                    pair.layers.iter().map(String::as_str).collect()
+                };
+                for layer in required_layers {
+                    if pair.stages.is_empty() {
+                        let stage_comparisons = comparisons
+                            .iter()
+                            .filter(|comparison| {
+                                comparison.baseline_method == pair.baseline_method
+                                    && comparison.native_method == pair.native_method
+                                    && comparison.layer == layer
+                            })
+                            .collect::<Vec<_>>();
+                        if stage_comparisons.is_empty() {
+                            reasons.push(format!(
+                                "declared {layer} parity evidence is missing for {}",
+                                pair.baseline_method
+                            ));
+                        }
+                        for comparison in stage_comparisons {
+                            if !comparison.within_tolerance {
+                                reasons.push(format!(
+                                    "declared {layer} parity exceeds tolerance at {}",
+                                    comparison.stage
+                                ));
+                            }
+                        }
+                    } else {
+                        for stage in &pair.stages {
+                            let comparison = comparisons.iter().find(|comparison| {
+                                comparison.baseline_method == pair.baseline_method
+                                    && comparison.native_method == pair.native_method
+                                    && comparison.stage == *stage
+                                    && comparison.layer == layer
+                            });
+                            match comparison {
+                                Some(comparison) if comparison.within_tolerance => {}
+                                Some(_) => reasons.push(format!(
+                                    "declared {layer} parity exceeds tolerance at {stage}"
+                                )),
+                                None => reasons.push(format!(
+                                    "declared {layer} parity evidence is missing at {stage}"
+                                )),
+                            }
+                        }
+                    }
+                }
             }
         }
         candidates.push((expert, reasons, warnings, calibration_peptides));
@@ -1056,6 +1286,32 @@ fn build_ensemble_lock(
                 "adds only {incremental} new Level-4 target peptides"
             ));
         }
+        let optimized_fitted_artifacts_sha256 = if expert.optimized_artifacts.is_file() {
+            match sha256_file(&expert.optimized_artifacts) {
+                Ok(hash) => hash,
+                Err(error) => {
+                    reasons.push(format!(
+                        "optimized fitted artifact cannot be hashed: {error}"
+                    ));
+                    String::new()
+                }
+            }
+        } else {
+            String::new()
+        };
+        let ms2rescore_fitted_artifacts_sha256 = expert
+            .ms2rescore_artifacts
+            .as_ref()
+            .filter(|path| path.is_file())
+            .and_then(|path| match sha256_file(path) {
+                Ok(hash) => Some(hash),
+                Err(error) => {
+                    reasons.push(format!(
+                        "MS2Rescore fitted artifact cannot be hashed: {error}"
+                    ));
+                    None
+                }
+            });
         let enabled = reasons.is_empty();
         if enabled {
             union.extend(peptides.iter().cloned());
@@ -1064,21 +1320,13 @@ fn build_ensemble_lock(
             model: expert.model.clone(),
             window: expert.window.clone(),
             optimized_fitted_artifacts: expert.optimized_artifacts.clone(),
-            optimized_fitted_artifacts_sha256: if expert.optimized_artifacts.is_file() {
-                sha256_file(&expert.optimized_artifacts)?
-            } else {
-                String::new()
-            },
+            optimized_fitted_artifacts_sha256,
             ms2rescore_fitted_artifacts: expert.ms2rescore_artifacts.clone(),
-            ms2rescore_fitted_artifacts_sha256: expert
-                .ms2rescore_artifacts
-                .as_ref()
-                .filter(|path| path.is_file())
-                .map(|path| sha256_file(path))
-                .transpose()?,
+            ms2rescore_fitted_artifacts_sha256,
             calibration_stage: expert.calibration_stage.clone(),
             calibration_results: expert.calibration_results.clone(),
             target_only_results: expert.target_only_results.clone(),
+            target_only_calibration_policy: expert.target_only_calibration_policy,
             enabled,
             target_peptides: peptides.len(),
             incremental_target_peptides: incremental,
@@ -1089,17 +1337,23 @@ fn build_ensemble_lock(
         });
     }
     let enabled = locked.iter().filter(|expert| expert.enabled).count();
-    anyhow::ensure!(
-        enabled >= manifest.validation.minimum_ensemble_experts,
-        "only {enabled} experts passed Ensemble gates; {} required",
-        manifest.validation.minimum_ensemble_experts
-    );
+    let evaluable = enabled >= manifest.validation.minimum_ensemble_experts;
+    let not_evaluable_reasons = (!evaluable)
+        .then(|| {
+            vec![format!(
+                "only {enabled} experts passed Ensemble gates; {} required",
+                manifest.validation.minimum_ensemble_experts
+            )]
+        })
+        .unwrap_or_default();
     Ok(EnsembleLock {
-        schema_version: 3,
+        schema_version: 4,
         source_manifest_hash: manifest_hash.into(),
         dataset_fingerprint: dataset.fingerprint.clone(),
         experts: locked,
         minimum_required_experts: manifest.validation.minimum_ensemble_experts,
+        evaluable,
+        not_evaluable_reasons,
     })
 }
 
@@ -1771,6 +2025,16 @@ pub fn execute_workflow(
         } else {
             None
         };
+        if model.model == ModelFit::Ensemble
+            && ensemble_lock.as_ref().is_some_and(|lock| !lock.evaluable)
+        {
+            let lock = ensemble_lock.as_ref().unwrap();
+            log::warn!(
+                "Ensemble is not evaluable and will be skipped without invalidating individual experts: {}",
+                lock.not_evaluable_reasons.join("; ")
+            );
+            continue;
+        }
         let optimized = run_search_stage(
             &manifest,
             &dataset,
@@ -1936,6 +2200,7 @@ pub fn execute_workflow(
             .unwrap_or(manifest.target_only_calibration_policy);
         let target_policies = concrete_target_only_policies(requested_policy);
         let mut release_target_only = None;
+        let mut release_target_only_policy = None;
         for (index, (policy, release_candidate)) in target_policies.iter().copied().enumerate() {
             let context = TargetOnlyStageContext {
                 policy,
@@ -1976,11 +2241,14 @@ pub fn execute_workflow(
             )?;
             if release_candidate {
                 release_target_only = Some(target_only.clone());
+                release_target_only_policy = Some(policy);
             }
             stages.push(target_only);
         }
         let target_only =
             release_target_only.context("target-only policy has no release result")?;
+        let target_only_policy = release_target_only_policy
+            .context("target-only policy has no release interpretation")?;
         if model.model != ModelFit::Ensemble && !plan_only {
             anyhow::ensure!(
                 frozen_model_artifacts.is_some(),
@@ -1990,7 +2258,9 @@ pub fn execute_workflow(
                 model: locked_model.model.clone(),
                 window: locked_model.window.clone(),
                 optimized_artifacts: optimized_artifact,
+                optimized_results: optimized.results.clone(),
                 ms2rescore_artifacts: ms2_artifact.is_file().then_some(ms2_artifact),
+                ms2rescore_results: ms2_record.as_ref().map(|record| record.results.clone()),
                 calibration_stage: if use_ms2_for_final {
                     "ms2rescore".into()
                 } else {
@@ -2006,6 +2276,7 @@ pub fn execute_workflow(
                     optimized.results.clone()
                 },
                 target_only_results: target_only.results,
+                target_only_calibration_policy: target_only_policy,
                 calibration_search_fingerprint: calibration_record
                     .candidate_pool
                     .as_ref()
@@ -2259,6 +2530,10 @@ mod tests {
         ExternalEmpiricalFeatureProfile, ExternalMs2RescoreProfiles, FrozenGumbelParameters,
     };
     use sage_core::ml::msfdr::MsfdrSeededModel;
+    use sage_core::ml::nokoi::{
+        LogisticRegression, NokoiArtifact, NokoiCalibrationPoint, NokoiConfig, NokoiNormalization,
+        NOKOI_FEATURE_SCHEMA,
+    };
     use std::time::{SystemTime, UNIX_EPOCH};
 
     fn test_directory(name: &str) -> PathBuf {
@@ -2349,6 +2624,8 @@ mod tests {
                 maximum_raw_fdp_increase: None,
                 minimum_level4_peptide_gain: None,
                 target_only_calibration_policy: None,
+                ensemble_participation: EnsembleParticipation::Auto,
+                ensemble_exclusion_reason: None,
             }],
             baseline: None,
             validation: ValidationWorkflow {
@@ -2390,7 +2667,20 @@ mod tests {
             maximum_raw_fdp_increase: None,
             minimum_level4_peptide_gain: None,
             target_only_calibration_policy: None,
+            ensemble_participation: EnsembleParticipation::Auto,
+            ensemble_exclusion_reason: None,
         });
+        manifest.validate().unwrap();
+        std::fs::remove_dir_all(directory).unwrap();
+    }
+
+    #[test]
+    fn explicit_ensemble_exclusion_requires_a_reason() {
+        let directory = test_directory("ensemble-exclusion-reason");
+        let mut manifest = minimal_manifest(&directory, ValidationDatasetRole::Development);
+        manifest.models[0].ensemble_participation = EnsembleParticipation::Excluded;
+        assert!(manifest.validate().is_err());
+        manifest.models[0].ensemble_exclusion_reason = Some("parity evidence is incomplete".into());
         manifest.validate().unwrap();
         std::fs::remove_dir_all(directory).unwrap();
     }
@@ -2570,10 +2860,14 @@ mod tests {
     }
 
     fn write_validation_tsv(path: &Path, start: usize, entrapments: usize) {
+        write_validation_tsv_counts(path, start, 700, entrapments);
+    }
+
+    fn write_validation_tsv_counts(path: &Path, start: usize, targets: usize, entrapments: usize) {
         let mut text = String::from(
             "psm_id\trank\tlabel\tproteins\tpeptide\tdecoy_free_q_value\tdecoy_free_peptide_q\tdecoy_free_protein_q\tdecoy_free_protein_supported_peptide\tdecoy_free_peptide_supported_psm\n",
         );
-        for index in start..start + 700 {
+        for index in start..start + targets {
             text.push_str(&format!(
                 "t{index}\t1\t1\tTarget_{index}\t{}\t0.001\t0.001\t0.001\ttrue\ttrue\n",
                 peptide(index)
@@ -2649,6 +2943,56 @@ mod tests {
     }
 
     #[test]
+    fn nokoi_v1_artifact_is_diagnostic_not_portable() {
+        let artifact = NokoiArtifact {
+            schema_version: 1,
+            model_version: "sage-nokoi-crossfit-portable-v1".into(),
+            feature_schema: NOKOI_FEATURE_SCHEMA
+                .iter()
+                .map(|name| (*name).to_string())
+                .collect(),
+            min_null_rank: 2,
+            max_null_rank: 12,
+            crossfit_seed: 0x5EED_5EED_5EED_5EED,
+            k_folds: 5,
+            fold_sizes: vec![10; 5],
+            config: NokoiConfig::default(),
+            selected_l1_lambda: 0.1,
+            final_model: LogisticRegression {
+                weights: vec![0.0; NOKOI_FEATURE_SCHEMA.len()],
+                bias: 0.0,
+            },
+            normalization: NokoiNormalization {
+                medians: vec![0.0; NOKOI_FEATURE_SCHEMA.len()],
+                means: vec![0.0; NOKOI_FEATURE_SCHEMA.len()],
+                stds: vec![1.0; NOKOI_FEATURE_SCHEMA.len()],
+            },
+            null_scores_oof: vec![0.5; 50],
+            development_pi0: 1.0,
+            pep_calibration: vec![
+                NokoiCalibrationPoint {
+                    p_value: 0.0,
+                    pep: 0.0,
+                },
+                NokoiCalibrationPoint {
+                    p_value: 1.0,
+                    pep: 1.0,
+                },
+            ],
+            positive_training_count: 100,
+            negative_training_count: 100,
+            reference_candidate_counts: vec![100; 50],
+        };
+        let artifacts = DfRunArtifacts {
+            nokoi: Some(artifact),
+            ..DfRunArtifacts::default()
+        };
+        assert!(!artifact_contains_model(&artifacts, &ModelFit::Nokoi));
+        let mut fdr = FdrOptions::default();
+        assert!(apply_fitted_artifacts(&mut fdr, &ModelFit::Nokoi, artifacts).is_err());
+    }
+
+    #[test]
     fn ensemble_lock_copies_independent_windows_without_manual_entry() {
         let directory = test_directory("ensemble-lock");
         let moments_artifact = directory.join("moments.artifacts.json");
@@ -2701,8 +3045,10 @@ mod tests {
             maximum_raw_fdp_increase: None,
             minimum_level4_peptide_gain: None,
             target_only_calibration_policy: None,
+            ensemble_participation: EnsembleParticipation::Auto,
+            ensemble_exclusion_reason: None,
         };
-        let manifest = WorkflowManifest {
+        let mut manifest = WorkflowManifest {
             schema_version: 1,
             name: "test".into(),
             dataset_id: Some("test-dataset".into()),
@@ -2792,25 +3138,33 @@ mod tests {
                 model: ModelFit::Moments,
                 window: manifest.models[0].window.clone(),
                 optimized_artifacts: moments_artifact,
+                optimized_results: moments_calibration.clone(),
                 ms2rescore_artifacts: None,
+                ms2rescore_results: None,
                 calibration_stage: "optimized".into(),
                 calibration_results: moments_calibration,
                 target_only_results: moments_target,
+                target_only_calibration_policy: TargetOnlyCalibrationPolicy::RefitWithLockedWindow,
                 calibration_search_fingerprint: "test-search-fingerprint".into(),
             },
             CompletedExpert {
                 model: ModelFit::Mle,
                 window: manifest.models[1].window.clone(),
                 optimized_artifacts: mle_artifact,
+                optimized_results: mle_calibration.clone(),
                 ms2rescore_artifacts: None,
+                ms2rescore_results: None,
                 calibration_stage: "optimized".into(),
                 calibration_results: mle_calibration,
                 target_only_results: mle_target,
+                target_only_calibration_policy: TargetOnlyCalibrationPolicy::RefitWithLockedWindow,
                 calibration_search_fingerprint: "test-search-fingerprint".into(),
             },
         ];
         let lock = build_ensemble_lock(&manifest, "manifest-hash", &dataset, &experts).unwrap();
         assert_eq!(lock.dataset_fingerprint, dataset.fingerprint);
+        assert!(lock.evaluable);
+        assert!(lock.not_evaluable_reasons.is_empty());
         assert_eq!(
             lock.experts.iter().filter(|expert| expert.enabled).count(),
             2
@@ -2856,6 +3210,87 @@ mod tests {
         .unwrap();
         assert!(reuse.moments_frozen_parameters.is_some());
         assert!(reuse.mle_frozen_parameters.is_some());
+
+        manifest.models[1].ensemble_participation = EnsembleParticipation::Excluded;
+        manifest.models[1].ensemble_exclusion_reason =
+            Some("annotated parity exceeds the platform tolerance".into());
+        let deferred = build_ensemble_lock(&manifest, "manifest-hash", &dataset, &experts).unwrap();
+        assert!(!deferred.evaluable);
+        assert_eq!(
+            deferred
+                .experts
+                .iter()
+                .filter(|expert| expert.enabled)
+                .count(),
+            1
+        );
+        assert!(deferred
+            .not_evaluable_reasons
+            .iter()
+            .any(|reason| reason.contains("only 1 experts")));
+        assert!(deferred.experts.iter().any(|expert| {
+            expert.model == ModelFit::Mle
+                && expert
+                    .gate_reasons
+                    .iter()
+                    .any(|reason| reason.contains("explicit Phase 8 exclusion"))
+        }));
+        let mut rejected = FdrOptions::default();
+        assert!(apply_ensemble_lock(
+            &mut rejected,
+            &deferred,
+            false,
+            &dataset,
+            &ArtifactReusePolicy::DatasetLocalOnly,
+            false,
+        )
+        .is_err());
+
+        manifest.models[1].ensemble_participation = EnsembleParticipation::Auto;
+        manifest.models[1].ensemble_exclusion_reason = None;
+        let mle_baseline = directory.join("mle.legacy.optimized.tsv");
+        write_validation_tsv_counts(&mle_baseline, 1_000, 350, 3);
+        manifest.validation.additional_runs.push(ValidationRun {
+            method: "legacy_mle".into(),
+            stage: "optimized".into(),
+            results: mle_baseline,
+            mode: ValidationMode::DecoyFree,
+            expected_search_space: Some("+Ent".into()),
+            calibration_stage: None,
+            target_only_calibration_policy: None,
+            release_candidate: true,
+        });
+        manifest.validation.parity_pairs.push(ParityPair {
+            baseline_method: "legacy_mle".into(),
+            native_method: "mle".into(),
+            stages: vec!["optimized".into()],
+            layers: vec!["level4".into()],
+            maximum_fraction_difference: Some(0.001),
+        });
+        let parity_rejected =
+            build_ensemble_lock(&manifest, "manifest-hash", &dataset, &experts).unwrap();
+        assert!(!parity_rejected.evaluable);
+        assert!(parity_rejected.experts.iter().any(|expert| {
+            expert.model == ModelFit::Mle
+                && !expert.enabled
+                && expert
+                    .gate_reasons
+                    .iter()
+                    .any(|reason| reason.contains("declared level4 parity exceeds tolerance"))
+        }));
+
+        std::fs::write(&experts[1].calibration_results, b"not a result table\n").unwrap();
+        let unreadable_expert =
+            build_ensemble_lock(&manifest, "manifest-hash", &dataset, &experts).unwrap();
+        assert!(!unreadable_expert.evaluable);
+        assert!(unreadable_expert.experts.iter().any(|expert| {
+            expert.model == ModelFit::Mle
+                && !expert.enabled
+                && expert
+                    .gate_reasons
+                    .iter()
+                    .any(|reason| reason.contains("unreadable"))
+        }));
         std::fs::remove_dir_all(directory).unwrap();
     }
 }

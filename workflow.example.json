@@ -43,6 +43,8 @@
     {
       "model": "lower_order",
       "target_only_calibration_policy": "compare_both",
+      "ensemble_participation": "excluded",
+      "ensemble_exclusion_reason": "Lower Order artifact-reuse transfer must pass before this expert can join an Ensemble.",
       "candidate_windows": [
         { "min_rank": 2, "max_rank": 5 },
         { "min_rank": 6, "max_rank": 9 }
@@ -51,6 +53,8 @@
     },
     {
       "model": "msfdr",
+      "ensemble_participation": "excluded",
+      "ensemble_exclusion_reason": "Annotated MSFDR parity is deferred until the feature environment is reproduced or platform robustness is repaired.",
       "candidate_windows": [
         { "min_rank": 2, "max_rank": 8 },
         { "min_rank": 9, "max_rank": 13 }
@@ -63,6 +67,8 @@
     },
     {
       "model": "msfdr2_smix",
+      "ensemble_participation": "excluded",
+      "ensemble_exclusion_reason": "Annotated MSFDR2-SMIX parity is deferred until the feature environment is reproduced or platform robustness is repaired.",
       "candidate_windows": [
         { "min_rank": 2, "max_rank": 8 },
         { "min_rank": 9, "max_rank": 17 }
@@ -71,6 +77,8 @@
     },
     {
       "model": "nokoi",
+      "ensemble_participation": "excluded",
+      "ensemble_exclusion_reason": "Nokoi v1 is diagnostic-only until its portable artifact and frozen parity are complete.",
       "candidate_windows": [
         { "min_rank": 2, "max_rank": 7 },
         { "min_rank": 2, "max_rank": 15 }

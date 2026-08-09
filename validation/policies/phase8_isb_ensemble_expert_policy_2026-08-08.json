@@ -1,0 +1,62 @@
+{
+  "schema_version": 1,
+  "phase": 8,
+  "date": "2026-08-08",
+  "dataset": "ISB18",
+  "purpose": "Predeclared production-Ensemble participation policy after frozen ISB parity. Automatic runtime gates remain mandatory and this file cannot override a failed gate.",
+  "minimum_required_experts": 2,
+  "experts": {
+    "moments": {
+      "participation": "auto",
+      "decision": "eligible_for_automatic_gates",
+      "evidence": "Exact frozen grid, fitted-parameter, optimized, peptide/protein MS2Rescore, and target-only refit parity."
+    },
+    "mle": {
+      "participation": "auto",
+      "decision": "eligible_for_automatic_gates",
+      "evidence": "Exact frozen grid, fitted-parameter, optimized, MS2Rescore, and target-only refit parity."
+    },
+    "msfdr1_smix": {
+      "participation": "auto",
+      "decision": "eligible_for_automatic_gates",
+      "rank_window": "1-1",
+      "evidence": "Rank-1-only fitted parameters, MS2Rescore, and target-only refit parity passed exactly."
+    },
+    "lower_order": {
+      "participation": "excluded",
+      "decision": "deferred_pending_artifact_reuse_repair",
+      "reason": "refit_with_locked_window passed exact parity, but reuse_dataset_artifact produced 6479/291/17 Level-4 PSM/peptide/protein counts instead of 558/44/10 and is not transfer-stable"
+    },
+    "msfdr": {
+      "participation": "excluded",
+      "decision": "deferred_pending_annotation_environment_or_robustness_repair",
+      "reason": "unannotated grid and fitted state matched exactly, but regenerated macOS MS2PIP/DeepLC annotations caused downstream counts to exceed the frozen Linux platform tolerance"
+    },
+    "msfdr2_smix": {
+      "participation": "excluded",
+      "decision": "deferred_pending_annotation_environment_or_robustness_repair",
+      "reason": "unannotated grid and fitted state matched exactly, but regenerated macOS MS2PIP/DeepLC annotations caused downstream counts to exceed the frozen Linux platform tolerance"
+    },
+    "nokoi": {
+      "participation": "excluded",
+      "decision": "deferred_pending_portable_artifact_v2_and_parity_repair",
+      "reason": "the v1 artifact lacks fold-specific models, a reproducible fold-membership rule, explicit training rules, complete Grenander state, and source hashes; frozen fit, selected-window, and target-only parity also failed"
+    }
+  },
+  "mandatory_runtime_gates": [
+    "dataset-local artifact provenance and strict search fingerprint",
+    "portable fitted-artifact schema and model-version validation",
+    "no fit fallback",
+    "declared frozen parity within the configured tolerance",
+    "gate-layer entrapment FDP at or below the configured threshold",
+    "target-only transfer loss within the configured limit",
+    "minimum incremental accepted target-peptide yield"
+  ],
+  "ensemble_semantics": {
+    "window_selection": "Each expert keeps its independently optimized dataset-local window; no combined Ensemble window is optimized.",
+    "insufficient_experts": "Write an evaluable=false Ensemble lock with reasons and skip Ensemble stages without invalidating completed individual-model stages.",
+    "invalid_evidence": "Record the expert as rejected; do not abort the core workflow or silently admit the expert."
+  },
+  "pxd_scope": "No additional PXD001468 model run is required for Phase 8; PXD Moments is the sole required PXD parity model for this refactor.",
+  "source_evidence": "validation/reports/phase6_isb_model_parity_2026-08-07.json"
+}

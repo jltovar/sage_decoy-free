@@ -114,7 +114,7 @@ match. A changed model/window calibration receives a different annotation cache,
 DeepLC behavior. See [`DECOY_FREE_WORKFLOW.md`](DECOY_FREE_WORKFLOW.md) for fingerprint,
 capability, integrity, and fail-closed rules.
 
-### Phase 5-7 calibration and parity status
+### Phase 5-8 calibration, parity, and secondary-model status
 
 Target-only calibration is now explicit. The default `refit_with_locked_window` policy keeps the
 dataset-local window selected with entrapment and refits nuisance parameters in the target-only
@@ -129,6 +129,17 @@ search or external feature generation. PXD Moments is the only required PXD mode
 refactor; additional PXD models are optional. See [`DECOY_FREE_WORKFLOW.md`](DECOY_FREE_WORKFLOW.md)
 and `validation/reports/phase7_pxd001468_moments_parity_2026-08-08.json` for the caveats and full
 evidence.
+
+Phase 8 makes secondary-model deferrals executable policy. Workflow model entries may set
+`ensemble_participation` to `auto` or `excluded`; an exclusion requires a nonempty
+`ensemble_exclusion_reason`. Lower Order, seeded MSFDR, MSFDR2-SMIX, and Nokoi remain excluded
+for the specific unresolved reasons recorded in
+`validation/policies/phase8_isb_ensemble_expert_policy_2026-08-08.json`. Moments, MLE, and
+rank-1-only MSFDR1-SMIX are eligible for the automatic gates, but are not guaranteed admission.
+Declared frozen parity, artifact/provenance validity, calibration, transfer stability, fallback,
+and incremental-yield checks can still reject any expert. If too few experts pass, the workflow
+writes an `evaluable: false` Ensemble lock and skips Ensemble without invalidating completed
+individual-model stages.
 
 
 ## Practical implication

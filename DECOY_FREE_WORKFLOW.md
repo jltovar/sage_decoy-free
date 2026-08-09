@@ -310,6 +310,43 @@ is in `validation/reports/phase7_pxd001468_moments_null_window_parity_2026-08-08
 PXD Moments is the only required PXD model for this refactor. Do not automatically run additional
 PXD models; decide later whether one is scientifically or technically necessary.
 
+## Phase 8: secondary-model and Ensemble release policy
+
+Phase 8 does not reinterpret the Phase 6 failures as passes. It makes their release consequences
+explicit and fail-closed. Each individual model may declare `ensemble_participation: auto`, or
+`ensemble_participation: excluded` with a required `ensemble_exclusion_reason`. An automatic model
+must still pass all applicable runtime gates; the field is eligibility for evaluation, not an
+override or guarantee of admission.
+
+The initial ISB production policy is:
+
+- Moments, MLE, and rank-1-only MSFDR1-SMIX remain eligible for automatic Ensemble gates.
+- Lower Order remains excluded. Its complete artifact is now validated more strictly, but its
+  target-only artifact-reuse interpretation remains materially unstable. Exact refit parity does
+  not make reuse safe.
+- Seeded MSFDR and MSFDR2-SMIX remain excluded until the frozen Linux annotation environment is
+  reproduced or the methods pass a declared cross-platform annotation-robustness gate.
+- Nokoi v1 is diagnostic-only. The workflow refuses to reuse it as a portable artifact because
+  it lacks the complete state required to reconstruct the frozen procedure, and its ISB fit and
+  target-only parity also failed.
+
+The Ensemble lock copies every accepted expert's independently optimized dataset-local window and
+artifact; it never optimizes one combined window. It rejects experts with missing or unreadable
+evidence, invalid provenance or artifact schemas, fit fallback, failed declared parity,
+unacceptable gate-layer entrapment FDP, unstable target-only transfer, or insufficient incremental
+peptide yield. A declared frozen parity pair is an admission gate rather than a reporting-only
+comparison.
+
+Ensemble remains optional and cannot block the core refactor. If fewer than
+`minimum_ensemble_experts` pass, `ensemble.lock.json` is still written with `evaluable: false` and
+the reasons, and Ensemble stages are skipped without invalidating completed individual-model
+stages. Applying a non-evaluable lock fails closed. The exact initial policy and rationale are in
+`validation/policies/phase8_isb_ensemble_expert_policy_2026-08-08.json`; implementation evidence
+is in `validation/reports/phase8_secondary_model_repairs_2026-08-08.json`.
+
+No additional PXD model search was run for Phase 8. PXD Moments remains the only required PXD
+parity run for this refactor.
+
 ## Outputs and resumption
 
 Each stage has a resolved search configuration and a hash checkpoint. A completed stage is reused

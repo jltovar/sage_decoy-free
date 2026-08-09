@@ -723,12 +723,55 @@ impl LowerOrderModel {
                 artifact.schema_version
             ));
         }
+        if artifact.model_version != "sage-lower-order-local-lom-extrapolated-v1" {
+            return Err(format!(
+                "unsupported Lower Order model version {}",
+                artifact.model_version
+            ));
+        }
+        if artifact.null_rank_min <= 1 || artifact.null_rank_max < artifact.null_rank_min {
+            return Err("Lower Order artifact has an invalid null-rank window".to_string());
+        }
+        if !artifact.evalue_candidate_count_power.is_finite()
+            || artifact.evalue_candidate_count_power < 0.0
+            || !artifact.evalue_scale.is_finite()
+            || artifact.evalue_scale <= 0.0
+            || !artifact.extrapolation_strength.is_finite()
+            || artifact.extrapolation_strength < 0.0
+        {
+            return Err(
+                "Lower Order artifact has invalid transformation or extrapolation state"
+                    .to_string(),
+            );
+        }
+        if !matches!(
+            artifact.tev_transform.as_str(),
+            "NegLogE" | "Log1000OverE" | "ScaledLog1000OverE"
+        ) {
+            return Err(format!(
+                "unsupported Lower Order TEV transform {}",
+                artifact.tev_transform
+            ));
+        }
         if artifact.params_by_charge.is_empty() {
             return Err("Lower Order artifact has no fitted charge parameters".to_string());
         }
         if artifact.reference_candidate_counts.is_empty() {
             return Err(
                 "Lower Order artifact has no reference candidate-count distribution".to_string(),
+            );
+        }
+        if artifact
+            .reference_candidate_counts
+            .iter()
+            .any(|&count| count == 0)
+            || artifact
+                .reference_candidate_counts
+                .windows(2)
+                .any(|pair| pair[0] > pair[1])
+        {
+            return Err(
+                "Lower Order reference candidate-count distribution is invalid".to_string(),
             );
         }
         let mut params_by_charge = FnvHashMap::default();
@@ -1879,5 +1922,17 @@ mod tests {
         assert_eq!(artifact.reference_candidate_counts, vec![200, 300, 400]);
         assert_eq!(model.p_value(15.0, 2), restored.p_value(15.0, 2));
         assert_eq!(model.p_value(15.0, 4), restored.p_value(15.0, 4));
+
+        let mut unsupported = artifact.clone();
+        unsupported.model_version = "legacy-incomplete".into();
+        assert!(LowerOrderModel::from_artifact(&unsupported).is_err());
+
+        let mut unsorted_counts = artifact.clone();
+        unsorted_counts.reference_candidate_counts = vec![300, 200];
+        assert!(LowerOrderModel::from_artifact(&unsorted_counts).is_err());
+
+        let mut invalid_window = artifact;
+        invalid_window.null_rank_min = 1;
+        assert!(LowerOrderModel::from_artifact(&invalid_window).is_err());
     }
 }

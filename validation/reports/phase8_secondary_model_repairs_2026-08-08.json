@@ -1,0 +1,135 @@
+{
+  "schema_version": 1,
+  "phase": 8,
+  "title": "Secondary-model repairs and non-blocking Ensemble policy",
+  "date": "2026-08-08",
+  "starting_commit": "85b5c09fdecb1b6e3858d8cd59a5ceacce2eb4c2",
+  "status": "completed_with_explicit_secondary_model_deferrals",
+  "scope": "Resolve, repair, or explicitly defer the Phase 6 secondary-model findings without expanding the required PXD scope or allowing optional Ensemble evaluation to block the core refactor.",
+  "source_evidence": {
+    "phase6": "validation/reports/phase6_isb_model_parity_2026-08-07.json",
+    "phase7": "validation/reports/phase7_pxd001468_moments_parity_2026-08-08.json",
+    "ensemble_policy": "validation/policies/phase8_isb_ensemble_expert_policy_2026-08-08.json",
+    "frozen_phase6_manifest_sha256": "58591cca1b2aaa4422dea078f942125bb264e1c550fce4b8dfd801b487a4262d"
+  },
+  "model_decisions": {
+    "lower_order": {
+      "status": "deferred_from_artifact_reuse_and_ensemble",
+      "repaired": [
+        "The complete fitted artifact remains persisted, including charge-stratified parameters, null window, TEV transform, extrapolation settings, and the reference candidate-count distribution.",
+        "Artifact loading now rejects unsupported schema/model versions, invalid windows, nonfinite or nonpositive scaling state, unsupported transforms, empty or unsorted candidate-count distributions, and invalid charge metadata."
+      ],
+      "evidence": {
+        "refit_with_locked_window": "Exact ISB grid, fitted-state, MS2Rescore, and target-only parity; target-only Level-4 counts 558 PSMs, 44 peptides, and 10 proteins.",
+        "reuse_dataset_artifact": "Diagnostic Level-4 counts 6479 PSMs, 291 peptides, and 17 proteins; materially different from legacy/refit and therefore not release eligible."
+      },
+      "decision": "Retain refit_with_locked_window as the parity interpretation, reject reuse as a production assumption, and keep Lower Order out of Ensemble until candidate-count normalization/transfer is repaired."
+    },
+    "nokoi": {
+      "status": "diagnostic_only_deferred",
+      "artifact_v1_present": [
+        "feature schema and ordering",
+        "normalization state",
+        "cross-validation seed, fold count, and fold sizes",
+        "selected L1 regularization",
+        "final weights and intercept",
+        "out-of-fold null scores",
+        "pi0 and PEP calibration mapping",
+        "candidate-count distribution",
+        "dataset/search/model provenance"
+      ],
+      "artifact_v1_insufficient": [
+        "fold-specific weights and intercepts",
+        "explicit fold membership or reconstruction rule",
+        "explicit positive and null training rules",
+        "complete Grenander calibration state",
+        "source-code hashes"
+      ],
+      "parity": "Frozen fit, selected window, optimized counts, and target-only behavior failed Phase 6 parity.",
+      "decision": "The workflow refuses to treat Nokoi v1 as a portable reusable artifact. Nokoi is excluded from the first refactor release rather than silently retrained under reuse semantics."
+    },
+    "msfdr": {
+      "status": "annotated_variant_deferred",
+      "passed": "All 59 frozen unannotated grid points, feasibility decisions, the selected 9-13 window, and fitted parameters matched exactly.",
+      "unresolved": "Regenerated macOS MS2PIP/DeepLC annotations differ from the frozen Linux environment and downstream counts exceed tolerance.",
+      "decision": "Exclude from Ensemble until the annotation environment is reproduced or declared platform-robustness parity passes."
+    },
+    "msfdr2_smix": {
+      "status": "annotated_variant_deferred",
+      "passed": "All 69 frozen unannotated grid points, feasibility decisions, the selected 9-17 window, and fitted parameters matched exactly.",
+      "unresolved": "Regenerated macOS MS2PIP/DeepLC annotations differ from the frozen Linux environment and downstream counts exceed tolerance.",
+      "decision": "Exclude from Ensemble until the annotation environment is reproduced or declared platform-robustness parity passes."
+    },
+    "msfdr1_smix": {
+      "status": "eligible_for_automatic_ensemble_gates",
+      "rank_window": "1-1",
+      "evidence": "Frozen fitted-state, MS2Rescore, and target-only parity passed exactly."
+    }
+  },
+  "ensemble_implementation": {
+    "lock_schema_version": 4,
+    "explicit_participation": "Individual models may use auto or excluded; excluded requires a nonempty reason and Ensemble itself cannot be marked as an excluded expert.",
+    "artifact_portability": "Lower Order requires successful strict artifact reconstruction; Nokoi v1 always fails portable-artifact admission.",
+    "admission_gates": [
+      "explicit release-policy exclusion",
+      "artifact presence, payload, model, provenance, candidate schema, and strict search fingerprint",
+      "MS2Rescore artifact validity when the Ensemble consumes annotated evidence",
+      "gate-layer entrapment calibration",
+      "target-only transfer stability",
+      "every declared frozen parity stage/layer within tolerance",
+      "minimum incremental target-peptide yield"
+    ],
+    "failure_semantics": "Unreadable or missing expert evidence is recorded as an expert gate reason rather than aborting completed core-model work.",
+    "insufficient_experts": "The lock is written with evaluable=false and explicit reasons; Ensemble stages are skipped. Reusing a non-evaluable lock fails closed.",
+    "window_semantics": "Accepted experts retain their independently optimized dataset-local windows and artifacts; no combined Ensemble window is optimized."
+  },
+  "tests_added_or_extended": [
+    "explicit Ensemble exclusion requires a reason",
+    "Nokoi v1 is diagnostic and rejected for frozen-artifact reuse",
+    "Lower Order artifact deserialization rejects incompatible or malformed complete state",
+    "independently optimized expert windows are copied into an evaluable lock",
+    "explicit exclusion can make a lock non-evaluable without an exception",
+    "declared frozen parity failure rejects an expert",
+    "malformed expert evidence rejects that expert without aborting lock construction",
+    "applying a non-evaluable lock fails closed"
+  ],
+  "verification": {
+    "cargo_fmt_check": "passed",
+    "cargo_test_workspace": {
+      "status": "passed",
+      "tests": 165,
+      "failures": 0,
+      "includes_doctests": true
+    },
+    "python_unittest_discovery": {
+      "status": "passed",
+      "tests": 14,
+      "failures": 0
+    },
+    "release_build": "passed",
+    "json_validation": "passed for workflow.example.json, the Phase 8 policy, and this report",
+    "frozen_phase6_manifest_unchanged": true
+  },
+  "pxd_scope": {
+    "additional_models_run": [],
+    "decision": "No additional PXD model is required. PXD Moments remains the sole required PXD parity run for this refactor."
+  },
+  "release_decision": {
+    "phase8_complete": true,
+    "ready_for_phase9": true,
+    "all_secondary_models_release_ready": false,
+    "production_ensemble_guaranteed": false,
+    "eligible_experts_before_runtime_gates": [
+      "moments",
+      "mle",
+      "msfdr1_smix"
+    ],
+    "deferred_experts": [
+      "lower_order",
+      "msfdr",
+      "msfdr2_smix",
+      "nokoi"
+    ],
+    "note": "Deferred experts are not marked passed. Ensemble is optional and is evaluable only if enough eligible experts pass every dataset-local runtime gate."
+  }
+}
