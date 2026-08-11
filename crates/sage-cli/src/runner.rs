@@ -682,10 +682,21 @@ impl Runner {
         let mut outputs = if let (Some(request), Some((search, analysis, directory))) =
             (candidate_pool.as_ref(), pool_identity.as_ref())
         {
-            if request.allow_reuse
-                && inspect_compatible_pool(directory, search, request.required_rank_depth)?
-                    .is_some()
-            {
+            let compatible = if request.allow_reuse || request.require_existing {
+                inspect_compatible_pool(directory, search, request.required_rank_depth)?
+            } else {
+                None
+            };
+            if request.require_existing && compatible.is_none() {
+                anyhow::bail!(
+                    "required existing candidate pool is missing or incompatible at {} (expected fingerprint={}, schema={}, retained rank depth >= {}); spectrum search fallback is disabled",
+                    directory.display(),
+                    search.digest,
+                    crate::candidate_pool::CANDIDATE_ID_SCHEMA,
+                    request.required_rank_depth
+                );
+            }
+            if compatible.is_some() {
                 anyhow::ensure!(
                     !self.parameters.quant.lfq
                         && self.parameters.quant.tmt.is_none()
@@ -909,6 +920,32 @@ impl Runner {
                 fitted_artifacts = artifacts;
             }
 
+            if self.parameters.external_features.enabled
+                && matches!(
+                    self.parameters.external_features.use_mode,
+                    ExternalFeatureUseMode::BoundedDfExperts
+                )
+            {
+                let calibration = &fdr_settings.external_profile_calibration;
+                anyhow::ensure!(
+                    calibration.min_null_rank > 1
+                        && calibration.max_null_rank >= calibration.min_null_rank,
+                    "external MS2Rescore scoring requires both external_profile_min_null_rank and external_profile_max_null_rank with a valid window above rank 1; resolved {}..={} ({:?})",
+                    calibration.min_null_rank,
+                    calibration.max_null_rank,
+                    calibration.provenance
+                );
+                anyhow::ensure!(
+                    features.iter().any(|feature| {
+                        feature.core.rank >= calibration.min_null_rank
+                            && feature.core.rank <= calibration.max_null_rank
+                    }),
+                    "external MS2Rescore calibration window {}..={} has no retained candidates; increase external_features.max_rank/candidate-pool rank depth",
+                    calibration.min_null_rank,
+                    calibration.max_null_rank
+                );
+            }
+
             annotation_usage = maybe_add_external_features(
                 &mut features,
                 &self.parameters.external_features,
@@ -959,11 +996,13 @@ impl Runner {
                             "applying external TIMS2/MS2Rescore features as bounded Decoy-Free expert evidence"
                         );
 
-                        fitted_artifacts.external_ms2rescore =
+                        fitted_artifacts.external_ms2rescore = Some(
                             sage_core::decoy_free_fdr::apply_external_ms2rescore_bounded_experts(
                                 &mut features,
                                 &fdr_settings,
-                            );
+                            )
+                            .map_err(anyhow::Error::msg)?,
+                        );
                     }
                 }
             }

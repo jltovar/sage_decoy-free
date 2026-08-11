@@ -164,6 +164,9 @@ pub struct CandidatePoolRequest {
     /// required, while still writing the resulting immutable pool for a later
     /// analysis of the same candidate population.
     pub allow_reuse: bool,
+    /// Require an exact, already-materialized pool. When true the runner must
+    /// never invoke Sage's spectrum-search path to satisfy this request.
+    pub require_existing: bool,
 }
 
 fn sha256_bytes(bytes: &[u8]) -> String {
@@ -544,6 +547,23 @@ pub fn load_pool(
     ))
 }
 
+/// Strict replay entry point: every incompatibility is an error and callers
+/// must not fall back to a search after this function fails.
+pub fn load_required_pool(
+    directory: &Path,
+    expected: &SearchFingerprint,
+    required_rank_depth: usize,
+    db: &IndexedDatabase,
+) -> Result<(CandidatePoolManifest, Vec<FeatureCore>)> {
+    inspect_compatible_pool(directory, expected, required_rank_depth)?.with_context(|| {
+        format!(
+            "required existing candidate pool is missing or incompatible in {} (fingerprint={}, schema={}, retained rank depth >= {})",
+            directory.display(), expected.digest, CANDIDATE_ID_SCHEMA, required_rank_depth
+        )
+    })?;
+    load_pool(directory, expected, required_rank_depth, db)
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -720,6 +740,20 @@ mod tests {
         let (_, through_fifty) = load_pool(&directory, &fingerprint, 50, &database).unwrap();
         assert_eq!(through_fifty.len(), 3);
 
+        let (_, strict) = load_required_pool(&directory, &fingerprint, 50, &database).unwrap();
+        assert_eq!(strict.len(), 3);
+        assert!(load_required_pool(&root.join("missing"), &fingerprint, 1, &database).is_err());
+        let mut wrong_fingerprint = fingerprint.clone();
+        wrong_fingerprint.digest = "different-search".into();
+        assert!(load_required_pool(&directory, &wrong_fingerprint, 1, &database).is_err());
+        assert!(load_required_pool(&directory, &fingerprint, 51, &database).is_err());
+
+        let payload = directory.join("candidate_pool.bin.zst");
+        let original_payload = std::fs::read(&payload).unwrap();
+        std::fs::write(&payload, b"corrupt").unwrap();
+        assert!(load_required_pool(&directory, &fingerprint, 1, &database).is_err());
+        std::fs::write(&payload, original_payload).unwrap();
+
         std::fs::remove_dir_all(root).unwrap();
     }
 
@@ -770,6 +804,7 @@ mod tests {
                     root: pool_root.clone(),
                     required_rank_depth: 1,
                     allow_reuse: true,
+                    require_existing: false,
                 }),
             )
             .unwrap();
@@ -785,6 +820,7 @@ mod tests {
                     root: pool_root,
                     required_rank_depth: 1,
                     allow_reuse: true,
+                    require_existing: false,
                 }),
             )
             .unwrap();
@@ -799,6 +835,39 @@ mod tests {
             second_usage.analysis_fingerprint
         );
 
+        let required = Runner::new(build_search(&root.join("required"), 0.025), 1).unwrap();
+        let (_, required_usage) = required
+            .run_with_candidate_pool(
+                1,
+                false,
+                Some(CandidatePoolRequest {
+                    root: root.join("pools"),
+                    required_rank_depth: 1,
+                    allow_reuse: true,
+                    require_existing: true,
+                }),
+            )
+            .unwrap();
+        assert!(required_usage.unwrap().reused);
+
+        let missing = Runner::new(build_search(&root.join("required-missing"), 0.026), 1).unwrap();
+        let error = missing
+            .run_with_candidate_pool(
+                1,
+                false,
+                Some(CandidatePoolRequest {
+                    root: root.join("missing-pools"),
+                    required_rank_depth: 1,
+                    allow_reuse: true,
+                    require_existing: true,
+                }),
+            )
+            .err()
+            .unwrap();
+        assert!(error
+            .to_string()
+            .contains("spectrum search fallback is disabled"));
+
         let forced = Runner::new(build_search(&root.join("forced"), 0.03), 1).unwrap();
         let (_, forced_usage) = forced
             .run_with_candidate_pool(
@@ -808,6 +877,7 @@ mod tests {
                     root: root.join("pools"),
                     required_rank_depth: 1,
                     allow_reuse: false,
+                    require_existing: false,
                 }),
             )
             .unwrap();

@@ -11162,6 +11162,8 @@ pub struct FittedArtifactProvenance {
     pub candidate_id_schema: String,
     pub fit_stage: String,
     pub model: String,
+    #[serde(default)]
+    pub external_profile_calibration: Option<crate::input::ExternalProfileCalibration>,
 }
 
 #[derive(Clone, Debug, Default, Serialize, Deserialize)]
@@ -11571,21 +11573,72 @@ pub fn run_df_layers(
 pub fn apply_external_ms2rescore_bounded_experts(
     features: &mut [DfFeature],
     settings: &FdrSettings,
-) -> Option<ExternalMs2RescoreProfiles> {
+) -> Result<ExternalMs2RescoreProfiles, String> {
+    let calibration = &settings.external_profile_calibration;
+    if calibration.min_null_rank <= 1
+        || calibration.max_null_rank < calibration.min_null_rank
+        || matches!(
+            calibration.provenance,
+            crate::input::ExternalProfileWindowProvenance::InvalidPartialConfiguration
+        )
+    {
+        return Err(format!(
+            "external MS2Rescore scoring requires a valid null calibration window above rank 1; resolved window is {}..={} ({:?})",
+            calibration.min_null_rank, calibration.max_null_rank, calibration.provenance
+        ));
+    }
     let cfg = match settings.physical_rescue.bounded_cfg.as_ref() {
         Some(cfg) => cfg,
         None => {
-            log::warn!(
-                "external bounded DF experts requested, but physical_rescue.bounded_cfg is missing; no external feature update applied"
-            );
-            return None;
+            return Err("external bounded DF experts require physical_rescue.bounded_cfg".into());
         }
     };
+
+    let joined_rank1 = features
+        .iter()
+        .filter(|f| f.core.rank == 1 && f.core.external_features.ms2rescore_feature_joined)
+        .count();
+    let joined_null = features
+        .iter()
+        .filter(|f| {
+            f.core.external_features.ms2rescore_feature_joined
+                && f.core.rank >= calibration.min_null_rank
+                && f.core.rank <= calibration.max_null_rank
+        })
+        .count();
+    if joined_rank1 == 0 || joined_null == 0 {
+        return Err(format!(
+            "external MS2Rescore scoring has no usable calibration population: joined rank-1={}, joined null={} in ranks {}..={}",
+            joined_rank1, joined_null, calibration.min_null_rank, calibration.max_null_rank
+        ));
+    }
 
     let profiles = settings
         .external_ms2rescore_frozen_profiles
         .clone()
         .unwrap_or_else(|| ExternalMs2RescoreProfiles::learn(features, settings));
+    if profiles.calibration != *calibration {
+        return Err(format!(
+            "external MS2Rescore fitted profile calibration {:?} does not match resolved workflow calibration {:?}",
+            profiles.calibration, calibration
+        ));
+    }
+    if ![
+        &profiles.ms2pip_pcc,
+        &profiles.spectral_angle,
+        &profiles.fragment_intensity_agreement,
+        &profiles.deeplc_abs_rt_error,
+        &profiles.ccs_pct_error,
+        &profiles.ccs_abs_error,
+    ]
+    .iter()
+    .any(|profile| profile.enabled)
+    {
+        return Err(format!(
+            "external MS2Rescore scoring requested, but no empirical feature passed calibration gates in ranks {}..={}",
+            calibration.min_null_rank, calibration.max_null_rank
+        ));
+    }
 
     log::info!(
         "external empirical profile mode: {}",
@@ -11718,18 +11771,19 @@ pub fn apply_external_ms2rescore_bounded_experts(
         cfg.max_penalty_shift,
         settings.physical_rescue.anchor_max_q,
         settings.physical_rescue.anchor_max_pep,
-        settings.moments_min_null_rank,
-        settings.moments_max_null_rank,
+        calibration.min_null_rank,
+        calibration.max_null_rank,
     );
 
-    Some(profiles)
+    Ok(profiles)
 }
 
 impl ExternalMs2RescoreProfiles {
     fn learn(features: &[DfFeature], settings: &FdrSettings) -> Self {
         Self {
-            schema_version: 1,
-            model_version: "sage-external-ms2rescore-profiles-v1".into(),
+            schema_version: 2,
+            model_version: "sage-external-ms2rescore-profiles-v2-explicit-window".into(),
+            calibration: settings.external_profile_calibration.clone(),
             ms2pip_pcc: ExternalEmpiricalFeatureProfile::learn(
                 "ms2rescore_ms2pip_pcc",
                 true,
@@ -11821,8 +11875,8 @@ impl ExternalEmpiricalFeatureProfile {
                 {
                     good.push(x);
                 }
-            } else if f.core.rank >= settings.moments_min_null_rank
-                && f.core.rank <= settings.moments_max_null_rank
+            } else if f.core.rank >= settings.external_profile_calibration.min_null_rank
+                && f.core.rank <= settings.external_profile_calibration.max_null_rank
             {
                 null.push(x);
             }
@@ -13152,6 +13206,137 @@ mod tests {
     use crate::database::PeptideIx;
     use crate::input::FdrOptions;
     use crate::peptide::Peptide;
+
+    fn external_profile_fixture() -> Vec<DfFeature> {
+        let mut features = Vec::new();
+        for index in 0..30 {
+            let mut feature = crate::scoring::FeatureCore {
+                rank: 1,
+                spec_id: format!("good-{index}"),
+                ..Default::default()
+            }
+            .to_df();
+            feature.core.external_features.ms2rescore_feature_joined = true;
+            feature.core.external_features.ms2rescore_ms2pip_pcc = 1.0;
+            feature.core.external_features.ms2rescore_spectral_angle = 1.0;
+            feature
+                .core
+                .external_features
+                .ms2rescore_fragment_intensity_agreement = 1.0;
+            feature
+                .core
+                .external_features
+                .ms2rescore_deeplc_abs_rt_error = 0.0;
+            feature.decoy_free_p_value = Some(0.001);
+            feature.decoy_free_pep = Some(0.001);
+            feature.decoy_free_q_value = Some(0.001);
+            feature.decoy_free_score = Some(3.0);
+            features.push(feature);
+        }
+        for index in 0..110 {
+            let mut feature = crate::scoring::FeatureCore {
+                rank: 9 + (index % 10) as u32,
+                spec_id: format!("null-{index}"),
+                ..Default::default()
+            }
+            .to_df();
+            feature.core.external_features.ms2rescore_feature_joined = true;
+            feature.core.external_features.ms2rescore_ms2pip_pcc = 0.0;
+            feature.core.external_features.ms2rescore_spectral_angle = 0.0;
+            feature
+                .core
+                .external_features
+                .ms2rescore_fragment_intensity_agreement = 0.0;
+            feature
+                .core
+                .external_features
+                .ms2rescore_deeplc_abs_rt_error = 1.0;
+            features.push(feature);
+        }
+        features
+    }
+
+    fn bounded_external_settings(explicit: bool) -> FdrSettings {
+        let mut options = FdrOptions {
+            moments_min_null_rank: Some(9),
+            moments_max_null_rank: Some(18),
+            ..Default::default()
+        };
+        if explicit {
+            options.external_profile_min_null_rank = Some(9);
+            options.external_profile_max_null_rank = Some(18);
+        }
+        let mut settings = FdrSettings::from(options);
+        settings.physical_rescue.bounded_cfg = Some(crate::input::BoundedAuxConfig {
+            update_space: BoundedAuxUpdateSpace::LogitConfidence,
+            max_rescue_shift: 0.25,
+            max_penalty_shift: 0.25,
+        });
+        settings
+    }
+
+    #[test]
+    fn explicit_external_profile_window_preserves_legacy_9_18_numerics() {
+        let mut legacy = external_profile_fixture();
+        let mut explicit = legacy.clone();
+        let legacy_profiles = apply_external_ms2rescore_bounded_experts(
+            &mut legacy,
+            &bounded_external_settings(false),
+        )
+        .unwrap();
+        let explicit_profiles = apply_external_ms2rescore_bounded_experts(
+            &mut explicit,
+            &bounded_external_settings(true),
+        )
+        .unwrap();
+        assert_eq!(explicit_profiles.calibration.min_null_rank, 9);
+        assert_eq!(explicit_profiles.calibration.max_null_rank, 18);
+        for (left, right) in legacy.iter().zip(&explicit) {
+            assert_eq!(left.decoy_free_p_value, right.decoy_free_p_value);
+            assert_eq!(left.decoy_free_pep, right.decoy_free_pep);
+            assert_eq!(left.decoy_free_q_value, right.decoy_free_q_value);
+        }
+        assert_eq!(
+            legacy_profiles.ms2pip_pcc.good_median,
+            explicit_profiles.ms2pip_pcc.good_median
+        );
+        assert_eq!(
+            legacy_profiles.ms2pip_pcc.null_median,
+            explicit_profiles.ms2pip_pcc.null_median
+        );
+    }
+
+    #[test]
+    fn invalid_or_empty_external_profile_anchor_fails_closed() {
+        let mut features = external_profile_fixture();
+        let mut rank_one = bounded_external_settings(true);
+        rank_one.external_profile_calibration.min_null_rank = 1;
+        rank_one.external_profile_calibration.max_null_rank = 1;
+        assert!(apply_external_ms2rescore_bounded_experts(&mut features, &rank_one).is_err());
+
+        let missing_anchor_options = FdrOptions {
+            moments_min_null_rank: Some(9),
+            moments_max_null_rank: Some(18),
+            external_profile_min_null_rank: Some(9),
+            external_profile_max_null_rank: None,
+            ..Default::default()
+        };
+        let mut missing_anchor = FdrSettings::from(missing_anchor_options);
+        missing_anchor.physical_rescue.bounded_cfg =
+            bounded_external_settings(true).physical_rescue.bounded_cfg;
+        let error =
+            apply_external_ms2rescore_bounded_experts(&mut features, &missing_anchor).unwrap_err();
+        assert!(error.contains("valid null calibration window above rank 1"));
+
+        let mut missing = external_profile_fixture();
+        missing.retain(|feature| feature.core.rank == 1);
+        let error = apply_external_ms2rescore_bounded_experts(
+            &mut missing,
+            &bounded_external_settings(true),
+        )
+        .unwrap_err();
+        assert!(error.contains("no usable calibration population"));
+    }
 
     fn test_peak(score: f64) -> (Peak, Vec<f64>) {
         (

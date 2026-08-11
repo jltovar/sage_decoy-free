@@ -264,6 +264,14 @@ pub struct EnsembleLock {
     pub evaluable: bool,
     #[serde(default)]
     pub not_evaluable_reasons: Vec<String>,
+    /// External empirical calibration is one shared dataset-local auxiliary
+    /// profile, never a per-expert last-writer-wins artifact.
+    #[serde(default = "default_ensemble_external_profile_contract")]
+    pub external_profile_contract: String,
+}
+
+fn default_ensemble_external_profile_contract() -> String {
+    "shared_dataset_local".into()
 }
 
 #[derive(Clone)]
@@ -311,6 +319,10 @@ pub struct WorkflowManifest {
     pub validation: ValidationWorkflow,
     #[serde(default = "default_true")]
     pub resume: bool,
+    /// Fail closed unless an exact immutable candidate pool already exists.
+    /// This is intended for annotation-only and downstream replay workflows.
+    #[serde(default)]
+    pub require_existing_candidate_pool: bool,
     #[serde(default)]
     pub annotate_target_matches: bool,
     #[serde(default)]
@@ -378,6 +390,8 @@ pub struct StageRecord {
     #[serde(default)]
     pub candidate_pool: Option<CandidatePoolUsage>,
     #[serde(default)]
+    pub require_existing_candidate_pool: bool,
+    #[serde(default)]
     pub ms2rescore_annotation_cache: Option<ExternalAnnotationCacheUsage>,
     #[serde(default)]
     pub target_only_calibration_policy: Option<TargetOnlyCalibrationPolicy>,
@@ -385,6 +399,8 @@ pub struct StageRecord {
     pub release_candidate: bool,
     #[serde(default)]
     pub window_provenance: Option<WindowProvenance>,
+    #[serde(default)]
+    pub external_profile_calibration: Option<sage_core::input::ExternalProfileCalibration>,
 }
 
 #[derive(Clone, Debug, Serialize, Deserialize)]
@@ -893,6 +909,7 @@ fn apply_fitted_artifacts(
     fdr: &mut FdrOptions,
     model: &ModelFit,
     artifacts: sage_core::decoy_free_fdr::DfRunArtifacts,
+    apply_external_profile: bool,
 ) -> Result<()> {
     anyhow::ensure!(
         artifact_contains_model(&artifacts, model),
@@ -901,12 +918,32 @@ fn apply_fitted_artifacts(
     );
     if let Some(profiles) = artifacts.external_ms2rescore.as_ref() {
         anyhow::ensure!(
-            profiles.schema_version == 1
-                && profiles.model_version == "sage-external-ms2rescore-profiles-v1",
+            profiles.schema_version == 2
+                && profiles.model_version == "sage-external-ms2rescore-profiles-v2-explicit-window",
             "external MS2Rescore fitted artifact is not portable or has an unsupported version"
         );
     }
-    fdr.external_ms2rescore_frozen_profiles = artifacts.external_ms2rescore.clone();
+    if apply_external_profile {
+        if let Some(profiles) = artifacts.external_ms2rescore.as_ref() {
+            if let (Some(min_rank), Some(max_rank)) = (
+                fdr.external_profile_min_null_rank,
+                fdr.external_profile_max_null_rank,
+            ) {
+                anyhow::ensure!(
+                    min_rank == profiles.calibration.min_null_rank
+                        && max_rank == profiles.calibration.max_null_rank,
+                    "configured external-profile window {}..={} disagrees with fitted artifact {}..={}",
+                    min_rank,
+                    max_rank,
+                    profiles.calibration.min_null_rank,
+                    profiles.calibration.max_null_rank
+                );
+            }
+            fdr.external_profile_min_null_rank = Some(profiles.calibration.min_null_rank);
+            fdr.external_profile_max_null_rank = Some(profiles.calibration.max_null_rank);
+        }
+        fdr.external_ms2rescore_frozen_profiles = artifacts.external_ms2rescore.clone();
+    }
     match model {
         ModelFit::Moments => {
             let artifact = artifacts.moments.context("Moments artifact is missing")?;
@@ -965,10 +1002,24 @@ fn apply_ensemble_lock(
     reuse_fitted_artifacts: bool,
 ) -> Result<()> {
     anyhow::ensure!(
+        lock.schema_version == 5,
+        "unsupported Ensemble lock schema {}; schema 5 is required for the shared external-profile contract",
+        lock.schema_version
+    );
+    anyhow::ensure!(
         lock.evaluable,
         "Ensemble lock is not evaluable: {}",
         lock.not_evaluable_reasons.join("; ")
     );
+    anyhow::ensure!(
+        lock.external_profile_contract == "shared_dataset_local",
+        "unsupported Ensemble external-profile contract {:?}",
+        lock.external_profile_contract
+    );
+    // The external empirical calibration is dataset-local auxiliary evidence
+    // shared by the assembled Ensemble. Expert artifacts contribute only their
+    // base-model nuisance state; no expert may overwrite this shared profile.
+    fdr.external_ms2rescore_frozen_profiles = None;
     fdr.enable_moments = Some(false);
     fdr.enable_mle = Some(false);
     fdr.enable_lower_order = Some(false);
@@ -977,6 +1028,16 @@ fn apply_ensemble_lock(
     fdr.enable_msfdr_2smix = Some(false);
     fdr.enable_nokoi = Some(false);
     let enabled = lock.experts.iter().filter(|expert| expert.enabled).count();
+    let unique_enabled = lock
+        .experts
+        .iter()
+        .filter(|expert| expert.enabled)
+        .map(|expert| model_slug(&expert.model))
+        .collect::<BTreeSet<_>>();
+    anyhow::ensure!(
+        unique_enabled.len() == enabled,
+        "Ensemble lock contains duplicate enabled expert models; refusing last-expert-wins artifact application"
+    );
     anyhow::ensure!(
         enabled >= lock.minimum_required_experts,
         "Ensemble lock has only {enabled} eligible experts"
@@ -1058,7 +1119,7 @@ fn apply_ensemble_lock(
             &expert.model,
             Some(&expert.fit_search_fingerprint),
         )?;
-        apply_fitted_artifacts(fdr, &expert.model, artifacts)?;
+        apply_fitted_artifacts(fdr, &expert.model, artifacts, false)?;
     }
     Ok(())
 }
@@ -1471,13 +1532,14 @@ fn build_ensemble_lock(
         })
         .unwrap_or_default();
     Ok(EnsembleLock {
-        schema_version: 4,
+        schema_version: 5,
         source_manifest_hash: manifest_hash.into(),
         dataset_fingerprint: dataset.fingerprint.clone(),
         experts: locked,
         minimum_required_experts: manifest.validation.minimum_ensemble_experts,
         evaluable,
         not_evaluable_reasons,
+        external_profile_contract: default_ensemble_external_profile_contract(),
     })
 }
 
@@ -1496,6 +1558,7 @@ fn fitted_artifact_provenance(
         candidate_id_schema: CANDIDATE_ID_SCHEMA.into(),
         fit_stage: stage.into(),
         model: model_slug(model).into(),
+        external_profile_calibration: None,
     }
 }
 
@@ -1603,9 +1666,13 @@ fn stamp_fitted_artifacts(
     }
     let mut artifacts: DfRunArtifacts = serde_json::from_slice(&std::fs::read(&path)?)
         .with_context(|| format!("invalid fitted artifacts {}", path.display()))?;
-    let provenance = inherited.unwrap_or_else(|| {
+    let mut provenance = inherited.unwrap_or_else(|| {
         fitted_artifact_provenance(dataset, stage, model, fit_search_fingerprint)
     });
+    provenance.external_profile_calibration = artifacts
+        .external_ms2rescore
+        .as_ref()
+        .map(|profiles| profiles.calibration.clone());
     artifacts.provenance = Some(provenance.clone());
     write_json_atomic(&path, &artifacts)?;
     Ok(Some(provenance))
@@ -1623,7 +1690,7 @@ fn hash_stage(
     target_only: Option<&TargetOnlyStageContext>,
 ) -> Result<String> {
     let mut hasher = Sha256::new();
-    hasher.update(b"sage-workflow-stage-v5-explicit-target-calibration\0");
+    hasher.update(b"sage-workflow-stage-v6-external-profile-and-required-pool\0");
     hasher.update(serde_json::to_vec(manifest)?);
     hasher.update(serde_json::to_vec(model)?);
     hasher.update(dataset.fingerprint.as_bytes());
@@ -1936,6 +2003,7 @@ fn run_search_stage(
                     candidate_id_schema: String::new(),
                     fit_stage: "unknown".into(),
                     model: model_slug(&model.model).into(),
+                    external_profile_calibration: None,
                 },
             )
         });
@@ -1946,7 +2014,7 @@ fn run_search_stage(
                 path.display()
             );
         }
-        apply_fitted_artifacts(fdr, &model.model, artifacts)?;
+        apply_fitted_artifacts(fdr, &model.model, artifacts, true)?;
         provenance
     } else {
         None
@@ -1990,10 +2058,12 @@ fn run_search_stage(
             .as_ref()
             .map(|provenance| provenance.dataset_fingerprint.clone()),
         candidate_pool: None,
+        require_existing_candidate_pool: manifest.require_existing_candidate_pool,
         ms2rescore_annotation_cache: None,
         target_only_calibration_policy: target_only.map(|context| context.policy),
         release_candidate: target_only.is_none_or(|context| context.release_candidate),
         window_provenance: target_only.map(|context| context.window_provenance.clone()),
+        external_profile_calibration: None,
     };
     std::fs::create_dir_all(output_directory)?;
     write_json_atomic(&checkpoint, &record)?;
@@ -2058,9 +2128,11 @@ fn run_search_stage(
                 required_rank_depth: requested_by_external
                     .map(|rank| rank.max(requested_by_model))
                     .unwrap_or(requested_by_model),
-                allow_reuse: target_only
-                    .map(|context| context.allow_candidate_pool_reuse)
-                    .unwrap_or(true),
+                allow_reuse: manifest.require_existing_candidate_pool
+                    || target_only
+                        .map(|context| context.allow_candidate_pool_reuse)
+                        .unwrap_or(true),
+                require_existing: manifest.require_existing_candidate_pool,
             }
         });
     let annotation_cache = external.then(|| ExternalAnnotationCacheRequest {
@@ -2100,6 +2172,9 @@ fn run_search_stage(
     record.artifact_fit_dataset_fingerprint = stamped
         .as_ref()
         .map(|provenance| provenance.dataset_fingerprint.clone());
+    record.external_profile_calibration = stamped
+        .as_ref()
+        .and_then(|provenance| provenance.external_profile_calibration.clone());
     record.status = "complete".into();
     record.results_sha256 = sha256_file(&record.results)?;
     record.config_snapshot_sha256 = sha256_file(&record.config_snapshot)?;
@@ -2943,7 +3018,8 @@ mod tests {
     use super::*;
     use sage_core::decoy_free_fdr::{DfRunArtifacts, FrozenModelMetadata};
     use sage_core::input::{
-        ExternalEmpiricalFeatureProfile, ExternalMs2RescoreProfiles, FrozenGumbelParameters,
+        ExternalEmpiricalFeatureProfile, ExternalMs2RescoreProfiles, ExternalProfileCalibration,
+        ExternalProfileWindowProvenance, FrozenGumbelParameters,
     };
     use sage_core::ml::msfdr::MsfdrSeededModel;
     use sage_core::ml::nokoi::{
@@ -2991,8 +3067,13 @@ mod tests {
 
     fn external_profiles() -> ExternalMs2RescoreProfiles {
         ExternalMs2RescoreProfiles {
-            schema_version: 1,
-            model_version: "sage-external-ms2rescore-profiles-v1".into(),
+            schema_version: 2,
+            model_version: "sage-external-ms2rescore-profiles-v2-explicit-window".into(),
+            calibration: ExternalProfileCalibration {
+                min_null_rank: 9,
+                max_null_rank: 18,
+                provenance: ExternalProfileWindowProvenance::ExplicitConfiguration,
+            },
             ms2pip_pcc: external_profile("ms2pip_pcc"),
             spectral_angle: external_profile("spectral_angle"),
             fragment_intensity_agreement: external_profile("fragment_intensity_agreement"),
@@ -3063,6 +3144,7 @@ mod tests {
                 diagnostic_only: false,
             },
             resume: true,
+            require_existing_candidate_pool: false,
             annotate_target_matches: false,
             ensemble_lock: None,
             locked_expert_artifacts: BTreeMap::new(),
@@ -3210,10 +3292,12 @@ mod tests {
             dataset_fingerprint: dataset.fingerprint.clone(),
             artifact_fit_dataset_fingerprint: None,
             candidate_pool: None,
+            require_existing_candidate_pool: false,
             ms2rescore_annotation_cache: None,
             target_only_calibration_policy: None,
             release_candidate: true,
             window_provenance: None,
+            external_profile_calibration: None,
         };
         assert!(!stage_checkpoint_identity_matches(
             &record,
@@ -3340,6 +3424,7 @@ mod tests {
                 candidate_id_schema: CANDIDATE_ID_SCHEMA.into(),
                 fit_stage: "optimized".into(),
                 model: "moments".into(),
+                external_profile_calibration: None,
             }),
             ..DfRunArtifacts::default()
         };
@@ -3462,11 +3547,58 @@ mod tests {
         let encoded = serde_json::to_vec(&artifacts).unwrap();
         let artifacts: DfRunArtifacts = serde_json::from_slice(&encoded).unwrap();
         let mut fdr = FdrOptions::default();
-        apply_fitted_artifacts(&mut fdr, &ModelFit::Moments, artifacts).unwrap();
+        apply_fitted_artifacts(&mut fdr, &ModelFit::Moments, artifacts, true).unwrap();
         assert_eq!(fdr.moments_min_null_rank, Some(9));
         assert_eq!(fdr.moments_max_null_rank, Some(18));
         assert!(fdr.moments_frozen_parameters.is_some());
         assert!(fdr.external_ms2rescore_frozen_profiles.is_some());
+    }
+
+    #[test]
+    fn ensemble_experts_cannot_overwrite_shared_external_profile() {
+        let shared = external_profiles();
+        let mut fdr = FdrOptions {
+            external_ms2rescore_frozen_profiles: Some(shared.clone()),
+            ..Default::default()
+        };
+        let mut first_profile = external_profiles();
+        first_profile.ms2pip_pcc.good_median = Some(2.0);
+        let first = DfRunArtifacts {
+            moments: Some(FrozenGumbelParameters {
+                schema_version: 1,
+                model_version: "sage-moments-gumbel-v1".into(),
+                min_rank: 9,
+                max_rank: 18,
+                mu: 1.0,
+                beta: 2.0,
+            }),
+            external_ms2rescore: Some(first_profile),
+            ..Default::default()
+        };
+        let mut second_profile = external_profiles();
+        second_profile.ms2pip_pcc.good_median = Some(3.0);
+        let second = DfRunArtifacts {
+            mle: Some(FrozenGumbelParameters {
+                schema_version: 1,
+                model_version: "sage-mle-gumbel-v1".into(),
+                min_rank: 9,
+                max_rank: 18,
+                mu: 1.0,
+                beta: 2.0,
+            }),
+            external_ms2rescore: Some(second_profile),
+            ..Default::default()
+        };
+        apply_fitted_artifacts(&mut fdr, &ModelFit::Moments, first, false).unwrap();
+        apply_fitted_artifacts(&mut fdr, &ModelFit::Mle, second, false).unwrap();
+        assert_eq!(
+            fdr.external_ms2rescore_frozen_profiles
+                .as_ref()
+                .unwrap()
+                .ms2pip_pcc
+                .good_median,
+            shared.ms2pip_pcc.good_median
+        );
     }
 
     #[test]
@@ -3546,7 +3678,7 @@ mod tests {
         };
         assert!(!artifact_contains_model(&artifacts, &ModelFit::Nokoi));
         let mut fdr = FdrOptions::default();
-        assert!(apply_fitted_artifacts(&mut fdr, &ModelFit::Nokoi, artifacts).is_err());
+        assert!(apply_fitted_artifacts(&mut fdr, &ModelFit::Nokoi, artifacts, true).is_err());
     }
 
     #[test]
@@ -3662,6 +3794,7 @@ mod tests {
                 diagnostic_only: false,
             },
             resume: false,
+            require_existing_candidate_pool: false,
             annotate_target_matches: false,
             ensemble_lock: None,
             locked_expert_artifacts: BTreeMap::new(),
@@ -3755,6 +3888,30 @@ mod tests {
         assert_eq!(refit.moments_max_null_rank, Some(18));
         assert!(refit.moments_frozen_parameters.is_none());
         assert!(refit.mle_frozen_parameters.is_none());
+
+        let mut legacy_lock = lock.clone();
+        legacy_lock.schema_version = 4;
+        assert!(apply_ensemble_lock(
+            &mut FdrOptions::default(),
+            &legacy_lock,
+            false,
+            &dataset,
+            &ArtifactReusePolicy::DatasetLocalOnly,
+            false,
+        )
+        .is_err());
+
+        let mut duplicate_lock = lock.clone();
+        duplicate_lock.experts.push(lock.experts[0].clone());
+        assert!(apply_ensemble_lock(
+            &mut FdrOptions::default(),
+            &duplicate_lock,
+            false,
+            &dataset,
+            &ArtifactReusePolicy::DatasetLocalOnly,
+            false,
+        )
+        .is_err());
 
         let mut reuse = FdrOptions::default();
         apply_ensemble_lock(

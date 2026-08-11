@@ -239,6 +239,31 @@ pub struct ExternalEmpiricalFeatureProfile {
     pub null_n: usize,
 }
 
+#[derive(Clone, Debug, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(rename_all = "snake_case")]
+pub enum ExternalProfileWindowProvenance {
+    ExplicitConfiguration,
+    LegacyMomentsFallback,
+    InvalidPartialConfiguration,
+}
+
+#[derive(Clone, Debug, Serialize, Deserialize, PartialEq, Eq)]
+pub struct ExternalProfileCalibration {
+    pub min_null_rank: u32,
+    pub max_null_rank: u32,
+    pub provenance: ExternalProfileWindowProvenance,
+}
+
+impl Default for ExternalProfileCalibration {
+    fn default() -> Self {
+        Self {
+            min_null_rank: 0,
+            max_null_rank: 0,
+            provenance: ExternalProfileWindowProvenance::InvalidPartialConfiguration,
+        }
+    }
+}
+
 /// Portable set of empirical MS2Rescore profiles learned on the development
 /// +entrapment search. Holdout and target-only searches must evaluate these
 /// profiles without relearning their medians, direction, or enablement gates.
@@ -246,6 +271,8 @@ pub struct ExternalEmpiricalFeatureProfile {
 pub struct ExternalMs2RescoreProfiles {
     pub schema_version: u32,
     pub model_version: String,
+    #[serde(default)]
+    pub calibration: ExternalProfileCalibration,
     pub ms2pip_pcc: ExternalEmpiricalFeatureProfile,
     pub spectral_angle: ExternalEmpiricalFeatureProfile,
     pub fragment_intensity_agreement: ExternalEmpiricalFeatureProfile,
@@ -989,6 +1016,10 @@ pub struct FdrOptions {
     // =========================================================================
     pub moments_min_null_rank: Option<u32>,
     pub moments_max_null_rank: Option<u32>,
+    /// Dataset-local auxiliary calibration anchor for external MS2Rescore
+    /// empirical profiles. Both bounds must be supplied together.
+    pub external_profile_min_null_rank: Option<u32>,
+    pub external_profile_max_null_rank: Option<u32>,
     pub moments_purification_factor: Option<f64>,
 
     /// Robust method-of-moments Gumbel fitting.
@@ -1332,6 +1363,7 @@ pub struct FdrSettings {
     // =========================================================================
     pub moments_min_null_rank: u32,
     pub moments_max_null_rank: u32,
+    pub external_profile_calibration: ExternalProfileCalibration,
     pub moments_purification_factor: f64,
 
     pub moments_robust_fit: bool,
@@ -1813,6 +1845,22 @@ impl From<FdrOptions> for FdrSettings {
             4,
             50,
         );
+        let external_profile_calibration = match (
+            options.external_profile_min_null_rank,
+            options.external_profile_max_null_rank,
+        ) {
+            (Some(min_null_rank), Some(max_null_rank)) => ExternalProfileCalibration {
+                min_null_rank,
+                max_null_rank,
+                provenance: ExternalProfileWindowProvenance::ExplicitConfiguration,
+            },
+            (None, None) => ExternalProfileCalibration {
+                min_null_rank: moments_min_null_rank,
+                max_null_rank: moments_max_null_rank,
+                provenance: ExternalProfileWindowProvenance::LegacyMomentsFallback,
+            },
+            _ => ExternalProfileCalibration::default(),
+        };
 
         // ---------------------------------------------------------------------
         // C) MLE specific resolved null window
@@ -2118,6 +2166,7 @@ impl From<FdrOptions> for FdrSettings {
             // =========================================================================
             moments_min_null_rank,
             moments_max_null_rank,
+            external_profile_calibration,
             moments_purification_factor,
 
             moments_robust_fit,
