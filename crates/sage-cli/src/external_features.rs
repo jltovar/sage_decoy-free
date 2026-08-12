@@ -9,9 +9,9 @@ use std::process::Command;
 
 use crate::candidate_pool::stable_candidate_id;
 use crate::external_feature_cache::{
-    annotation_identity, cache_directory, load_cache, usage as cache_usage, write_cache,
-    ExternalAnnotationCacheRequest, ExternalAnnotationCacheUsage, ExternalAnnotationInput,
-    ExternalAnnotationRecord,
+    annotation_identity_with_probe_root, cache_directory, load_cache, usage as cache_usage,
+    write_cache, ExternalAnnotationCacheRequest, ExternalAnnotationCacheUsage,
+    ExternalAnnotationInput, ExternalAnnotationRecord,
 };
 use crate::input::{
     ExternalFeatureEngine, ExternalFeatureFailPolicy, ExternalFeatureGenerationSettings,
@@ -107,8 +107,13 @@ fn add_external_features_inner(
         (Some(search_fingerprint), Some(request)) => {
             let (inputs, candidate_indices) =
                 annotation_inputs(features, db, search_fingerprint, requested_max_rank);
-            let identity =
-                annotation_identity(search_fingerprint, settings, &inputs, requested_max_rank)?;
+            let identity = annotation_identity_with_probe_root(
+                search_fingerprint,
+                settings,
+                &inputs,
+                requested_max_rank,
+                Some(&request.root),
+            )?;
             let directory = cache_directory(&request.root, &identity);
             if let Some((manifest, records)) = load_cache(&directory, &identity)? {
                 apply_cached_annotations(features, &candidate_indices, records)?;
@@ -122,7 +127,7 @@ fn add_external_features_inner(
                 log_external_feature_local_separation(features, db);
                 return Ok(Some(cache_usage(&directory, &manifest, true)));
             }
-            Some((identity, directory, candidate_indices))
+            Some((identity, directory, candidate_indices, inputs))
         }
         (None, None) => None,
         _ => unreachable!("cache arguments were validated by caller"),
@@ -158,6 +163,22 @@ fn add_external_features_inner(
         })?;
     }
 
+    if let (Some((expected, _, _, inputs)), Some(search_fingerprint), Some(cache_request)) =
+        (&prepared_cache, search_fingerprint, cache_request)
+    {
+        let current = annotation_identity_with_probe_root(
+            search_fingerprint,
+            settings,
+            inputs,
+            requested_max_rank,
+            Some(&cache_request.root),
+        )?;
+        anyhow::ensure!(
+            current == *expected,
+            "annotation generator identity changed after candidate export; refusing to run with stale model/package/wrapper identity"
+        );
+    }
+
     run_external_process(settings, &config_path)?;
 
     let parsed = parse_feature_output(&output_tsv)
@@ -188,7 +209,22 @@ fn add_external_features_inner(
         }
     }
 
-    if let Some((identity, directory, candidate_indices)) = prepared_cache {
+    if let Some((identity, directory, candidate_indices, inputs)) = prepared_cache {
+        let current = annotation_identity_with_probe_root(
+            search_fingerprint.expect("prepared cache has a search fingerprint"),
+            settings,
+            &inputs,
+            requested_max_rank,
+            Some(
+                &cache_request
+                    .expect("prepared cache has a cache request")
+                    .root,
+            ),
+        )?;
+        anyhow::ensure!(
+            current == identity,
+            "annotation generator identity changed during annotation; refusing to cache results under stale model/package/wrapper identity"
+        );
         let records = candidate_indices
             .into_iter()
             .map(|(index, stable_id)| ExternalAnnotationRecord {

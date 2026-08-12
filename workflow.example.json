@@ -138,6 +138,7 @@
     ]
   },
   "resume": true,
+  "require_existing_candidate_pool": false,
   "annotate_target_matches": true,
   "ensemble_lock": null,
   "locked_expert_artifacts": {},

@@ -1,4 +1,4 @@
-use crate::candidate_pool::{content_sha256, CANDIDATE_ID_SCHEMA};
+use crate::candidate_pool::CANDIDATE_ID_SCHEMA;
 use crate::input::ExternalFeatureGenerationSettings;
 use crate::provenance::{sha256_file, write_json_atomic};
 use anyhow::{Context, Result};
@@ -11,9 +11,19 @@ use std::io::{BufReader, BufWriter};
 use std::path::{Path, PathBuf};
 use std::process::Command;
 
-pub const EXTERNAL_ANNOTATION_CACHE_SCHEMA_VERSION: u32 = 1;
+pub const EXTERNAL_ANNOTATION_CACHE_SCHEMA_VERSION: u32 = 2;
 pub const EXTERNAL_ANNOTATION_FEATURE_SCHEMA: &str = "sage-external-psm-features-v1";
-const EXTERNAL_ANNOTATION_FINGERPRINT_SCHEMA: &str = "sage-external-annotation-fingerprint-v1";
+const EXTERNAL_ANNOTATION_FINGERPRINT_SCHEMA: &str =
+    "sage-external-annotation-fingerprint-v2-model-content";
+
+#[derive(Clone, Debug, Serialize, Deserialize, PartialEq, Eq)]
+pub struct ModelComponentIdentity {
+    pub generator: String,
+    pub logical_model_name: String,
+    pub relative_filename: String,
+    pub size_bytes: u64,
+    pub sha256: String,
+}
 
 #[derive(Clone, Debug)]
 pub struct ExternalAnnotationCacheRequest {
@@ -44,6 +54,7 @@ pub struct ExternalAnnotationIdentity {
     pub feature_schema: String,
     pub requested_candidate_count: usize,
     pub requested_max_rank: u32,
+    pub model_components: Vec<ModelComponentIdentity>,
 }
 
 #[derive(Clone, Debug, Serialize, Deserialize)]
@@ -65,7 +76,7 @@ pub struct ExternalAnnotationRecord {
 #[derive(Clone, Debug, Serialize, Deserialize)]
 struct ExternalAnnotationPayload {
     schema_version: u32,
-    annotation_fingerprint: String,
+    annotation_identity: ExternalAnnotationIdentity,
     records: Vec<ExternalAnnotationRecord>,
 }
 
@@ -101,6 +112,7 @@ struct GeneratorSettingsIdentity<'a> {
     deeplc_calibration_set_size: Option<usize>,
     modification_mapping: Option<serde_json::Value>,
     fixed_modifications: Option<serde_json::Value>,
+    model_components: &'a [ModelComponentIdentity],
 }
 
 #[derive(Clone, Debug, Serialize)]
@@ -130,6 +142,25 @@ fn canonical_json(value: &serde_json::Value) -> serde_json::Value {
         }
         other => other.clone(),
     }
+}
+
+fn portable_feature_generators(value: &serde_json::Value) -> serde_json::Value {
+    let mut value = canonical_json(value);
+    if let Some(generators) = value.as_object_mut() {
+        if let Some(ms2pip) = generators
+            .get_mut("ms2pip")
+            .and_then(serde_json::Value::as_object_mut)
+        {
+            ms2pip.remove("model_dir");
+        }
+        if let Some(deeplc) = generators
+            .get_mut("deeplc")
+            .and_then(serde_json::Value::as_object_mut)
+        {
+            deeplc.remove("path_model");
+        }
+    }
+    value
 }
 
 fn directory_sha256(path: &Path) -> Result<String> {
@@ -181,7 +212,7 @@ fn directory_sha256(path: &Path) -> Result<String> {
         let relative = file.strip_prefix(&canonical).unwrap_or(&file);
         hasher.update(relative.to_string_lossy().as_bytes());
         hasher.update(b"\0");
-        hasher.update(content_sha256(&file)?.as_bytes());
+        hasher.update(sha256_file(&file)?.as_bytes());
         hasher.update(b"\0");
     }
     Ok(format!("{:x}", hasher.finalize()))
@@ -193,7 +224,7 @@ fn source_identity(source: &str) -> Result<SourceIdentity> {
         return Ok(SourceIdentity {
             source: source.into(),
             kind: "file".into(),
-            sha256: content_sha256(path)?,
+            sha256: sha256_file(path)?,
         });
     }
     if path.is_dir() {
@@ -210,29 +241,293 @@ fn source_identity(source: &str) -> Result<SourceIdentity> {
     })
 }
 
-fn python_environment_identity(python: Option<&str>) -> Option<String> {
-    let python = python?;
+#[derive(Deserialize)]
+struct PythonEnvironmentProbe {
+    identity: String,
+    metadata_paths: Vec<String>,
+}
+
+fn python_environment_identity(
+    python: Option<&str>,
+) -> Result<(Option<String>, Vec<OperationalFileIdentity>)> {
+    let Some(python) = python else {
+        return Ok((None, Vec::new()));
+    };
     let script = r#"
 import importlib.metadata as m
 import json, platform
 names = ['ms2rescore', 'ms2pip', 'deeplc', 'im2deep', 'psm-utils', 'numpy', 'pandas']
 versions = {}
+metadata_paths = []
 for name in names:
     try:
-        versions[name] = m.version(name)
+        dist = m.distribution(name)
+        versions[name] = dist.version
+        path = getattr(dist, '_path', None)
+        if path is not None:
+            metadata_paths.append(str(path / 'METADATA'))
     except m.PackageNotFoundError:
         versions[name] = None
-print(json.dumps({'python': platform.python_version(), 'packages': versions}, sort_keys=True))
+identity = {'python': platform.python_version(), 'packages': versions}
+print(json.dumps({'identity': json.dumps(identity, sort_keys=True),
+                  'metadata_paths': metadata_paths}, sort_keys=True))
 "#;
-    let output = Command::new(python).arg("-c").arg(script).output().ok()?;
-    if !output.status.success() {
-        return None;
+    let output = Command::new(python)
+        .arg("-c")
+        .arg(script)
+        .output()
+        .with_context(|| format!("probing relevant annotation packages with {python}"))?;
+    anyhow::ensure!(
+        output.status.success(),
+        "annotation package-version probe failed: {}",
+        String::from_utf8_lossy(&output.stderr).trim()
+    );
+    let probe: PythonEnvironmentProbe = serde_json::from_slice(&output.stdout)
+        .context("annotation package-version probe returned invalid JSON")?;
+    let metadata = probe
+        .metadata_paths
+        .iter()
+        .map(|path| operational_file_identity(Path::new(path)))
+        .collect::<Result<Vec<_>>>()?;
+    Ok((Some(probe.identity), metadata))
+}
+
+#[derive(Deserialize)]
+struct ModelComponentProbe {
+    generator: String,
+    logical_model_name: String,
+    relative_filename: String,
+    path: String,
+}
+
+#[derive(Clone, Debug, Serialize, Deserialize)]
+struct OperationalFileIdentity {
+    path: PathBuf,
+    size_bytes: u64,
+    sha256: String,
+}
+
+#[derive(Clone, Debug, Serialize, Deserialize)]
+struct GeneratorProbeCache {
+    schema_version: u32,
+    probe_key: String,
+    python_environment: Option<String>,
+    package_metadata: Vec<OperationalFileIdentity>,
+    model_components: Vec<ModelComponentIdentity>,
+    model_files: Vec<OperationalFileIdentity>,
+}
+
+fn operational_file_identity(path: &Path) -> Result<OperationalFileIdentity> {
+    let metadata = path
+        .metadata()
+        .with_context(|| format!("reading annotation identity source {}", path.display()))?;
+    anyhow::ensure!(
+        metadata.is_file(),
+        "annotation identity source is not a file"
+    );
+    Ok(OperationalFileIdentity {
+        path: path.to_path_buf(),
+        size_bytes: metadata.len(),
+        sha256: sha256_file(path)?,
+    })
+}
+
+fn operational_file_is_current(file: &OperationalFileIdentity) -> bool {
+    file.path
+        .metadata()
+        .ok()
+        .filter(|metadata| metadata.is_file() && metadata.len() == file.size_bytes)
+        .and_then(|_| sha256_file(&file.path).ok())
+        .is_some_and(|sha256| sha256 == file.sha256)
+}
+
+fn selected_model_components(
+    settings: &ExternalFeatureGenerationSettings,
+) -> Result<(Vec<ModelComponentIdentity>, Vec<OperationalFileIdentity>)> {
+    let Some(python) = settings.python_executable.as_deref() else {
+        return Ok((Vec::new(), Vec::new()));
+    };
+    let generators = settings
+        .feature_generators
+        .as_ref()
+        .and_then(serde_json::Value::as_object);
+    if !generators.is_some_and(|g| g.contains_key("ms2pip") || g.contains_key("deeplc")) {
+        return Ok((Vec::new(), Vec::new()));
     }
-    let value = String::from_utf8(output.stdout).ok()?;
-    Some(value.trim().to_owned())
+    // Resolve files without loading TensorFlow, running a predictor, downloading
+    // weights, or modifying the Python environment.
+    let script = r#"
+import importlib.metadata as md
+import json, pathlib, sys
+cfg = json.loads(sys.argv[1])
+gens = cfg.get('feature_generators') or {}
+out = []
+if 'ms2pip' in gens:
+    from ms2pip.constants import MODELS
+    g = gens.get('ms2pip') or {}
+    name = g.get('model') or cfg.get('ms2pip_model') or 'HCD'
+    if name not in MODELS:
+        raise RuntimeError(f'unknown MS2PIP model {name!r}')
+    model_dir = pathlib.Path(g.get('model_dir') or pathlib.Path.home() / '.ms2pip').expanduser()
+    for ion, filename in sorted((MODELS[name].get('xgboost_model_files') or {}).items()):
+        out.append({'generator':'ms2pip','logical_model_name':f'{name}:{ion}',
+                    'relative_filename':filename,'path':str(model_dir / filename)})
+if 'deeplc' in gens:
+    g = gens.get('deeplc') or {}
+    configured = g.get('path_model')
+    if configured:
+        paths = configured if isinstance(configured, list) else [configured]
+        for i, value in enumerate(paths):
+            path = pathlib.Path(value).expanduser()
+            out.append({'generator':'deeplc','logical_model_name':f'configured:{i}',
+                        'relative_filename':path.name,'path':str(path)})
+    else:
+        dist = md.distribution('deeplc')
+        files = sorted(str(p) for p in (dist.files or [])
+                       if str(p).replace('\\', '/').startswith('deeplc/mods/')
+                       and str(p).endswith('.keras'))
+        if g.get('single_model_mode', True):
+            files = files[:1]
+        for i, relative in enumerate(files):
+            path = pathlib.Path(dist.locate_file(relative))
+            out.append({'generator':'deeplc','logical_model_name':f'default_candidate:{i}',
+                        'relative_filename':relative.replace('\\', '/'), 'path':str(path)})
+print(json.dumps(out, sort_keys=True))
+"#;
+    let output = Command::new(python)
+        .arg("-c")
+        .arg(script)
+        .arg(serde_json::to_string(settings)?)
+        .output()
+        .with_context(|| format!("probing selected annotation model files with {python}"))?;
+    anyhow::ensure!(
+        output.status.success(),
+        "annotation model-file probe failed: {}",
+        String::from_utf8_lossy(&output.stderr).trim()
+    );
+    let probes: Vec<ModelComponentProbe> = serde_json::from_slice(&output.stdout)
+        .context("annotation model-file probe returned invalid JSON")?;
+    let mut components = Vec::with_capacity(probes.len());
+    let mut model_files = Vec::with_capacity(probes.len());
+    for probe in probes {
+        let path = Path::new(&probe.path);
+        let file = operational_file_identity(path)
+            .with_context(|| format!("selected {} model file is missing", probe.generator))?;
+        components.push(ModelComponentIdentity {
+            generator: probe.generator,
+            logical_model_name: probe.logical_model_name,
+            relative_filename: probe.relative_filename,
+            size_bytes: file.size_bytes,
+            sha256: file.sha256.clone(),
+        });
+        model_files.push(file);
+    }
+    components.sort_by(|a, b| {
+        (&a.generator, &a.logical_model_name, &a.relative_filename).cmp(&(
+            &b.generator,
+            &b.logical_model_name,
+            &b.relative_filename,
+        ))
+    });
+    Ok((components, model_files))
 }
 
 pub fn generator_settings_sha256(settings: &ExternalFeatureGenerationSettings) -> Result<String> {
+    Ok(generator_identity(settings, None)?.0)
+}
+
+/// Resolve the portable generator identity through the same durable probe
+/// cache used by annotation generation. Workflow stage hashing calls this on
+/// resume so a verified, unchanged cache does not need to launch Python merely
+/// to reconstruct provenance that is already durable.
+pub fn generator_settings_sha256_with_probe_root(
+    settings: &ExternalFeatureGenerationSettings,
+    probe_root: &Path,
+) -> Result<String> {
+    Ok(generator_identity(settings, Some(probe_root))?.0)
+}
+
+fn generator_identity(
+    settings: &ExternalFeatureGenerationSettings,
+    probe_root: Option<&Path>,
+) -> Result<(String, Vec<ModelComponentIdentity>)> {
+    let probe_key = generator_probe_key(settings)?;
+    let probe_path = probe_root.map(|root| {
+        root.join("generator_identity_probes")
+            .join(format!("{probe_key}.json"))
+    });
+    let cached = probe_path
+        .as_ref()
+        .filter(|path| path.is_file())
+        .and_then(|path| std::fs::read(path).ok())
+        .and_then(|bytes| serde_json::from_slice::<GeneratorProbeCache>(&bytes).ok())
+        .filter(|probe| {
+            probe.schema_version == 2
+                && probe.probe_key == probe_key
+                && probe
+                    .package_metadata
+                    .iter()
+                    .all(operational_file_is_current)
+                && probe.model_files.iter().all(operational_file_is_current)
+                && probe.model_files.len() == probe.model_components.len()
+        });
+    let probe = if let Some(probe) = cached {
+        probe
+    } else {
+        let (python_environment, package_metadata) =
+            python_environment_identity(settings.python_executable.as_deref())?;
+        let (model_components, model_files) = selected_model_components(settings)?;
+        let probe = GeneratorProbeCache {
+            schema_version: 2,
+            probe_key,
+            python_environment,
+            package_metadata,
+            model_components,
+            model_files,
+        };
+        if let Some(path) = probe_path.as_ref() {
+            std::fs::create_dir_all(path.parent().expect("probe path has a parent"))?;
+            write_json_atomic(path, &probe)?;
+        }
+        probe
+    };
+    let digest = generator_identity_digest(
+        settings,
+        probe.python_environment.clone(),
+        &probe.model_components,
+    )?;
+    Ok((digest, probe.model_components))
+}
+
+fn generator_probe_key(settings: &ExternalFeatureGenerationSettings) -> Result<String> {
+    let mut operational = canonical_json(&serde_json::to_value(settings)?);
+    if let Some(object) = operational.as_object_mut() {
+        for ignored in [
+            "enabled",
+            "temp_directory",
+            "output_directory",
+            "fail_policy",
+            "use_mode",
+            "log_level",
+        ] {
+            object.remove(ignored);
+        }
+    }
+    let value = serde_json::json!({
+        "schema": "sage-generator-probe-key-v1",
+        "settings": operational,
+        "operational_home": std::env::var_os("HOME").map(|value| value.to_string_lossy().into_owned()),
+        "command": settings.command_path.as_deref().map(source_identity).transpose()?,
+        "python": settings.python_executable.as_deref().map(source_identity).transpose()?,
+    });
+    Ok(sha256_bytes(&serde_json::to_vec(&canonical_json(&value))?))
+}
+
+fn generator_identity_digest(
+    settings: &ExternalFeatureGenerationSettings,
+    python_environment: Option<String>,
+    model_components: &[ModelComponentIdentity],
+) -> Result<String> {
     let command = settings
         .command_path
         .as_deref()
@@ -254,11 +549,14 @@ pub fn generator_settings_sha256(settings: &ExternalFeatureGenerationSettings) -
         engine: &settings.engine,
         command,
         python,
-        python_environment: python_environment_identity(settings.python_executable.as_deref()),
+        python_environment,
         spectrum_file_mapping,
         feature_only: settings.feature_only,
         max_rank: settings.max_rank,
-        feature_generators: settings.feature_generators.as_ref().map(canonical_json),
+        feature_generators: settings
+            .feature_generators
+            .as_ref()
+            .map(portable_feature_generators),
         processes: settings.processes,
         ms2pip_model: settings.ms2pip_model.as_deref(),
         ms2pip_ms2_tolerance_bits: settings.ms2pip_ms2_tolerance.map(f64::to_bits),
@@ -267,6 +565,7 @@ pub fn generator_settings_sha256(settings: &ExternalFeatureGenerationSettings) -
         deeplc_calibration_set_size: settings.deeplc_calibration_set_size,
         modification_mapping: settings.modification_mapping.as_ref().map(canonical_json),
         fixed_modifications: settings.fixed_modifications.as_ref().map(canonical_json),
+        model_components,
     };
     Ok(sha256_bytes(&serde_json::to_vec(&value)?))
 }
@@ -307,7 +606,23 @@ pub fn annotation_identity(
     inputs: &[ExternalAnnotationInput],
     requested_max_rank: u32,
 ) -> Result<ExternalAnnotationIdentity> {
-    let generator_settings_sha256 = generator_settings_sha256(settings)?;
+    annotation_identity_with_probe_root(
+        search_fingerprint,
+        settings,
+        inputs,
+        requested_max_rank,
+        None,
+    )
+}
+
+pub fn annotation_identity_with_probe_root(
+    search_fingerprint: &str,
+    settings: &ExternalFeatureGenerationSettings,
+    inputs: &[ExternalAnnotationInput],
+    requested_max_rank: u32,
+    probe_root: Option<&Path>,
+) -> Result<ExternalAnnotationIdentity> {
+    let (generator_settings_sha256, model_components) = generator_identity(settings, probe_root)?;
     let calibration_input_sha256 = calibration_input_sha256(inputs);
     let mut hasher = Sha256::new();
     hasher.update(EXTERNAL_ANNOTATION_FINGERPRINT_SCHEMA.as_bytes());
@@ -332,6 +647,7 @@ pub fn annotation_identity(
         feature_schema: EXTERNAL_ANNOTATION_FEATURE_SCHEMA.into(),
         requested_candidate_count: inputs.len(),
         requested_max_rank,
+        model_components,
     })
 }
 
@@ -388,7 +704,8 @@ pub fn load_cache(
     let payload: ExternalAnnotationPayload = bincode::deserialize_from(&mut decoder)?;
     anyhow::ensure!(
         payload.schema_version == EXTERNAL_ANNOTATION_CACHE_SCHEMA_VERSION
-            && payload.annotation_fingerprint == expected.digest,
+            && payload.annotation_identity == *expected
+            && payload.annotation_identity == manifest.identity,
         "MS2Rescore annotation cache payload identity mismatch"
     );
     anyhow::ensure!(
@@ -436,7 +753,7 @@ pub fn write_cache(
     let temporary = directory.join("ms2rescore_annotations.bin.zst.tmp");
     let payload = ExternalAnnotationPayload {
         schema_version: EXTERNAL_ANNOTATION_CACHE_SCHEMA_VERSION,
-        annotation_fingerprint: identity.digest.clone(),
+        annotation_identity: identity.clone(),
         records,
     };
     {
@@ -518,6 +835,12 @@ pub fn verify_usage(usage: &ExternalAnnotationCacheUsage) -> Result<()> {
         usage.payload.is_file() && sha256_file(&usage.payload)? == manifest.payload_sha256,
         "MS2Rescore annotation cache payload hash mismatch"
     );
+    let (verified_manifest, _) = load_cache(directory, &manifest.identity)?
+        .context("MS2Rescore annotation cache disappeared during verification")?;
+    anyhow::ensure!(
+        verified_manifest.payload_sha256 == manifest.payload_sha256,
+        "MS2Rescore annotation cache manifest and payload disagree"
+    );
     Ok(())
 }
 
@@ -536,6 +859,7 @@ mod tests {
             feature_schema: EXTERNAL_ANNOTATION_FEATURE_SCHEMA.into(),
             requested_candidate_count: 1,
             requested_max_rank: 10,
+            model_components: Vec::new(),
         }
     }
 
@@ -609,5 +933,117 @@ mod tests {
 
         changed.ms2pip_model = Some("different-model".into());
         assert_ne!(expected, generator_settings_sha256(&changed).unwrap());
+    }
+
+    #[test]
+    fn model_content_identity_is_path_independent_and_byte_sensitive() {
+        let root = std::env::temp_dir().join(format!(
+            "sage-model-identity-test-{}-{}",
+            std::process::id(),
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .unwrap()
+                .as_nanos()
+        ));
+        let first = root.join("first/model.keras");
+        let second = root.join("moved/model.keras");
+        std::fs::create_dir_all(first.parent().unwrap()).unwrap();
+        std::fs::create_dir_all(second.parent().unwrap()).unwrap();
+        std::fs::write(&first, b"same-model-bytes").unwrap();
+        std::fs::write(&second, b"same-model-bytes").unwrap();
+        let identify = |path: &Path| ModelComponentIdentity {
+            generator: "deeplc".into(),
+            logical_model_name: "configured:0".into(),
+            relative_filename: "model.keras".into(),
+            size_bytes: path.metadata().unwrap().len(),
+            sha256: sha256_file(path).unwrap(),
+        };
+        let first_component = identify(&first);
+        let second_component = identify(&second);
+        assert_eq!(first_component, second_component);
+        let mut first_settings = ExternalFeatureGenerationSettings::default();
+        first_settings.feature_generators = Some(serde_json::json!({
+            "deeplc": {"path_model": first}
+        }));
+        let mut moved_settings = first_settings.clone();
+        moved_settings.feature_generators = Some(serde_json::json!({
+            "deeplc": {"path_model": second}
+        }));
+        let first_digest =
+            generator_identity_digest(&first_settings, None, &[first_component.clone()]).unwrap();
+        let moved_digest =
+            generator_identity_digest(&moved_settings, None, &[second_component]).unwrap();
+        assert_eq!(first_digest, moved_digest);
+        std::fs::write(&second, b"one-byte-change!").unwrap();
+        let changed_component = identify(&second);
+        assert_ne!(first_component, changed_component);
+        assert_ne!(
+            first_digest,
+            generator_identity_digest(&moved_settings, None, &[changed_component]).unwrap()
+        );
+        std::fs::remove_dir_all(root).unwrap();
+    }
+
+    #[test]
+    fn wrapper_and_relevant_environment_changes_invalidate_identity() {
+        let root = std::env::temp_dir().join(format!(
+            "sage-generator-identity-test-{}-{}",
+            std::process::id(),
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .unwrap()
+                .as_nanos()
+        ));
+        std::fs::create_dir_all(&root).unwrap();
+        let wrapper = root.join("wrapper.py");
+        std::fs::write(&wrapper, b"print('v1')\n").unwrap();
+        let mut settings = ExternalFeatureGenerationSettings::default();
+        settings.command_path = Some(wrapper.display().to_string());
+        let env_v1 = Some(r#"{"python":"3.12.0","packages":{"ms2pip":"4.1.2"}}"#.into());
+        let env_v2 = Some(r#"{"python":"3.12.0","packages":{"ms2pip":"4.1.3"}}"#.into());
+        let first = generator_identity_digest(&settings, env_v1.clone(), &[]).unwrap();
+        let package_changed = generator_identity_digest(&settings, env_v2, &[]).unwrap();
+        assert_ne!(first, package_changed);
+        std::fs::write(&wrapper, b"print('v2')\n").unwrap();
+        let wrapper_changed = generator_identity_digest(&settings, env_v1, &[]).unwrap();
+        assert_ne!(first, wrapper_changed);
+        std::fs::remove_dir_all(root).unwrap();
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn cached_generator_probe_avoids_a_second_python_invocation() {
+        use std::os::unix::fs::PermissionsExt;
+
+        let root = std::env::temp_dir().join(format!(
+            "sage-generator-probe-cache-test-{}-{}",
+            std::process::id(),
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .unwrap()
+                .as_nanos()
+        ));
+        std::fs::create_dir_all(&root).unwrap();
+        let marker = root.join("invocations");
+        let python = root.join("python");
+        std::fs::write(
+            &python,
+            format!(
+                "#!/bin/sh\nprintf x >> '{}'\nprintf '%s\\n' '{{\"identity\":\"test-environment\",\"metadata_paths\":[]}}'\n",
+                marker.display()
+            ),
+        )
+        .unwrap();
+        let mut permissions = python.metadata().unwrap().permissions();
+        permissions.set_mode(0o755);
+        std::fs::set_permissions(&python, permissions).unwrap();
+
+        let mut settings = ExternalFeatureGenerationSettings::default();
+        settings.python_executable = Some(python.display().to_string());
+        let first = generator_settings_sha256_with_probe_root(&settings, &root).unwrap();
+        let second = generator_settings_sha256_with_probe_root(&settings, &root).unwrap();
+        assert_eq!(first, second);
+        assert_eq!(std::fs::read(&marker).unwrap(), b"x");
+        std::fs::remove_dir_all(root).unwrap();
     }
 }
