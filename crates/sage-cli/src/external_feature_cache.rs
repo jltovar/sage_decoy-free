@@ -436,6 +436,17 @@ pub fn generator_settings_sha256(settings: &ExternalFeatureGenerationSettings) -
     Ok(generator_identity(settings, None)?.0)
 }
 
+/// Resolve the portable generator identity through the same durable probe
+/// cache used by annotation generation. Workflow stage hashing calls this on
+/// resume so a verified, unchanged cache does not need to launch Python merely
+/// to reconstruct provenance that is already durable.
+pub fn generator_settings_sha256_with_probe_root(
+    settings: &ExternalFeatureGenerationSettings,
+    probe_root: &Path,
+) -> Result<String> {
+    Ok(generator_identity(settings, Some(probe_root))?.0)
+}
+
 fn generator_identity(
     settings: &ExternalFeatureGenerationSettings,
     probe_root: Option<&Path>,
@@ -1029,8 +1040,8 @@ mod tests {
 
         let mut settings = ExternalFeatureGenerationSettings::default();
         settings.python_executable = Some(python.display().to_string());
-        let first = generator_identity(&settings, Some(&root)).unwrap();
-        let second = generator_identity(&settings, Some(&root)).unwrap();
+        let first = generator_settings_sha256_with_probe_root(&settings, &root).unwrap();
+        let second = generator_settings_sha256_with_probe_root(&settings, &root).unwrap();
         assert_eq!(first, second);
         assert_eq!(std::fs::read(&marker).unwrap(), b"x");
         std::fs::remove_dir_all(root).unwrap();

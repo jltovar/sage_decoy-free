@@ -9,7 +9,7 @@ use crate::entrapment::{
     LegacyEntrapmentReference, SharedPeptideExclusionMode,
 };
 use crate::external_feature_cache::{
-    generator_settings_sha256, verify_usage as verify_annotation_cache_usage,
+    generator_settings_sha256_with_probe_root, verify_usage as verify_annotation_cache_usage,
     ExternalAnnotationCacheRequest, ExternalAnnotationCacheUsage,
 };
 use crate::input::Input;
@@ -1702,7 +1702,13 @@ fn hash_stage(
         let input = Input::load(manifest.search_config.to_string_lossy().as_ref())?;
         let settings =
             crate::input::ExternalFeatureGenerationSettings::from(input.external_features);
-        hasher.update(generator_settings_sha256(&settings)?.as_bytes());
+        hasher.update(
+            generator_settings_sha256_with_probe_root(
+                &settings,
+                &manifest.output_root.join("ms2rescore_annotations"),
+            )?
+            .as_bytes(),
+        );
     }
     if fasta.is_file() {
         hasher.update(sha256_file(fasta)?.as_bytes());
