@@ -1,5 +1,6 @@
 use anyhow::{Context, Result};
 use csv::StringRecord;
+use sage_core::input::ModelFit;
 use serde::{Deserialize, Serialize};
 use std::collections::{BTreeMap, BTreeSet};
 use std::path::PathBuf;
@@ -32,6 +33,47 @@ impl TargetOnlyCalibrationPolicy {
             Self::ReuseDatasetArtifact => "target_only_reuse_dataset_artifact",
             Self::CompareBoth => "target_only_compare_both",
         }
+    }
+}
+
+pub const LOWER_ORDER_TARGET_ONLY_REUSE_UNSUPPORTED_REASON: &str =
+    "Lower Order nuisance parameters and candidate-count normalization are search-space dependent and must be refitted after the FASTA/candidate space changes.";
+
+/// Resolved model capability for one concrete target-only interpretation.
+///
+/// Keep this separate from workflow parsing so artifact application and other
+/// lower-level callers enforce the same scientific contract.
+#[derive(Clone, Debug, Serialize, Deserialize, PartialEq, Eq)]
+pub struct TargetOnlyPolicyCapability {
+    pub model: String,
+    pub policy: TargetOnlyCalibrationPolicy,
+    pub supported: bool,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub reason: Option<String>,
+}
+
+pub fn target_only_policy_capability(
+    model: &ModelFit,
+    policy: TargetOnlyCalibrationPolicy,
+) -> TargetOnlyPolicyCapability {
+    let unsupported_lower_order_reuse = *model == ModelFit::LowerOrder
+        && policy == TargetOnlyCalibrationPolicy::ReuseDatasetArtifact;
+    TargetOnlyPolicyCapability {
+        model: match model {
+            ModelFit::Moments => "moments",
+            ModelFit::Mle => "mle",
+            ModelFit::LowerOrder => "lower_order",
+            ModelFit::Msfdr => "msfdr",
+            ModelFit::Msfdr1Smix => "msfdr1_smix",
+            ModelFit::Msfdr2Smix => "msfdr2_smix",
+            ModelFit::Nokoi => "nokoi",
+            ModelFit::Ensemble => "ensemble",
+        }
+        .into(),
+        policy,
+        supported: !unsupported_lower_order_reuse,
+        reason: unsupported_lower_order_reuse
+            .then(|| LOWER_ORDER_TARGET_ONLY_REUSE_UNSUPPORTED_REASON.into()),
     }
 }
 

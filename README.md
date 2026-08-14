@@ -171,7 +171,7 @@ slightly exceeded 1%; this does not invalidate parity, but it prevents a broader
 | Moments | Required ISB and PXD Moments parity complete; still subject to dataset-local runtime gates. |
 | MLE | ISB parity complete; eligible for automatic Ensemble gates. No additional PXD model was required. |
 | MSFDR1-SMIX | Rank-1-only fitted-state, MS2Rescore, and target-only parity complete; eligible for automatic gates. |
-| Lower Order | Refit parity is valid, but complete-artifact reuse transfers unstably; excluded from Ensemble. |
+| Lower Order | Supports target-only `refit_with_locked_window` only; `reuse_dataset_artifact` is unsupported across target-only search spaces. Excluded from automatic Ensemble participation pending independent prospective validation. |
 | MSFDR | Unannotated grid and fitted-state parity passed; annotated parity is deferred because the frozen Linux and regenerated macOS feature environments differ. |
 | MSFDR2-SMIX | Unannotated grid and fitted-state parity passed; annotated parity is deferred for the same environment issue. |
 | Nokoi | Portable artifact and frozen parity are incomplete; diagnostic-only and excluded from Ensemble. |
@@ -1139,9 +1139,10 @@ The completed validation establishes engineering behavior, not general statistic
    must not be described as proof of calibrated 1% protein FDR.
 4. A matched TDC benchmark is still absent from the final release evidence. The repository therefore
    cannot yet evaluate whether Decoy-Free should replace TDC as a statistical default.
-5. Lower Order artifact reuse, annotated MSFDR/MSFDR2-SMIX portability, and Nokoi portability/parity
-   remain explicitly deferred. Ensemble is optional and cannot promote those experts around their
-   gates.
+5. Lower Order supports target-only `refit_with_locked_window` only and remains excluded pending
+   independent prospective validation. Annotated MSFDR/MSFDR2-SMIX portability and Nokoi
+   portability/parity remain explicitly deferred. Ensemble is optional and cannot promote those
+   experts around their gates.
 6. The present evidence does not select a universally best Decoy-Free model. Model suitability must
    be assessed within each dataset using entrapment calibration and matched comparisons.
 
