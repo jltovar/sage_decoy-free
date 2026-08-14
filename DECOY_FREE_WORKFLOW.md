@@ -188,7 +188,7 @@ rank-depth boundary.
 
 `target_only_calibration_policy` replaces the ambiguous term "locked" and defaults to
 `refit_with_locked_window`. The setting is workflow-wide and can be overridden on an individual
-model while Lower Order is being evaluated. The policies are:
+model subject to that model's declared target-only capability. The policies are:
 
 - `refit_with_locked_window`: retain the window selected on the dataset's +entrapment search, but
   re-estimate nuisance parameters in the target-only candidate space. Target-only outcomes never
@@ -199,6 +199,13 @@ model while Lower Order is being evaluated. The policies are:
 - `compare_both`: materialize both interpretations in separate directories and validation rows.
   The refit result is the release candidate; reuse is retained as a diagnostic comparison and
   cannot veto that release candidate.
+
+Lower Order supports only `refit_with_locked_window` across the +entrapment and target-only search
+spaces. Its nuisance parameters and candidate-count normalization are search-space dependent and
+must be refitted after the FASTA/candidate space changes. For Lower Order, `reuse_dataset_artifact`
+fails closed and `compare_both` records the reuse branch as `not_evaluable`; neither path silently
+omits or substitutes the unsupported result. The +entrapment-selected window is still reused, and
+target-only outcomes never retune it.
 
 Every target-only checkpoint records the policy plus a separate `window_provenance` object with
 the source dataset, model, +entrapment stage, selected ranks, source artifact hash, candidate
@@ -258,21 +265,23 @@ workflows.
 
 The entrapment search writes `lower_order_model_artifact.json`. It contains the complete fitted
 charge-stratified model, rank window, TEV transformation, candidate-count power/scale,
-extrapolation strength, version, and reference candidate-count distribution. Under
-`reuse_dataset_artifact`, the target-only stage validates and loads this artifact without
-refitting. Candidate counts are empirically quantile-normalized to the reference +entrapment
-distribution. Under `refit_with_locked_window`, Lower Order retains only its selected ranks and
-fits target-only nuisance state. Missing or incompatible reuse artifacts fail closed.
+extrapolation strength, version, and reference candidate-count distribution. The artifact remains
+valid for exact same-pool replay and +entrapment Ensemble application. Across a target-only search
+space, Lower Order retains only its selected ranks and refits the nuisance state under
+`refit_with_locked_window`; complete-artifact reuse is unsupported and fails closed.
 
-This normalization is intentionally auditable and must first pass the complete ISB18 parity and
-same-dataset target-only tests before Lower Order is restored as an Ensemble default. A costly
-PXD001468 Lower Order run is optional and will be considered only after PXD001468 Moments parity.
+The ISB diagnostic established decision-equivalent numerical grid behavior, exact same-pool
+artifact replay, deterministic schema-v2 annotation reuse, and controlled target-only refitting at
+the locked `6-9` window. Bitwise historical grid parity and complete frozen annotated parity are
+`not_evaluable` because the raw historical search payload differs by pre-existing one-ULP values
+and the required historical non-rank-1 Linux annotations were not preserved. Preserved rank-1
+annotations match exactly.
 
-The frozen ISB comparison established exact grid, MS2Rescore, and target-only parity for
-`refit_with_locked_window`. The diagnostic `reuse_dataset_artifact` interpretation did not match:
-it produced 6,479 Level-4 PSMs, 291 peptides, and 17 proteins instead of the legacy/refit
-558/44/10. Lower Order remains excluded from the production Ensemble until that normalization
-behavior is repaired; the exact refit result does not make artifact reuse release-eligible.
+Lower Order is technically ready for a controlled independent holdout, but remains excluded from
+automatic production Ensemble participation pending that prospective validation. Its controlled
+ISB Ensemble contribution was two canonical peptides/peptidoforms and no target-only peptide,
+peptidoform, or protein evidence; calibration at Level 4 was underpowered. These results do not
+establish production utility or eligibility for the statistical default.
 
 ## Frozen ISB parity status
 
@@ -335,9 +344,8 @@ override or guarantee of admission.
 The initial ISB production policy is:
 
 - Moments, MLE, and rank-1-only MSFDR1-SMIX remain eligible for automatic Ensemble gates.
-- Lower Order remains excluded. Its complete artifact is now validated more strictly, but its
-  target-only artifact-reuse interpretation remains materially unstable. Exact refit parity does
-  not make reuse safe.
+- Lower Order remains excluded pending independent prospective validation. It supports target-only
+  `refit_with_locked_window` only; cross-space `reuse_dataset_artifact` is explicitly unsupported.
 - Seeded MSFDR and MSFDR2-SMIX remain excluded until the frozen Linux annotation environment is
   reproduced or the methods pass a declared cross-platform annotation-robustness gate.
 - Nokoi v1 is diagnostic-only. The workflow refuses to reuse it as a portable artifact because
