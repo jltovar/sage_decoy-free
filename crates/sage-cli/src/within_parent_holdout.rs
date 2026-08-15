@@ -24,8 +24,9 @@ use sage_core::decoy_free_fdr::{
     optimize_null_window, DfRunArtifacts, NullWindowEvaluation,
 };
 use sage_core::input::{
-    AdaptiveNullWindowSearchOptions, FdrSettings, ModelFit, NullWindowCandidate,
-    NullWindowOptimizerOptions, NullWindowSearchStrategy, NullWindowValidationScope,
+    AdaptiveNullWindowSearchOptions, EnsemblePCombiner, EnsemblePepCombiner, FdrSettings, ModelFit,
+    NullWindowCandidate, NullWindowOptimizerOptions, NullWindowSearchStrategy,
+    NullWindowValidationScope,
 };
 use sage_core::scoring::DfFeature;
 use serde::{Deserialize, Serialize};
@@ -36,10 +37,19 @@ use std::sync::Arc;
 
 pub const SUBSET_SCHEMA: &str = "within-parent-subset-v1";
 pub const ARTIFACT_SCHEMA: &str = "within-parent-holdout-artifact-v1";
-pub const LOCK_SCHEMA: &str = "within-parent-holdout-lock-v2";
+pub const LOCK_SCHEMA: &str = "within-parent-holdout-lock-v3-one-model-one-vote";
 pub const PREREGISTRATION_SCHEMA: &str = "within-parent-holdout-preregistration-v2";
 pub const PREFLIGHT_SCHEMA: &str = "within-parent-holdout-preflight-v2";
 pub const RESULT_SCHEMA: &str = "within-parent-holdout-result-v2";
+pub const TRAINING_RESULT_SCHEMA: &str = "within-parent-holdout-training-result-v1";
+
+#[derive(Clone, Copy, Debug, Default, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(rename_all = "snake_case")]
+pub enum ExpertVoteContract {
+    #[default]
+    SequentialUniqueOnly,
+    OneDistinctValidatedModelOneEqualVote,
+}
 
 #[derive(Clone, Copy, Debug, Serialize, Deserialize, PartialEq, Eq)]
 #[serde(rename_all = "snake_case")]
@@ -168,6 +178,10 @@ pub struct HoldoutPreregistration {
     pub optimizer_validation_scope: NullWindowValidationScope,
     pub optimizer_seed: u64,
     pub runtime_gates: HoldoutRuntimeGates,
+    #[serde(default)]
+    pub expert_vote_contract: ExpertVoteContract,
+    #[serde(default)]
+    pub prospective_amendment_sha256: Option<String>,
     pub disclosures: Vec<String>,
     pub source_build: SourceBuildIdentity,
     pub aggregation_definition: String,
@@ -327,7 +341,9 @@ pub struct HoldoutLockExpert {
     pub model: ModelFit,
     pub selected_window: Option<NullWindow>,
     pub training_artifact_digest: String,
+    pub training_fitted_payload_sha256: String,
     pub enabled: bool,
+    pub vote_weight: u32,
     pub participation_reason: String,
     pub gate_reasons: Vec<String>,
     pub gate_warnings: Vec<String>,
@@ -345,6 +361,8 @@ pub struct WithinParentHoldoutLock {
     pub experts: Vec<HoldoutLockExpert>,
     pub external_profile_window: NullWindow,
     pub target_only_policy: String,
+    pub expert_vote_contract: ExpertVoteContract,
+    pub prospective_amendment_sha256: Option<String>,
     pub production_evidence: bool,
 }
 
@@ -523,6 +541,28 @@ fn validate_preregistration(manifest: &HoldoutPreregistration) -> Result<()> {
         manifest.comparison_matrix == expected_matrix,
         "comparison matrix must be the preregistered A-D current-baseline/MSFDR/MSFDR2 design"
     );
+    for composition in &manifest.comparison_matrix {
+        let unique = composition
+            .requested_experts
+            .iter()
+            .map(model_slug)
+            .collect::<BTreeSet<_>>();
+        anyhow::ensure!(
+            unique.len() == composition.requested_experts.len(),
+            "composition {} contains a duplicate canonical model",
+            composition.id
+        );
+    }
+    if manifest.expert_vote_contract == ExpertVoteContract::OneDistinctValidatedModelOneEqualVote {
+        let amendment = manifest
+            .prospective_amendment_sha256
+            .as_deref()
+            .context("one-model/one-vote execution is missing its prospective amendment hash")?;
+        anyhow::ensure!(
+            amendment.len() == 64 && amendment.bytes().all(|byte| byte.is_ascii_hexdigit()),
+            "prospective amendment SHA-256 is malformed"
+        );
+    }
     anyhow::ensure!(
         !manifest
             .model_grids
@@ -716,6 +756,18 @@ fn verify_running_build(identity: &SourceBuildIdentity) -> Result<()> {
     anyhow::ensure!(
         sha256_file(&cargo_lock)? == identity.cargo_lock_sha256,
         "validation-runner Cargo.lock hash mismatch"
+    );
+    Ok(())
+}
+
+fn validate_frozen_ensemble_combiner(settings: &FdrSettings) -> Result<()> {
+    anyhow::ensure!(
+        settings.ensemble_p_combiner == EnsemblePCombiner::SecondBest,
+        "prospective holdout requires the frozen second_best p-value combiner"
+    );
+    anyhow::ensure!(
+        settings.ensemble_pep_combiner == EnsemblePepCombiner::Median,
+        "prospective holdout requires the frozen median PEP combiner"
     );
     Ok(())
 }
@@ -1365,8 +1417,8 @@ struct AuditEntitySupport {
     cross_level_support: BTreeMap<String, usize>,
 }
 
-#[derive(Clone, Debug, Serialize)]
-struct AuditPairwise {
+#[derive(Clone, Debug, Serialize, Deserialize)]
+pub struct AuditPairwise {
     left: String,
     right: String,
     exact_score_stream_duplicate: bool,
@@ -1791,6 +1843,57 @@ fn audit_pairwise(
         }
     }
     output
+}
+
+fn compact_support_diagnostics(
+    support: &[AuditEntitySupport],
+    experts: &[String],
+) -> serde_json::Value {
+    let mut classes = BTreeMap::<String, usize>::new();
+    for row in support {
+        *classes
+            .entry(format!("{}:{}", row.level, row.evidence_class))
+            .or_default() += 1;
+    }
+    let per_expert = experts
+        .iter()
+        .map(|expert| {
+            let mut counts = BTreeMap::<String, usize>::new();
+            for row in support {
+                let accepted = row.accepted_by.contains(expert);
+                if accepted {
+                    *counts.entry(format!("{}:accepted", row.level)).or_default() += 1;
+                    if row.accepted_by.len() == 1 {
+                        *counts.entry(format!("{}:unique", row.level)).or_default() += 1;
+                    } else {
+                        *counts
+                            .entry(format!("{}:corroborated", row.level))
+                            .or_default() += 1;
+                    }
+                    if row.evidence_class == "disputed" {
+                        *counts.entry(format!("{}:disputed", row.level)).or_default() += 1;
+                    }
+                }
+                if !row.accepted_by.is_empty() && !accepted {
+                    if let Some(status) = row
+                        .expert_status
+                        .iter()
+                        .find(|status| &status.expert == expert)
+                    {
+                        *counts
+                            .entry(format!("{}:nonacceptance:{}", row.level, status.state))
+                            .or_default() += 1;
+                    }
+                }
+            }
+            serde_json::json!({"expert": expert, "counts": counts})
+        })
+        .collect::<Vec<_>>();
+    serde_json::json!({
+        "support_classes": classes,
+        "per_expert": per_expert,
+        "missing_state_contract": "nonacceptance counts only when another valid expert accepts; invalid and nonevaluable experts supply no negative evidence"
+    })
 }
 
 fn factorial(value: usize) -> f64 {
@@ -2500,7 +2603,7 @@ pub fn audit_training_usefulness(
     write_json_atomic(&output.join("training_usefulness_audit.json"), &result)
 }
 
-#[derive(Clone, Debug, Default)]
+#[derive(Clone, Debug, Default, PartialEq)]
 struct EvidenceSets {
     target_psms: BTreeSet<String>,
     entrapment_psms: BTreeSet<String>,
@@ -2577,7 +2680,16 @@ pub struct ExpertTrainingGate {
     pub warnings: Vec<String>,
     pub calibration_level4_target_peptides: usize,
     pub target_only_level4_target_peptides: usize,
+    /// Retained for backward-readable diagnostics. Under one-model/one-vote
+    /// this is the order-independent unique contribution against all other
+    /// individually valid requested models and is never an eligibility gate.
     pub incremental_level4_target_peptides: usize,
+    #[serde(default)]
+    pub corroborated_level4_target_peptides: usize,
+    #[serde(default)]
+    pub vote_contract: ExpertVoteContract,
+    #[serde(default)]
+    pub vote_weight: u32,
 }
 
 #[derive(Clone, Debug, Serialize, Deserialize, PartialEq)]
@@ -2598,6 +2710,8 @@ pub struct CompositionComparison {
     pub target_only_incremental: Vec<IncrementalEvidence>,
     pub interaction_deltas: Vec<InteractionDelta>,
     pub final_level4_calibration_decision: String,
+    #[serde(default)]
+    pub psm_score_movement: serde_json::Value,
 }
 
 #[derive(Clone, Debug, Serialize, Deserialize)]
@@ -2606,6 +2720,12 @@ pub struct FoldCompositionSummary {
     pub lock: WithinParentHoldoutLock,
     pub plus_entrapment: StageSummary,
     pub target_only: StageSummary,
+    #[serde(default)]
+    pub order_permutation_identical: bool,
+    #[serde(default)]
+    pub plus_stream_sha256: String,
+    #[serde(default)]
+    pub target_stream_sha256: String,
 }
 
 #[derive(Clone, Debug, Serialize, Deserialize)]
@@ -2618,6 +2738,14 @@ pub struct FoldSummary {
     pub training_gates: BTreeMap<String, Vec<ExpertTrainingGate>>,
     pub compositions: Vec<FoldCompositionSummary>,
     pub comparisons_to_baseline: Vec<CompositionComparison>,
+    #[serde(default)]
+    pub plus_entrapment_support_diagnostics: serde_json::Value,
+    #[serde(default)]
+    pub target_only_support_diagnostics: serde_json::Value,
+    #[serde(default)]
+    pub plus_entrapment_pairwise_diagnostics: Vec<AuditPairwise>,
+    #[serde(default)]
+    pub target_only_pairwise_diagnostics: Vec<AuditPairwise>,
     pub technically_valid: bool,
 }
 
@@ -2659,6 +2787,56 @@ pub struct HoldoutResult {
     pub folds: Vec<FoldSummary>,
     pub aggregate: AggregateSummary,
     pub classifications: BTreeMap<String, HoldoutClassification>,
+}
+
+#[derive(Clone, Debug, Serialize, Deserialize)]
+pub struct TrainingCompositionSummary {
+    pub composition: String,
+    pub lock: WithinParentHoldoutLock,
+    pub plus_entrapment: StageSummary,
+    pub target_only: StageSummary,
+    pub order_permutation_identical: bool,
+    pub plus_stream_sha256: String,
+    pub target_stream_sha256: String,
+}
+
+#[derive(Clone, Debug, Serialize, Deserialize)]
+pub struct TrainingFoldSummary {
+    pub fold: usize,
+    pub training_plus_subset_digest: String,
+    pub training_target_subset_digest: String,
+    pub selected_windows: Vec<ModelWindowSelection>,
+    pub training_gates: BTreeMap<String, Vec<ExpertTrainingGate>>,
+    pub compositions: Vec<TrainingCompositionSummary>,
+    pub comparisons_to_baseline: Vec<CompositionComparison>,
+    pub support_diagnostics: serde_json::Value,
+    pub pairwise_diagnostics: Vec<AuditPairwise>,
+    pub minimum_distinct_valid_models_passed: bool,
+    pub held_out_data_accessed: bool,
+}
+
+#[derive(Clone, Debug, Serialize, Deserialize)]
+pub struct TrainingOnlyResult {
+    pub schema: String,
+    pub manifest_sha256: String,
+    pub preflight_sha256: String,
+    pub source_build: SourceBuildIdentity,
+    pub capabilities: ValidationRunnerCapabilities,
+    pub expert_vote_contract: ExpertVoteContract,
+    pub prospective_amendment_sha256: Option<String>,
+    pub folds: Vec<TrainingFoldSummary>,
+    pub held_out_data_accessed: bool,
+}
+
+#[derive(Clone, Debug, Serialize, Deserialize)]
+pub struct TrainingCheckpointAuthorization {
+    pub schema: String,
+    pub manifest_sha256: String,
+    pub training_result_sha256: String,
+    pub training_binary_sha256: String,
+    pub resume_binary_sha256: String,
+    pub resume_source_tree_sha256: String,
+    pub purpose: String,
 }
 
 #[derive(Clone)]
@@ -3302,25 +3480,8 @@ fn build_training_gates(
     requested_experts: &[ModelFit],
 ) -> Result<Vec<ExpertTrainingGate>> {
     let requested_models = composition_gate_models(manifest, requested_experts)?;
-    let mut order = requested_models
-        .iter()
-        .map(|grid| {
-            let slug = model_slug(grid);
-            let stage = plus
-                .get(slug)
-                .with_context(|| format!("missing training +entrapment stage for {slug}"))?;
-            Ok((grid.clone(), stage.level4.target_peptides.len()))
-        })
-        .collect::<Result<Vec<_>>>()?;
-    order.sort_by(|left, right| {
-        right
-            .1
-            .cmp(&left.1)
-            .then_with(|| model_slug(&left.0).cmp(model_slug(&right.0)))
-    });
-    let mut union = BTreeSet::new();
-    let mut gates = Vec::new();
-    for (model, _) in order {
+    let mut inputs = Vec::new();
+    for model in requested_models {
         let slug = model_slug(&model);
         let plus_stage = plus.get(slug).context("missing +entrapment gate stage")?;
         let target_stage = target.get(slug).context("missing target-only gate stage")?;
@@ -3371,20 +3532,68 @@ fn build_training_gates(
                 ));
             }
         }
-        let incremental_peptides = plus_stage.level4.target_peptides.difference(&union).count();
-        if reasons.is_empty()
-            && incremental_peptides
-                < manifest
-                    .runtime_gates
-                    .minimum_incremental_level4_target_peptides
-        {
-            reasons.push(format!(
-                "adds only {incremental_peptides} new Level-4 target peptides"
-            ));
+        inputs.push((
+            model,
+            reasons,
+            warnings,
+            calibration_peptides,
+            target_peptides,
+            plus_stage.level4.target_peptides.clone(),
+        ));
+    }
+
+    if manifest.expert_vote_contract == ExpertVoteContract::SequentialUniqueOnly {
+        inputs.sort_by(|left, right| {
+            right
+                .3
+                .cmp(&left.3)
+                .then_with(|| model_slug(&left.0).cmp(model_slug(&right.0)))
+        });
+    } else {
+        inputs.sort_by(|left, right| model_slug(&left.0).cmp(model_slug(&right.0)));
+    }
+
+    let individually_valid = inputs
+        .iter()
+        .filter(|(_, reasons, _, _, _, _)| reasons.is_empty())
+        .map(|(model, _, _, _, _, peptides)| (model_slug(model), peptides.clone()))
+        .collect::<BTreeMap<_, _>>();
+    let mut sequential_union = BTreeSet::new();
+    let mut gates = Vec::new();
+    for (model, mut reasons, mut warnings, calibration_peptides, target_peptides, peptides) in
+        inputs
+    {
+        let slug = model_slug(&model);
+        let other_union = individually_valid
+            .iter()
+            .filter(|(other, _)| **other != slug)
+            .flat_map(|(_, evidence)| evidence.iter().cloned())
+            .collect::<BTreeSet<_>>();
+        let unique_peptides = peptides.difference(&other_union).count();
+        let corroborated_peptides = peptides.intersection(&other_union).count();
+        let mut reported_incremental = unique_peptides;
+        if manifest.expert_vote_contract == ExpertVoteContract::SequentialUniqueOnly {
+            let incremental = peptides.difference(&sequential_union).count();
+            reported_incremental = incremental;
+            if reasons.is_empty()
+                && incremental
+                    < manifest
+                        .runtime_gates
+                        .minimum_incremental_level4_target_peptides
+            {
+                reasons.push(format!(
+                    "adds only {incremental} new Level-4 target peptides"
+                ));
+            }
+        } else if reasons.is_empty() && unique_peptides == 0 {
+            warnings.push(
+                "zero unique Level-4 target peptides is diagnostic only under one-model/one-vote"
+                    .into(),
+            );
         }
         let eligible = reasons.is_empty();
-        if eligible {
-            union.extend(plus_stage.level4.target_peptides.iter().cloned());
+        if eligible && manifest.expert_vote_contract == ExpertVoteContract::SequentialUniqueOnly {
+            sequential_union.extend(peptides.iter().cloned());
         }
         gates.push(ExpertTrainingGate {
             model: model.clone(),
@@ -3400,11 +3609,67 @@ fn build_training_gates(
             warnings,
             calibration_level4_target_peptides: calibration_peptides,
             target_only_level4_target_peptides: target_peptides,
-            incremental_level4_target_peptides: incremental_peptides,
+            incremental_level4_target_peptides: reported_incremental,
+            corroborated_level4_target_peptides: corroborated_peptides,
+            vote_contract: manifest.expert_vote_contract,
+            vote_weight: u32::from(eligible),
         });
     }
     gates.sort_by(|left, right| model_slug(&left.model).cmp(model_slug(&right.model)));
     Ok(gates)
+}
+
+fn psm_score_movement(
+    baseline: &CompletedStage,
+    comparison: &CompletedStage,
+    database: &IndexedDatabase,
+    search_fingerprint: &str,
+) -> serde_json::Value {
+    let baseline = psm_metric_map(baseline, database, search_fingerprint);
+    let comparison = psm_metric_map(comparison, database, search_fingerprint);
+    let joined = baseline
+        .iter()
+        .filter_map(|(id, left)| comparison.get(id).map(|right| (left, right)))
+        .collect::<Vec<_>>();
+    let summarize = |field: fn(&AuditPsmMetric) -> Option<f64>| {
+        let mut increased = 0_usize;
+        let mut decreased = 0_usize;
+        let mut bit_identical = 0_usize;
+        let mut not_jointly_evaluable = 0_usize;
+        let mut maximum_absolute_change = 0.0_f64;
+        for (left, right) in &joined {
+            match (field(left), field(right)) {
+                (Some(before), Some(after)) if before.is_finite() && after.is_finite() => {
+                    if before.to_bits() == after.to_bits() {
+                        bit_identical += 1;
+                    } else if after > before {
+                        increased += 1;
+                    } else {
+                        decreased += 1;
+                    }
+                    maximum_absolute_change = maximum_absolute_change.max((after - before).abs());
+                }
+                _ => not_jointly_evaluable += 1,
+            }
+        }
+        serde_json::json!({
+            "increased": increased,
+            "decreased": decreased,
+            "bit_identical": bit_identical,
+            "not_jointly_evaluable": not_jointly_evaluable,
+            "maximum_absolute_change": maximum_absolute_change
+        })
+    };
+    serde_json::json!({
+        "baseline_rank1_psms": baseline.len(),
+        "comparison_rank1_psms": comparison.len(),
+        "joined_stable_candidate_ids": joined.len(),
+        "baseline_only_stable_candidate_ids": baseline.keys().filter(|id| !comparison.contains_key(*id)).count(),
+        "comparison_only_stable_candidate_ids": comparison.keys().filter(|id| !baseline.contains_key(*id)).count(),
+        "p_value": summarize(|metric| metric.p_value),
+        "pep": summarize(|metric| metric.pep),
+        "q_value": summarize(|metric| metric.psm_q)
+    })
 }
 
 fn interaction_comparison(
@@ -3415,6 +3680,7 @@ fn interaction_comparison(
     comparison_plus: &CompletedStage,
     baseline_target: &CompletedStage,
     comparison_target: &CompletedStage,
+    psm_score_movement: serde_json::Value,
 ) -> Result<CompositionComparison> {
     let plus_incremental = vec![
         incremental("raw_q", &baseline_plus.raw, &comparison_plus.raw),
@@ -3472,6 +3738,7 @@ fn interaction_comparison(
         target_only_incremental: target_incremental,
         interaction_deltas,
         final_level4_calibration_decision,
+        psm_score_movement,
     })
 }
 
@@ -3546,6 +3813,7 @@ fn aggregate_comparison(
         target_only_incremental,
         interaction_deltas,
         final_level4_calibration_decision,
+        psm_score_movement: serde_json::Value::Null,
     })
 }
 
@@ -3597,6 +3865,38 @@ fn build_holdout_lock(
     composition: &HoldoutComposition,
     gates: &[ExpertTrainingGate],
 ) -> Result<WithinParentHoldoutLock> {
+    let requested_models = composition
+        .requested_experts
+        .iter()
+        .map(model_slug)
+        .collect::<BTreeSet<_>>();
+    anyhow::ensure!(
+        requested_models.len() == composition.requested_experts.len(),
+        "composition {} repeats a canonical model",
+        composition.id
+    );
+    let selected_artifacts = artifacts
+        .iter()
+        .filter(|artifact| composition.requested_experts.contains(&artifact.model))
+        .collect::<Vec<_>>();
+    let artifact_digests = selected_artifacts
+        .iter()
+        .map(|artifact| artifact.digest.as_str())
+        .collect::<BTreeSet<_>>();
+    anyhow::ensure!(
+        artifact_digests.len() == selected_artifacts.len(),
+        "composition {} repeats the same training artifact",
+        composition.id
+    );
+    let fitted_payloads = selected_artifacts
+        .iter()
+        .map(|artifact| artifact.fitted_payload_sha256.as_str())
+        .collect::<BTreeSet<_>>();
+    anyhow::ensure!(
+        fitted_payloads.len() == selected_artifacts.len(),
+        "composition {} repeats an identical fitted artifact payload",
+        composition.id
+    );
     let mut experts = artifacts
         .iter()
         .filter(|artifact| composition.requested_experts.contains(&artifact.model))
@@ -3611,7 +3911,9 @@ fn build_holdout_lock(
                 model: artifact.model.clone(),
                 selected_window: artifact.selected_window.clone(),
                 training_artifact_digest: artifact.digest.clone(),
+                training_fitted_payload_sha256: artifact.fitted_payload_sha256.clone(),
                 enabled: gate.eligible,
+                vote_weight: u32::from(gate.eligible),
                 participation_reason: gate.participation_reason.clone(),
                 gate_reasons: gate.reasons.clone(),
                 gate_warnings: gate.warnings.clone(),
@@ -3641,6 +3943,8 @@ fn build_holdout_lock(
         experts,
         external_profile_window: manifest.external_profile_window.clone(),
         target_only_policy: "refit_with_locked_window".into(),
+        expert_vote_contract: manifest.expert_vote_contract,
+        prospective_amendment_sha256: manifest.prospective_amendment_sha256.clone(),
         production_evidence: false,
     };
     lock.digest = hash_serialized(&lock)?;
@@ -3674,6 +3978,11 @@ fn validate_holdout_lock(
         lock.external_profile_window.min_rank == 9 && lock.external_profile_window.max_rank == 18,
         "holdout lock external profile mismatch"
     );
+    anyhow::ensure!(
+        lock.expert_vote_contract == manifest.expert_vote_contract
+            && lock.prospective_amendment_sha256 == manifest.prospective_amendment_sha256,
+        "holdout lock prospective vote contract mismatch"
+    );
     let unique = lock
         .experts
         .iter()
@@ -3683,13 +3992,33 @@ fn validate_holdout_lock(
         unique.len() == lock.experts.len(),
         "holdout lock contains duplicate experts"
     );
+    let artifact_digests = lock
+        .experts
+        .iter()
+        .map(|expert| expert.training_artifact_digest.as_str())
+        .collect::<BTreeSet<_>>();
+    anyhow::ensure!(
+        artifact_digests.len() == lock.experts.len(),
+        "holdout lock contains a repeated training artifact"
+    );
+    let fitted_payloads = lock
+        .experts
+        .iter()
+        .map(|expert| expert.training_fitted_payload_sha256.as_str())
+        .collect::<BTreeSet<_>>();
+    anyhow::ensure!(
+        fitted_payloads.len() == lock.experts.len(),
+        "holdout lock contains a repeated fitted artifact payload"
+    );
     for expert in &lock.experts {
         anyhow::ensure!(
             (expert.enabled
                 && expert.participation_reason == "included"
+                && expert.vote_weight == 1
                 && expert.gate_reasons.is_empty())
                 || (!expert.enabled
                     && expert.participation_reason == "excluded_by_training_runtime_gates"
+                    && expert.vote_weight == 0
                     && !expert.gate_reasons.is_empty()),
             "holdout expert {} has inconsistent runtime-gate provenance",
             model_slug(&expert.model)
@@ -3931,7 +4260,10 @@ fn classify_result(
     }
 }
 
-pub fn execute_holdout(manifest_path: impl AsRef<Path>, output: impl AsRef<Path>) -> Result<()> {
+pub fn execute_training_only(
+    manifest_path: impl AsRef<Path>,
+    output: impl AsRef<Path>,
+) -> Result<()> {
     let manifest_path = manifest_path.as_ref();
     let manifest_bytes = std::fs::read(manifest_path)
         .with_context(|| format!("reading {}", manifest_path.display()))?;
@@ -3939,7 +4271,407 @@ pub fn execute_holdout(manifest_path: impl AsRef<Path>, output: impl AsRef<Path>
     let manifest: HoldoutPreregistration =
         serde_json::from_slice(&manifest_bytes).context("invalid holdout preregistration")?;
     validate_preregistration(&manifest)?;
+    anyhow::ensure!(
+        manifest.expert_vote_contract == ExpertVoteContract::OneDistinctValidatedModelOneEqualVote,
+        "training-only prospective replay requires one-model/one-vote"
+    );
     verify_running_build(&manifest.source_build)?;
+
+    let output = output.as_ref();
+    std::fs::create_dir_all(output)?;
+    let preflight = preflight_for_manifest(&manifest, &manifest_sha256, &output.join("scratch"))?;
+    let preflight_path = output.join("within_parent_holdout.preflight.json");
+    write_json_atomic(&preflight_path, &preflight)?;
+    let preflight_sha256 = sha256_file(&preflight_path)?;
+    let plus_context =
+        build_parent_context(&manifest.plus_entrapment, &output.join("scratch/plus-run"))?;
+    let target_context =
+        build_parent_context(&manifest.target_only, &output.join("scratch/target-run"))?;
+    validate_frozen_ensemble_combiner(&plus_context.search.fdr)?;
+    validate_frozen_ensemble_combiner(&target_context.search.fdr)?;
+
+    let mut fold_summaries = Vec::new();
+    for fold in &manifest.folds {
+        let fold_root = output.join(format!("fold_{}", fold.fold));
+        std::fs::create_dir_all(&fold_root)?;
+        let training = derive_subset(
+            &manifest,
+            &plus_context,
+            &manifest_sha256,
+            fold.fold,
+            SubsetRole::Training,
+            &fold.training_file_ids,
+        )?;
+        let training_target = derive_subset(
+            &manifest,
+            &target_context,
+            &manifest_sha256,
+            fold.fold,
+            SubsetRole::Training,
+            &fold.training_file_ids,
+        )?;
+        let (selected_windows, windows, mut evaluations) = select_training_windows(
+            &manifest,
+            &training.features,
+            &plus_context.search.fdr,
+            &plus_context.database,
+        )?;
+        let evaluation_root = fold_root.join("training_evaluations");
+        std::fs::create_dir_all(&evaluation_root)?;
+        for (model, rows) in evaluations.iter_mut() {
+            for row in rows.iter_mut() {
+                row.elapsed_milliseconds = 0;
+            }
+            write_json_atomic(&evaluation_root.join(format!("{model}.json")), rows)?;
+        }
+
+        let mut artifacts = Vec::new();
+        let mut plus_stages = BTreeMap::new();
+        let mut target_stages = BTreeMap::new();
+        for grid in &manifest.model_grids {
+            let model = grid.model.clone();
+            let window = if model == ModelFit::Msfdr1Smix {
+                None
+            } else {
+                windows.get(model_slug(&model)).cloned().flatten()
+            };
+            let plus_settings =
+                settings_for_model(&plus_context.search.fdr, model.clone(), window.clone());
+            let plus_stage = run_scored_stage(
+                &training,
+                &plus_settings,
+                &plus_context.database,
+                model_slug(&model),
+                manifest.effective_ratios,
+                SearchSpace::PlusEntrapment,
+            )?;
+            artifacts.push(write_training_artifact(
+                &fold_root,
+                &manifest,
+                &manifest_sha256,
+                &training.identity,
+                model.clone(),
+                window.clone(),
+                &plus_stage.artifacts,
+            )?);
+            let target_settings =
+                settings_for_model(&target_context.search.fdr, model.clone(), window);
+            let target_stage = run_scored_stage(
+                &training_target,
+                &target_settings,
+                &target_context.database,
+                model_slug(&model),
+                manifest.effective_ratios,
+                SearchSpace::TargetOnly,
+            )?;
+            anyhow::ensure!(
+                !target_stage.summary.window_retuned
+                    && !target_stage.summary.complete_artifact_reused,
+                "training target-only stage violated locked-window refit semantics"
+            );
+            plus_stages.insert(model_slug(&model).into(), plus_stage);
+            target_stages.insert(model_slug(&model).into(), target_stage);
+        }
+
+        let mut training_gates = BTreeMap::new();
+        let mut locks = BTreeMap::new();
+        for composition in &manifest.comparison_matrix {
+            let gates = build_training_gates(
+                &manifest,
+                &windows,
+                &plus_stages,
+                &target_stages,
+                &composition.requested_experts,
+            )?;
+            write_json_atomic(
+                &fold_root.join(format!("{}.training_gates.json", composition.id)),
+                &gates,
+            )?;
+            let lock = build_holdout_lock(
+                &manifest,
+                &manifest_sha256,
+                fold.fold,
+                &training.identity,
+                &artifacts,
+                composition,
+                &gates,
+            )?;
+            validate_holdout_lock(&lock, &manifest, &manifest_sha256, &training.identity)?;
+            write_json_atomic(
+                &fold_root.join(format!("{}.holdout.lock.json", composition.id)),
+                &lock,
+            )?;
+            training_gates.insert(composition.id.clone(), gates);
+            locks.insert(composition.id.clone(), lock);
+        }
+
+        let diagnostic_gates = training_gates
+            .get("D")
+            .context("diagnostic composition D gates are missing")?;
+        let validity = diagnostic_gates
+            .iter()
+            .map(|gate| {
+                (
+                    model_slug(&gate.model).to_string(),
+                    (!gate.eligible).then(|| gate.reasons.join("; ")),
+                )
+            })
+            .collect::<BTreeMap<_, _>>();
+        let expert_names = manifest
+            .model_grids
+            .iter()
+            .map(|grid| model_slug(&grid.model).to_string())
+            .collect::<Vec<_>>();
+        let metrics = expert_names
+            .iter()
+            .map(|name| {
+                (
+                    name.clone(),
+                    psm_metric_map(
+                        &plus_stages[name],
+                        &plus_context.database,
+                        &manifest.plus_entrapment.search_fingerprint,
+                    ),
+                )
+            })
+            .collect::<BTreeMap<_, _>>();
+        let support = build_support_matrix(
+            &expert_names,
+            &validity,
+            &plus_stages,
+            &metrics,
+            manifest.runtime_gates.fdr_threshold,
+        );
+        let support_diagnostics = compact_support_diagnostics(&support, &expert_names);
+        let pairwise_diagnostics = audit_pairwise(
+            &expert_names,
+            &plus_stages,
+            &metrics,
+            manifest.runtime_gates.fdr_threshold,
+        );
+
+        let mut composition_summaries = Vec::new();
+        let mut coalition_plus = BTreeMap::new();
+        let mut coalition_target = BTreeMap::new();
+        for composition in &manifest.comparison_matrix {
+            let lock = &locks[&composition.id];
+            let experts = experts_from_lock(lock);
+            let plus_settings = settings_for_ensemble(
+                &plus_context.search.fdr,
+                &windows_from_lock(lock),
+                &experts,
+            )?;
+            let target_settings = settings_for_ensemble(
+                &target_context.search.fdr,
+                &windows_from_lock(lock),
+                &experts,
+            )?;
+            let plus = run_scored_stage(
+                &training,
+                &plus_settings,
+                &plus_context.database,
+                &composition.id,
+                manifest.effective_ratios,
+                SearchSpace::PlusEntrapment,
+            )?;
+            let target = run_scored_stage(
+                &training_target,
+                &target_settings,
+                &target_context.database,
+                &composition.id,
+                manifest.effective_ratios,
+                SearchSpace::TargetOnly,
+            )?;
+            let mut reversed = experts.clone();
+            reversed.reverse();
+            let reverse_plus_settings = settings_for_ensemble(
+                &plus_context.search.fdr,
+                &windows_from_lock(lock),
+                &reversed,
+            )?;
+            let reverse_target_settings = settings_for_ensemble(
+                &target_context.search.fdr,
+                &windows_from_lock(lock),
+                &reversed,
+            )?;
+            let reverse_plus = run_scored_stage(
+                &training,
+                &reverse_plus_settings,
+                &plus_context.database,
+                &composition.id,
+                manifest.effective_ratios,
+                SearchSpace::PlusEntrapment,
+            )?;
+            let reverse_target = run_scored_stage(
+                &training_target,
+                &reverse_target_settings,
+                &target_context.database,
+                &composition.id,
+                manifest.effective_ratios,
+                SearchSpace::TargetOnly,
+            )?;
+            let order_identical = stream_hash(&plus)? == stream_hash(&reverse_plus)?
+                && stream_hash(&target)? == stream_hash(&reverse_target)?
+                && plus.raw == reverse_plus.raw
+                && plus.level4 == reverse_plus.level4
+                && target.raw == reverse_target.raw
+                && target.level4 == reverse_target.level4;
+            anyhow::ensure!(
+                order_identical,
+                "composition {} changes under expert-order permutation",
+                composition.id
+            );
+            composition_summaries.push(TrainingCompositionSummary {
+                composition: composition.id.clone(),
+                lock: lock.clone(),
+                plus_entrapment: plus.summary.clone(),
+                target_only: target.summary.clone(),
+                order_permutation_identical: order_identical,
+                plus_stream_sha256: stream_hash(&plus)?,
+                target_stream_sha256: stream_hash(&target)?,
+            });
+            coalition_plus.insert(composition.id.clone(), plus);
+            coalition_target.insert(composition.id.clone(), target);
+        }
+        let mut comparisons = Vec::new();
+        for composition in manifest
+            .comparison_matrix
+            .iter()
+            .filter(|composition| composition.id != "A")
+        {
+            comparisons.push(interaction_comparison(
+                &manifest,
+                "A",
+                &composition.id,
+                &coalition_plus["A"],
+                &coalition_plus[&composition.id],
+                &coalition_target["A"],
+                &coalition_target[&composition.id],
+                psm_score_movement(
+                    &coalition_plus["A"],
+                    &coalition_plus[&composition.id],
+                    &plus_context.database,
+                    &manifest.plus_entrapment.search_fingerprint,
+                ),
+            )?);
+        }
+        let baseline_valid = locks["A"]
+            .experts
+            .iter()
+            .filter(|expert| expert.enabled)
+            .count();
+        anyhow::ensure!(
+            baseline_valid >= manifest.runtime_gates.minimum_ensemble_experts,
+            "Fold {} has only {baseline_valid} distinct valid baseline models after one-model/one-vote gates",
+            fold.fold
+        );
+        let fold_summary = TrainingFoldSummary {
+            fold: fold.fold,
+            training_plus_subset_digest: training.identity.digest.clone(),
+            training_target_subset_digest: training_target.identity.digest.clone(),
+            selected_windows,
+            training_gates,
+            compositions: composition_summaries,
+            comparisons_to_baseline: comparisons,
+            support_diagnostics,
+            pairwise_diagnostics,
+            minimum_distinct_valid_models_passed: true,
+            held_out_data_accessed: false,
+        };
+        write_json_atomic(&fold_root.join("training_fold_summary.json"), &fold_summary)?;
+        fold_summaries.push(fold_summary);
+    }
+    let result = TrainingOnlyResult {
+        schema: TRAINING_RESULT_SCHEMA.into(),
+        manifest_sha256,
+        preflight_sha256,
+        source_build: manifest.source_build,
+        capabilities: CAPABILITIES,
+        expert_vote_contract: manifest.expert_vote_contract,
+        prospective_amendment_sha256: manifest.prospective_amendment_sha256,
+        folds: fold_summaries,
+        held_out_data_accessed: false,
+    };
+    write_json_atomic(
+        &output.join("within_parent_holdout.training_result.json"),
+        &result,
+    )
+}
+
+fn load_training_checkpoint(
+    root: &Path,
+    authorization_path: &Path,
+    manifest: &HoldoutPreregistration,
+    manifest_sha256: &str,
+) -> Result<TrainingOnlyResult> {
+    let result_path = root.join("within_parent_holdout.training_result.json");
+    let result_sha256 = sha256_file(&result_path)?;
+    let result: TrainingOnlyResult = serde_json::from_slice(&std::fs::read(&result_path)?)?;
+    let authorization: TrainingCheckpointAuthorization =
+        serde_json::from_slice(&std::fs::read(authorization_path)?)?;
+    anyhow::ensure!(
+        authorization.schema == "within-parent-holdout-training-checkpoint-authorization-v1",
+        "invalid training checkpoint authorization schema"
+    );
+    anyhow::ensure!(
+        authorization.manifest_sha256 == manifest_sha256
+            && authorization.training_result_sha256 == result_sha256
+            && authorization.training_binary_sha256 == manifest.source_build.release_binary_sha256,
+        "training checkpoint authorization identity mismatch"
+    );
+    let executable = std::env::current_exe()?;
+    anyhow::ensure!(
+        authorization.resume_binary_sha256 == sha256_file(&executable)?,
+        "resume binary is not authorized for this training checkpoint"
+    );
+    anyhow::ensure!(
+        result.schema == TRAINING_RESULT_SCHEMA
+            && result.manifest_sha256 == manifest_sha256
+            && result.expert_vote_contract == manifest.expert_vote_contract
+            && result.prospective_amendment_sha256 == manifest.prospective_amendment_sha256
+            && !result.held_out_data_accessed,
+        "training checkpoint result is incompatible or accessed held-out data"
+    );
+    anyhow::ensure!(
+        result.folds.len() == manifest.folds.len()
+            && result
+                .folds
+                .iter()
+                .all(|fold| fold.minimum_distinct_valid_models_passed
+                    && !fold.held_out_data_accessed),
+        "training checkpoint does not contain a complete valid training-only fold set"
+    );
+    Ok(result)
+}
+
+pub fn execute_holdout(
+    manifest_path: impl AsRef<Path>,
+    output: impl AsRef<Path>,
+    training_checkpoint: Option<(&Path, &Path)>,
+) -> Result<()> {
+    let manifest_path = manifest_path.as_ref();
+    let manifest_bytes = std::fs::read(manifest_path)
+        .with_context(|| format!("reading {}", manifest_path.display()))?;
+    let manifest_sha256 = sha256_bytes(&manifest_bytes);
+    let manifest: HoldoutPreregistration =
+        serde_json::from_slice(&manifest_bytes).context("invalid holdout preregistration")?;
+    validate_preregistration(&manifest)?;
+    anyhow::ensure!(
+        manifest.expert_vote_contract == ExpertVoteContract::OneDistinctValidatedModelOneEqualVote,
+        "prospective held-out scoring requires one-model/one-vote"
+    );
+    let checkpoint = match training_checkpoint {
+        Some((root, authorization)) => Some(load_training_checkpoint(
+            root,
+            authorization,
+            &manifest,
+            &manifest_sha256,
+        )?),
+        None => {
+            verify_running_build(&manifest.source_build)?;
+            None
+        }
+    };
 
     let output = output.as_ref();
     std::fs::create_dir_all(output)?;
@@ -3952,6 +4684,8 @@ pub fn execute_holdout(manifest_path: impl AsRef<Path>, output: impl AsRef<Path>
         build_parent_context(&manifest.plus_entrapment, &output.join("scratch/plus-run"))?;
     let target_context =
         build_parent_context(&manifest.target_only, &output.join("scratch/target-run"))?;
+    validate_frozen_ensemble_combiner(&plus_context.search.fdr)?;
+    validate_frozen_ensemble_combiner(&target_context.search.fdr)?;
     anyhow::ensure!(
         matches!(
             plus_context.search.external_features.use_mode,
@@ -3994,103 +4728,175 @@ pub fn execute_holdout(manifest_path: impl AsRef<Path>, output: impl AsRef<Path>
             SubsetRole::Training,
             &fold.training_file_ids,
         )?;
-        let (selected_windows, windows, mut evaluations) = select_training_windows(
-            &manifest,
-            &training.features,
-            &plus_context.search.fdr,
-            &plus_context.database,
-        )?;
-        let evaluation_root = fold_root.join("training_evaluations");
-        std::fs::create_dir_all(&evaluation_root)?;
-        for (model, rows) in evaluations.iter_mut() {
-            for row in rows.iter_mut() {
-                row.elapsed_milliseconds = 0;
-            }
-            write_json_atomic(&evaluation_root.join(format!("{model}.json")), rows)?;
-        }
-
-        let mut training_artifacts = Vec::new();
-        let mut training_plus_stages = BTreeMap::new();
-        let mut training_target_stages = BTreeMap::new();
-        for grid in &manifest.model_grids {
-            let model = grid.model.clone();
-            let window = if model == ModelFit::Msfdr1Smix {
-                None
+        let (selected_windows, windows, training_gates, locks) =
+            if let Some(checkpoint) = &checkpoint {
+                let checkpoint_root = training_checkpoint.expect("checkpoint paths").0;
+                let checkpoint_fold = checkpoint
+                    .folds
+                    .iter()
+                    .find(|row| row.fold == fold.fold)
+                    .context("training checkpoint fold is missing")?;
+                anyhow::ensure!(
+                    checkpoint_fold.training_plus_subset_digest == training.identity.digest
+                        && checkpoint_fold.training_target_subset_digest
+                            == training_target.identity.digest,
+                    "training checkpoint subset identity mismatch"
+                );
+                let windows = checkpoint_fold
+                    .selected_windows
+                    .iter()
+                    .map(|selection| {
+                        (
+                            model_slug(&selection.model).to_string(),
+                            selection.window.clone(),
+                        )
+                    })
+                    .collect::<BTreeMap<_, _>>();
+                let locks = checkpoint_fold
+                    .compositions
+                    .iter()
+                    .map(|composition| (composition.composition.clone(), composition.lock.clone()))
+                    .collect::<BTreeMap<_, _>>();
+                for lock in locks.values() {
+                    validate_holdout_lock(lock, &manifest, &manifest_sha256, &training.identity)?;
+                }
+                for grid in &manifest.model_grids {
+                    let artifact_root = checkpoint_root
+                        .join(format!("fold_{}", fold.fold))
+                        .join("training_artifacts")
+                        .join(model_slug(&grid.model));
+                    let artifact: WithinParentHoldoutArtifact = serde_json::from_slice(
+                        &std::fs::read(artifact_root.join("within_parent_holdout_artifact.json"))?,
+                    )?;
+                    anyhow::ensure!(
+                        artifact.manifest_sha256 == manifest_sha256
+                            && artifact.training_subset_digest == training.identity.digest
+                            && artifact.parent_dataset_fingerprint
+                                == manifest.parent_dataset_fingerprint
+                            && artifact.model == grid.model
+                            && artifact.fitted_payload_sha256
+                                == sha256_file(&artifact_root.join("fitted_model_artifacts.json"))?,
+                        "training checkpoint artifact or fitted payload identity mismatch"
+                    );
+                    let mut unhashed = artifact.clone();
+                    unhashed.digest.clear();
+                    anyhow::ensure!(
+                        hash_serialized(&unhashed)? == artifact.digest,
+                        "training checkpoint artifact digest mismatch"
+                    );
+                    let bound_experts = locks
+                        .values()
+                        .filter_map(|lock| {
+                            lock.experts
+                                .iter()
+                                .find(|expert| expert.model == grid.model)
+                        })
+                        .collect::<Vec<_>>();
+                    anyhow::ensure!(
+                        !bound_experts.is_empty()
+                            && bound_experts.iter().all(|expert| {
+                                expert.training_artifact_digest == artifact.digest
+                                    && expert.training_fitted_payload_sha256
+                                        == artifact.fitted_payload_sha256
+                            }),
+                        "training checkpoint lock does not bind the verified artifact"
+                    );
+                }
+                (
+                    checkpoint_fold.selected_windows.clone(),
+                    windows,
+                    checkpoint_fold.training_gates.clone(),
+                    locks,
+                )
             } else {
-                windows.get(model_slug(&model)).cloned().flatten()
+                let (selected_windows, windows, mut evaluations) = select_training_windows(
+                    &manifest,
+                    &training.features,
+                    &plus_context.search.fdr,
+                    &plus_context.database,
+                )?;
+                let evaluation_root = fold_root.join("training_evaluations");
+                std::fs::create_dir_all(&evaluation_root)?;
+                for (model, rows) in evaluations.iter_mut() {
+                    for row in rows.iter_mut() {
+                        row.elapsed_milliseconds = 0;
+                    }
+                    write_json_atomic(&evaluation_root.join(format!("{model}.json")), rows)?;
+                }
+                let mut training_artifacts = Vec::new();
+                let mut training_plus_stages = BTreeMap::new();
+                let mut training_target_stages = BTreeMap::new();
+                for grid in &manifest.model_grids {
+                    let model = grid.model.clone();
+                    let window = if model == ModelFit::Msfdr1Smix {
+                        None
+                    } else {
+                        windows.get(model_slug(&model)).cloned().flatten()
+                    };
+                    let plus_settings =
+                        settings_for_model(&plus_context.search.fdr, model.clone(), window.clone());
+                    let plus_stage = run_scored_stage(
+                        &training,
+                        &plus_settings,
+                        &plus_context.database,
+                        model_slug(&model),
+                        manifest.effective_ratios,
+                        SearchSpace::PlusEntrapment,
+                    )?;
+                    training_artifacts.push(write_training_artifact(
+                        &fold_root,
+                        &manifest,
+                        &manifest_sha256,
+                        &training.identity,
+                        model.clone(),
+                        window.clone(),
+                        &plus_stage.artifacts,
+                    )?);
+                    let target_settings =
+                        settings_for_model(&target_context.search.fdr, model.clone(), window);
+                    let target_stage = run_scored_stage(
+                        &training_target,
+                        &target_settings,
+                        &target_context.database,
+                        model_slug(&model),
+                        manifest.effective_ratios,
+                        SearchSpace::TargetOnly,
+                    )?;
+                    anyhow::ensure!(
+                        !target_stage.summary.window_retuned
+                            && !target_stage.summary.complete_artifact_reused,
+                        "training target-only stage violated locked-window refit semantics"
+                    );
+                    training_plus_stages.insert(model_slug(&model).into(), plus_stage);
+                    training_target_stages.insert(model_slug(&model).into(), target_stage);
+                }
+                let mut training_gates = BTreeMap::new();
+                let mut locks = BTreeMap::new();
+                for composition in &manifest.comparison_matrix {
+                    let gates = build_training_gates(
+                        &manifest,
+                        &windows,
+                        &training_plus_stages,
+                        &training_target_stages,
+                        &composition.requested_experts,
+                    )?;
+                    let lock = build_holdout_lock(
+                        &manifest,
+                        &manifest_sha256,
+                        fold.fold,
+                        &training.identity,
+                        &training_artifacts,
+                        composition,
+                        &gates,
+                    )?;
+                    validate_holdout_lock(&lock, &manifest, &manifest_sha256, &training.identity)?;
+                    training_gates.insert(composition.id.clone(), gates);
+                    locks.insert(composition.id.clone(), lock);
+                }
+                (selected_windows, windows, training_gates, locks)
             };
-            let plus_settings =
-                settings_for_model(&plus_context.search.fdr, model.clone(), window.clone());
-            let plus_stage = run_scored_stage(
-                &training,
-                &plus_settings,
-                &plus_context.database,
-                model_slug(&model),
-                manifest.effective_ratios,
-                SearchSpace::PlusEntrapment,
-            )?;
-            training_artifacts.push(write_training_artifact(
-                &fold_root,
-                &manifest,
-                &manifest_sha256,
-                &training.identity,
-                model.clone(),
-                window.clone(),
-                &plus_stage.artifacts,
-            )?);
-            let target_settings =
-                settings_for_model(&target_context.search.fdr, model.clone(), window);
-            let target_stage = run_scored_stage(
-                &training_target,
-                &target_settings,
-                &target_context.database,
-                model_slug(&model),
-                manifest.effective_ratios,
-                SearchSpace::TargetOnly,
-            )?;
-            anyhow::ensure!(
-                target_stage.summary.window_retuned == false
-                    && target_stage.summary.complete_artifact_reused == false,
-                "training target-only stage violated locked-window refit semantics"
-            );
-            training_plus_stages.insert(model_slug(&model).into(), plus_stage);
-            training_target_stages.insert(model_slug(&model).into(), target_stage);
-        }
-        let mut training_gates = BTreeMap::new();
-        let mut locks = BTreeMap::new();
-        for composition in &manifest.comparison_matrix {
-            let gates = build_training_gates(
-                &manifest,
-                &windows,
-                &training_plus_stages,
-                &training_target_stages,
-                &composition.requested_experts,
-            )?;
-            write_json_atomic(
-                &fold_root.join(format!("{}.training_gates.json", composition.id)),
-                &gates,
-            )?;
-            let lock = build_holdout_lock(
-                &manifest,
-                &manifest_sha256,
-                fold.fold,
-                &training.identity,
-                &training_artifacts,
-                composition,
-                &gates,
-            )?;
-            validate_holdout_lock(&lock, &manifest, &manifest_sha256, &training.identity)?;
-            write_json_atomic(
-                &fold_root.join(format!("{}.holdout.lock.json", composition.id)),
-                &lock,
-            )?;
-            training_gates.insert(composition.id.clone(), gates);
-            locks.insert(composition.id.clone(), lock);
-        }
         drop(training);
         drop(training_target);
-        drop(training_plus_stages);
-        drop(training_target_stages);
 
         let held_plus = derive_subset(
             &manifest,
@@ -4110,6 +4916,123 @@ pub fn execute_holdout(manifest_path: impl AsRef<Path>, output: impl AsRef<Path>
             &fold.held_out_file_ids,
         )?;
         let held_target_digest = held_target.identity.digest.clone();
+
+        // Diagnostic single-model applications use the already locked
+        // training-selected windows. They are never consulted for roster
+        // eligibility and therefore cannot leak held-out outcomes into the
+        // training decision.
+        let diagnostic_gates = training_gates
+            .get("D")
+            .context("diagnostic composition D gates are missing")?;
+        let diagnostic_validity = diagnostic_gates
+            .iter()
+            .map(|gate| {
+                (
+                    model_slug(&gate.model).to_string(),
+                    (!gate.eligible).then(|| gate.reasons.join("; ")),
+                )
+            })
+            .collect::<BTreeMap<_, _>>();
+        let diagnostic_experts = manifest
+            .model_grids
+            .iter()
+            .map(|grid| model_slug(&grid.model).to_string())
+            .collect::<Vec<_>>();
+        let mut diagnostic_plus_stages = BTreeMap::new();
+        let mut diagnostic_target_stages = BTreeMap::new();
+        for grid in &manifest.model_grids {
+            let model = grid.model.clone();
+            let window = if model == ModelFit::Msfdr1Smix {
+                None
+            } else {
+                windows.get(model_slug(&model)).cloned().flatten()
+            };
+            let plus_settings =
+                settings_for_model(&plus_context.search.fdr, model.clone(), window.clone());
+            let target_settings =
+                settings_for_model(&target_context.search.fdr, model.clone(), window);
+            let plus_stage = run_scored_stage(
+                &held_plus,
+                &plus_settings,
+                &plus_context.database,
+                model_slug(&model),
+                manifest.effective_ratios,
+                SearchSpace::PlusEntrapment,
+            )?;
+            let target_stage = run_scored_stage(
+                &held_target,
+                &target_settings,
+                &target_context.database,
+                model_slug(&model),
+                manifest.effective_ratios,
+                SearchSpace::TargetOnly,
+            )?;
+            anyhow::ensure!(
+                !plus_stage.summary.window_retuned
+                    && !target_stage.summary.window_retuned
+                    && !plus_stage.summary.complete_artifact_reused
+                    && !target_stage.summary.complete_artifact_reused,
+                "held-out diagnostic model application violated locked-window refit semantics"
+            );
+            diagnostic_plus_stages.insert(model_slug(&model).into(), plus_stage);
+            diagnostic_target_stages.insert(model_slug(&model).into(), target_stage);
+        }
+        let plus_metrics = diagnostic_experts
+            .iter()
+            .map(|name| {
+                (
+                    name.clone(),
+                    psm_metric_map(
+                        &diagnostic_plus_stages[name],
+                        &plus_context.database,
+                        &manifest.plus_entrapment.search_fingerprint,
+                    ),
+                )
+            })
+            .collect::<BTreeMap<_, _>>();
+        let target_metrics = diagnostic_experts
+            .iter()
+            .map(|name| {
+                (
+                    name.clone(),
+                    psm_metric_map(
+                        &diagnostic_target_stages[name],
+                        &target_context.database,
+                        &manifest.target_only.search_fingerprint,
+                    ),
+                )
+            })
+            .collect::<BTreeMap<_, _>>();
+        let plus_support = build_support_matrix(
+            &diagnostic_experts,
+            &diagnostic_validity,
+            &diagnostic_plus_stages,
+            &plus_metrics,
+            manifest.runtime_gates.fdr_threshold,
+        );
+        let target_support = build_support_matrix(
+            &diagnostic_experts,
+            &diagnostic_validity,
+            &diagnostic_target_stages,
+            &target_metrics,
+            manifest.runtime_gates.fdr_threshold,
+        );
+        let plus_entrapment_support_diagnostics =
+            compact_support_diagnostics(&plus_support, &diagnostic_experts);
+        let target_only_support_diagnostics =
+            compact_support_diagnostics(&target_support, &diagnostic_experts);
+        let plus_entrapment_pairwise_diagnostics = audit_pairwise(
+            &diagnostic_experts,
+            &diagnostic_plus_stages,
+            &plus_metrics,
+            manifest.runtime_gates.fdr_threshold,
+        );
+        let target_only_pairwise_diagnostics = audit_pairwise(
+            &diagnostic_experts,
+            &diagnostic_target_stages,
+            &target_metrics,
+            manifest.runtime_gates.fdr_threshold,
+        );
         let mut fold_plus = BTreeMap::new();
         let mut fold_target = BTreeMap::new();
         let mut composition_summaries = Vec::new();
@@ -4150,6 +5073,46 @@ pub fn execute_holdout(manifest_path: impl AsRef<Path>, output: impl AsRef<Path>
                 manifest.effective_ratios,
                 SearchSpace::TargetOnly,
             )?;
+            let mut reversed_experts = experts.clone();
+            reversed_experts.reverse();
+            let reversed_plus_settings = settings_for_ensemble(
+                &plus_context.search.fdr,
+                &windows_from_lock(lock),
+                &reversed_experts,
+            )?;
+            let reversed_target_settings = settings_for_ensemble(
+                &target_context.search.fdr,
+                &windows_from_lock(lock),
+                &reversed_experts,
+            )?;
+            let reversed_plus = run_scored_stage(
+                &held_plus,
+                &reversed_plus_settings,
+                &plus_context.database,
+                &composition.id,
+                manifest.effective_ratios,
+                SearchSpace::PlusEntrapment,
+            )?;
+            let reversed_target = run_scored_stage(
+                &held_target,
+                &reversed_target_settings,
+                &target_context.database,
+                &composition.id,
+                manifest.effective_ratios,
+                SearchSpace::TargetOnly,
+            )?;
+            let order_permutation_identical = stream_hash(&plus_stage)?
+                == stream_hash(&reversed_plus)?
+                && stream_hash(&target_stage)? == stream_hash(&reversed_target)?
+                && plus_stage.raw == reversed_plus.raw
+                && plus_stage.level4 == reversed_plus.level4
+                && target_stage.raw == reversed_target.raw
+                && target_stage.level4 == reversed_target.level4;
+            anyhow::ensure!(
+                order_permutation_identical,
+                "held-out composition {} changes under expert-order permutation",
+                composition.id
+            );
             aggregate_plus_features
                 .get_mut(&composition.id)
                 .context("aggregate +entrapment composition is missing")?
@@ -4163,6 +5126,9 @@ pub fn execute_holdout(manifest_path: impl AsRef<Path>, output: impl AsRef<Path>
                 lock: lock.clone(),
                 plus_entrapment: plus_stage.summary.clone(),
                 target_only: target_stage.summary.clone(),
+                order_permutation_identical,
+                plus_stream_sha256: stream_hash(&plus_stage)?,
+                target_stream_sha256: stream_hash(&target_stage)?,
             });
             fold_plus.insert(composition.id.clone(), plus_stage);
             fold_target.insert(composition.id.clone(), target_stage);
@@ -4201,6 +5167,14 @@ pub fn execute_holdout(manifest_path: impl AsRef<Path>, output: impl AsRef<Path>
                 fold_target
                     .get(&composition.id)
                     .context("comparison target-only stage is missing")?,
+                psm_score_movement(
+                    baseline_plus,
+                    fold_plus
+                        .get(&composition.id)
+                        .context("comparison +entrapment stage is missing")?,
+                    &plus_context.database,
+                    &manifest.plus_entrapment.search_fingerprint,
+                ),
             )?);
         }
         let technically_valid = composition_summaries.iter().all(|summary| {
@@ -4226,6 +5200,10 @@ pub fn execute_holdout(manifest_path: impl AsRef<Path>, output: impl AsRef<Path>
             training_gates,
             compositions: composition_summaries,
             comparisons_to_baseline: comparisons,
+            plus_entrapment_support_diagnostics,
+            target_only_support_diagnostics,
+            plus_entrapment_pairwise_diagnostics,
+            target_only_pairwise_diagnostics,
             technically_valid,
         };
         write_json_atomic(&fold_root.join("fold_summary.json"), &fold_summary)?;
@@ -4586,6 +5564,8 @@ mod tests {
                 minimum_ensemble_experts: 2,
                 raw_q_interaction_warning_threshold: 0.01,
             },
+            expert_vote_contract: ExpertVoteContract::SequentialUniqueOnly,
+            prospective_amendment_sha256: None,
             disclosures: vec![
                 "fold assignments reused from the Lower Order validation".into(),
                 "baseline Lower Order behavior has previously been observed".into(),
@@ -4641,6 +5621,122 @@ mod tests {
         ExternalAnnotationRecord {
             stable_id: id.into(),
             features,
+        }
+    }
+
+    fn synthetic_stage(peptides: &[&str], fdp: Option<f64>) -> CompletedStage {
+        let target_peptides = peptides
+            .iter()
+            .map(|peptide| (*peptide).to_string())
+            .collect::<BTreeSet<_>>();
+        let evidence = EvidenceSets {
+            target_peptides,
+            ..EvidenceSets::default()
+        };
+        let count = |target| CountWithEntrapment {
+            target,
+            entrapment: 0,
+            ratio_adjusted_fdp: fdp,
+            ratio_adjusted_fdp_wilson_95: None,
+        };
+        let layer = |name: &str| LayerSummary {
+            layer: name.into(),
+            psm: count(0),
+            peptide: count(peptides.len()),
+            peptidoform: count(peptides.len()),
+            protein: count(1),
+        };
+        CompletedStage {
+            summary: StageSummary {
+                search_space: SearchSpace::PlusEntrapment,
+                composition: "synthetic".into(),
+                subset_digest: "subset".into(),
+                layers: vec![layer("raw_q"), layer("level4")],
+                fallback_used: false,
+                unexplained_na_count: 0,
+                external_profile_window: NullWindow {
+                    min_rank: 9,
+                    max_rank: 18,
+                },
+                external_profile_sha256: "profile".into(),
+                nuisance_state_provenance: "synthetic".into(),
+                complete_artifact_reused: false,
+                window_retuned: false,
+            },
+            raw: evidence.clone(),
+            level4: evidence,
+            artifacts: DfRunArtifacts::default(),
+            rank1_features: Vec::new(),
+        }
+    }
+
+    fn synthetic_artifact(
+        model: ModelFit,
+        digest: &str,
+        payload: &str,
+    ) -> WithinParentHoldoutArtifact {
+        WithinParentHoldoutArtifact {
+            schema: ARTIFACT_SCHEMA.into(),
+            digest: digest.into(),
+            manifest_sha256: "manifest".into(),
+            training_subset_digest: "subset".into(),
+            parent_dataset_fingerprint: "dataset".into(),
+            model,
+            selected_window: None,
+            fitted_payload_sha256: payload.into(),
+            nuisance_state_provenance: "training".into(),
+            complete_artifact_transfer_allowed: false,
+        }
+    }
+
+    fn synthetic_subset() -> WithinParentSubsetIdentity {
+        WithinParentSubsetIdentity {
+            schema: SUBSET_SCHEMA.into(),
+            digest: "subset".into(),
+            parent_dataset_fingerprint: "dataset".into(),
+            parent_search_fingerprint: "search".into(),
+            parent_pool_payload_sha256: "pool".into(),
+            parent_annotation_manifest_sha256: "manifest".into(),
+            parent_annotation_payload_sha256: "annotations".into(),
+            fold_manifest_sha256: "fold-manifest".into(),
+            fold: 1,
+            role: SubsetRole::Training,
+            search_space: SearchSpace::PlusEntrapment,
+            spectrum_files: Vec::new(),
+            selected_file_ids: vec![0],
+            ordered_stable_candidate_ids_sha256: "ids".into(),
+            selected_spectrum_count: 1,
+            selected_candidate_count: 1,
+            candidate_id_schema: CANDIDATE_ID_SCHEMA.into(),
+            annotation_schema_version: EXTERNAL_ANNOTATION_CACHE_SCHEMA_VERSION,
+            annotation_feature_schema: EXTERNAL_ANNOTATION_FEATURE_SCHEMA.into(),
+            source_build: source_build(),
+        }
+    }
+
+    fn synthetic_gate(model: ModelFit, eligible: bool) -> ExpertTrainingGate {
+        ExpertTrainingGate {
+            model,
+            selected_window: None,
+            eligible,
+            participation_reason: if eligible {
+                "included"
+            } else {
+                "excluded_by_training_runtime_gates"
+            }
+            .into(),
+            reasons: if eligible {
+                Vec::new()
+            } else {
+                vec!["invalid".into()]
+            },
+            warnings: Vec::new(),
+            calibration_level4_target_peptides: 1,
+            target_only_level4_target_peptides: 1,
+            incremental_level4_target_peptides: 0,
+            corroborated_level4_target_peptides: 1,
+            vote_contract: ExpertVoteContract::OneDistinctValidatedModelOneEqualVote,
+            vote_weight: u32::from(eligible),
         }
     }
 
@@ -4937,9 +6033,9 @@ mod tests {
             manifest_sha256: "manifest".into(),
             training_subset_digest: "subset".into(),
             parent_dataset_fingerprint: "dataset".into(),
-            model,
+            model: model.clone(),
             selected_window: None,
-            fitted_payload_sha256: "payload".into(),
+            fitted_payload_sha256: format!("payload-{}", model_slug(&model)),
             nuisance_state_provenance: "training".into(),
             complete_artifact_transfer_allowed: false,
         })
@@ -4956,6 +6052,9 @@ mod tests {
                 calibration_level4_target_peptides: 1,
                 target_only_level4_target_peptides: 1,
                 incremental_level4_target_peptides: 1,
+                corroborated_level4_target_peptides: 0,
+                vote_contract: manifest.expert_vote_contract,
+                vote_weight: 1,
             })
             .collect::<Vec<_>>();
         let composition = &manifest.comparison_matrix[0];
@@ -5272,5 +6371,223 @@ mod tests {
             })
             .count();
         assert_eq!(valid, 2);
+    }
+
+    #[test]
+    fn one_model_one_vote_keeps_distinct_zero_unique_models_eligible() {
+        let mut manifest = manifest("/unused");
+        manifest.expert_vote_contract = ExpertVoteContract::OneDistinctValidatedModelOneEqualVote;
+        manifest.prospective_amendment_sha256 = Some("a".repeat(64));
+        manifest.model_grids = vec![
+            ModelGrid {
+                model: ModelFit::Moments,
+                candidates: Vec::new(),
+                fixed_window: Some(NullWindow {
+                    min_rank: 9,
+                    max_rank: 18,
+                }),
+            },
+            ModelGrid {
+                model: ModelFit::Mle,
+                candidates: Vec::new(),
+                fixed_window: Some(NullWindow {
+                    min_rank: 9,
+                    max_rank: 18,
+                }),
+            },
+        ];
+        let plus = [
+            ("moments".into(), synthetic_stage(&["A", "B"], Some(0.0))),
+            ("mle".into(), synthetic_stage(&["A", "B"], Some(0.0))),
+        ]
+        .into_iter()
+        .collect();
+        let target = [
+            ("moments".into(), synthetic_stage(&["A", "B"], None)),
+            ("mle".into(), synthetic_stage(&["A", "B"], None)),
+        ]
+        .into_iter()
+        .collect();
+        let gates = build_training_gates(
+            &manifest,
+            &BTreeMap::new(),
+            &plus,
+            &target,
+            &[ModelFit::Moments, ModelFit::Mle],
+        )
+        .unwrap();
+        assert!(gates
+            .iter()
+            .all(|gate| gate.eligible && gate.vote_weight == 1));
+        assert!(gates
+            .iter()
+            .all(|gate| gate.incremental_level4_target_peptides == 0));
+        assert!(gates.iter().all(|gate| gate
+            .warnings
+            .iter()
+            .any(|warning| warning.contains("diagnostic only"))));
+    }
+
+    #[test]
+    fn duplicate_canonical_models_fail_closed() {
+        let mut manifest = manifest("/unused");
+        manifest.expert_vote_contract = ExpertVoteContract::OneDistinctValidatedModelOneEqualVote;
+        manifest.prospective_amendment_sha256 = Some("a".repeat(64));
+        let composition = HoldoutComposition {
+            id: "duplicate".into(),
+            requested_experts: vec![ModelFit::Moments, ModelFit::Moments],
+        };
+        let artifact = synthetic_artifact(ModelFit::Moments, "moments", "payload-moments");
+        let gate = synthetic_gate(ModelFit::Moments, true);
+        let error = build_holdout_lock(
+            &manifest,
+            "manifest",
+            1,
+            &synthetic_subset(),
+            &[artifact],
+            &composition,
+            &[gate],
+        )
+        .unwrap_err();
+        assert!(error.to_string().contains("repeats a canonical model"));
+    }
+
+    #[test]
+    fn repeated_artifact_and_payload_fail_closed() {
+        let mut manifest = manifest("/unused");
+        manifest.expert_vote_contract = ExpertVoteContract::OneDistinctValidatedModelOneEqualVote;
+        manifest.prospective_amendment_sha256 = Some("a".repeat(64));
+        let composition = HoldoutComposition {
+            id: "A".into(),
+            requested_experts: vec![ModelFit::Moments, ModelFit::Mle],
+        };
+        let repeated = vec![
+            synthetic_artifact(ModelFit::Moments, "same", "same-payload"),
+            synthetic_artifact(ModelFit::Mle, "same", "same-payload"),
+        ];
+        let gates = vec![
+            synthetic_gate(ModelFit::Moments, true),
+            synthetic_gate(ModelFit::Mle, true),
+        ];
+        let error = build_holdout_lock(
+            &manifest,
+            "manifest",
+            1,
+            &synthetic_subset(),
+            &repeated,
+            &composition,
+            &gates,
+        )
+        .unwrap_err();
+        assert!(error
+            .to_string()
+            .contains("repeats the same training artifact"));
+
+        let repeated_payload = vec![
+            synthetic_artifact(ModelFit::Moments, "moments", "same-payload"),
+            synthetic_artifact(ModelFit::Mle, "mle", "same-payload"),
+        ];
+        let error = build_holdout_lock(
+            &manifest,
+            "manifest",
+            1,
+            &synthetic_subset(),
+            &repeated_payload,
+            &composition,
+            &gates,
+        )
+        .unwrap_err();
+        assert!(error
+            .to_string()
+            .contains("repeats an identical fitted artifact payload"));
+    }
+
+    #[test]
+    fn invalid_expert_has_zero_vote_and_no_ensemble_effect() {
+        let mut manifest = manifest("/unused");
+        manifest.expert_vote_contract = ExpertVoteContract::OneDistinctValidatedModelOneEqualVote;
+        manifest.prospective_amendment_sha256 = Some("a".repeat(64));
+        let composition = HoldoutComposition {
+            id: "A".into(),
+            requested_experts: vec![ModelFit::Moments, ModelFit::Mle, ModelFit::Msfdr1Smix],
+        };
+        let artifacts = vec![
+            synthetic_artifact(ModelFit::Moments, "moments", "payload-moments"),
+            synthetic_artifact(ModelFit::Mle, "mle", "payload-mle"),
+            synthetic_artifact(ModelFit::Msfdr1Smix, "msfdr1", "payload-msfdr1"),
+        ];
+        let gates = vec![
+            synthetic_gate(ModelFit::Moments, true),
+            synthetic_gate(ModelFit::Mle, true),
+            synthetic_gate(ModelFit::Msfdr1Smix, false),
+        ];
+        let lock = build_holdout_lock(
+            &manifest,
+            "manifest",
+            1,
+            &synthetic_subset(),
+            &artifacts,
+            &composition,
+            &gates,
+        )
+        .unwrap();
+        assert_eq!(
+            experts_from_lock(&lock),
+            vec![ModelFit::Mle, ModelFit::Moments]
+        );
+        assert_eq!(
+            lock.experts
+                .iter()
+                .find(|expert| expert.model == ModelFit::Msfdr1Smix)
+                .unwrap()
+                .vote_weight,
+            0
+        );
+    }
+
+    #[test]
+    fn one_model_one_vote_lock_is_canonical_under_input_order_permutation() {
+        let mut manifest = manifest("/unused");
+        manifest.expert_vote_contract = ExpertVoteContract::OneDistinctValidatedModelOneEqualVote;
+        manifest.prospective_amendment_sha256 = Some("a".repeat(64));
+        let composition = HoldoutComposition {
+            id: "A".into(),
+            requested_experts: vec![ModelFit::Moments, ModelFit::Mle],
+        };
+        let artifacts = vec![
+            synthetic_artifact(ModelFit::Moments, "moments", "payload-moments"),
+            synthetic_artifact(ModelFit::Mle, "mle", "payload-mle"),
+        ];
+        let gates = vec![
+            synthetic_gate(ModelFit::Moments, true),
+            synthetic_gate(ModelFit::Mle, true),
+        ];
+        let first = build_holdout_lock(
+            &manifest,
+            "manifest",
+            1,
+            &synthetic_subset(),
+            &artifacts,
+            &composition,
+            &gates,
+        )
+        .unwrap();
+        let mut reversed_artifacts = artifacts;
+        reversed_artifacts.reverse();
+        let mut reversed_gates = gates;
+        reversed_gates.reverse();
+        let second = build_holdout_lock(
+            &manifest,
+            "manifest",
+            1,
+            &synthetic_subset(),
+            &reversed_artifacts,
+            &composition,
+            &reversed_gates,
+        )
+        .unwrap();
+        assert_eq!(first.digest, second.digest);
+        assert_eq!(first.experts.len(), 2);
+        assert!(first.experts.iter().all(|expert| expert.vote_weight == 1));
     }
 }

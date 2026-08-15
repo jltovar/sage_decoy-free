@@ -1,7 +1,7 @@
 use clap::{Arg, Command};
 use sage_cli::within_parent_holdout::{
     audit_annotation_caches, audit_training_usefulness, create_preregistration, execute_holdout,
-    preflight_holdout,
+    execute_training_only, preflight_holdout,
 };
 
 fn main() -> anyhow::Result<()> {
@@ -25,6 +25,13 @@ fn main() -> anyhow::Result<()> {
         )
         .subcommand(
             Command::new("run")
+                .arg(Arg::new("manifest").required(true))
+                .arg(Arg::new("output").required(true))
+                .arg(Arg::new("training-checkpoint").long("training-checkpoint"))
+                .arg(Arg::new("checkpoint-authorization").long("checkpoint-authorization")),
+        )
+        .subcommand(
+            Command::new("training-only")
                 .arg(Arg::new("manifest").required(true))
                 .arg(Arg::new("output").required(true)),
         )
@@ -51,7 +58,28 @@ fn main() -> anyhow::Result<()> {
             args.get_one::<String>("manifest").expect("required"),
             args.get_one::<String>("output").expect("required"),
         ),
-        Some(("run", args)) => execute_holdout(
+        Some(("run", args)) => {
+            let checkpoint = args
+                .get_one::<String>("training-checkpoint")
+                .zip(args.get_one::<String>("checkpoint-authorization"))
+                .map(|(root, authorization)| {
+                    (
+                        std::path::Path::new(root),
+                        std::path::Path::new(authorization),
+                    )
+                });
+            anyhow::ensure!(
+                args.get_one::<String>("training-checkpoint").is_some()
+                    == args.get_one::<String>("checkpoint-authorization").is_some(),
+                "training checkpoint and authorization must be supplied together"
+            );
+            execute_holdout(
+                args.get_one::<String>("manifest").expect("required"),
+                args.get_one::<String>("output").expect("required"),
+                checkpoint,
+            )
+        }
+        Some(("training-only", args)) => execute_training_only(
             args.get_one::<String>("manifest").expect("required"),
             args.get_one::<String>("output").expect("required"),
         ),
