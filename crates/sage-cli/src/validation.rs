@@ -5,7 +5,7 @@ use serde::{Deserialize, Serialize};
 use std::collections::{BTreeMap, BTreeSet};
 use std::path::PathBuf;
 
-#[derive(Clone, Debug, Serialize, Deserialize)]
+#[derive(Clone, Debug, Serialize, Deserialize, PartialEq)]
 #[serde(rename_all = "snake_case")]
 pub enum ValidationMode {
     DecoyFree,
@@ -131,14 +131,14 @@ impl Default for EffectiveRatios {
     }
 }
 
-#[derive(Clone, Debug, Default, Serialize, Deserialize)]
+#[derive(Clone, Debug, Default, Serialize, Deserialize, PartialEq)]
 pub struct IdentificationCount {
     pub target: usize,
     pub entrapment: usize,
     pub combined_entrapment_fdp: Option<f64>,
 }
 
-#[derive(Clone, Debug, Serialize, Deserialize)]
+#[derive(Clone, Debug, Serialize, Deserialize, PartialEq)]
 pub struct RunValidationSummary {
     pub method: String,
     pub stage: String,
@@ -159,6 +159,206 @@ pub struct RunValidationSummary {
     pub peptidoform: IdentificationCount,
     pub protein: IdentificationCount,
     pub counting_definition: String,
+}
+
+#[derive(Clone, Debug, Serialize, Deserialize, PartialEq)]
+pub struct EnsembleInteractionLevel {
+    pub measured_entrapment_ratio: f64,
+    pub baseline_target: usize,
+    pub baseline_entrapment: usize,
+    pub baseline_fdp_numerator: Option<f64>,
+    pub baseline_fdp_denominator: usize,
+    pub baseline_fdp: Option<f64>,
+    pub final_target: usize,
+    pub final_entrapment: usize,
+    pub final_fdp_numerator: Option<f64>,
+    pub final_fdp_denominator: usize,
+    pub final_fdp: Option<f64>,
+    pub absolute_fdp_change: Option<f64>,
+    pub relative_fdp_change: Option<f64>,
+}
+
+#[derive(Clone, Debug, Serialize, Deserialize, PartialEq)]
+pub struct EnsembleInteractionLayer {
+    pub psm: EnsembleInteractionLevel,
+    pub peptide: EnsembleInteractionLevel,
+    pub peptidoform: EnsembleInteractionLevel,
+}
+
+#[derive(Clone, Debug, Serialize, Deserialize, PartialEq)]
+pub struct EnsembleInteractionWarning {
+    pub code: String,
+    pub threshold: f64,
+    pub affected_levels: Vec<String>,
+    pub message: String,
+}
+
+#[derive(Clone, Debug, Serialize, Deserialize, PartialEq)]
+pub struct EnsembleInteractionCalibration {
+    pub schema_version: u32,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub baseline_lock_analysis_fingerprint: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub final_lock_analysis_fingerprint: Option<String>,
+    pub baseline_experts: Vec<String>,
+    pub final_experts: Vec<String>,
+    pub newly_participating_experts: Vec<String>,
+    pub raw_q: Option<EnsembleInteractionLayer>,
+    pub level4: Option<EnsembleInteractionLayer>,
+    pub raw_q_warning: Option<EnsembleInteractionWarning>,
+    pub final_level4_calibration_pass: bool,
+    pub evaluable: bool,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub not_evaluable_reason: Option<String>,
+}
+
+fn interaction_level(
+    baseline: &IdentificationCount,
+    final_count: &IdentificationCount,
+    measured_entrapment_ratio: f64,
+) -> EnsembleInteractionLevel {
+    let absolute_fdp_change = baseline
+        .combined_entrapment_fdp
+        .zip(final_count.combined_entrapment_fdp)
+        .map(|(before, after)| after - before);
+    let relative_fdp_change = baseline
+        .combined_entrapment_fdp
+        .zip(final_count.combined_entrapment_fdp)
+        .and_then(|(before, after)| {
+            if before > 0.0 {
+                Some((after - before) / before)
+            } else if after == 0.0 {
+                Some(0.0)
+            } else {
+                None
+            }
+        });
+    EnsembleInteractionLevel {
+        measured_entrapment_ratio,
+        baseline_target: baseline.target,
+        baseline_entrapment: baseline.entrapment,
+        baseline_fdp_numerator: (measured_entrapment_ratio.is_finite()
+            && measured_entrapment_ratio > 0.0)
+            .then(|| baseline.entrapment as f64 * (1.0 + 1.0 / measured_entrapment_ratio)),
+        baseline_fdp_denominator: baseline.target + baseline.entrapment,
+        baseline_fdp: baseline.combined_entrapment_fdp,
+        final_target: final_count.target,
+        final_entrapment: final_count.entrapment,
+        final_fdp_numerator: (measured_entrapment_ratio.is_finite()
+            && measured_entrapment_ratio > 0.0)
+            .then(|| final_count.entrapment as f64 * (1.0 + 1.0 / measured_entrapment_ratio)),
+        final_fdp_denominator: final_count.target + final_count.entrapment,
+        final_fdp: final_count.combined_entrapment_fdp,
+        absolute_fdp_change,
+        relative_fdp_change,
+    }
+}
+
+fn interaction_layer(
+    baseline: &RunValidationSummary,
+    final_result: &RunValidationSummary,
+    ratios: &EffectiveRatios,
+) -> EnsembleInteractionLayer {
+    EnsembleInteractionLayer {
+        psm: interaction_level(&baseline.psm, &final_result.psm, ratios.psm),
+        peptide: interaction_level(&baseline.peptide, &final_result.peptide, ratios.peptide),
+        // Peptidoforms use the PSM-space measured ratio in summarize_run.
+        peptidoform: interaction_level(
+            &baseline.peptidoform,
+            &final_result.peptidoform,
+            ratios.psm,
+        ),
+    }
+}
+
+fn interaction_summary<'a>(
+    rows: &'a [RunValidationSummary],
+    layer: &str,
+) -> Option<&'a RunValidationSummary> {
+    rows.iter()
+        .find(|row| row.layer == layer && row.search_space == "+Ent")
+}
+
+pub fn ensemble_interaction_calibration(
+    baseline: &[RunValidationSummary],
+    final_result: &[RunValidationSummary],
+    ratios: &EffectiveRatios,
+    fdr_threshold: f64,
+    raw_q_warning_threshold: f64,
+    mut baseline_experts: Vec<String>,
+    mut final_experts: Vec<String>,
+) -> Result<EnsembleInteractionCalibration> {
+    anyhow::ensure!(
+        fdr_threshold.is_finite() && fdr_threshold >= 0.0,
+        "invalid Ensemble interaction FDR threshold"
+    );
+    anyhow::ensure!(
+        raw_q_warning_threshold.is_finite() && raw_q_warning_threshold >= 0.0,
+        "invalid Ensemble interaction warning threshold"
+    );
+    baseline_experts.sort();
+    baseline_experts.dedup();
+    final_experts.sort();
+    final_experts.dedup();
+    anyhow::ensure!(
+        baseline_experts
+            .iter()
+            .all(|expert| final_experts.contains(expert)),
+        "Ensemble interaction baseline contains an expert absent from the final Ensemble"
+    );
+    let newly_participating_experts = final_experts
+        .iter()
+        .filter(|expert| !baseline_experts.contains(expert))
+        .cloned()
+        .collect::<Vec<_>>();
+    let baseline_raw = interaction_summary(baseline, "raw_q")
+        .context("baseline Ensemble has no evaluable +entrapment raw-q calibration summary")?;
+    let final_raw = interaction_summary(final_result, "raw_q")
+        .context("final Ensemble has no evaluable +entrapment raw-q calibration summary")?;
+    let baseline_level4 = interaction_summary(baseline, "level4")
+        .context("baseline Ensemble has no evaluable +entrapment Level-4 calibration summary")?;
+    let final_level4 = interaction_summary(final_result, "level4")
+        .context("final Ensemble has no evaluable +entrapment Level-4 calibration summary")?;
+    let raw_q = interaction_layer(baseline_raw, final_raw, ratios);
+    let level4 = interaction_layer(baseline_level4, final_level4, ratios);
+    let affected_levels = [
+        ("psm", raw_q.psm.absolute_fdp_change),
+        ("peptide", raw_q.peptide.absolute_fdp_change),
+        ("peptidoform", raw_q.peptidoform.absolute_fdp_change),
+    ]
+    .into_iter()
+    .filter(|(_, change)| change.is_some_and(|change| change > raw_q_warning_threshold))
+    .map(|(level, _)| level.into())
+    .collect::<Vec<_>>();
+    let raw_q_warning = (!affected_levels.is_empty()).then(|| EnsembleInteractionWarning {
+        code: "raw_q_ensemble_interaction_deterioration".into(),
+        threshold: raw_q_warning_threshold,
+        affected_levels,
+        message: "post-assembly raw-q entrapment FDP deterioration exceeds the informational validation reference; this warning is not a passing calibration gate".into(),
+    });
+    // The production release policy gates peptide calibration. PSM and
+    // peptidoform FDP remain fully reported without creating a new,
+    // post-observation admission threshold.
+    let final_level4_calibration_pass = level4
+        .peptide
+        .final_fdp
+        .is_some_and(|fdp| fdp <= fdr_threshold);
+    let evaluable = level4.peptide.final_fdp.is_some();
+    Ok(EnsembleInteractionCalibration {
+        schema_version: 1,
+        baseline_lock_analysis_fingerprint: None,
+        final_lock_analysis_fingerprint: None,
+        baseline_experts,
+        final_experts,
+        newly_participating_experts,
+        raw_q: Some(raw_q),
+        level4: Some(level4),
+        raw_q_warning,
+        final_level4_calibration_pass,
+        evaluable,
+        not_evaluable_reason: (!evaluable)
+            .then(|| "final Ensemble Level-4 peptide entrapment FDP is missing".into()),
+    })
 }
 
 fn column(headers: &StringRecord, names: &[&str]) -> Option<usize> {
@@ -1361,5 +1561,101 @@ mod tests {
         assert_eq!(level4.peptidoform.entrapment, 1);
         assert!(level4.counting_definition.contains("peptidoform retains"));
         std::fs::remove_file(path).unwrap();
+    }
+
+    #[test]
+    fn ensemble_interaction_reports_raw_warning_separately_from_level4_gate() {
+        let mut baseline_raw = summary("baseline", "optimized", "raw_q", 1_000, 5);
+        let mut final_raw = summary("ensemble", "optimized", "raw_q", 1_010, 12);
+        baseline_raw.psm.combined_entrapment_fdp = Some(0.005);
+        baseline_raw.peptide.combined_entrapment_fdp = Some(0.004);
+        baseline_raw.peptidoform.combined_entrapment_fdp = Some(0.006);
+        final_raw.psm.combined_entrapment_fdp = Some(0.016);
+        final_raw.peptide.combined_entrapment_fdp = Some(0.015);
+        final_raw.peptidoform.combined_entrapment_fdp = Some(0.018);
+        let mut baseline_level4 = summary("baseline", "optimized", "level4", 900, 3);
+        let mut final_level4 = summary("ensemble", "optimized", "level4", 910, 3);
+        baseline_level4.peptide.combined_entrapment_fdp = Some(0.007);
+        final_level4.peptide.combined_entrapment_fdp = Some(0.006);
+
+        let baseline = vec![baseline_raw, baseline_level4];
+        let final_result = vec![final_raw, final_level4];
+        let report = ensemble_interaction_calibration(
+            &baseline,
+            &final_result,
+            &EffectiveRatios {
+                psm: 2.0,
+                peptide: 3.0,
+                protein: 4.0,
+            },
+            0.01,
+            0.01,
+            vec!["mle".into(), "moments".into()],
+            vec!["lower_order".into(), "moments".into(), "mle".into()],
+        )
+        .unwrap();
+        let repeated = ensemble_interaction_calibration(
+            &baseline,
+            &final_result,
+            &EffectiveRatios {
+                psm: 2.0,
+                peptide: 3.0,
+                protein: 4.0,
+            },
+            0.01,
+            0.01,
+            vec!["moments".into(), "mle".into()],
+            vec!["mle".into(), "moments".into(), "lower_order".into()],
+        )
+        .unwrap();
+
+        assert_eq!(report.baseline_experts, vec!["mle", "moments"]);
+        assert_eq!(report.newly_participating_experts, vec!["lower_order"]);
+        assert!(report.final_level4_calibration_pass);
+        assert_eq!(
+            serde_json::to_vec(&report).unwrap(),
+            serde_json::to_vec(&repeated).unwrap()
+        );
+        let warning = report.raw_q_warning.as_ref().unwrap();
+        assert_eq!(warning.code, "raw_q_ensemble_interaction_deterioration");
+        assert_eq!(
+            warning.affected_levels,
+            vec!["psm", "peptide", "peptidoform"]
+        );
+        assert!(warning.message.contains("not a passing calibration gate"));
+        let raw_q = report.raw_q.as_ref().unwrap();
+        assert_eq!(raw_q.peptide.measured_entrapment_ratio, 3.0);
+        assert_eq!(raw_q.peptide.final_fdp_numerator, Some(16.0));
+        assert_eq!(raw_q.peptide.final_fdp_denominator, 1_022);
+        assert_eq!(raw_q.peptide.absolute_fdp_change, Some(0.011));
+    }
+
+    #[test]
+    fn invalid_final_level4_peptide_calibration_does_not_pass() {
+        let baseline = vec![
+            summary("baseline", "optimized", "raw_q", 1_000, 1),
+            summary("baseline", "optimized", "level4", 900, 1),
+        ];
+        let mut final_result = vec![
+            summary("ensemble", "optimized", "raw_q", 1_001, 1),
+            summary("ensemble", "optimized", "level4", 901, 1),
+        ];
+        final_result[1].peptide.combined_entrapment_fdp = None;
+        let report = ensemble_interaction_calibration(
+            &baseline,
+            &final_result,
+            &EffectiveRatios::default(),
+            0.01,
+            0.01,
+            vec!["moments".into()],
+            vec!["moments".into(), "lower_order".into()],
+        )
+        .unwrap();
+        assert!(!report.evaluable);
+        assert!(!report.final_level4_calibration_pass);
+        assert!(report
+            .not_evaluable_reason
+            .as_deref()
+            .is_some_and(|reason| reason.contains("missing")));
     }
 }

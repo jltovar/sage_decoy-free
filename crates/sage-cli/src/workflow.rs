@@ -16,10 +16,11 @@ use crate::input::Input;
 use crate::provenance::{freeze_baseline, sha256_file, write_json_atomic, BaselineManifest};
 use crate::runner::Runner;
 use crate::validation::{
-    accepted_target_peptides, expert_quality_gates, is_target_only_stage, missing_parity_evidence,
-    parity_comparisons, stage_comparisons, summarize_run, target_only_policy_capability,
-    tdc_benchmark_comparisons, transfer_stability, EffectiveRatios, ExpertQualityGate,
-    InvalidValidationRun, ParityComparison, ParityPair, RunValidationSummary, StageComparison,
+    accepted_target_peptides, ensemble_interaction_calibration, expert_quality_gates,
+    is_target_only_stage, missing_parity_evidence, parity_comparisons, stage_comparisons,
+    summarize_run, target_only_policy_capability, tdc_benchmark_comparisons, transfer_stability,
+    EffectiveRatios, EnsembleInteractionCalibration, ExpertQualityGate, InvalidValidationRun,
+    ParityComparison, ParityPair, RunValidationSummary, StageComparison,
     TargetOnlyCalibrationPolicy, TargetOnlyPolicyCapability, TdcBenchmarkComparison,
     ValidationMode, ValidationRun,
 };
@@ -110,7 +111,7 @@ pub struct ModelWorkflow {
     #[serde(default)]
     pub minimum_level4_peptide_gain: Option<usize>,
     /// Optional model-specific exception to the workflow-wide target-only
-    /// calibration policy (for example, while Lower Order is evaluated).
+    /// calibration policy. Lower Order resolves this to refit-only semantics.
     #[serde(default)]
     pub target_only_calibration_policy: Option<TargetOnlyCalibrationPolicy>,
     /// Phase 8 release control. This can exclude a known-nonportable or
@@ -120,6 +121,12 @@ pub struct ModelWorkflow {
     pub ensemble_participation: EnsembleParticipation,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub ensemble_exclusion_reason: Option<String>,
+    /// Membership in the established Ensemble used only as the counterfactual
+    /// for post-assembly interaction reporting. It does not bypass or alter
+    /// any participation gate. Legacy manifests default all experts to the
+    /// baseline, producing an identity comparison.
+    #[serde(default = "default_true")]
+    pub ensemble_interaction_baseline: bool,
 }
 
 #[derive(Clone, Debug, Serialize, Deserialize)]
@@ -249,6 +256,20 @@ pub struct EnsembleExpertLock {
     pub fit_search_fingerprint: String,
     #[serde(default)]
     pub candidate_id_schema: String,
+    #[serde(default = "default_true")]
+    pub interaction_baseline: bool,
+    #[serde(default)]
+    pub participation_decision: String,
+    #[serde(default)]
+    pub fallback_used: bool,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub fallback_reason: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub target_only_policy_capability: Option<TargetOnlyPolicyCapability>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub external_profile_identity_sha256: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub external_profile_calibration: Option<sage_core::input::ExternalProfileCalibration>,
 }
 
 #[derive(Clone, Debug, Serialize, Deserialize)]
@@ -269,6 +290,16 @@ pub struct EnsembleLock {
     /// profile, never a per-expert last-writer-wins artifact.
     #[serde(default = "default_ensemble_external_profile_contract")]
     pub external_profile_contract: String,
+    #[serde(default)]
+    pub external_profile_identity_sha256: Option<String>,
+    #[serde(default)]
+    pub external_profile_calibration: Option<sage_core::input::ExternalProfileCalibration>,
+    #[serde(default)]
+    pub source_configuration_sha256: String,
+    #[serde(default)]
+    pub analysis_fingerprint: String,
+    #[serde(default = "default_raw_q_interaction_warning_threshold")]
+    pub raw_q_interaction_warning_threshold: f64,
 }
 
 fn default_ensemble_external_profile_contract() -> String {
@@ -288,6 +319,8 @@ struct CompletedExpert {
     target_only_results: PathBuf,
     target_only_calibration_policy: TargetOnlyCalibrationPolicy,
     calibration_search_fingerprint: String,
+    external_profile_identity_sha256: Option<String>,
+    external_profile_calibration: Option<sage_core::input::ExternalProfileCalibration>,
 }
 
 struct SharedDatabase {
@@ -422,6 +455,8 @@ pub struct StageRecord {
     pub fallback_reason: Option<String>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub model_artifact_schema: Option<u32>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub ensemble_interaction_calibration: Option<EnsembleInteractionCalibration>,
 }
 
 #[derive(Clone, Debug, Serialize, Deserialize)]
@@ -449,6 +484,8 @@ pub struct WorkflowState {
     pub release_gate: ReleaseGate,
     pub transfer_stability: Vec<crate::validation::TransferStability>,
     pub pending_validation_gates: Vec<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub ensemble_interaction_calibration: Option<EnsembleInteractionCalibration>,
 }
 
 #[derive(Clone, Debug, Serialize, Deserialize)]
@@ -508,6 +545,9 @@ fn default_minimum_entrapment_peptides_for_stable_estimate() -> usize {
 }
 fn default_parity_tolerance() -> f64 {
     0.001
+}
+fn default_raw_q_interaction_warning_threshold() -> f64 {
+    0.01
 }
 
 fn concrete_target_only_policies(
@@ -939,6 +979,24 @@ fn artifact_contains_model(
     }
 }
 
+fn external_profile_identity(
+    artifacts: &DfRunArtifacts,
+) -> Result<Option<(String, sage_core::input::ExternalProfileCalibration)>> {
+    artifacts
+        .external_ms2rescore
+        .as_ref()
+        .map(|profiles| {
+            let mut hasher = Sha256::new();
+            hasher.update(b"sage-external-profile-identity-v1\0");
+            hasher.update(serde_json::to_vec(profiles)?);
+            Ok((
+                format!("{:x}", hasher.finalize()),
+                profiles.calibration.clone(),
+            ))
+        })
+        .transpose()
+}
+
 fn apply_fitted_artifacts(
     fdr: &mut FdrOptions,
     model: &ModelFit,
@@ -1066,6 +1124,33 @@ fn apply_ensemble_lock(
         "unsupported Ensemble external-profile contract {:?}",
         lock.external_profile_contract
     );
+    anyhow::ensure!(
+        !lock.analysis_fingerprint.is_empty()
+            && lock.analysis_fingerprint == ensemble_lock_analysis_fingerprint(lock)?,
+        "Ensemble lock analysis fingerprint is missing or does not match its payload"
+    );
+    anyhow::ensure!(
+        lock.source_configuration_sha256 == dataset.search_config_sha256,
+        "Ensemble lock configuration fingerprint does not match this dataset"
+    );
+    if external {
+        anyhow::ensure!(
+            lock.external_profile_identity_sha256.is_some()
+                && lock.external_profile_calibration.is_some(),
+            "external Ensemble lock has no shared external-profile identity"
+        );
+        anyhow::ensure!(
+            lock.external_profile_calibration
+                .as_ref()
+                .is_some_and(|calibration| {
+                    calibration.min_null_rank == 9
+                        && calibration.max_null_rank == 18
+                        && calibration.provenance
+                            == sage_core::input::ExternalProfileWindowProvenance::ExplicitConfiguration
+                }),
+            "external Ensemble lock does not use the explicit shared 9-18 calibration contract"
+        );
+    }
     // The external empirical calibration is dataset-local auxiliary evidence
     // shared by the assembled Ensemble. Expert artifacts contribute only their
     // base-model nuisance state; no expert may overwrite this shared profile.
@@ -1093,6 +1178,30 @@ fn apply_ensemble_lock(
         "Ensemble lock has only {enabled} eligible experts"
     );
     for expert in lock.experts.iter().filter(|expert| expert.enabled) {
+        anyhow::ensure!(
+            expert.participation_decision == "included"
+                && !expert.fallback_used
+                && expert.fallback_reason.is_none(),
+            "Ensemble expert {:?} has inconsistent participation or fallback provenance",
+            expert.model
+        );
+        if external {
+            anyhow::ensure!(
+                expert.external_profile_identity_sha256 == lock.external_profile_identity_sha256
+                    && expert.external_profile_calibration == lock.external_profile_calibration,
+                "Ensemble expert {:?} does not match the shared external-profile identity",
+                expert.model
+            );
+        }
+        anyhow::ensure!(
+            expert.target_only_policy_capability.as_ref()
+                == Some(&target_only_policy_capability(
+                    &expert.model,
+                    expert.target_only_calibration_policy,
+                )),
+            "Ensemble expert {:?} target-only capability provenance is missing or stale",
+            expert.model
+        );
         if let Some(target_policy) = target_only_policy {
             let capability = target_only_policy_capability(&expert.model, target_policy);
             anyhow::ensure!(
@@ -1190,6 +1299,84 @@ fn canonicalize_ensemble_lock(mut lock: EnsembleLock) -> EnsembleLock {
     lock
 }
 
+fn ensemble_lock_analysis_fingerprint(lock: &EnsembleLock) -> Result<String> {
+    let experts = lock
+        .experts
+        .iter()
+        .map(|expert| {
+            serde_json::json!({
+                "model": expert.model,
+                "window": expert.window,
+                "optimized_fitted_artifacts_sha256": expert.optimized_fitted_artifacts_sha256,
+                "ms2rescore_fitted_artifacts_sha256": expert.ms2rescore_fitted_artifacts_sha256,
+                "target_only_calibration_policy": expert.target_only_calibration_policy,
+                "enabled": expert.enabled,
+                "interaction_baseline": expert.interaction_baseline,
+                "participation_decision": expert.participation_decision,
+                "fallback_used": expert.fallback_used,
+                "fallback_reason": expert.fallback_reason,
+                "target_only_policy_capability": expert.target_only_policy_capability,
+                "gate_reasons": expert.gate_reasons,
+                "gate_warnings": expert.gate_warnings,
+                "fit_search_fingerprint": expert.fit_search_fingerprint,
+                "candidate_id_schema": expert.candidate_id_schema,
+                "external_profile_identity_sha256": expert.external_profile_identity_sha256,
+                "external_profile_calibration": expert.external_profile_calibration,
+            })
+        })
+        .collect::<Vec<_>>();
+    let value = serde_json::json!({
+        "schema": "sage-ensemble-analysis-v1",
+        "dataset_fingerprint": lock.dataset_fingerprint,
+        "source_configuration_sha256": lock.source_configuration_sha256,
+        "experts": experts,
+        "minimum_required_experts": lock.minimum_required_experts,
+        "evaluable": lock.evaluable,
+        "not_evaluable_reasons": lock.not_evaluable_reasons,
+        "external_profile_contract": lock.external_profile_contract,
+        "external_profile_identity_sha256": lock.external_profile_identity_sha256,
+        "external_profile_calibration": lock.external_profile_calibration,
+        "raw_q_interaction_warning_threshold": lock.raw_q_interaction_warning_threshold,
+    });
+    let mut hasher = Sha256::new();
+    hasher.update(serde_json::to_vec(&value)?);
+    Ok(format!("{:x}", hasher.finalize()))
+}
+
+fn stamp_ensemble_lock_analysis_fingerprint(mut lock: EnsembleLock) -> Result<EnsembleLock> {
+    lock = canonicalize_ensemble_lock(lock);
+    lock.analysis_fingerprint = ensemble_lock_analysis_fingerprint(&lock)?;
+    Ok(lock)
+}
+
+fn interaction_baseline_lock(lock: &EnsembleLock) -> Result<EnsembleLock> {
+    let mut baseline = lock.clone();
+    for expert in &mut baseline.experts {
+        if expert.enabled && !expert.interaction_baseline {
+            expert.enabled = false;
+            expert.participation_decision = "interaction_baseline_only_exclusion".into();
+            expert
+                .gate_reasons
+                .push("not a member of the preregistered Ensemble interaction baseline".into());
+        }
+    }
+    let enabled = baseline
+        .experts
+        .iter()
+        .filter(|expert| expert.enabled)
+        .count();
+    baseline.evaluable = enabled >= baseline.minimum_required_experts;
+    baseline.not_evaluable_reasons = (!baseline.evaluable)
+        .then(|| {
+            vec![format!(
+                "interaction baseline has only {enabled} eligible experts; {} required",
+                baseline.minimum_required_experts
+            )]
+        })
+        .unwrap_or_default();
+    stamp_ensemble_lock_analysis_fingerprint(baseline)
+}
+
 fn build_ensemble_lock(
     manifest: &WorkflowManifest,
     manifest_hash: &str,
@@ -1205,11 +1392,11 @@ fn build_ensemble_lock(
     for expert in experts {
         let mut reasons = Vec::new();
         let mut warnings = Vec::new();
-        if let Some(configuration) = manifest
+        let configuration = manifest
             .models
             .iter()
-            .find(|configuration| configuration.model == expert.model)
-        {
+            .find(|configuration| configuration.model == expert.model);
+        if let Some(configuration) = configuration {
             if configuration.ensemble_participation == EnsembleParticipation::Excluded {
                 reasons.push(format!(
                     "explicit Phase 8 exclusion: {}",
@@ -1278,6 +1465,23 @@ fn build_ensemble_lock(
                 });
             if !ms2_artifact_valid {
                 reasons.push("MS2Rescore model artifact is missing or fell back".into());
+            }
+            if expert.external_profile_identity_sha256.is_none()
+                || expert.external_profile_calibration.is_none()
+            {
+                reasons.push("shared external-profile identity is missing".into());
+            } else if !expert.external_profile_calibration.as_ref().is_some_and(
+                |calibration| {
+                    calibration.min_null_rank == 9
+                        && calibration.max_null_rank == 18
+                        && calibration.provenance
+                            == sage_core::input::ExternalProfileWindowProvenance::ExplicitConfiguration
+                },
+            ) {
+                reasons.push(
+                    "shared external-profile calibration must be the explicit 9-18 contract"
+                        .into(),
+                );
             }
         }
         let run = ValidationRun {
@@ -1519,6 +1723,20 @@ fn build_ensemble_lock(
         }
         candidates.push((expert, reasons, warnings, calibration_peptides));
     }
+    if ensemble_uses_ms2 {
+        let shared_identities = candidates
+            .iter()
+            .filter(|(_, reasons, _, _)| reasons.is_empty())
+            .filter_map(|(expert, _, _, _)| expert.external_profile_identity_sha256.as_deref())
+            .collect::<BTreeSet<_>>();
+        if shared_identities.len() > 1 {
+            for (_, reasons, _, _) in &mut candidates {
+                reasons.push(
+                    "eligible experts do not share one identical external-profile identity".into(),
+                );
+            }
+        }
+    }
     candidates.sort_by(|left, right| {
         right
             .3
@@ -1564,6 +1782,14 @@ fn build_ensemble_lock(
                 }
             });
         let enabled = reasons.is_empty();
+        let optimized_fallback =
+            !artifacts_contains_selected_model(&expert.optimized_artifacts, &expert.model);
+        let ms2rescore_fallback = ensemble_uses_ms2
+            && !expert
+                .ms2rescore_artifacts
+                .as_ref()
+                .is_some_and(|path| artifacts_contains_selected_model(path, &expert.model));
+        let fallback_used = optimized_fallback || ms2rescore_fallback;
         if enabled {
             union.extend(peptides.iter().cloned());
         }
@@ -1585,6 +1811,25 @@ fn build_ensemble_lock(
             gate_warnings: warnings,
             fit_search_fingerprint: expert.calibration_search_fingerprint.clone(),
             candidate_id_schema: CANDIDATE_ID_SCHEMA.into(),
+            interaction_baseline: configuration_for_model(manifest, &expert.model)
+                .is_none_or(|configuration| configuration.ensemble_interaction_baseline),
+            participation_decision: if enabled { "included" } else { "excluded" }.into(),
+            fallback_used,
+            fallback_reason: fallback_used.then(|| {
+                match (optimized_fallback, ms2rescore_fallback) {
+                    (true, true) => "optimized and MS2Rescore fitted artifacts do not contain the requested model",
+                    (true, false) => "optimized fitted artifact does not contain the requested model",
+                    (false, true) => "MS2Rescore fitted artifact does not contain the requested model",
+                    (false, false) => unreachable!(),
+                }
+                .into()
+            }),
+            target_only_policy_capability: Some(target_only_policy_capability(
+                &expert.model,
+                expert.target_only_calibration_policy,
+            )),
+            external_profile_identity_sha256: expert.external_profile_identity_sha256.clone(),
+            external_profile_calibration: expert.external_profile_calibration.clone(),
         });
     }
     let enabled = locked.iter().filter(|expert| expert.enabled).count();
@@ -1597,7 +1842,19 @@ fn build_ensemble_lock(
             )]
         })
         .unwrap_or_default();
-    Ok(canonicalize_ensemble_lock(EnsembleLock {
+    let external_profile_identities = locked
+        .iter()
+        .filter(|expert| expert.enabled)
+        .filter_map(|expert| expert.external_profile_identity_sha256.clone())
+        .collect::<BTreeSet<_>>();
+    let external_profile_identity_sha256 = (external_profile_identities.len() == 1)
+        .then(|| external_profile_identities.into_iter().next())
+        .flatten();
+    let external_profile_calibration = locked
+        .iter()
+        .find(|expert| expert.enabled)
+        .and_then(|expert| expert.external_profile_calibration.clone());
+    stamp_ensemble_lock_analysis_fingerprint(EnsembleLock {
         schema_version: 5,
         source_manifest_hash: manifest_hash.into(),
         dataset_fingerprint: dataset.fingerprint.clone(),
@@ -1606,7 +1863,30 @@ fn build_ensemble_lock(
         evaluable,
         not_evaluable_reasons,
         external_profile_contract: default_ensemble_external_profile_contract(),
-    }))
+        external_profile_identity_sha256,
+        external_profile_calibration,
+        source_configuration_sha256: dataset.search_config_sha256.clone(),
+        analysis_fingerprint: String::new(),
+        raw_q_interaction_warning_threshold: default_raw_q_interaction_warning_threshold(),
+    })
+}
+
+fn configuration_for_model<'a>(
+    manifest: &'a WorkflowManifest,
+    model: &ModelFit,
+) -> Option<&'a ModelWorkflow> {
+    manifest
+        .models
+        .iter()
+        .find(|configuration| configuration.model == *model)
+}
+
+fn artifacts_contains_selected_model(path: &Path, model: &ModelFit) -> bool {
+    path.is_file()
+        && std::fs::read(path)
+            .ok()
+            .and_then(|bytes| serde_json::from_slice::<DfRunArtifacts>(&bytes).ok())
+            .is_some_and(|artifacts| artifact_contains_model(&artifacts, model))
 }
 
 fn fitted_artifact_provenance(
@@ -1916,7 +2196,7 @@ fn run_search_stage(
     if manifest.resume && results.is_file() && checkpoint.is_file() {
         let mut old: StageRecord = serde_json::from_slice(&std::fs::read(&checkpoint)?)?;
         anyhow::ensure!(
-            matches!(old.schema_version, 1 | 2 | 3),
+            matches!(old.schema_version, 1 | 2 | 3 | 4),
             "unsupported workflow stage checkpoint schema {}",
             old.schema_version
         );
@@ -2162,7 +2442,7 @@ fn run_search_stage(
     write_json_atomic(&config_snapshot, &parameters)?;
 
     let mut record = StageRecord {
-        schema_version: 3,
+        schema_version: 4,
         stage: stage.into(),
         model: model_slug(&model.model).into(),
         input_hash,
@@ -2214,6 +2494,7 @@ fn run_search_stage(
         fallback_used: false,
         fallback_reason: None,
         model_artifact_schema: None,
+        ensemble_interaction_calibration: None,
     };
     std::fs::create_dir_all(output_directory)?;
     write_json_atomic(&checkpoint, &record)?;
@@ -2245,46 +2526,48 @@ fn run_search_stage(
     // actual search parameters that produced or consumed the pool.
     write_json_atomic(&config_snapshot, &runner.parameters)?;
 
-    let candidate_pool = (matches!(stage, "optimized" | "ms2rescore") || target_only.is_some())
-        .then(|| {
-            let requested_by_model = model
-                .candidate_windows
-                .iter()
-                .map(|window| window.max_rank as usize)
-                .chain(
-                    model
-                        .window_optimizer
-                        .iter()
-                        .map(|search| search.max_rank_range[1] as usize),
-                )
-                .chain(model.window.iter().map(|window| window.max_rank as usize))
-                .max()
-                .unwrap_or(1);
-            // The optimized stage creates the immutable +entrapment pool first.
-            // Retain enough depth for its later MS2Rescore stage now so enabling
-            // annotations cannot force a second native spectrum search.
-            let will_run_external_stage =
-                external || !matches!(model.ms2rescore, Ms2RescorePolicy::Never);
-            let requested_by_external = will_run_external_stage.then_some(
-                runner
-                    .parameters
-                    .external_features
-                    .max_rank
-                    .map(|rank| rank as usize)
-                    .unwrap_or(runner.parameters.report_psms),
-            );
-            CandidatePoolRequest {
-                root: manifest.output_root.join("candidate_pools"),
-                required_rank_depth: requested_by_external
-                    .map(|rank| rank.max(requested_by_model))
-                    .unwrap_or(requested_by_model),
-                allow_reuse: manifest.require_existing_candidate_pool
-                    || target_only
-                        .map(|context| context.allow_candidate_pool_reuse)
-                        .unwrap_or(true),
-                require_existing: manifest.require_existing_candidate_pool,
-            }
-        });
+    let candidate_pool = (matches!(stage, "optimized" | "ms2rescore")
+        || model.model == ModelFit::Ensemble
+        || target_only.is_some())
+    .then(|| {
+        let requested_by_model = model
+            .candidate_windows
+            .iter()
+            .map(|window| window.max_rank as usize)
+            .chain(
+                model
+                    .window_optimizer
+                    .iter()
+                    .map(|search| search.max_rank_range[1] as usize),
+            )
+            .chain(model.window.iter().map(|window| window.max_rank as usize))
+            .max()
+            .unwrap_or(1);
+        // The optimized stage creates the immutable +entrapment pool first.
+        // Retain enough depth for its later MS2Rescore stage now so enabling
+        // annotations cannot force a second native spectrum search.
+        let will_run_external_stage =
+            external || !matches!(model.ms2rescore, Ms2RescorePolicy::Never);
+        let requested_by_external = will_run_external_stage.then_some(
+            runner
+                .parameters
+                .external_features
+                .max_rank
+                .map(|rank| rank as usize)
+                .unwrap_or(runner.parameters.report_psms),
+        );
+        CandidatePoolRequest {
+            root: manifest.output_root.join("candidate_pools"),
+            required_rank_depth: requested_by_external
+                .map(|rank| rank.max(requested_by_model))
+                .unwrap_or(requested_by_model),
+            allow_reuse: manifest.require_existing_candidate_pool
+                || target_only
+                    .map(|context| context.allow_candidate_pool_reuse)
+                    .unwrap_or(true),
+            require_existing: manifest.require_existing_candidate_pool,
+        }
+    });
     let annotation_cache = external.then(|| ExternalAnnotationCacheRequest {
         root: manifest.output_root.join("ms2rescore_annotations"),
     });
@@ -2468,6 +2751,7 @@ pub fn execute_workflow(
 
     let mut stages = Vec::new();
     let mut completed_experts = Vec::new();
+    let mut ensemble_interaction_report = None;
     let mut runtime = WorkflowRuntime::default();
     let mut ordered_models = manifest
         .models
@@ -2643,6 +2927,162 @@ pub fn execute_workflow(
                 }
             }
         };
+        if model.model == ModelFit::Ensemble && !plan_only {
+            let final_lock = ensemble_lock
+                .as_ref()
+                .context("Ensemble stage has no assembled lock")?;
+            let baseline_lock = interaction_baseline_lock(final_lock)?;
+            write_json_atomic(
+                &manifest
+                    .output_root
+                    .join("ensemble.interaction_baseline.lock.json"),
+                &baseline_lock,
+            )?;
+            let final_experts = final_lock
+                .experts
+                .iter()
+                .filter(|expert| expert.enabled)
+                .map(|expert| model_slug(&expert.model).into())
+                .collect::<Vec<_>>();
+            let baseline_experts = baseline_lock
+                .experts
+                .iter()
+                .filter(|expert| expert.enabled)
+                .map(|expert| model_slug(&expert.model).into())
+                .collect::<Vec<_>>();
+            let final_record = if use_ms2_for_final {
+                ms2_record
+                    .as_ref()
+                    .context("selected Ensemble MS2Rescore stage is missing")?
+            } else {
+                &optimized
+            };
+            let final_summaries = summarize_run(
+                &ValidationRun {
+                    method: "ensemble".into(),
+                    stage: final_record.stage.clone(),
+                    results: final_record.results.clone(),
+                    mode: ValidationMode::DecoyFree,
+                    expected_search_space: Some("+Ent".into()),
+                    calibration_stage: None,
+                    target_only_calibration_policy: None,
+                    release_candidate: true,
+                },
+                &manifest.validation.effective_ratios,
+                manifest.validation.fdr_threshold,
+            )?;
+            let mut report = if baseline_experts == final_experts {
+                ensemble_interaction_calibration(
+                    &final_summaries,
+                    &final_summaries,
+                    &manifest.validation.effective_ratios,
+                    manifest.validation.fdr_threshold,
+                    final_lock.raw_q_interaction_warning_threshold,
+                    baseline_experts,
+                    final_experts,
+                )?
+            } else if !baseline_lock.evaluable {
+                EnsembleInteractionCalibration {
+                    schema_version: 1,
+                    baseline_lock_analysis_fingerprint: None,
+                    final_lock_analysis_fingerprint: None,
+                    baseline_experts,
+                    final_experts,
+                    newly_participating_experts: final_lock
+                        .experts
+                        .iter()
+                        .filter(|expert| expert.enabled && !expert.interaction_baseline)
+                        .map(|expert| model_slug(&expert.model).into())
+                        .collect(),
+                    raw_q: None,
+                    level4: None,
+                    raw_q_warning: None,
+                    final_level4_calibration_pass: false,
+                    evaluable: false,
+                    not_evaluable_reason: Some(baseline_lock.not_evaluable_reasons.join("; ")),
+                }
+            } else {
+                let mut baseline_record = run_search_stage(
+                    &manifest,
+                    &dataset,
+                    &locked_model,
+                    "ensemble_interaction_baseline",
+                    &active_entrapment_fasta,
+                    &model_root
+                        .join("interaction_baseline")
+                        .join(if use_ms2_for_final {
+                            "ms2rescore"
+                        } else {
+                            "optimized"
+                        }),
+                    use_ms2_for_final,
+                    false,
+                    parallel,
+                    false,
+                    None,
+                    Some(&baseline_lock),
+                    None,
+                    &mut runtime,
+                )?;
+                baseline_record.release_candidate = false;
+                write_json_atomic(
+                    &baseline_record
+                        .config_snapshot
+                        .parent()
+                        .context("interaction baseline configuration has no parent directory")?
+                        .join("workflow.stage.json"),
+                    &baseline_record,
+                )?;
+                let baseline_summaries = summarize_run(
+                    &ValidationRun {
+                        method: "ensemble_interaction_baseline".into(),
+                        stage: "ensemble_interaction_baseline".into(),
+                        results: baseline_record.results,
+                        mode: ValidationMode::DecoyFree,
+                        expected_search_space: Some("+Ent".into()),
+                        calibration_stage: None,
+                        target_only_calibration_policy: None,
+                        release_candidate: false,
+                    },
+                    &manifest.validation.effective_ratios,
+                    manifest.validation.fdr_threshold,
+                )?;
+                ensemble_interaction_calibration(
+                    &baseline_summaries,
+                    &final_summaries,
+                    &manifest.validation.effective_ratios,
+                    manifest.validation.fdr_threshold,
+                    final_lock.raw_q_interaction_warning_threshold,
+                    baseline_experts,
+                    final_experts,
+                )?
+            };
+            report.baseline_lock_analysis_fingerprint =
+                Some(baseline_lock.analysis_fingerprint.clone());
+            report.final_lock_analysis_fingerprint = Some(final_lock.analysis_fingerprint.clone());
+            write_json_atomic(
+                &manifest
+                    .output_root
+                    .join("validation.ensemble_interaction.json"),
+                &report,
+            )?;
+            if let Some(record) = stages
+                .iter_mut()
+                .find(|record| record.results == final_record.results)
+            {
+                record.schema_version = 4;
+                record.ensemble_interaction_calibration = Some(report.clone());
+                write_json_atomic(
+                    &record
+                        .config_snapshot
+                        .parent()
+                        .context("Ensemble stage configuration has no parent directory")?
+                        .join("workflow.stage.json"),
+                    record,
+                )?;
+            }
+            ensemble_interaction_report = Some(report);
+        }
         let optimized_artifact = model_root.join("optimized/fitted_model_artifacts.json");
         let ms2_artifact = model_root.join("ms2rescore/fitted_model_artifacts.json");
         let frozen_model_artifacts = if imported_diagnostic_artifact.is_some() {
@@ -2731,7 +3171,7 @@ pub fn execute_workflow(
                     Some(&context),
                 )?;
                 let record = StageRecord {
-                    schema_version: 3,
+                    schema_version: 4,
                     stage: policy.stage_name().into(),
                     model: model_slug(&locked_model.model).into(),
                     input_hash,
@@ -2771,6 +3211,7 @@ pub fn execute_workflow(
                     fallback_used: false,
                     fallback_reason: None,
                     model_artifact_schema: optimized.model_artifact_schema,
+                    ensemble_interaction_calibration: None,
                 };
                 std::fs::create_dir_all(&target_output_directory)?;
                 write_json_atomic(
@@ -2813,6 +3254,18 @@ pub fn execute_workflow(
                 frozen_model_artifacts.is_some(),
                 "individual expert has no selected fitted artifact"
             );
+            let (external_profile_identity_sha256, external_profile_calibration) =
+                if ms2_artifact.is_file() {
+                    let artifacts: DfRunArtifacts =
+                        serde_json::from_slice(&std::fs::read(&ms2_artifact)?).with_context(
+                            || format!("invalid fitted artifacts {}", ms2_artifact.display()),
+                        )?;
+                    external_profile_identity(&artifacts)?
+                        .map(|(identity, calibration)| (Some(identity), Some(calibration)))
+                        .unwrap_or((None, None))
+                } else {
+                    (None, None)
+                };
             completed_experts.push(CompletedExpert {
                 model: locked_model.model.clone(),
                 window: locked_model.window.clone(),
@@ -2842,6 +3295,8 @@ pub fn execute_workflow(
                     .context("calibration stage has no candidate-pool provenance")?
                     .search_fingerprint
                     .clone(),
+                external_profile_identity_sha256,
+                external_profile_calibration,
             });
         }
     }
@@ -3112,6 +3567,23 @@ pub fn execute_workflow(
     {
         not_evaluable_reasons.push("too few experts passed the Ensemble quality gates".into());
     }
+    if ensemble_requested {
+        match ensemble_interaction_report.as_ref() {
+            None => not_evaluable_reasons
+                .push("post-assembly Ensemble interaction calibration is missing".into()),
+            Some(report) if !report.evaluable => not_evaluable_reasons.push(format!(
+                "post-assembly Ensemble interaction calibration is not evaluable: {}",
+                report
+                    .not_evaluable_reason
+                    .as_deref()
+                    .unwrap_or("unspecified reason")
+            )),
+            Some(report) if !report.final_level4_calibration_pass => not_eligible_reasons.push(
+                "final post-assembly Ensemble Level-4 peptide calibration exceeds the configured release threshold".into(),
+            ),
+            Some(_) => {}
+        }
+    }
     let calibrated_tdc_improvements = tdc_benchmarks
         .iter()
         .filter(|comparison| {
@@ -3230,6 +3702,7 @@ pub fn execute_workflow(
         release_gate,
         transfer_stability: stability,
         pending_validation_gates,
+        ensemble_interaction_calibration: ensemble_interaction_report,
     };
     write_json_atomic(&manifest.output_root.join("workflow.state.json"), &state)?;
     Ok(state)
@@ -3371,6 +3844,7 @@ mod tests {
                 target_only_calibration_policy: None,
                 ensemble_participation: EnsembleParticipation::Auto,
                 ensemble_exclusion_reason: None,
+                ensemble_interaction_baseline: true,
             }],
             baseline: None,
             validation: ValidationWorkflow {
@@ -3416,6 +3890,7 @@ mod tests {
             target_only_calibration_policy: None,
             ensemble_participation: EnsembleParticipation::Auto,
             ensemble_exclusion_reason: None,
+            ensemble_interaction_baseline: true,
         });
         manifest.validate().unwrap();
         std::fs::remove_dir_all(directory).unwrap();
@@ -3554,6 +4029,7 @@ mod tests {
             fallback_used: false,
             fallback_reason: None,
             model_artifact_schema: None,
+            ensemble_interaction_calibration: None,
         };
         let mut legacy_value = serde_json::to_value(&record).unwrap();
         legacy_value["schema_version"] = serde_json::json!(2);
@@ -3613,11 +4089,16 @@ mod tests {
             .as_object_mut()
             .unwrap()
             .remove("target_only_calibration_policy");
+        value["models"][0]
+            .as_object_mut()
+            .unwrap()
+            .remove("ensemble_interaction_baseline");
         let restored: WorkflowManifest = serde_json::from_value(value).unwrap();
         assert_eq!(
             restored.target_only_calibration_policy,
             TargetOnlyCalibrationPolicy::RefitWithLockedWindow
         );
+        assert!(restored.models[0].ensemble_interaction_baseline);
         assert_eq!(
             concrete_target_only_policies(TargetOnlyCalibrationPolicy::CompareBoth),
             vec![
@@ -4012,6 +4493,18 @@ mod tests {
             external_ms2rescore: Some(second_profile),
             ..Default::default()
         };
+        let shared_identity = external_profile_identity(&DfRunArtifacts {
+            external_ms2rescore: Some(shared.clone()),
+            ..Default::default()
+        })
+        .unwrap()
+        .unwrap();
+        let first_identity = external_profile_identity(&first).unwrap().unwrap();
+        let second_identity = external_profile_identity(&second).unwrap().unwrap();
+        assert_ne!(shared_identity.0, first_identity.0);
+        assert_ne!(first_identity.0, second_identity.0);
+        assert_eq!(shared_identity.1.min_null_rank, 9);
+        assert_eq!(shared_identity.1.max_null_rank, 18);
         apply_fitted_artifacts(&mut fdr, &ModelFit::Moments, first, false, None).unwrap();
         apply_fitted_artifacts(&mut fdr, &ModelFit::Mle, second, false, None).unwrap();
         assert_eq!(
@@ -4160,6 +4653,7 @@ mod tests {
             target_only_calibration_policy: None,
             ensemble_participation: EnsembleParticipation::Auto,
             ensemble_exclusion_reason: None,
+            ensemble_interaction_baseline: true,
         };
         let mut manifest = WorkflowManifest {
             schema_version: 1,
@@ -4260,6 +4754,8 @@ mod tests {
                 target_only_results: moments_target,
                 target_only_calibration_policy: TargetOnlyCalibrationPolicy::RefitWithLockedWindow,
                 calibration_search_fingerprint: "test-search-fingerprint".into(),
+                external_profile_identity_sha256: None,
+                external_profile_calibration: None,
             },
             CompletedExpert {
                 model: ModelFit::Mle,
@@ -4273,6 +4769,8 @@ mod tests {
                 target_only_results: mle_target,
                 target_only_calibration_policy: TargetOnlyCalibrationPolicy::RefitWithLockedWindow,
                 calibration_search_fingerprint: "test-search-fingerprint".into(),
+                external_profile_identity_sha256: None,
+                external_profile_calibration: None,
             },
         ];
         let lock = build_ensemble_lock(&manifest, "manifest-hash", &dataset, &experts).unwrap();
@@ -4362,6 +4860,12 @@ mod tests {
 
         let mut lower_order_lock = lock.clone();
         lower_order_lock.experts[1].model = ModelFit::LowerOrder;
+        lower_order_lock.experts[1].target_only_policy_capability =
+            Some(target_only_policy_capability(
+                &ModelFit::LowerOrder,
+                TargetOnlyCalibrationPolicy::RefitWithLockedWindow,
+            ));
+        let lower_order_lock = stamp_ensemble_lock_analysis_fingerprint(lower_order_lock).unwrap();
         let mut target_refit = FdrOptions::default();
         apply_ensemble_lock(
             &mut target_refit,
@@ -4468,6 +4972,90 @@ mod tests {
                     .iter()
                     .any(|reason| reason.contains("unreadable"))
         }));
+        std::fs::remove_dir_all(directory).unwrap();
+    }
+
+    #[test]
+    fn lower_order_is_runtime_gated_and_records_refit_only_capability() {
+        let directory = test_directory("lower-order-auto-ensemble");
+        let mut manifest = minimal_manifest(&directory, ValidationDatasetRole::Development);
+        manifest.models[0].model = ModelFit::LowerOrder;
+        manifest.models[0].candidate_windows.clear();
+        manifest.models[0].window = Some(NullWindow {
+            min_rank: 6,
+            max_rank: 9,
+        });
+        manifest.models[0].ms2rescore = Ms2RescorePolicy::Never;
+        manifest.models[0].ensemble_participation = EnsembleParticipation::Auto;
+        manifest.models[0].ensemble_interaction_baseline = false;
+        manifest.validation.minimum_ensemble_experts = 1;
+        let dataset = DatasetIdentity {
+            schema_version: 1,
+            dataset_id: "test-dataset".into(),
+            fingerprint: "dataset-fingerprint".into(),
+            target_fasta_sha256: "target-sha256".into(),
+            spectra_sha256: vec!["spectra-sha256".into()],
+            search_config_sha256: sha256_file(&manifest.search_config).unwrap(),
+        };
+        let artifact_path = directory.join("lower-order.artifacts.json");
+        let mut artifacts = lower_order_artifacts(-1.5);
+        artifacts.provenance = Some(fitted_artifact_provenance(
+            &dataset,
+            "optimized",
+            &ModelFit::LowerOrder,
+            "test-search-fingerprint",
+        ));
+        write_json_atomic(&artifact_path, &artifacts).unwrap();
+        let calibration = directory.join("lower-order.calibration.tsv");
+        let target = directory.join("lower-order.target.tsv");
+        write_validation_tsv_counts(&calibration, 500, 200, 1);
+        write_validation_tsv_counts(&target, 500, 200, 0);
+        let expert = CompletedExpert {
+            model: ModelFit::LowerOrder,
+            window: manifest.models[0].window.clone(),
+            optimized_artifacts: artifact_path.clone(),
+            optimized_results: calibration.clone(),
+            ms2rescore_artifacts: None,
+            ms2rescore_results: None,
+            calibration_stage: "optimized".into(),
+            calibration_results: calibration,
+            target_only_results: target,
+            target_only_calibration_policy: TargetOnlyCalibrationPolicy::RefitWithLockedWindow,
+            calibration_search_fingerprint: "test-search-fingerprint".into(),
+            external_profile_identity_sha256: None,
+            external_profile_calibration: None,
+        };
+        let lock =
+            build_ensemble_lock(&manifest, "manifest-hash", &dataset, &[expert.clone()]).unwrap();
+        let lower_order = &lock.experts[0];
+        assert!(lower_order.enabled);
+        assert_eq!(lower_order.participation_decision, "included");
+        assert!(!lower_order.interaction_baseline);
+        assert!(!lower_order.fallback_used);
+        assert_eq!(
+            lower_order.target_only_policy_capability,
+            Some(target_only_policy_capability(
+                &ModelFit::LowerOrder,
+                TargetOnlyCalibrationPolicy::RefitWithLockedWindow,
+            ))
+        );
+        let baseline = interaction_baseline_lock(&lock).unwrap();
+        assert!(!baseline.evaluable);
+        assert_ne!(baseline.analysis_fingerprint, lock.analysis_fingerprint);
+        assert_eq!(
+            baseline.experts[0].fit_search_fingerprint,
+            lock.experts[0].fit_search_fingerprint
+        );
+
+        std::fs::write(&artifact_path, b"{}\n").unwrap();
+        let rejected =
+            build_ensemble_lock(&manifest, "manifest-hash", &dataset, &[expert]).unwrap();
+        assert!(!rejected.experts[0].enabled);
+        assert!(rejected.experts[0].fallback_used);
+        assert!(rejected.experts[0]
+            .gate_reasons
+            .iter()
+            .any(|reason| reason.contains("artifact")));
         std::fs::remove_dir_all(directory).unwrap();
     }
 }

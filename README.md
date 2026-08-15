@@ -171,9 +171,9 @@ slightly exceeded 1%; this does not invalidate parity, but it prevents a broader
 | Moments | Required ISB and PXD Moments parity complete; still subject to dataset-local runtime gates. |
 | MLE | ISB parity complete; eligible for automatic Ensemble gates. No additional PXD model was required. |
 | MSFDR1-SMIX | Rank-1-only fitted-state, MS2Rescore, and target-only parity complete; eligible for automatic gates. |
-| Lower Order | Supports target-only `refit_with_locked_window` only; `reuse_dataset_artifact` is unsupported across target-only search spaces. Excluded from automatic Ensemble participation pending independent prospective validation. |
-| MSFDR | Unannotated grid and fitted-state parity passed; annotated parity is deferred because the frozen Linux and regenerated macOS feature environments differ. |
-| MSFDR2-SMIX | Unannotated grid and fitted-state parity passed; annotated parity is deferred for the same environment issue. |
+| Lower Order | Eligible for runtime-gated automatic Ensemble consideration after dataset-local optimization. Target-only supports `refit_with_locked_window` only; cross-space `reuse_dataset_artifact` is unsupported. |
+| MSFDR | Individual +entrapment and target-only parity passed in the reproduced WSL annotation environment; Ensemble participation remains excluded pending independent holdout evidence. |
+| MSFDR2-SMIX | Individual +entrapment and target-only parity passed in the reproduced WSL annotation environment; Ensemble participation remains excluded pending independent holdout evidence. |
 | Nokoi | Portable artifact and frozen parity are incomplete; diagnostic-only and excluded from Ensemble. |
 | Ensemble | Optional; assembled only when enough dataset-local experts pass provenance, parity, calibration, transfer, fallback, and incremental-yield gates. |
 
@@ -188,7 +188,7 @@ Missing or invalid evidence is never reported as stable or passed. See
 [`DECOY_FREE_WORKFLOW.md`](DECOY_FREE_WORKFLOW.md),
 [`validation/reports/phase9_release_finalization_2026-08-09.json`](validation/reports/phase9_release_finalization_2026-08-09.json),
 and
-[`validation/policies/phase8_isb_ensemble_expert_policy_2026-08-08.json`](validation/policies/phase8_isb_ensemble_expert_policy_2026-08-08.json)
+[`validation/policies/current_ensemble_expert_policy_2026-08-15.json`](validation/policies/current_ensemble_expert_policy_2026-08-15.json)
 for the detailed engineering record.
 
 
@@ -1106,13 +1106,19 @@ The ensemble combines expert p-value streams and/or expert PEP-like streams depe
 
 These models produce fitted-null tail p-value streams and calibrated local-FDR/PEP-like streams derived from those p-values.  They are useful for decoy-free modeling of lower-rank null evidence, but their calibration should be checked with entrapment or other external validation.
 
+Lower Order is eligible for runtime-gated automatic Ensemble consideration after dataset-local
+window optimization. Its target-only contract is `refit_with_locked_window`: the selected
++entrapment window is retained, nuisance state is refitted in the target-only candidate space, and
+target-only outcomes never retune the window. Complete-artifact cross-space reuse remains
+unsupported and fails closed.
+
 ### MSFDR variants
 
 The MSFDR family produces fitted or empirical null-survival p-like streams and derived PEP-like
 streams. The SMIX variants use mixture-model fitting and can be sensitive to initialization and
-rank-window choices. Seeded MSFDR and MSFDR2-SMIX passed the frozen unannotated engineering grids,
-but their regenerated MS2Rescore feature environment did not meet annotated parity tolerance; they
-remain excluded from production Ensemble participation.
+rank-window choices. Seeded MSFDR and MSFDR2-SMIX passed individual +entrapment and target-only
+parity in the reproduced WSL annotation environment, but remain excluded from production Ensemble
+participation pending independent holdout evidence.
 
 ### NOKOI
 
@@ -1124,7 +1130,14 @@ semantics.
 
 ### Ensemble
 
-The ensemble is designed to combine evidence from multiple experts. Direct searches use static flags and weights. The native workflow optimizes each constituent window independently within the current dataset, rejects experts that fail calibration/transfer/artifact/support gates, and creates `ensemble.lock.json` automatically. It keeps native and MS2Rescore-fitted artifacts separate. A holdout dataset applies the same locked expert-selection procedure to its own independently optimized experts; it never imports another dataset's expert windows or fitted models in normal operation.
+The ensemble is designed to combine evidence from multiple experts. Direct searches use static flags and weights. The native workflow optimizes each constituent window independently within the current dataset, rejects experts that fail calibration, stability, usefulness, fallback, artifact, or provenance gates, and creates `ensemble.lock.json` automatically. It keeps native and MS2Rescore-fitted artifacts separate. A holdout dataset applies the same locked expert-selection procedure to its own independently optimized experts; it never imports another dataset's expert windows or fitted models in normal operation.
+
+When an automatically eligible expert is outside the declared established interaction baseline,
+the workflow also reports the baseline-to-final raw-q and Level-4 entrapment FDP changes for PSMs,
+canonical peptides, and peptidoforms. An absolute raw-q deterioration above `0.01` produces a
+structured informational warning; it is not recorded as a passing gate and is distinct from the
+final Level-4 peptide-calibration release check. The diagnostic is deterministic, provenance
+bearing, and does not use target-only outcomes to decide participation.
 
 ---
 
@@ -1139,10 +1152,10 @@ The completed validation establishes engineering behavior, not general statistic
    must not be described as proof of calibrated 1% protein FDR.
 4. A matched TDC benchmark is still absent from the final release evidence. The repository therefore
    cannot yet evaluate whether Decoy-Free should replace TDC as a statistical default.
-5. Lower Order supports target-only `refit_with_locked_window` only and remains excluded pending
-   independent prospective validation. Annotated MSFDR/MSFDR2-SMIX portability and Nokoi
-   portability/parity remain explicitly deferred. Ensemble is optional and cannot promote those
-   experts around their gates.
+5. Lower Order supports target-only `refit_with_locked_window` only and is eligible for automatic
+   consideration subject to every runtime Ensemble gate. Seeded MSFDR and MSFDR2-SMIX remain
+   excluded pending independent holdout evidence, and Nokoi portability/parity remains deferred.
+   Ensemble is optional and cannot promote any expert around its gates.
 6. The present evidence does not select a universally best Decoy-Free model. Model suitability must
    be assessed within each dataset using entrapment calibration and matched comparisons.
 

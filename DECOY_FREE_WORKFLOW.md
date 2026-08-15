@@ -277,11 +277,11 @@ the locked `6-9` window. Bitwise historical grid parity and complete frozen anno
 and the required historical non-rank-1 Linux annotations were not preserved. Preserved rank-1
 annotations match exactly.
 
-Lower Order is technically ready for a controlled independent holdout, but remains excluded from
-automatic production Ensemble participation pending that prospective validation. Its controlled
-ISB Ensemble contribution was two canonical peptides/peptidoforms and no target-only peptide,
-peptidoform, or protein evidence; calibration at Level 4 was underpowered. These results do not
-establish production utility or eligibility for the statistical default.
+Lower Order completed the controlled within-parent ISB holdout and is now eligible for automatic
+Ensemble consideration through the normal runtime gates. Eligibility is not unconditional
+inclusion: dataset-local calibration, stability, incremental usefulness, fallback, artifact, and
+provenance checks still determine participation. This engineering evidence does not establish
+statistical superiority over TDC or eligibility for the statistical default.
 
 ## Frozen ISB parity status
 
@@ -292,10 +292,9 @@ remained fixed at rank `1-1`. Moments, MLE, Lower Order under refit semantics, a
 also passed the applicable downstream count comparisons; the Moments MS2Rescore result differed
 by only two PSMs with exact peptide and protein counts.
 
-Seeded MSFDR and MSFDR2-SMIX matched their unannotated fits but exceeded downstream tolerance
-after regenerating MS2PIP/DeepLC features on macOS. Candidate identities and hyperscores matched;
-the external features did not match the frozen Linux environment. These annotated variants are
-deferred until their environment can be reproduced or their platform robustness is repaired.
+Seeded MSFDR and MSFDR2-SMIX later passed individual +entrapment and target-only parity after the
+frozen Linux annotation environment was reproduced under WSL. Both remain excluded from automatic
+Ensemble participation pending independent holdout evidence.
 Nokoi failed the frozen fit, selected-window, and target-only checks and is deferred as described
 above. The production Ensemble is not assembled from these incomplete experts. Full evidence is
 recorded in `validation/reports/phase6_isb_model_parity_2026-08-07.json`.
@@ -341,13 +340,14 @@ explicit and fail-closed. Each individual model may declare `ensemble_participat
 must still pass all applicable runtime gates; the field is eligibility for evaluation, not an
 override or guarantee of admission.
 
-The initial ISB production policy is:
+The current production participation policy is:
 
 - Moments, MLE, and rank-1-only MSFDR1-SMIX remain eligible for automatic Ensemble gates.
-- Lower Order remains excluded pending independent prospective validation. It supports target-only
-  `refit_with_locked_window` only; cross-space `reuse_dataset_artifact` is explicitly unsupported.
-- Seeded MSFDR and MSFDR2-SMIX remain excluded until the frozen Linux annotation environment is
-  reproduced or the methods pass a declared cross-platform annotation-robustness gate.
+- Lower Order is eligible for the same automatic runtime gates after dataset-local window
+  optimization. It supports target-only `refit_with_locked_window` only; cross-space
+  `reuse_dataset_artifact` is explicitly unsupported, and target-only outcomes never tune its
+  window.
+- Seeded MSFDR and MSFDR2-SMIX remain excluded pending independent holdout evidence.
 - Nokoi v1 is diagnostic-only. The workflow refuses to reuse it as a portable artifact because
   it lacks the complete state required to reconstruct the frozen procedure, and its ISB fit and
   target-only parity also failed.
@@ -359,12 +359,24 @@ unacceptable gate-layer entrapment FDP, unstable target-only transfer, or insuff
 peptide yield. A declared frozen parity pair is an admission gate rather than a reporting-only
 comparison.
 
+For newly eligible experts, `ensemble_interaction_baseline` distinguishes the established
+counterfactual Ensemble from the final assembled Ensemble without changing any gate. The workflow
+reuses the same candidate pool and annotation cache to report baseline and final raw-q and Level-4
+PSM, canonical-peptide, and peptidoform entrapment FDP, including measured-ratio numerators,
+denominators, and absolute/relative changes. Raw-q deterioration greater than `0.01` is emitted as
+a structured informational warning and is never mislabeled as a passing calibration gate. Final
+Level-4 peptide calibration remains a release check. The report is stored in
+`validation.ensemble_interaction.json`, the selected Ensemble stage checkpoint, and workflow state;
+the schema-v5 lock records the baseline membership and warning contract.
+
 Ensemble remains optional and cannot block the core refactor. If fewer than
 `minimum_ensemble_experts` pass, `ensemble.lock.json` is still written with `evaluable: false` and
 the reasons, and Ensemble stages are skipped without invalidating completed individual-model
-stages. Applying a non-evaluable lock fails closed. The exact initial policy and rationale are in
-`validation/policies/phase8_isb_ensemble_expert_policy_2026-08-08.json`; implementation evidence
-is in `validation/reports/phase8_secondary_model_repairs_2026-08-08.json`.
+stages. Applying a non-evaluable lock fails closed. The historical Phase 8 policy remains preserved
+in `validation/policies/phase8_isb_ensemble_expert_policy_2026-08-08.json`. The current status is in
+`validation/policies/current_ensemble_expert_policy_2026-08-15.json`; implementation evidence for
+the original secondary-expert repair is in
+`validation/reports/phase8_secondary_model_repairs_2026-08-08.json`.
 
 No additional PXD model search was run for the secondary-model audit. PXD Moments remains the only required PXD
 parity run for this refactor.
