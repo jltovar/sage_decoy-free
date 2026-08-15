@@ -1,0 +1,55 @@
+{
+  "schema_version": 1,
+  "policy_date": "2026-08-15",
+  "statistical_default": {
+    "status": "not_evaluated",
+    "note": "Runtime-gated expert eligibility does not establish superiority over TDC or change the statistical default."
+  },
+  "experts": {
+    "moments": {
+      "participation": "auto",
+      "interaction_baseline": true
+    },
+    "mle": {
+      "participation": "auto",
+      "interaction_baseline": true
+    },
+    "msfdr1_smix": {
+      "participation": "auto",
+      "interaction_baseline": true
+    },
+    "lower_order": {
+      "participation": "auto",
+      "interaction_baseline": false,
+      "target_only_calibration_policy": "refit_with_locked_window",
+      "reuse_dataset_artifact": "unsupported",
+      "decision": "eligible_for_runtime_gated_consideration",
+      "note": "The preregistered Fold 3 raw-q calibration gate remains FAIL; forensic review found sparse boundary crossings and no software/model defect or broad systematic deterioration."
+    },
+    "msfdr": {
+      "participation": "excluded",
+      "reason": "independent holdout evidence is pending"
+    },
+    "msfdr2_smix": {
+      "participation": "excluded",
+      "reason": "independent holdout evidence is pending"
+    },
+    "nokoi": {
+      "participation": "excluded",
+      "reason": "portable artifact and parity work remains incomplete"
+    }
+  },
+  "runtime_gates": [
+    "dataset-local calibration",
+    "target-only transfer stability",
+    "incremental Level-4 canonical-peptide usefulness",
+    "no fit fallback",
+    "artifact and provenance integrity",
+    "minimum eligible expert count"
+  ],
+  "ensemble_interaction_reporting": {
+    "raw_q_absolute_deterioration_warning": 0.01,
+    "warning_is_informational": true,
+    "final_level4_peptide_calibration_is_release_gate": true
+  }
+}
