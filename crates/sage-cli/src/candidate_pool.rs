@@ -534,6 +534,52 @@ pub fn load_pool_entries(
     Ok((manifest, entries))
 }
 
+/// Development-only verified loader for read-only within-parent subset views.
+///
+/// This has no fallback or pool-writing path: the complete immutable parent
+/// payload must match every preregistered identity field before records are
+/// returned for in-memory filtering.
+#[cfg(feature = "within-parent-holdout")]
+pub(crate) fn load_verified_parent_entries(
+    directory: &Path,
+    expected_search_fingerprint: &str,
+    expected_payload_sha256: &str,
+    expected_candidate_count: usize,
+    required_rank_depth: usize,
+    db: &IndexedDatabase,
+) -> Result<(CandidatePoolManifest, Vec<CandidatePoolEntry>)> {
+    let bytes = std::fs::read(manifest_path(directory)).with_context(|| {
+        format!(
+            "candidate-pool manifest is missing or unreadable: {}",
+            manifest_path(directory).display()
+        )
+    })?;
+    let manifest: CandidatePoolManifest =
+        serde_json::from_slice(&bytes).context("invalid within-parent candidate-pool manifest")?;
+    anyhow::ensure!(
+        manifest.search_fingerprint.digest == expected_search_fingerprint,
+        "within-parent candidate-pool fingerprint mismatch"
+    );
+    anyhow::ensure!(
+        manifest.payload_sha256 == expected_payload_sha256,
+        "within-parent candidate-pool payload identity mismatch"
+    );
+    anyhow::ensure!(
+        manifest.candidate_count == expected_candidate_count,
+        "within-parent candidate-pool count mismatch"
+    );
+    anyhow::ensure!(
+        manifest.capabilities.retained_rank_depth >= required_rank_depth,
+        "within-parent candidate-pool retained rank depth is insufficient"
+    );
+    load_pool_entries(
+        directory,
+        &manifest.search_fingerprint,
+        required_rank_depth,
+        db,
+    )
+}
+
 pub fn load_pool(
     directory: &Path,
     expected: &SearchFingerprint,

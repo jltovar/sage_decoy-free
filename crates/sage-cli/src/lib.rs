@@ -10,3 +10,6 @@ pub mod runner;
 pub mod telemetry;
 pub mod validation;
 pub mod workflow;
+
+#[cfg(feature = "within-parent-holdout")]
+pub mod within_parent_holdout;

@@ -732,6 +732,50 @@ pub fn load_cache(
     Ok(Some((manifest, payload.records)))
 }
 
+/// Development-only verified loader for a complete immutable parent
+/// annotation cache. It cannot generate annotations and rejects any mismatch
+/// before exposing records to the within-parent subset runner.
+#[cfg(feature = "within-parent-holdout")]
+pub(crate) fn load_verified_parent_annotations(
+    directory: &Path,
+    expected_annotation_fingerprint: &str,
+    expected_search_fingerprint: &str,
+    expected_payload_sha256: &str,
+    expected_annotation_count: usize,
+) -> Result<(
+    ExternalAnnotationCacheManifest,
+    Vec<ExternalAnnotationRecord>,
+)> {
+    let manifest_file = cache_manifest_path(directory);
+    let manifest: ExternalAnnotationCacheManifest =
+        serde_json::from_slice(&std::fs::read(&manifest_file).with_context(|| {
+            format!(
+                "annotation-cache manifest is missing or unreadable: {}",
+                manifest_file.display()
+            )
+        })?)
+        .context("invalid within-parent annotation-cache manifest")?;
+    anyhow::ensure!(
+        manifest.identity.digest == expected_annotation_fingerprint,
+        "within-parent annotation-cache fingerprint mismatch"
+    );
+    anyhow::ensure!(
+        manifest.identity.search_fingerprint == expected_search_fingerprint,
+        "within-parent annotation-cache parent search mismatch"
+    );
+    anyhow::ensure!(
+        manifest.payload_sha256 == expected_payload_sha256,
+        "within-parent annotation-cache payload identity mismatch"
+    );
+    anyhow::ensure!(
+        manifest.annotation_count == expected_annotation_count
+            && manifest.joined_annotation_count == expected_annotation_count,
+        "within-parent annotation cache is incomplete"
+    );
+    load_cache(directory, &manifest.identity)?
+        .context("verified within-parent annotation cache disappeared")
+}
+
 pub fn write_cache(
     directory: &Path,
     identity: &ExternalAnnotationIdentity,

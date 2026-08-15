@@ -21,6 +21,17 @@ path = "src/lib.rs"
 name = "sage"
 path = "src/main.rs"
 
+[[bin]]
+name = "sage-within-parent-holdout"
+path = "src/within_parent_holdout_main.rs"
+required-features = ["within-parent-holdout"]
+
+[features]
+default = []
+# Development-only validation infrastructure. This feature deliberately does
+# not alter or extend the normal `sage workflow` command surface.
+within-parent-holdout = []
+
 [dependencies]
 sage-core = { path = "../sage" }
 sage-cloudpath = { path = "../sage-cloudpath", features = ["parquet"] }
