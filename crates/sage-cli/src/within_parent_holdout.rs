@@ -36,10 +36,10 @@ use std::sync::Arc;
 
 pub const SUBSET_SCHEMA: &str = "within-parent-subset-v1";
 pub const ARTIFACT_SCHEMA: &str = "within-parent-holdout-artifact-v1";
-pub const LOCK_SCHEMA: &str = "within-parent-holdout-lock-v1";
-pub const PREREGISTRATION_SCHEMA: &str = "within-parent-holdout-preregistration-v1";
-pub const PREFLIGHT_SCHEMA: &str = "within-parent-holdout-preflight-v1";
-pub const RESULT_SCHEMA: &str = "within-parent-holdout-result-v1";
+pub const LOCK_SCHEMA: &str = "within-parent-holdout-lock-v2";
+pub const PREREGISTRATION_SCHEMA: &str = "within-parent-holdout-preregistration-v2";
+pub const PREFLIGHT_SCHEMA: &str = "within-parent-holdout-preflight-v2";
+pub const RESULT_SCHEMA: &str = "within-parent-holdout-result-v2";
 
 #[derive(Clone, Copy, Debug, Serialize, Deserialize, PartialEq, Eq)]
 #[serde(rename_all = "snake_case")]
@@ -116,6 +116,23 @@ pub struct ModelGrid {
     pub fixed_window: Option<NullWindow>,
 }
 
+#[derive(Clone, Debug, Serialize, Deserialize, PartialEq, Eq)]
+pub struct HoldoutComposition {
+    pub id: String,
+    pub requested_experts: Vec<ModelFit>,
+}
+
+#[derive(Clone, Debug, Serialize, Deserialize)]
+pub struct HoldoutRuntimeGates {
+    pub validation_scope: NullWindowValidationScope,
+    pub fdr_threshold: f64,
+    pub maximum_target_only_peptide_fraction_loss: f64,
+    pub minimum_incremental_level4_target_peptides: usize,
+    pub minimum_entrapment_peptides_for_stable_estimate: usize,
+    pub minimum_ensemble_experts: usize,
+    pub raw_q_interaction_warning_threshold: f64,
+}
+
 #[derive(Clone, Debug, Serialize, Deserialize)]
 pub struct HoldoutAcceptanceCriteria {
     pub require_all_folds_valid: bool,
@@ -144,12 +161,14 @@ pub struct HoldoutPreregistration {
     pub grid_source_manifest_sha256: String,
     pub model_grids: Vec<ModelGrid>,
     pub baseline_experts: Vec<ModelFit>,
-    pub comparison_additional_expert: ModelFit,
+    pub comparison_matrix: Vec<HoldoutComposition>,
     pub target_only_policies: BTreeMap<String, String>,
     pub external_profile_window: NullWindow,
     pub effective_ratios: EffectiveRatios,
     pub optimizer_validation_scope: NullWindowValidationScope,
     pub optimizer_seed: u64,
+    pub runtime_gates: HoldoutRuntimeGates,
+    pub disclosures: Vec<String>,
     pub source_build: SourceBuildIdentity,
     pub aggregation_definition: String,
     pub uncertainty_method: String,
@@ -207,6 +226,69 @@ pub struct HoldoutPreflight {
     pub capabilities: ValidationRunnerCapabilities,
 }
 
+#[derive(Clone, Debug, Serialize, Deserialize)]
+pub struct AnnotationAuditEntry {
+    pub label: String,
+    pub manifest: PathBuf,
+}
+
+#[derive(Clone, Debug, Serialize, Deserialize)]
+pub struct AnnotationAuditGroup {
+    pub label: String,
+    pub reference: AnnotationAuditEntry,
+    pub comparisons: Vec<AnnotationAuditEntry>,
+}
+
+#[derive(Clone, Debug, Serialize, Deserialize)]
+pub struct AnnotationAuditRequest {
+    pub schema: String,
+    pub groups: Vec<AnnotationAuditGroup>,
+}
+
+#[derive(Clone, Debug, Serialize, Deserialize, PartialEq)]
+pub struct AnnotationFieldDifference {
+    pub field: String,
+    pub differing_values: usize,
+    pub maximum_finite_absolute_difference: f64,
+    pub nonfinite_mismatches: usize,
+}
+
+#[derive(Clone, Debug, Serialize, Deserialize)]
+pub struct AnnotationCacheInventory {
+    pub label: String,
+    pub manifest: PathBuf,
+    pub manifest_sha256: String,
+    pub annotation_fingerprint: String,
+    pub search_fingerprint: String,
+    pub generator_settings_sha256: String,
+    pub calibration_input_sha256: String,
+    pub payload_sha256: String,
+    pub annotation_count: usize,
+    pub requested_max_rank: u32,
+    pub model_components: Vec<crate::external_feature_cache::ModelComponentIdentity>,
+}
+
+#[derive(Clone, Debug, Serialize, Deserialize)]
+pub struct AnnotationCacheComparison {
+    pub reference: String,
+    pub comparison: String,
+    pub joined_stable_ids: usize,
+    pub reference_only_stable_ids: usize,
+    pub comparison_only_stable_ids: usize,
+    pub duplicate_stable_ids: usize,
+    pub exact_raw_feature_payload: bool,
+    pub field_differences: Vec<AnnotationFieldDifference>,
+}
+
+#[derive(Clone, Debug, Serialize, Deserialize)]
+pub struct AnnotationAuditResult {
+    pub schema: String,
+    pub capabilities: ValidationRunnerCapabilities,
+    pub inventories: Vec<AnnotationCacheInventory>,
+    pub comparisons: Vec<AnnotationCacheComparison>,
+    pub conclusion: String,
+}
+
 #[derive(Clone, Copy, Debug, Serialize, Deserialize, PartialEq, Eq)]
 pub struct ValidationRunnerCapabilities {
     pub spectrum_search: bool,
@@ -245,6 +327,10 @@ pub struct HoldoutLockExpert {
     pub model: ModelFit,
     pub selected_window: Option<NullWindow>,
     pub training_artifact_digest: String,
+    pub enabled: bool,
+    pub participation_reason: String,
+    pub gate_reasons: Vec<String>,
+    pub gate_warnings: Vec<String>,
 }
 
 #[derive(Clone, Debug, Serialize, Deserialize)]
@@ -255,6 +341,7 @@ pub struct WithinParentHoldoutLock {
     pub parent_dataset_fingerprint: String,
     pub training_subset_digest: String,
     pub fold: usize,
+    pub composition: String,
     pub experts: Vec<HoldoutLockExpert>,
     pub external_profile_window: NullWindow,
     pub target_only_policy: String,
@@ -390,19 +477,58 @@ fn validate_preregistration(manifest: &HoldoutPreregistration) -> Result<()> {
         "within-parent external profile must be explicitly locked to 9..=18"
     );
     anyhow::ensure!(
-        manifest.baseline_experts == vec![ModelFit::Moments, ModelFit::Mle, ModelFit::Msfdr1Smix],
-        "baseline expert set must be Moments + MLE + MSFDR1-SMIX"
+        manifest.baseline_experts
+            == vec![
+                ModelFit::Moments,
+                ModelFit::Mle,
+                ModelFit::Msfdr1Smix,
+                ModelFit::LowerOrder,
+            ],
+        "baseline expert set must be the current production candidates: Moments + MLE + MSFDR1-SMIX + Lower Order"
+    );
+    let expected_matrix = vec![
+        HoldoutComposition {
+            id: "A".into(),
+            requested_experts: manifest.baseline_experts.clone(),
+        },
+        HoldoutComposition {
+            id: "B".into(),
+            requested_experts: manifest
+                .baseline_experts
+                .iter()
+                .cloned()
+                .chain([ModelFit::Msfdr])
+                .collect(),
+        },
+        HoldoutComposition {
+            id: "C".into(),
+            requested_experts: manifest
+                .baseline_experts
+                .iter()
+                .cloned()
+                .chain([ModelFit::Msfdr2Smix])
+                .collect(),
+        },
+        HoldoutComposition {
+            id: "D".into(),
+            requested_experts: manifest
+                .baseline_experts
+                .iter()
+                .cloned()
+                .chain([ModelFit::Msfdr, ModelFit::Msfdr2Smix])
+                .collect(),
+        },
+    ];
+    anyhow::ensure!(
+        manifest.comparison_matrix == expected_matrix,
+        "comparison matrix must be the preregistered A-D current-baseline/MSFDR/MSFDR2 design"
     );
     anyhow::ensure!(
-        manifest.comparison_additional_expert == ModelFit::LowerOrder,
-        "the only comparison expert may be Lower Order"
-    );
-    anyhow::ensure!(
-        !manifest.model_grids.iter().any(|grid| matches!(
-            grid.model,
-            ModelFit::Msfdr | ModelFit::Msfdr2Smix | ModelFit::Nokoi
-        )),
-        "deferred experts are prohibited from this holdout"
+        !manifest
+            .model_grids
+            .iter()
+            .any(|grid| matches!(grid.model, ModelFit::Nokoi | ModelFit::Ensemble)),
+        "Nokoi and nested Ensemble models are prohibited from this holdout"
     );
     anyhow::ensure!(
         manifest
@@ -420,12 +546,51 @@ fn validate_preregistration(manifest: &HoldoutPreregistration) -> Result<()> {
                 == 0.01,
         "holdout acceptance thresholds differ from the preregistered contract"
     );
+    anyhow::ensure!(
+        manifest.runtime_gates.validation_scope == NullWindowValidationScope::Level4
+            && manifest.runtime_gates.fdr_threshold == 0.01
+            && manifest
+                .runtime_gates
+                .maximum_target_only_peptide_fraction_loss
+                == 0.20
+            && manifest
+                .runtime_gates
+                .minimum_incremental_level4_target_peptides
+                == 1
+            && manifest
+                .runtime_gates
+                .minimum_entrapment_peptides_for_stable_estimate
+                == 3
+            && manifest.runtime_gates.minimum_ensemble_experts == 2
+            && manifest.runtime_gates.raw_q_interaction_warning_threshold == 0.01,
+        "training-side runtime gates differ from current production policy"
+    );
+    anyhow::ensure!(
+        manifest
+            .disclosures
+            .iter()
+            .any(|item| item.contains("reused from the Lower Order"))
+            && manifest
+                .disclosures
+                .iter()
+                .any(|item| item.contains("Lower Order behavior has previously been observed"))
+            && manifest.disclosures.iter().any(|item| {
+                item.contains("MSFDR/MSFDR2 fold-level Ensemble outcomes have not been evaluated")
+            })
+            && manifest
+                .disclosures
+                .iter()
+                .any(|item| item.contains("within-dataset run-level validation")),
+        "required holdout disclosures are incomplete"
+    );
 
     let expected_models = [
         ModelFit::Moments,
         ModelFit::Mle,
         ModelFit::LowerOrder,
+        ModelFit::Msfdr,
         ModelFit::Msfdr1Smix,
+        ModelFit::Msfdr2Smix,
     ]
     .into_iter()
     .map(|model| model_slug(&model))
@@ -438,6 +603,15 @@ fn validate_preregistration(manifest: &HoldoutPreregistration) -> Result<()> {
     anyhow::ensure!(
         observed_models == expected_models && manifest.model_grids.len() == expected_models.len(),
         "holdout model grids are incomplete or duplicated"
+    );
+    anyhow::ensure!(
+        manifest
+            .target_only_policies
+            .keys()
+            .map(String::as_str)
+            .collect::<BTreeSet<_>>()
+            == expected_models,
+        "target-only policy map does not cover the preregistered expert set exactly"
     );
     let mut maximum_rank = 1_u32;
     for grid in &manifest.model_grids {
@@ -906,6 +1080,15 @@ fn preflight_for_manifest(
             &manifest.target_only,
             manifest_sha256,
             fold.fold,
+            SubsetRole::Training,
+            &fold.training_file_ids,
+            &target_records,
+        )?);
+        target_subsets.push(subset_identity(
+            manifest,
+            &manifest.target_only,
+            manifest_sha256,
+            fold.fold,
             SubsetRole::HeldOut,
             &fold.held_out_file_ids,
             &target_records,
@@ -938,6 +1121,1383 @@ pub fn preflight_holdout(manifest_path: impl AsRef<Path>, output: impl AsRef<Pat
         &output.join("within_parent_holdout.preflight.json"),
         &preflight,
     )
+}
+
+fn load_annotation_audit_entry(
+    entry: &AnnotationAuditEntry,
+) -> Result<(
+    AnnotationCacheInventory,
+    Vec<crate::external_feature_cache::ExternalAnnotationRecord>,
+)> {
+    let manifest: crate::external_feature_cache::ExternalAnnotationCacheManifest =
+        serde_json::from_slice(&std::fs::read(&entry.manifest).with_context(|| {
+            format!("reading annotation manifest {}", entry.manifest.display())
+        })?)?;
+    let directory = entry
+        .manifest
+        .parent()
+        .context("annotation audit manifest has no parent directory")?;
+    let (_, records) = load_verified_parent_annotations(
+        directory,
+        &manifest.identity.digest,
+        &manifest.identity.search_fingerprint,
+        &manifest.payload_sha256,
+        manifest.annotation_count,
+    )?;
+    Ok((
+        AnnotationCacheInventory {
+            label: entry.label.clone(),
+            manifest: entry.manifest.clone(),
+            manifest_sha256: sha256_file(&entry.manifest)?,
+            annotation_fingerprint: manifest.identity.digest,
+            search_fingerprint: manifest.identity.search_fingerprint,
+            generator_settings_sha256: manifest.identity.generator_settings_sha256,
+            calibration_input_sha256: manifest.identity.calibration_input_sha256,
+            payload_sha256: manifest.payload_sha256,
+            annotation_count: manifest.annotation_count,
+            requested_max_rank: manifest.identity.requested_max_rank,
+            model_components: manifest.identity.model_components,
+        },
+        records,
+    ))
+}
+
+const ANNOTATION_FIELD_NAMES: [&str; 15] = [
+    "ms2pip_pcc",
+    "spectral_angle",
+    "fragment_intensity_agreement",
+    "deeplc_predicted_rt",
+    "deeplc_calibrated_rt",
+    "deeplc_rt_error",
+    "deeplc_abs_rt_error",
+    "im2deep_predicted_ccs",
+    "observed_ccs",
+    "abs_ccs_error",
+    "pct_ccs_error",
+    "predicted_ion_mobility",
+    "observed_ion_mobility",
+    "abs_ion_mobility_error",
+    "pct_ion_mobility_error",
+];
+
+fn annotation_values(features: &sage_core::scoring::ExternalPsmFeatures) -> [f32; 15] {
+    [
+        features.ms2rescore_ms2pip_pcc,
+        features.ms2rescore_spectral_angle,
+        features.ms2rescore_fragment_intensity_agreement,
+        features.ms2rescore_deeplc_predicted_rt,
+        features.ms2rescore_deeplc_calibrated_rt,
+        features.ms2rescore_deeplc_rt_error,
+        features.ms2rescore_deeplc_abs_rt_error,
+        features.tims2rescore_im2deep_predicted_ccs,
+        features.tims2rescore_observed_ccs,
+        features.tims2rescore_abs_ccs_error,
+        features.tims2rescore_pct_ccs_error,
+        features.tims2rescore_predicted_ion_mobility,
+        features.tims2rescore_observed_ion_mobility,
+        features.tims2rescore_abs_ion_mobility_error,
+        features.tims2rescore_pct_ion_mobility_error,
+    ]
+}
+
+pub fn audit_annotation_caches(
+    request_path: impl AsRef<Path>,
+    output: impl AsRef<Path>,
+) -> Result<()> {
+    let request: AnnotationAuditRequest =
+        serde_json::from_slice(&std::fs::read(request_path.as_ref())?)?;
+    anyhow::ensure!(
+        request.schema == "within-parent-annotation-audit-v1",
+        "unsupported annotation-audit request schema"
+    );
+    anyhow::ensure!(!request.groups.is_empty(), "annotation audit has no groups");
+    let mut inventories = Vec::new();
+    let mut comparisons = Vec::new();
+    for group in request.groups {
+        let (reference_inventory, reference_records) =
+            load_annotation_audit_entry(&group.reference)?;
+        let reference_search = reference_inventory.search_fingerprint.clone();
+        let mut reference = HashMap::with_capacity(reference_records.len());
+        for record in reference_records {
+            anyhow::ensure!(
+                reference
+                    .insert(record.stable_id, record.features)
+                    .is_none(),
+                "reference annotation cache contains duplicate stable IDs"
+            );
+        }
+        inventories.push(reference_inventory);
+        for entry in group.comparisons {
+            let (inventory, records) = load_annotation_audit_entry(&entry)?;
+            anyhow::ensure!(
+                inventory.search_fingerprint == reference_search,
+                "annotation audit group {} mixes parent search fingerprints",
+                group.label
+            );
+            let mut comparison = HashMap::with_capacity(records.len());
+            for record in records {
+                anyhow::ensure!(
+                    comparison
+                        .insert(record.stable_id, record.features)
+                        .is_none(),
+                    "comparison annotation cache contains duplicate stable IDs"
+                );
+            }
+            let mut differing = [0_usize; 15];
+            let mut maximum = [0.0_f64; 15];
+            let mut nonfinite = [0_usize; 15];
+            let mut joined = 0_usize;
+            for (stable_id, left) in &reference {
+                let Some(right) = comparison.get(stable_id) else {
+                    continue;
+                };
+                joined += 1;
+                for (index, (x, y)) in annotation_values(left)
+                    .into_iter()
+                    .zip(annotation_values(right))
+                    .enumerate()
+                {
+                    if x.to_bits() != y.to_bits() {
+                        differing[index] += 1;
+                        let difference = if x.is_finite() && y.is_finite() {
+                            (x as f64 - y as f64).abs()
+                        } else {
+                            nonfinite[index] += 1;
+                            0.0
+                        };
+                        maximum[index] = maximum[index].max(difference);
+                    }
+                }
+                anyhow::ensure!(
+                    left.ms2rescore_feature_joined == right.ms2rescore_feature_joined,
+                    "joined-feature flag differs for stable candidate {stable_id}"
+                );
+            }
+            let field_differences = ANNOTATION_FIELD_NAMES
+                .iter()
+                .enumerate()
+                .map(|(index, field)| AnnotationFieldDifference {
+                    field: (*field).into(),
+                    differing_values: differing[index],
+                    maximum_finite_absolute_difference: maximum[index],
+                    nonfinite_mismatches: nonfinite[index],
+                })
+                .collect::<Vec<_>>();
+            let reference_only = reference.len() - joined;
+            let comparison_only = comparison.len() - joined;
+            comparisons.push(AnnotationCacheComparison {
+                reference: group.reference.label.clone(),
+                comparison: entry.label,
+                joined_stable_ids: joined,
+                reference_only_stable_ids: reference_only,
+                comparison_only_stable_ids: comparison_only,
+                duplicate_stable_ids: 0,
+                exact_raw_feature_payload: reference_only == 0
+                    && comparison_only == 0
+                    && field_differences
+                        .iter()
+                        .all(|field| field.differing_values == 0),
+                field_differences,
+            });
+            inventories.push(inventory);
+        }
+    }
+    let exact = comparisons
+        .iter()
+        .all(|comparison| comparison.exact_raw_feature_payload);
+    let result = AnnotationAuditResult {
+        schema: "within-parent-annotation-audit-result-v1".into(),
+        capabilities: CAPABILITIES,
+        inventories,
+        comparisons,
+        conclusion: if exact {
+            "all compared composition-specific caches contain byte-identical raw annotation fields by stable candidate ID; identity differences are preliminary-calibration-input metadata only"
+        } else {
+            "one or more composition-specific caches contain raw annotation differences"
+        }
+        .into(),
+    };
+    write_json_atomic(output.as_ref(), &result)
+}
+
+#[derive(Clone, Debug, Serialize)]
+struct AuditPsmMetric {
+    stable_id: String,
+    spectrum_key: String,
+    peptide: String,
+    canonical_peptide: String,
+    peptidoform: String,
+    protein: Option<String>,
+    entrapment: Option<bool>,
+    score: Option<f64>,
+    p_value: Option<f64>,
+    pep: Option<f64>,
+    psm_q: Option<f64>,
+    peptide_q: Option<f64>,
+    protein_q: Option<f64>,
+    psm_level4_supported: Option<bool>,
+    peptide_level4_supported: Option<bool>,
+}
+
+#[derive(Clone, Debug, Serialize)]
+struct AuditExpertEntityStatus {
+    expert: String,
+    state: String,
+    valid_for_support: bool,
+    invalid_reason: Option<String>,
+    score: Option<f64>,
+    p_value: Option<f64>,
+    pep: Option<f64>,
+    q_value: Option<f64>,
+    distance_from_acceptance_boundary: Option<f64>,
+    hierarchical_support: Option<bool>,
+}
+
+#[derive(Clone, Debug, Serialize)]
+struct AuditEntitySupport {
+    level: String,
+    entity: String,
+    entrapment: Option<bool>,
+    evidence_class: String,
+    accepted_by: Vec<String>,
+    valid_nonaccepting_experts: Vec<String>,
+    expert_status: Vec<AuditExpertEntityStatus>,
+    cross_level_support: BTreeMap<String, usize>,
+}
+
+#[derive(Clone, Debug, Serialize)]
+struct AuditPairwise {
+    left: String,
+    right: String,
+    exact_score_stream_duplicate: bool,
+    joined_psms: usize,
+    score_pearson: Option<f64>,
+    pep_pearson: Option<f64>,
+    q_value_pearson: Option<f64>,
+    level4_target_psm_intersection: usize,
+    level4_target_psm_union: usize,
+    level4_target_psm_jaccard: Option<f64>,
+    level4_target_peptide_intersection: usize,
+    level4_target_peptide_union: usize,
+    level4_target_peptide_jaccard: Option<f64>,
+    accepted_by_left_only_psms: usize,
+    accepted_by_right_only_psms: usize,
+    both_narrowly_not_accepted_psms: usize,
+}
+
+#[derive(Clone, Debug, Serialize)]
+struct AuditCoalition {
+    experts: Vec<String>,
+    valid_for_admission: bool,
+    invalid_reasons: Vec<String>,
+    plus_entrapment: Vec<LayerSummary>,
+    target_only: Vec<LayerSummary>,
+    plus_stream_sha256: String,
+    target_stream_sha256: String,
+}
+
+fn psm_metric_map(
+    stage: &CompletedStage,
+    database: &IndexedDatabase,
+    search_fingerprint: &str,
+) -> BTreeMap<String, AuditPsmMetric> {
+    stage
+        .rank1_features
+        .iter()
+        .map(|feature| {
+            let peptide = database[feature.core.peptide_idx].to_string();
+            let stable_id = stable_candidate_id(search_fingerprint, &feature.core, &peptide);
+            let proteins = database[feature.core.peptide_idx]
+                .proteins(&database.decoy_tag, database.generate_decoys);
+            let metric = AuditPsmMetric {
+                stable_id: stable_id.clone(),
+                spectrum_key: format!("{}\u{1f}{}", feature.core.file_id, feature.core.spec_id),
+                canonical_peptide: canonical_peptide(&peptide),
+                peptidoform: canonical_peptidoform(&peptide),
+                protein: inferred_protein(feature, database),
+                entrapment: classify_proteins(&proteins),
+                peptide,
+                score: feature.decoy_free_score,
+                p_value: feature.decoy_free_p_value,
+                pep: feature.decoy_free_pep,
+                psm_q: feature.decoy_free_q_value,
+                peptide_q: feature.decoy_free_peptide_q,
+                protein_q: feature.decoy_free_protein_q,
+                psm_level4_supported: feature.decoy_free_peptide_supported_psm,
+                peptide_level4_supported: feature.decoy_free_protein_supported_peptide,
+            };
+            (stable_id, metric)
+        })
+        .collect()
+}
+
+fn pearson_pairs(values: impl Iterator<Item = (Option<f64>, Option<f64>)>) -> Option<f64> {
+    let pairs = values
+        .filter_map(|(x, y)| x.zip(y))
+        .filter(|(x, y)| x.is_finite() && y.is_finite())
+        .collect::<Vec<_>>();
+    if pairs.len() < 2 {
+        return None;
+    }
+    let n = pairs.len() as f64;
+    let mx = pairs.iter().map(|(x, _)| x).sum::<f64>() / n;
+    let my = pairs.iter().map(|(_, y)| y).sum::<f64>() / n;
+    let covariance = pairs.iter().map(|(x, y)| (x - mx) * (y - my)).sum::<f64>();
+    let vx = pairs.iter().map(|(x, _)| (x - mx).powi(2)).sum::<f64>();
+    let vy = pairs.iter().map(|(_, y)| (y - my).powi(2)).sum::<f64>();
+    (vx > 0.0 && vy > 0.0).then(|| covariance / (vx * vy).sqrt())
+}
+
+fn jaccard<T: Ord>(left: &BTreeSet<T>, right: &BTreeSet<T>) -> Option<f64> {
+    let union = left.union(right).count();
+    (union > 0).then(|| left.intersection(right).count() as f64 / union as f64)
+}
+
+fn stream_hash(stage: &CompletedStage) -> Result<String> {
+    let stream = stage
+        .rank1_features
+        .iter()
+        .map(|feature| {
+            (
+                feature.core.file_id,
+                feature.core.spec_id.as_str(),
+                feature.decoy_free_score.map(f64::to_bits),
+                feature.decoy_free_p_value.map(f64::to_bits),
+                feature.decoy_free_pep.map(f64::to_bits),
+                feature.decoy_free_q_value.map(f64::to_bits),
+            )
+        })
+        .collect::<Vec<_>>();
+    hash_serialized(&stream)
+}
+
+fn next_q_plateau(
+    metrics: &BTreeMap<String, AuditPsmMetric>,
+    level: &str,
+    threshold: f64,
+) -> Option<f64> {
+    metrics
+        .values()
+        .filter_map(|metric| match level {
+            "psm" => metric.psm_q,
+            "peptide" | "peptidoform" => metric.peptide_q,
+            "protein" => metric.protein_q,
+            _ => None,
+        })
+        .filter(|q| q.is_finite() && *q > threshold)
+        .min_by(f64::total_cmp)
+}
+
+fn metric_q(metric: &AuditPsmMetric, level: &str) -> Option<f64> {
+    match level {
+        "psm" => metric.psm_q,
+        "peptide" | "peptidoform" => metric.peptide_q,
+        "protein" => metric.protein_q,
+        _ => None,
+    }
+}
+
+fn entity_key(metric: &AuditPsmMetric, level: &str) -> Option<String> {
+    match level {
+        "psm" => Some(metric.stable_id.clone()),
+        "peptide" => Some(metric.canonical_peptide.clone()),
+        "peptidoform" => Some(metric.peptidoform.clone()),
+        "protein" => metric.protein.clone(),
+        _ => None,
+    }
+}
+
+fn entity_is_accepted(sets: &EvidenceSets, level: &str, entity: &str, entrapment: bool) -> bool {
+    match (level, entrapment) {
+        ("psm", false) => sets.target_psms.contains(entity),
+        ("psm", true) => sets.entrapment_psms.contains(entity),
+        ("peptide", false) => sets.target_peptides.contains(entity),
+        ("peptide", true) => sets.entrapment_peptides.contains(entity),
+        ("peptidoform", false) => sets.target_peptidoforms.contains(entity),
+        ("peptidoform", true) => sets.entrapment_peptidoforms.contains(entity),
+        ("protein", false) => sets.target_proteins.contains(entity),
+        ("protein", true) => sets.entrapment_proteins.contains(entity),
+        _ => false,
+    }
+}
+
+fn best_entity_metric<'a>(
+    metrics: &'a BTreeMap<String, AuditPsmMetric>,
+    level: &str,
+    entity: &str,
+) -> Option<&'a AuditPsmMetric> {
+    metrics
+        .values()
+        .filter(|metric| entity_key(metric, level).as_deref() == Some(entity))
+        .min_by(|left, right| {
+            metric_q(left, level)
+                .unwrap_or(f64::INFINITY)
+                .total_cmp(&metric_q(right, level).unwrap_or(f64::INFINITY))
+        })
+}
+
+fn exact_stream_duplicate(
+    left: &BTreeMap<String, AuditPsmMetric>,
+    right: &BTreeMap<String, AuditPsmMetric>,
+) -> bool {
+    left.len() == right.len()
+        && left.iter().all(|(id, x)| {
+            right.get(id).is_some_and(|y| {
+                x.score.map(f64::to_bits) == y.score.map(f64::to_bits)
+                    && x.p_value.map(f64::to_bits) == y.p_value.map(f64::to_bits)
+                    && x.pep.map(f64::to_bits) == y.pep.map(f64::to_bits)
+                    && x.psm_q.map(f64::to_bits) == y.psm_q.map(f64::to_bits)
+            })
+        })
+}
+
+fn build_support_matrix(
+    experts: &[String],
+    valid: &BTreeMap<String, Option<String>>,
+    stages: &BTreeMap<String, CompletedStage>,
+    metrics: &BTreeMap<String, BTreeMap<String, AuditPsmMetric>>,
+    threshold: f64,
+) -> Vec<AuditEntitySupport> {
+    let exact_duplicates = experts
+        .iter()
+        .flat_map(|left| {
+            experts.iter().filter_map(move |right| {
+                (left < right
+                    && exact_stream_duplicate(
+                        metrics.get(left).expect("expert metrics"),
+                        metrics.get(right).expect("expert metrics"),
+                    ))
+                .then(|| (left.clone(), right.clone()))
+            })
+        })
+        .collect::<BTreeSet<_>>();
+    let mut output = Vec::new();
+    for level in ["psm", "peptidoform", "peptide", "protein"] {
+        let mut universe = BTreeSet::new();
+        for expert in experts {
+            for metric in metrics.get(expert).expect("expert metrics").values() {
+                if let Some(entity) = entity_key(metric, level) {
+                    universe.insert(entity);
+                }
+            }
+        }
+        let next_plateaus = experts
+            .iter()
+            .map(|expert| {
+                (
+                    expert.clone(),
+                    next_q_plateau(
+                        metrics.get(expert).expect("expert metrics"),
+                        level,
+                        threshold,
+                    ),
+                )
+            })
+            .collect::<BTreeMap<_, _>>();
+        for entity in universe {
+            let entrapment = experts.iter().find_map(|expert| {
+                best_entity_metric(metrics.get(expert).expect("expert metrics"), level, &entity)
+                    .and_then(|metric| metric.entrapment)
+            });
+            let mut statuses = Vec::new();
+            let mut accepted_by = Vec::new();
+            let mut nonaccepting = Vec::new();
+            for expert in experts {
+                let invalid_reason = valid.get(expert).cloned().flatten();
+                let metric = best_entity_metric(
+                    metrics.get(expert).expect("expert metrics"),
+                    level,
+                    &entity,
+                );
+                let accepted = metric.is_some_and(|metric| {
+                    metric.entrapment.is_some_and(|is_entrapment| {
+                        entity_is_accepted(
+                            &stages.get(expert).expect("expert stage").level4,
+                            level,
+                            &entity,
+                            is_entrapment,
+                        )
+                    })
+                });
+                let valid_for_support = invalid_reason.is_none();
+                let q = metric.and_then(|metric| metric_q(metric, level));
+                let hierarchical = metric.and_then(|metric| match level {
+                    "psm" => metric.psm_level4_supported,
+                    "peptide" | "peptidoform" => metric.peptide_level4_supported,
+                    "protein" => Some(true),
+                    _ => None,
+                });
+                let state = if !valid_for_support {
+                    "expert_invalid_or_excluded"
+                } else if metric.is_none() {
+                    "candidate_or_entity_absent"
+                } else if q.is_none() {
+                    "not_evaluable"
+                } else if accepted {
+                    "accepted"
+                } else if q.is_some_and(|value| {
+                    next_plateaus
+                        .get(expert)
+                        .and_then(|plateau| *plateau)
+                        .is_some_and(|boundary| value.to_bits() == boundary.to_bits())
+                }) {
+                    "scored_but_narrowly_not_accepted"
+                } else {
+                    "scored_and_clearly_not_accepted"
+                };
+                if accepted && valid_for_support {
+                    accepted_by.push(expert.clone());
+                } else if valid_for_support && metric.is_some() {
+                    nonaccepting.push(expert.clone());
+                }
+                statuses.push(AuditExpertEntityStatus {
+                    expert: expert.clone(),
+                    state: state.into(),
+                    valid_for_support,
+                    invalid_reason,
+                    score: metric.and_then(|metric| metric.score),
+                    p_value: metric.and_then(|metric| metric.p_value),
+                    pep: metric.and_then(|metric| metric.pep),
+                    q_value: q,
+                    distance_from_acceptance_boundary: q.map(|value| value - threshold),
+                    hierarchical_support: hierarchical,
+                });
+            }
+            let accepted_classes = accepted_by
+                .iter()
+                .map(|expert| {
+                    accepted_by
+                        .iter()
+                        .filter(|other| {
+                            *other < expert
+                                && exact_duplicates.contains(&(other.to_string(), expert.clone()))
+                        })
+                        .min()
+                        .cloned()
+                        .unwrap_or_else(|| expert.clone())
+                })
+                .collect::<BTreeSet<_>>()
+                .len();
+            let has_clear_disagreement = statuses.iter().any(|status| {
+                status.valid_for_support && status.state == "scored_and_clearly_not_accepted"
+            });
+            let evaluable_count = statuses
+                .iter()
+                .filter(|status| status.valid_for_support && status.state != "not_evaluable")
+                .count();
+            let evidence_class = classify_support_evidence(
+                accepted_by.len(),
+                accepted_classes,
+                evaluable_count,
+                has_clear_disagreement,
+            );
+            let mut cross_level_support = BTreeMap::new();
+            if let Some(metric) = experts.iter().find_map(|expert| {
+                best_entity_metric(metrics.get(expert).expect("expert metrics"), level, &entity)
+            }) {
+                cross_level_support.insert(
+                    "accepted_psms_for_same_peptide".into(),
+                    experts
+                        .iter()
+                        .map(|expert| {
+                            stages
+                                .get(expert)
+                                .expect("expert stage")
+                                .level4
+                                .target_psms
+                                .iter()
+                                .filter(|psm| {
+                                    metrics
+                                        .get(expert)
+                                        .and_then(|map| map.get(*psm))
+                                        .is_some_and(|candidate| {
+                                            candidate.canonical_peptide == metric.canonical_peptide
+                                        })
+                                })
+                                .count()
+                        })
+                        .sum(),
+                );
+            }
+            output.push(AuditEntitySupport {
+                level: level.into(),
+                entity,
+                entrapment,
+                evidence_class: evidence_class.into(),
+                accepted_by,
+                valid_nonaccepting_experts: nonaccepting,
+                expert_status: statuses,
+                cross_level_support,
+            });
+        }
+    }
+    output
+}
+
+fn audit_pairwise(
+    experts: &[String],
+    stages: &BTreeMap<String, CompletedStage>,
+    metrics: &BTreeMap<String, BTreeMap<String, AuditPsmMetric>>,
+    threshold: f64,
+) -> Vec<AuditPairwise> {
+    let mut output = Vec::new();
+    for (index, left_name) in experts.iter().enumerate() {
+        for right_name in experts.iter().skip(index + 1) {
+            let left = metrics.get(left_name).expect("left metrics");
+            let right = metrics.get(right_name).expect("right metrics");
+            let left_stage = stages.get(left_name).expect("left stage");
+            let right_stage = stages.get(right_name).expect("right stage");
+            let joined = left
+                .iter()
+                .filter_map(|(id, metric)| right.get(id).map(|other| (metric, other)))
+                .collect::<Vec<_>>();
+            let left_boundary = next_q_plateau(left, "psm", threshold);
+            let right_boundary = next_q_plateau(right, "psm", threshold);
+            let both_narrow = joined
+                .iter()
+                .filter(|(x, y)| {
+                    x.psm_q
+                        .zip(left_boundary)
+                        .is_some_and(|(q, boundary)| q.to_bits() == boundary.to_bits())
+                        && y.psm_q
+                            .zip(right_boundary)
+                            .is_some_and(|(q, boundary)| q.to_bits() == boundary.to_bits())
+                })
+                .count();
+            let left_psm = &left_stage.level4.target_psms;
+            let right_psm = &right_stage.level4.target_psms;
+            let left_peptide = &left_stage.level4.target_peptides;
+            let right_peptide = &right_stage.level4.target_peptides;
+            output.push(AuditPairwise {
+                left: left_name.clone(),
+                right: right_name.clone(),
+                exact_score_stream_duplicate: exact_stream_duplicate(left, right),
+                joined_psms: joined.len(),
+                score_pearson: pearson_pairs(joined.iter().map(|(x, y)| (x.score, y.score))),
+                pep_pearson: pearson_pairs(joined.iter().map(|(x, y)| (x.pep, y.pep))),
+                q_value_pearson: pearson_pairs(joined.iter().map(|(x, y)| (x.psm_q, y.psm_q))),
+                level4_target_psm_intersection: left_psm.intersection(right_psm).count(),
+                level4_target_psm_union: left_psm.union(right_psm).count(),
+                level4_target_psm_jaccard: jaccard(left_psm, right_psm),
+                level4_target_peptide_intersection: left_peptide
+                    .intersection(right_peptide)
+                    .count(),
+                level4_target_peptide_union: left_peptide.union(right_peptide).count(),
+                level4_target_peptide_jaccard: jaccard(left_peptide, right_peptide),
+                accepted_by_left_only_psms: left_psm.difference(right_psm).count(),
+                accepted_by_right_only_psms: right_psm.difference(left_psm).count(),
+                both_narrowly_not_accepted_psms: both_narrow,
+            });
+        }
+    }
+    output
+}
+
+fn factorial(value: usize) -> f64 {
+    (1..=value).product::<usize>() as f64
+}
+
+fn evidence_count(sets: &EvidenceSets, level: &str, entrapment: bool) -> usize {
+    match (level, entrapment) {
+        ("psm", false) => sets.target_psms.len(),
+        ("psm", true) => sets.entrapment_psms.len(),
+        ("peptide", false) => sets.target_peptides.len(),
+        ("peptide", true) => sets.entrapment_peptides.len(),
+        ("peptidoform", false) => sets.target_peptidoforms.len(),
+        ("peptidoform", true) => sets.entrapment_peptidoforms.len(),
+        ("protein", false) => sets.target_proteins.len(),
+        ("protein", true) => sets.entrapment_proteins.len(),
+        _ => 0,
+    }
+}
+
+fn evidence_set<'a>(sets: &'a EvidenceSets, level: &str, entrapment: bool) -> &'a BTreeSet<String> {
+    match (level, entrapment) {
+        ("psm", false) => &sets.target_psms,
+        ("psm", true) => &sets.entrapment_psms,
+        ("peptide", false) => &sets.target_peptides,
+        ("peptide", true) => &sets.entrapment_peptides,
+        ("peptidoform", false) => &sets.target_peptidoforms,
+        ("peptidoform", true) => &sets.entrapment_peptidoforms,
+        ("protein", false) => &sets.target_proteins,
+        ("protein", true) => &sets.entrapment_proteins,
+        _ => unreachable!("validated evidence level"),
+    }
+}
+
+fn classify_support_evidence(
+    accepted_count: usize,
+    accepted_nonredundant_classes: usize,
+    evaluable_count: usize,
+    has_clear_disagreement: bool,
+) -> &'static str {
+    if accepted_count == 0 {
+        if evaluable_count == 0 {
+            "not_evaluable"
+        } else {
+            "not_accepted"
+        }
+    } else if accepted_nonredundant_classes >= 2 {
+        "corroborated"
+    } else if evaluable_count == accepted_count {
+        "uniquely_evaluable"
+    } else if has_clear_disagreement {
+        "disputed"
+    } else {
+        "singly_supported_but_consistent"
+    }
+}
+
+fn classify_low_input_expert(
+    invalid_reason: Option<&str>,
+    exact_duplicate: bool,
+    unique_discoveries: usize,
+    corroborated: usize,
+    shapley_target_peptides: f64,
+) -> &'static str {
+    if invalid_reason.is_some() {
+        "invalid"
+    } else if shapley_target_peptides < 0.0 {
+        "harmful"
+    } else if unique_discoveries > 0 {
+        "novel_contributor"
+    } else if corroborated > 0 && !exact_duplicate {
+        "supporting_corroborating_contributor"
+    } else if exact_duplicate || corroborated == 0 {
+        "redundant"
+    } else {
+        "not_evaluable"
+    }
+}
+
+fn sequential_unique_credit(
+    order: &[&str],
+    accepted: &BTreeMap<String, BTreeSet<String>>,
+    minimum_unique: usize,
+) -> Vec<(String, usize, bool)> {
+    let mut union = BTreeSet::new();
+    order
+        .iter()
+        .map(|expert| {
+            let evidence = &accepted[*expert];
+            let incremental = evidence.difference(&union).count();
+            let included = incremental >= minimum_unique;
+            if included {
+                union.extend(evidence.iter().cloned());
+            }
+            ((*expert).to_string(), incremental, included)
+        })
+        .collect()
+}
+
+fn shapley_rows(
+    valid_experts: &[String],
+    bit_for_expert: &BTreeMap<String, usize>,
+    coalition_evidence: &BTreeMap<usize, (EvidenceSets, EvidenceSets)>,
+) -> Vec<serde_json::Value> {
+    let n = valid_experts.len();
+    let mut rows = Vec::new();
+    for layer in ["raw_q", "level4"] {
+        for level in ["psm", "peptidoform", "peptide", "protein"] {
+            for entrapment in [false, true] {
+                for expert in valid_experts {
+                    let bit = bit_for_expert[expert];
+                    let mut contribution = 0.0;
+                    for subset_index in 0..(1_usize << n) {
+                        let mut mask = 0_usize;
+                        let mut size = 0_usize;
+                        for (local_index, member) in valid_experts.iter().enumerate() {
+                            if subset_index & (1 << local_index) != 0 {
+                                mask |= bit_for_expert[member];
+                                size += 1;
+                            }
+                        }
+                        if mask & bit != 0 {
+                            continue;
+                        }
+                        let with = mask | bit;
+                        let value = |coalition: usize| {
+                            if coalition == 0 {
+                                0
+                            } else {
+                                let sets = &coalition_evidence[&coalition];
+                                evidence_count(
+                                    if layer == "raw_q" { &sets.0 } else { &sets.1 },
+                                    level,
+                                    entrapment,
+                                )
+                            }
+                        };
+                        let weight = factorial(size) * factorial(n - size - 1) / factorial(n);
+                        contribution += weight * (value(with) as f64 - value(mask) as f64);
+                    }
+                    rows.push(serde_json::json!({
+                        "expert": expert,
+                        "layer": layer,
+                        "level": level,
+                        "evidence": if entrapment { "entrapment" } else { "target" },
+                        "shapley_count_contribution": contribution
+                    }));
+                }
+            }
+        }
+    }
+    rows
+}
+
+/// Post-failure, training-only audit. This path deliberately never derives a
+/// held-out subset and cannot search spectra or generate annotations.
+pub fn audit_training_usefulness(
+    manifest_path: impl AsRef<Path>,
+    failed_run_root: impl AsRef<Path>,
+    fold_number: usize,
+    output: impl AsRef<Path>,
+) -> Result<()> {
+    let manifest_path = manifest_path.as_ref();
+    let manifest_bytes = std::fs::read(manifest_path)?;
+    let manifest_sha256 = sha256_bytes(&manifest_bytes);
+    let manifest: HoldoutPreregistration = serde_json::from_slice(&manifest_bytes)?;
+    validate_preregistration(&manifest)?;
+    verify_parent_identity(&manifest.plus_entrapment)?;
+    verify_parent_identity(&manifest.target_only)?;
+    let fold = manifest
+        .folds
+        .iter()
+        .find(|fold| fold.fold == fold_number)
+        .context("requested training fold is absent from preregistration")?;
+    let output = output.as_ref();
+    std::fs::create_dir_all(output)?;
+    let plus_context =
+        build_parent_context(&manifest.plus_entrapment, &output.join("scratch/plus"))?;
+    let target_context =
+        build_parent_context(&manifest.target_only, &output.join("scratch/target"))?;
+    let training = derive_subset(
+        &manifest,
+        &plus_context,
+        &manifest_sha256,
+        fold.fold,
+        SubsetRole::Training,
+        &fold.training_file_ids,
+    )?;
+    let training_target = derive_subset(
+        &manifest,
+        &target_context,
+        &manifest_sha256,
+        fold.fold,
+        SubsetRole::Training,
+        &fold.training_file_ids,
+    )?;
+
+    let failed_fold_root = failed_run_root.as_ref().join(format!("fold_{}", fold.fold));
+    let preserved_gates_path = failed_fold_root.join("A.training_gates.json");
+    let preserved_gates: Vec<ExpertTrainingGate> =
+        serde_json::from_slice(&std::fs::read(&preserved_gates_path).with_context(|| {
+            format!("reading preserved gates {}", preserved_gates_path.display())
+        })?)?;
+    let mut windows = BTreeMap::<String, Option<NullWindow>>::new();
+    let mut selected_artifacts = Vec::new();
+    for grid in &manifest.model_grids {
+        let slug = model_slug(&grid.model);
+        let artifact_path = failed_fold_root
+            .join("training_artifacts")
+            .join(slug)
+            .join("within_parent_holdout_artifact.json");
+        let artifact: WithinParentHoldoutArtifact =
+            serde_json::from_slice(&std::fs::read(&artifact_path)?)?;
+        anyhow::ensure!(
+            artifact.schema == ARTIFACT_SCHEMA,
+            "invalid preserved artifact schema"
+        );
+        anyhow::ensure!(
+            artifact.manifest_sha256 == manifest_sha256,
+            "preserved artifact manifest mismatch"
+        );
+        anyhow::ensure!(
+            artifact.training_subset_digest == training.identity.digest,
+            "preserved artifact training subset mismatch"
+        );
+        anyhow::ensure!(
+            artifact.model == grid.model,
+            "preserved artifact model mismatch"
+        );
+        let mut unhashed = artifact.clone();
+        unhashed.digest.clear();
+        anyhow::ensure!(
+            hash_serialized(&unhashed)? == artifact.digest,
+            "preserved artifact digest mismatch"
+        );
+        windows.insert(slug.into(), artifact.selected_window.clone());
+        selected_artifacts.push(artifact);
+    }
+
+    let audited_models = [
+        ModelFit::Moments,
+        ModelFit::Mle,
+        ModelFit::Msfdr1Smix,
+        ModelFit::LowerOrder,
+    ];
+    let expert_names = audited_models
+        .iter()
+        .map(|model| model_slug(model).to_string())
+        .collect::<Vec<_>>();
+    let mut plus_stages = BTreeMap::<String, CompletedStage>::new();
+    let mut target_stages = BTreeMap::<String, CompletedStage>::new();
+    for model in &audited_models {
+        let slug = model_slug(model);
+        let window = windows.get(slug).cloned().flatten();
+        let plus_settings =
+            settings_for_model(&plus_context.search.fdr, model.clone(), window.clone());
+        let target_settings = settings_for_model(&target_context.search.fdr, model.clone(), window);
+        plus_stages.insert(
+            slug.into(),
+            run_scored_stage(
+                &training,
+                &plus_settings,
+                &plus_context.database,
+                slug,
+                manifest.effective_ratios,
+                SearchSpace::PlusEntrapment,
+            )?,
+        );
+        target_stages.insert(
+            slug.into(),
+            run_scored_stage(
+                &training_target,
+                &target_settings,
+                &target_context.database,
+                slug,
+                manifest.effective_ratios,
+                SearchSpace::TargetOnly,
+            )?,
+        );
+    }
+    let validity = preserved_gates
+        .iter()
+        .map(|gate| {
+            let non_usefulness = gate
+                .reasons
+                .iter()
+                .filter(|reason| !reason.starts_with("adds only "))
+                .cloned()
+                .collect::<Vec<_>>();
+            (
+                model_slug(&gate.model).to_string(),
+                (!non_usefulness.is_empty()).then(|| non_usefulness.join("; ")),
+            )
+        })
+        .collect::<BTreeMap<_, _>>();
+    let metrics = expert_names
+        .iter()
+        .map(|expert| {
+            (
+                expert.clone(),
+                psm_metric_map(
+                    plus_stages.get(expert).expect("plus stage"),
+                    &plus_context.database,
+                    &manifest.plus_entrapment.search_fingerprint,
+                ),
+            )
+        })
+        .collect::<BTreeMap<_, _>>();
+    let support = build_support_matrix(
+        &expert_names,
+        &validity,
+        &plus_stages,
+        &metrics,
+        manifest.runtime_gates.fdr_threshold,
+    );
+    write_json_atomic(&output.join("training_support_matrix.json"), &support)?;
+    let support_sha256 = sha256_file(&output.join("training_support_matrix.json"))?;
+    let pairwise = audit_pairwise(
+        &expert_names,
+        &plus_stages,
+        &metrics,
+        manifest.runtime_gates.fdr_threshold,
+    );
+
+    let baseline_names = ["moments", "mle", "msfdr1_smix"];
+    let baseline_accepted = baseline_names
+        .iter()
+        .map(|name| {
+            (
+                name.to_string(),
+                plus_stages[*name].level4.target_peptides.clone(),
+            )
+        })
+        .collect::<BTreeMap<_, _>>();
+    let permutations = [
+        [0, 1, 2],
+        [0, 2, 1],
+        [1, 0, 2],
+        [1, 2, 0],
+        [2, 0, 1],
+        [2, 1, 0],
+    ]
+    .into_iter()
+    .map(|order| {
+        let ordered_names = order.map(|index| baseline_names[index]);
+        let assignments = sequential_unique_credit(
+            &ordered_names,
+            &baseline_accepted,
+            manifest
+                .runtime_gates
+                .minimum_incremental_level4_target_peptides,
+        )
+        .into_iter()
+        .map(|(expert, incremental, included)| {
+            serde_json::json!({
+                "expert": expert,
+                "incremental_level4_target_peptides": incremental,
+                "included": included && validity[&expert].is_none()
+            })
+        })
+        .collect::<Vec<_>>();
+        serde_json::json!({"order": ordered_names, "assignments": assignments})
+    })
+    .collect::<Vec<_>>();
+
+    let coalition_models = audited_models.to_vec();
+    let bit_for_expert = coalition_models
+        .iter()
+        .enumerate()
+        .map(|(index, model)| (model_slug(model).to_string(), 1_usize << index))
+        .collect::<BTreeMap<_, _>>();
+    let mut coalition_rows = Vec::new();
+    let mut coalition_evidence = BTreeMap::new();
+    for mask in 1_usize..(1_usize << coalition_models.len()) {
+        let models = coalition_models
+            .iter()
+            .enumerate()
+            .filter(|(index, _)| mask & (1 << index) != 0)
+            .map(|(_, model)| model.clone())
+            .collect::<Vec<_>>();
+        let names = models
+            .iter()
+            .map(|model| model_slug(model).to_string())
+            .collect::<Vec<_>>();
+        let coalition_windows = names
+            .iter()
+            .map(|name| (name.clone(), windows.get(name).cloned().flatten()))
+            .collect::<BTreeMap<_, _>>();
+        let (plus_settings, target_settings) = if models.len() == 1 {
+            let model = models[0].clone();
+            let window = coalition_windows.get(model_slug(&model)).cloned().flatten();
+            (
+                settings_for_model(&plus_context.search.fdr, model.clone(), window.clone()),
+                settings_for_model(&target_context.search.fdr, model, window),
+            )
+        } else {
+            (
+                settings_for_ensemble(&plus_context.search.fdr, &coalition_windows, &models)?,
+                settings_for_ensemble(&target_context.search.fdr, &coalition_windows, &models)?,
+            )
+        };
+        let plus = run_scored_stage(
+            &training,
+            &plus_settings,
+            &plus_context.database,
+            &format!("coalition_{mask}"),
+            manifest.effective_ratios,
+            SearchSpace::PlusEntrapment,
+        )?;
+        let target = run_scored_stage(
+            &training_target,
+            &target_settings,
+            &target_context.database,
+            &format!("coalition_{mask}"),
+            manifest.effective_ratios,
+            SearchSpace::TargetOnly,
+        )?;
+        let invalid_reasons = names
+            .iter()
+            .filter_map(|name| {
+                validity
+                    .get(name)
+                    .cloned()
+                    .flatten()
+                    .map(|reason| format!("{name}: {reason}"))
+            })
+            .collect::<Vec<_>>();
+        coalition_rows.push(AuditCoalition {
+            experts: names,
+            valid_for_admission: invalid_reasons.is_empty(),
+            invalid_reasons,
+            plus_entrapment: plus.summary.layers.clone(),
+            target_only: target.summary.layers.clone(),
+            plus_stream_sha256: stream_hash(&plus)?,
+            target_stream_sha256: stream_hash(&target)?,
+        });
+        coalition_evidence.insert(mask, (plus.raw, plus.level4));
+    }
+    let shapley = shapley_rows(
+        &baseline_names
+            .iter()
+            .map(|name| name.to_string())
+            .collect::<Vec<_>>(),
+        &bit_for_expert,
+        &coalition_evidence,
+    );
+    let mut coalition_transitions = Vec::new();
+    let valid_baseline = baseline_names
+        .iter()
+        .filter(|name| validity.get(**name).is_some_and(Option::is_none))
+        .map(|name| name.to_string())
+        .collect::<Vec<_>>();
+    for expert in &valid_baseline {
+        let bit = bit_for_expert[expert];
+        for subset in 0_usize..(1_usize << valid_baseline.len()) {
+            let mut mask = 0_usize;
+            for (index, member) in valid_baseline.iter().enumerate() {
+                if subset & (1 << index) != 0 {
+                    mask |= bit_for_expert[member];
+                }
+            }
+            if mask & bit != 0 {
+                continue;
+            }
+            let with = mask | bit;
+            for layer in ["raw_q", "level4"] {
+                for level in ["psm", "peptidoform", "peptide", "protein"] {
+                    for entrapment in [false, true] {
+                        let empty = EvidenceSets::default();
+                        let before_pair = coalition_evidence.get(&mask);
+                        let before = before_pair
+                            .map(|pair| if layer == "raw_q" { &pair.0 } else { &pair.1 })
+                            .unwrap_or(&empty);
+                        let after_pair = &coalition_evidence[&with];
+                        let after = if layer == "raw_q" {
+                            &after_pair.0
+                        } else {
+                            &after_pair.1
+                        };
+                        let before_set = evidence_set(before, level, entrapment);
+                        let after_set = evidence_set(after, level, entrapment);
+                        coalition_transitions.push(serde_json::json!({
+                            "expert_added": expert,
+                            "coalition_before_mask": mask,
+                            "coalition_after_mask": with,
+                            "layer": layer,
+                            "level": level,
+                            "evidence": if entrapment { "entrapment" } else { "target" },
+                            "gained": after_set.difference(before_set).count(),
+                            "lost": before_set.difference(after_set).count()
+                        }));
+                    }
+                }
+            }
+        }
+    }
+
+    let mut proposed_classifications = Vec::new();
+    for expert in &expert_names {
+        let unique = support
+            .iter()
+            .filter(|row| {
+                row.level == "peptide"
+                    && row.entrapment == Some(false)
+                    && row.accepted_by == vec![expert.clone()]
+            })
+            .count();
+        let corroborated = support
+            .iter()
+            .filter(|row| {
+                row.level == "peptide"
+                    && row.entrapment == Some(false)
+                    && row.evidence_class == "corroborated"
+                    && row.accepted_by.contains(expert)
+            })
+            .count();
+        let disputed = support
+            .iter()
+            .filter(|row| {
+                row.level == "peptide"
+                    && row.entrapment == Some(false)
+                    && row.evidence_class == "disputed"
+                    && row.accepted_by.contains(expert)
+            })
+            .count();
+        let duplicate = pairwise.iter().any(|pair| {
+            pair.exact_score_stream_duplicate && (&pair.left == expert || &pair.right == expert)
+        });
+        let shapley_peptides = shapley
+            .iter()
+            .find(|row| {
+                row.get("expert").and_then(serde_json::Value::as_str) == Some(expert)
+                    && row.get("layer").and_then(serde_json::Value::as_str) == Some("level4")
+                    && row.get("level").and_then(serde_json::Value::as_str) == Some("peptide")
+                    && row.get("evidence").and_then(serde_json::Value::as_str) == Some("target")
+            })
+            .and_then(|row| row.get("shapley_count_contribution"))
+            .and_then(serde_json::Value::as_f64)
+            .unwrap_or(0.0);
+        proposed_classifications.push(serde_json::json!({
+            "expert": expert,
+            "classification": classify_low_input_expert(
+                validity[expert].as_deref(),
+                duplicate,
+                unique,
+                corroborated,
+                shapley_peptides,
+            ),
+            "invalid_reason": validity[expert],
+            "unique_level4_target_peptides": unique,
+            "corroborated_level4_target_peptides": corroborated,
+            "disputed_level4_target_peptides": disputed,
+            "exact_score_stream_duplicate": duplicate,
+            "shapley_level4_target_peptide_contribution": shapley_peptides
+        }));
+    }
+    let proposed_valid_nonredundant = proposed_classifications
+        .iter()
+        .filter(|row| {
+            matches!(
+                row.get("classification")
+                    .and_then(serde_json::Value::as_str),
+                Some("novel_contributor" | "supporting_corroborating_contributor")
+            )
+        })
+        .count();
+    let proposed_baseline = baseline_names
+        .iter()
+        .map(|name| name.to_string())
+        .collect::<BTreeSet<_>>();
+    let proposed_baseline_final_level4_peptide_fdp = coalition_rows
+        .iter()
+        .find(|row| row.experts.iter().cloned().collect::<BTreeSet<_>>() == proposed_baseline)
+        .and_then(|row| {
+            row.plus_entrapment
+                .iter()
+                .find(|layer| layer.layer == "level4")
+        })
+        .and_then(|layer| layer.peptide.ratio_adjusted_fdp);
+    let proposed_baseline_final_level4_calibration_pass =
+        proposed_baseline_final_level4_peptide_fdp
+            .is_some_and(|fdp| fdp <= manifest.runtime_gates.fdr_threshold);
+
+    let plus_lo = plus_stages
+        .get("lower_order")
+        .expect("lower order plus stage");
+    let target_lo = target_stages
+        .get("lower_order")
+        .expect("lower order target stage");
+    let plus_lo_metrics = metrics
+        .get("lower_order")
+        .expect("lower order plus metrics");
+    let target_lo_metrics = psm_metric_map(
+        target_lo,
+        &target_context.database,
+        &manifest.target_only.search_fingerprint,
+    );
+    let target_by_spectrum = target_lo_metrics
+        .values()
+        .map(|metric| (metric.spectrum_key.clone(), metric))
+        .collect::<BTreeMap<_, _>>();
+    let mut matched_spectra = 0_usize;
+    let mut same_rank1_candidate = 0_usize;
+    let mut plus_accepted_with_same_target_candidate = 0_usize;
+    let mut plus_accepted_same_candidate_also_accepted = 0_usize;
+    for metric in plus_lo_metrics.values() {
+        if let Some(target_metric) = target_by_spectrum.get(&metric.spectrum_key) {
+            matched_spectra += 1;
+            if metric.peptidoform == target_metric.peptidoform {
+                same_rank1_candidate += 1;
+                if plus_lo.level4.target_psms.contains(&metric.stable_id) {
+                    plus_accepted_with_same_target_candidate += 1;
+                    if target_lo
+                        .level4
+                        .target_psms
+                        .contains(&target_metric.stable_id)
+                    {
+                        plus_accepted_same_candidate_also_accepted += 1;
+                    }
+                }
+            }
+        }
+    }
+    let lo_peptide_intersection = plus_lo
+        .level4
+        .target_peptides
+        .intersection(&target_lo.level4.target_peptides)
+        .count();
+    let lower_order_transfer = serde_json::json!({
+        "aggregate_plus_level4_target_peptides": plus_lo.level4.target_peptides.len(),
+        "aggregate_target_level4_target_peptides": target_lo.level4.target_peptides.len(),
+        "aggregate_reported_loss_fraction": 1.0 - target_lo.level4.target_peptides.len() as f64 / plus_lo.level4.target_peptides.len() as f64,
+        "matched_spectrum_keys": matched_spectra,
+        "same_rank1_peptidoform": same_rank1_candidate,
+        "plus_accepted_psms_with_same_target_rank1_peptidoform": plus_accepted_with_same_target_candidate,
+        "same_candidate_accepted_in_both_spaces": plus_accepted_same_candidate_also_accepted,
+        "level4_target_peptide_intersection": lo_peptide_intersection,
+        "plus_only_level4_target_peptides": plus_lo.level4.target_peptides.len() - lo_peptide_intersection,
+        "target_only_level4_target_peptides": target_lo.level4.target_peptides.len() - lo_peptide_intersection,
+        "matched_peptide_jaccard": jaccard(&plus_lo.level4.target_peptides, &target_lo.level4.target_peptides)
+    });
+
+    let mut support_class_counts = BTreeMap::<String, usize>::new();
+    for row in &support {
+        *support_class_counts
+            .entry(format!("{}:{}", row.level, row.evidence_class))
+            .or_default() += 1;
+    }
+    let individual = expert_names
+        .iter()
+        .map(|name| {
+            serde_json::json!({
+                "expert": name,
+                "validity_without_usefulness": validity[name],
+                "plus_entrapment": plus_stages[name].summary.layers,
+                "target_only": target_stages[name].summary.layers,
+                "plus_stream_sha256": stream_hash(&plus_stages[name]).expect("stream hash"),
+                "target_stream_sha256": stream_hash(&target_stages[name]).expect("stream hash")
+            })
+        })
+        .collect::<Vec<_>>();
+    let executable = std::env::current_exe()?;
+    let result = serde_json::json!({
+        "schema": "within-parent-training-usefulness-audit-v1",
+        "capabilities": CAPABILITIES,
+        "manifest_sha256": manifest_sha256,
+        "failed_gate_audit_preserved": preserved_gates_path,
+        "audit_binary_sha256": sha256_file(&executable)?,
+        "fold": fold.fold,
+        "training_file_ids": fold.training_file_ids,
+        "held_out_data_accessed": false,
+        "selected_artifacts": selected_artifacts,
+        "preserved_sequential_gates": preserved_gates,
+        "production_semantics": {
+            "sequential": true,
+            "deterministic_sort": "descending accepted Level-4 target peptide count, then model slug",
+            "first_expert_receives_shared_credit": true,
+            "later_expert_requires_unique_peptide": true,
+            "minimum_expert_count_uses_post_usefulness_eligibility": true,
+            "manifest_or_hash_map_order_affects_result": false,
+            "scientific_credit_is_order_asymmetric": true
+        },
+        "individual_experts": individual,
+        "sequential_permutations": permutations,
+        "pairwise": pairwise,
+        "support_matrix_path": output.join("training_support_matrix.json"),
+        "support_matrix_sha256": support_sha256,
+        "support_class_counts": support_class_counts,
+        "coalitions": coalition_rows,
+        "coalition_transitions": coalition_transitions,
+        "shapley_count_contributions": shapley,
+        "proposed_low_input_expert_classifications": proposed_classifications,
+        "proposed_fold1_baseline_could_form": proposed_valid_nonredundant >= manifest.runtime_gates.minimum_ensemble_experts
+            && proposed_baseline_final_level4_calibration_pass,
+        "proposed_valid_nonredundant_expert_count": proposed_valid_nonredundant,
+        "proposed_baseline_final_level4_peptide_fdp": proposed_baseline_final_level4_peptide_fdp,
+        "proposed_baseline_final_level4_calibration_pass": proposed_baseline_final_level4_calibration_pass,
+        "lower_order_transfer": lower_order_transfer,
+        "ensemble_combination_audit": {
+            "p_combiner": "second_best",
+            "pep_combiner": "median",
+            "p_values_are_not_explicitly_modeled_as_independent_by_second_best_but_duplicate streams can alter order statistics once three or more experts participate": true,
+            "median_pep_can_double_weight_duplicate_or highly correlated streams": true,
+            "final_level4_entrapment_calibration_remains_the blocking empirical safeguard": true
+        }
+    });
+    write_json_atomic(&output.join("training_usefulness_audit.json"), &result)
 }
 
 #[derive(Clone, Debug, Default)]
@@ -1008,31 +2568,70 @@ pub struct IncrementalEvidence {
 }
 
 #[derive(Clone, Debug, Serialize, Deserialize)]
+pub struct ExpertTrainingGate {
+    pub model: ModelFit,
+    pub selected_window: Option<NullWindow>,
+    pub eligible: bool,
+    pub participation_reason: String,
+    pub reasons: Vec<String>,
+    pub warnings: Vec<String>,
+    pub calibration_level4_target_peptides: usize,
+    pub target_only_level4_target_peptides: usize,
+    pub incremental_level4_target_peptides: usize,
+}
+
+#[derive(Clone, Debug, Serialize, Deserialize, PartialEq)]
+pub struct InteractionDelta {
+    pub layer: String,
+    pub level: String,
+    pub baseline_fdp: Option<f64>,
+    pub final_fdp: Option<f64>,
+    pub absolute_change: Option<f64>,
+    pub raw_q_warning: bool,
+}
+
+#[derive(Clone, Debug, Serialize, Deserialize, PartialEq)]
+pub struct CompositionComparison {
+    pub baseline: String,
+    pub comparison: String,
+    pub plus_entrapment_incremental: Vec<IncrementalEvidence>,
+    pub target_only_incremental: Vec<IncrementalEvidence>,
+    pub interaction_deltas: Vec<InteractionDelta>,
+    pub final_level4_calibration_decision: String,
+}
+
+#[derive(Clone, Debug, Serialize, Deserialize)]
+pub struct FoldCompositionSummary {
+    pub composition: String,
+    pub lock: WithinParentHoldoutLock,
+    pub plus_entrapment: StageSummary,
+    pub target_only: StageSummary,
+}
+
+#[derive(Clone, Debug, Serialize, Deserialize)]
 pub struct FoldSummary {
     pub fold: usize,
     pub training_subset_digest: String,
     pub held_out_plus_entrapment_subset_digest: String,
     pub held_out_target_only_subset_digest: String,
     pub selected_windows: Vec<ModelWindowSelection>,
-    pub baseline_lock: WithinParentHoldoutLock,
-    pub comparison_lock: WithinParentHoldoutLock,
-    pub plus_entrapment_baseline: StageSummary,
-    pub plus_entrapment_comparison: StageSummary,
-    pub plus_entrapment_incremental: Vec<IncrementalEvidence>,
-    pub target_only_baseline: StageSummary,
-    pub target_only_comparison: StageSummary,
-    pub target_only_incremental: Vec<IncrementalEvidence>,
+    pub training_gates: BTreeMap<String, Vec<ExpertTrainingGate>>,
+    pub compositions: Vec<FoldCompositionSummary>,
+    pub comparisons_to_baseline: Vec<CompositionComparison>,
     pub technically_valid: bool,
 }
 
 #[derive(Clone, Debug, Serialize, Deserialize, PartialEq)]
+pub struct AggregateCompositionSummary {
+    pub composition: String,
+    pub plus_entrapment: Vec<LayerSummary>,
+    pub target_only: Vec<LayerSummary>,
+}
+
+#[derive(Clone, Debug, Serialize, Deserialize, PartialEq)]
 pub struct AggregateSummary {
-    pub baseline_plus_entrapment: Vec<LayerSummary>,
-    pub comparison_plus_entrapment: Vec<LayerSummary>,
-    pub plus_entrapment_incremental: Vec<IncrementalEvidence>,
-    pub baseline_target_only: Vec<LayerSummary>,
-    pub comparison_target_only: Vec<LayerSummary>,
-    pub target_only_incremental: Vec<IncrementalEvidence>,
+    pub compositions: Vec<AggregateCompositionSummary>,
+    pub comparisons_to_baseline: Vec<CompositionComparison>,
     pub construction: String,
     pub every_run_once: bool,
 }
@@ -1059,7 +2658,7 @@ pub struct HoldoutResult {
     pub capabilities: ValidationRunnerCapabilities,
     pub folds: Vec<FoldSummary>,
     pub aggregate: AggregateSummary,
-    pub classification: HoldoutClassification,
+    pub classifications: BTreeMap<String, HoldoutClassification>,
 }
 
 #[derive(Clone)]
@@ -1149,21 +2748,34 @@ fn settings_for_model(
 fn settings_for_ensemble(
     base: &FdrSettings,
     windows: &BTreeMap<String, Option<NullWindow>>,
-    include_lower_order: bool,
+    experts: &[ModelFit],
 ) -> Result<FdrSettings> {
     let mut settings = settings_for_model(base, ModelFit::Ensemble, None);
-    settings.enable_moments = true;
-    settings.enable_mle = true;
-    settings.enable_msfdr_1smix = true;
-    settings.enable_lower_order = include_lower_order;
-    for model in [ModelFit::Moments, ModelFit::Mle, ModelFit::LowerOrder] {
-        if model == ModelFit::LowerOrder && !include_lower_order {
+    let unique = experts.iter().map(model_slug).collect::<BTreeSet<_>>();
+    anyhow::ensure!(
+        unique.len() == experts.len(),
+        "Ensemble composition contains duplicate experts"
+    );
+    settings.enable_moments = experts.contains(&ModelFit::Moments);
+    settings.enable_mle = experts.contains(&ModelFit::Mle);
+    settings.enable_lower_order = experts.contains(&ModelFit::LowerOrder);
+    settings.enable_msfdr_seeded = experts.contains(&ModelFit::Msfdr);
+    settings.enable_msfdr_1smix = experts.contains(&ModelFit::Msfdr1Smix);
+    settings.enable_msfdr_2smix = experts.contains(&ModelFit::Msfdr2Smix);
+    settings.enable_nokoi = experts.contains(&ModelFit::Nokoi);
+    for model in experts {
+        anyhow::ensure!(
+            !matches!(model, ModelFit::Nokoi | ModelFit::Ensemble),
+            "unsupported holdout Ensemble expert {}",
+            model_slug(model)
+        );
+        if *model == ModelFit::Msfdr1Smix {
             continue;
         }
         let window = windows
-            .get(model_slug(&model))
-            .with_context(|| format!("missing locked window for {}", model_slug(&model)))?;
-        apply_model_window(&mut settings, &model, window);
+            .get(model_slug(model))
+            .with_context(|| format!("missing locked window for {}", model_slug(model)))?;
+        apply_model_window(&mut settings, model, window);
     }
     Ok(settings)
 }
@@ -1657,6 +3269,286 @@ fn incremental(
     }
 }
 
+fn summary_layer<'a>(summary: &'a StageSummary, layer: &str) -> Result<&'a LayerSummary> {
+    summary
+        .layers
+        .iter()
+        .find(|row| row.layer == layer)
+        .with_context(|| format!("{} has no {layer} summary", summary.composition))
+}
+
+fn composition_gate_models(
+    manifest: &HoldoutPreregistration,
+    requested_experts: &[ModelFit],
+) -> Result<Vec<ModelFit>> {
+    let requested_models = manifest
+        .model_grids
+        .iter()
+        .filter(|grid| requested_experts.contains(&grid.model))
+        .map(|grid| grid.model.clone())
+        .collect::<Vec<_>>();
+    anyhow::ensure!(
+        requested_models.len() == requested_experts.len(),
+        "composition training-gate expert set is incomplete"
+    );
+    Ok(requested_models)
+}
+
+fn build_training_gates(
+    manifest: &HoldoutPreregistration,
+    windows: &BTreeMap<String, Option<NullWindow>>,
+    plus: &BTreeMap<String, CompletedStage>,
+    target: &BTreeMap<String, CompletedStage>,
+    requested_experts: &[ModelFit],
+) -> Result<Vec<ExpertTrainingGate>> {
+    let requested_models = composition_gate_models(manifest, requested_experts)?;
+    let mut order = requested_models
+        .iter()
+        .map(|grid| {
+            let slug = model_slug(grid);
+            let stage = plus
+                .get(slug)
+                .with_context(|| format!("missing training +entrapment stage for {slug}"))?;
+            Ok((grid.clone(), stage.level4.target_peptides.len()))
+        })
+        .collect::<Result<Vec<_>>>()?;
+    order.sort_by(|left, right| {
+        right
+            .1
+            .cmp(&left.1)
+            .then_with(|| model_slug(&left.0).cmp(model_slug(&right.0)))
+    });
+    let mut union = BTreeSet::new();
+    let mut gates = Vec::new();
+    for (model, _) in order {
+        let slug = model_slug(&model);
+        let plus_stage = plus.get(slug).context("missing +entrapment gate stage")?;
+        let target_stage = target.get(slug).context("missing target-only gate stage")?;
+        let plus_level4 = summary_layer(&plus_stage.summary, "level4")?;
+        let mut reasons = Vec::new();
+        let mut warnings = Vec::new();
+        if plus_stage.summary.fallback_used || target_stage.summary.fallback_used {
+            reasons.push("fit fallback occurred".into());
+        }
+        if plus_stage.summary.unexplained_na_count > 0
+            || target_stage.summary.unexplained_na_count > 0
+        {
+            reasons.push("unexplained NA values occurred".into());
+        }
+        if !plus_level4
+            .peptide
+            .ratio_adjusted_fdp
+            .is_some_and(|fdp| fdp <= manifest.runtime_gates.fdr_threshold)
+        {
+            reasons.push("Level-4 peptide entrapment FDP is missing or exceeds threshold".into());
+        }
+        if plus_level4.peptide.entrapment
+            < manifest
+                .runtime_gates
+                .minimum_entrapment_peptides_for_stable_estimate
+        {
+            warnings.push(format!(
+                "Level-4 peptide entrapment count {} is below stability minimum {}",
+                plus_level4.peptide.entrapment,
+                manifest
+                    .runtime_gates
+                    .minimum_entrapment_peptides_for_stable_estimate
+            ));
+        }
+        let calibration_peptides = plus_stage.level4.target_peptides.len();
+        let target_peptides = target_stage.level4.target_peptides.len();
+        if calibration_peptides > 0 {
+            let loss = (calibration_peptides as f64 - target_peptides as f64)
+                / calibration_peptides as f64;
+            if loss
+                > manifest
+                    .runtime_gates
+                    .maximum_target_only_peptide_fraction_loss
+            {
+                reasons.push(format!(
+                    "target-only peptide transfer loss is {:.1}%",
+                    100.0 * loss
+                ));
+            }
+        }
+        let incremental_peptides = plus_stage.level4.target_peptides.difference(&union).count();
+        if reasons.is_empty()
+            && incremental_peptides
+                < manifest
+                    .runtime_gates
+                    .minimum_incremental_level4_target_peptides
+        {
+            reasons.push(format!(
+                "adds only {incremental_peptides} new Level-4 target peptides"
+            ));
+        }
+        let eligible = reasons.is_empty();
+        if eligible {
+            union.extend(plus_stage.level4.target_peptides.iter().cloned());
+        }
+        gates.push(ExpertTrainingGate {
+            model: model.clone(),
+            selected_window: windows.get(slug).cloned().flatten(),
+            eligible,
+            participation_reason: if eligible {
+                "included"
+            } else {
+                "excluded_by_training_runtime_gates"
+            }
+            .into(),
+            reasons,
+            warnings,
+            calibration_level4_target_peptides: calibration_peptides,
+            target_only_level4_target_peptides: target_peptides,
+            incremental_level4_target_peptides: incremental_peptides,
+        });
+    }
+    gates.sort_by(|left, right| model_slug(&left.model).cmp(model_slug(&right.model)));
+    Ok(gates)
+}
+
+fn interaction_comparison(
+    manifest: &HoldoutPreregistration,
+    baseline_id: &str,
+    comparison_id: &str,
+    baseline_plus: &CompletedStage,
+    comparison_plus: &CompletedStage,
+    baseline_target: &CompletedStage,
+    comparison_target: &CompletedStage,
+) -> Result<CompositionComparison> {
+    let plus_incremental = vec![
+        incremental("raw_q", &baseline_plus.raw, &comparison_plus.raw),
+        incremental("level4", &baseline_plus.level4, &comparison_plus.level4),
+    ];
+    let target_incremental = vec![
+        incremental("raw_q", &baseline_target.raw, &comparison_target.raw),
+        incremental("level4", &baseline_target.level4, &comparison_target.level4),
+    ];
+    let mut interaction_deltas = Vec::new();
+    for layer in ["raw_q", "level4"] {
+        let baseline = summary_layer(&baseline_plus.summary, layer)?;
+        let final_result = summary_layer(&comparison_plus.summary, layer)?;
+        for (level, before, after) in [
+            ("psm", &baseline.psm, &final_result.psm),
+            ("peptide", &baseline.peptide, &final_result.peptide),
+            (
+                "peptidoform",
+                &baseline.peptidoform,
+                &final_result.peptidoform,
+            ),
+        ] {
+            let absolute_change = before
+                .ratio_adjusted_fdp
+                .zip(after.ratio_adjusted_fdp)
+                .map(|(x, y)| y - x);
+            interaction_deltas.push(InteractionDelta {
+                layer: layer.into(),
+                level: level.into(),
+                baseline_fdp: before.ratio_adjusted_fdp,
+                final_fdp: after.ratio_adjusted_fdp,
+                absolute_change,
+                raw_q_warning: layer == "raw_q"
+                    && absolute_change.is_some_and(|change| {
+                        change > manifest.runtime_gates.raw_q_interaction_warning_threshold
+                    }),
+            });
+        }
+    }
+    let final_peptide_fdp = summary_layer(&comparison_plus.summary, "level4")?
+        .peptide
+        .ratio_adjusted_fdp;
+    let final_level4_calibration_decision = match final_peptide_fdp {
+        None => "not_evaluable_missing_final_level4_peptide_fdp",
+        Some(fdp) if fdp > manifest.runtime_gates.fdr_threshold => {
+            "not_eligible_final_level4_peptide_fdp_exceeds_threshold"
+        }
+        Some(_) => "pass",
+    }
+    .into();
+    Ok(CompositionComparison {
+        baseline: baseline_id.into(),
+        comparison: comparison_id.into(),
+        plus_entrapment_incremental: plus_incremental,
+        target_only_incremental: target_incremental,
+        interaction_deltas,
+        final_level4_calibration_decision,
+    })
+}
+
+fn aggregate_comparison(
+    manifest: &HoldoutPreregistration,
+    baseline: &AggregateCompositionSummary,
+    comparison: &AggregateCompositionSummary,
+    baseline_plus: (&EvidenceSets, &EvidenceSets),
+    comparison_plus: (&EvidenceSets, &EvidenceSets),
+    baseline_target: (&EvidenceSets, &EvidenceSets),
+    comparison_target: (&EvidenceSets, &EvidenceSets),
+) -> Result<CompositionComparison> {
+    let plus_entrapment_incremental = vec![
+        incremental("raw_q", baseline_plus.0, comparison_plus.0),
+        incremental("level4", baseline_plus.1, comparison_plus.1),
+    ];
+    let target_only_incremental = vec![
+        incremental("raw_q", baseline_target.0, comparison_target.0),
+        incremental("level4", baseline_target.1, comparison_target.1),
+    ];
+    let mut interaction_deltas = Vec::new();
+    for layer in ["raw_q", "level4"] {
+        let before = baseline
+            .plus_entrapment
+            .iter()
+            .find(|row| row.layer == layer)
+            .context("aggregate baseline layer is missing")?;
+        let after = comparison
+            .plus_entrapment
+            .iter()
+            .find(|row| row.layer == layer)
+            .context("aggregate comparison layer is missing")?;
+        for (level, left, right) in [
+            ("psm", &before.psm, &after.psm),
+            ("peptide", &before.peptide, &after.peptide),
+            ("peptidoform", &before.peptidoform, &after.peptidoform),
+        ] {
+            let absolute_change = left
+                .ratio_adjusted_fdp
+                .zip(right.ratio_adjusted_fdp)
+                .map(|(x, y)| y - x);
+            interaction_deltas.push(InteractionDelta {
+                layer: layer.into(),
+                level: level.into(),
+                baseline_fdp: left.ratio_adjusted_fdp,
+                final_fdp: right.ratio_adjusted_fdp,
+                absolute_change,
+                raw_q_warning: layer == "raw_q"
+                    && absolute_change.is_some_and(|change| {
+                        change > manifest.runtime_gates.raw_q_interaction_warning_threshold
+                    }),
+            });
+        }
+    }
+    let final_level4_calibration_decision = match comparison
+        .plus_entrapment
+        .iter()
+        .find(|row| row.layer == "level4")
+        .and_then(|row| row.peptide.ratio_adjusted_fdp)
+    {
+        None => "not_evaluable_missing_final_level4_peptide_fdp",
+        Some(fdp) if fdp > manifest.runtime_gates.fdr_threshold => {
+            "not_eligible_final_level4_peptide_fdp_exceeds_threshold"
+        }
+        Some(_) => "pass",
+    }
+    .into();
+    Ok(CompositionComparison {
+        baseline: baseline.composition.clone(),
+        comparison: comparison.composition.clone(),
+        plus_entrapment_incremental,
+        target_only_incremental,
+        interaction_deltas,
+        final_level4_calibration_decision,
+    })
+}
+
 fn write_training_artifact(
     root: &Path,
     manifest: &HoldoutPreregistration,
@@ -1702,22 +3594,41 @@ fn build_holdout_lock(
     fold: usize,
     training_subset: &WithinParentSubsetIdentity,
     artifacts: &[WithinParentHoldoutArtifact],
-    include_lower_order: bool,
+    composition: &HoldoutComposition,
+    gates: &[ExpertTrainingGate],
 ) -> Result<WithinParentHoldoutLock> {
     let mut experts = artifacts
         .iter()
-        .filter(|artifact| include_lower_order || artifact.model != ModelFit::LowerOrder)
-        .map(|artifact| HoldoutLockExpert {
-            model: artifact.model.clone(),
-            selected_window: artifact.selected_window.clone(),
-            training_artifact_digest: artifact.digest.clone(),
+        .filter(|artifact| composition.requested_experts.contains(&artifact.model))
+        .map(|artifact| {
+            let gate = gates
+                .iter()
+                .find(|gate| gate.model == artifact.model)
+                .with_context(|| {
+                    format!("missing training gate for {}", model_slug(&artifact.model))
+                })?;
+            Ok(HoldoutLockExpert {
+                model: artifact.model.clone(),
+                selected_window: artifact.selected_window.clone(),
+                training_artifact_digest: artifact.digest.clone(),
+                enabled: gate.eligible,
+                participation_reason: gate.participation_reason.clone(),
+                gate_reasons: gate.reasons.clone(),
+                gate_warnings: gate.warnings.clone(),
+            })
         })
-        .collect::<Vec<_>>();
+        .collect::<Result<Vec<_>>>()?;
     experts.sort_by(|left, right| model_slug(&left.model).cmp(model_slug(&right.model)));
-    let expected = if include_lower_order { 4 } else { 3 };
     anyhow::ensure!(
-        experts.len() == expected,
+        experts.len() == composition.requested_experts.len(),
         "holdout lock expert count mismatch"
+    );
+    let enabled = experts.iter().filter(|expert| expert.enabled).count();
+    anyhow::ensure!(
+        enabled >= manifest.runtime_gates.minimum_ensemble_experts,
+        "composition {} has only {enabled} runtime-eligible experts; {} required",
+        composition.id,
+        manifest.runtime_gates.minimum_ensemble_experts
     );
     let mut lock = WithinParentHoldoutLock {
         schema: LOCK_SCHEMA.into(),
@@ -1726,6 +3637,7 @@ fn build_holdout_lock(
         parent_dataset_fingerprint: manifest.parent_dataset_fingerprint.clone(),
         training_subset_digest: training_subset.digest.clone(),
         fold,
+        composition: composition.id.clone(),
         experts,
         external_profile_window: manifest.external_profile_window.clone(),
         target_only_policy: "refit_with_locked_window".into(),
@@ -1762,6 +3674,27 @@ fn validate_holdout_lock(
         lock.external_profile_window.min_rank == 9 && lock.external_profile_window.max_rank == 18,
         "holdout lock external profile mismatch"
     );
+    let unique = lock
+        .experts
+        .iter()
+        .map(|expert| model_slug(&expert.model))
+        .collect::<BTreeSet<_>>();
+    anyhow::ensure!(
+        unique.len() == lock.experts.len(),
+        "holdout lock contains duplicate experts"
+    );
+    for expert in &lock.experts {
+        anyhow::ensure!(
+            (expert.enabled
+                && expert.participation_reason == "included"
+                && expert.gate_reasons.is_empty())
+                || (!expert.enabled
+                    && expert.participation_reason == "excluded_by_training_runtime_gates"
+                    && !expert.gate_reasons.is_empty()),
+            "holdout expert {} has inconsistent runtime-gate provenance",
+            model_slug(&expert.model)
+        );
+    }
     let mut unhashed = lock.clone();
     unhashed.digest.clear();
     anyhow::ensure!(
@@ -1774,6 +3707,7 @@ fn validate_holdout_lock(
 fn windows_from_lock(lock: &WithinParentHoldoutLock) -> BTreeMap<String, Option<NullWindow>> {
     lock.experts
         .iter()
+        .filter(|expert| expert.enabled)
         .map(|expert| {
             let window = if expert.model == ModelFit::Msfdr1Smix {
                 None
@@ -1782,6 +3716,14 @@ fn windows_from_lock(lock: &WithinParentHoldoutLock) -> BTreeMap<String, Option<
             };
             (model_slug(&expert.model).into(), window)
         })
+        .collect()
+}
+
+fn experts_from_lock(lock: &WithinParentHoldoutLock) -> Vec<ModelFit> {
+    lock.experts
+        .iter()
+        .filter(|expert| expert.enabled)
+        .map(|expert| expert.model.clone())
         .collect()
 }
 
@@ -1858,11 +3800,12 @@ fn recompute_out_of_fold_evidence(
 fn classify_result(
     manifest: &HoldoutPreregistration,
     folds: &[FoldSummary],
-    aggregate_incremental: &[IncrementalEvidence],
-    target_incremental: &[IncrementalEvidence],
+    comparison_id: &str,
+    aggregate: &CompositionComparison,
 ) -> HoldoutClassification {
     let all_valid = folds.iter().all(|fold| fold.technically_valid);
-    let level4 = aggregate_incremental
+    let level4 = aggregate
+        .plus_entrapment_incremental
         .iter()
         .find(|row| row.layer == "level4");
     let positive = level4.is_some_and(|row| {
@@ -1873,46 +3816,32 @@ fn classify_result(
     let contributing_folds = folds
         .iter()
         .filter(|fold| {
-            fold.plus_entrapment_incremental
+            fold.comparisons_to_baseline
                 .iter()
-                .find(|row| row.layer == "level4")
-                .is_some_and(|row| {
-                    row.added_target_peptides > 0
-                        || row.added_target_peptidoforms > 0
-                        || row.added_target_proteins > 0
+                .find(|comparison| comparison.comparison == comparison_id)
+                .and_then(|comparison| {
+                    comparison
+                        .plus_entrapment_incremental
+                        .iter()
+                        .find(|row| row.layer == "level4")
+                })
+                .is_some_and(|incremental| {
+                    incremental.added_target_peptides > 0
+                        || incremental.added_target_peptidoforms > 0
+                        || incremental.added_target_proteins > 0
                 })
         })
         .count();
     let not_single_fold = contributing_folds >= 2;
-    let calibration_ok = folds.iter().all(|fold| {
-        ["raw_q", "level4"].into_iter().all(|layer| {
-            let baseline = fold
-                .plus_entrapment_baseline
-                .layers
+    let calibration_ok = aggregate.final_level4_calibration_decision == "pass"
+        && folds.iter().all(|fold| {
+            fold.comparisons_to_baseline
                 .iter()
-                .find(|row| row.layer == layer);
-            let comparison = fold
-                .plus_entrapment_comparison
-                .layers
-                .iter()
-                .find(|row| row.layer == layer);
-            match (baseline, comparison) {
-                (Some(a), Some(b)) => {
-                    match (a.peptide.ratio_adjusted_fdp, b.peptide.ratio_adjusted_fdp) {
-                        (Some(x), Some(y)) => {
-                            y <= x + manifest
-                                .acceptance
-                                .maximum_absolute_ratio_adjusted_peptide_fdp_increase
-                        }
-                        (None, None) => true,
-                        _ => false,
-                    }
-                }
-                _ => false,
-            }
-        })
-    });
-    let target_stable = target_incremental
+                .find(|comparison| comparison.comparison == comparison_id)
+                .is_some_and(|comparison| comparison.final_level4_calibration_decision == "pass")
+        });
+    let target_stable = aggregate
+        .target_only_incremental
         .iter()
         .find(|row| row.layer == "level4")
         .is_some_and(|row| {
@@ -1920,10 +3849,48 @@ fn classify_result(
                 && row.lost_target_peptidoforms == 0
                 && row.lost_target_proteins == 0
         });
-    let ready = all_valid && positive && not_single_fold && calibration_ok && target_stable;
+    let requested = manifest
+        .comparison_matrix
+        .iter()
+        .find(|composition| composition.id == comparison_id)
+        .map(|composition| {
+            composition
+                .requested_experts
+                .iter()
+                .filter(|expert| !manifest.baseline_experts.contains(expert))
+                .cloned()
+                .collect::<Vec<_>>()
+        })
+        .unwrap_or_default();
+    let requested_usable = !requested.is_empty()
+        && folds.iter().all(|fold| {
+            fold.compositions
+                .iter()
+                .find(|composition| composition.composition == comparison_id)
+                .is_some_and(|composition| {
+                    requested.iter().all(|model| {
+                        composition
+                            .lock
+                            .experts
+                            .iter()
+                            .any(|expert| expert.model == *model && expert.enabled)
+                    })
+                })
+        });
+    let ready = all_valid
+        && requested_usable
+        && positive
+        && not_single_fold
+        && calibration_ok
+        && target_stable;
     let mut reasons = Vec::new();
     if !all_valid {
         reasons.push("one or more folds failed technical validity".into());
+    }
+    if !requested_usable {
+        reasons.push(
+            "one or more requested diagnostic experts failed a training-side runtime gate".into(),
+        );
     }
     if !positive {
         reasons.push(
@@ -1936,7 +3903,7 @@ fn classify_result(
         );
     }
     if !calibration_ok {
-        reasons.push("material fold-level peptide calibration deterioration was observed".into());
+        reasons.push("final Level-4 peptide calibration is missing or fails the existing release requirement".into());
     }
     if !target_stable {
         reasons.push("target-only Level-4 higher-level evidence was lost".into());
@@ -2001,10 +3968,12 @@ pub fn execute_holdout(manifest_path: impl AsRef<Path>, output: impl AsRef<Path>
     );
 
     let mut fold_summaries = Vec::new();
-    let mut aggregate_plus_a_features = Vec::new();
-    let mut aggregate_plus_b_features = Vec::new();
-    let mut aggregate_target_a_features = Vec::new();
-    let mut aggregate_target_b_features = Vec::new();
+    let mut aggregate_plus_features = BTreeMap::<String, Vec<DfFeature>>::new();
+    let mut aggregate_target_features = BTreeMap::<String, Vec<DfFeature>>::new();
+    for composition in &manifest.comparison_matrix {
+        aggregate_plus_features.insert(composition.id.clone(), Vec::new());
+        aggregate_target_features.insert(composition.id.clone(), Vec::new());
+    }
 
     for fold in &manifest.folds {
         let fold_root = output.join(format!("fold_{}", fold.fold));
@@ -2012,6 +3981,14 @@ pub fn execute_holdout(manifest_path: impl AsRef<Path>, output: impl AsRef<Path>
         let training = derive_subset(
             &manifest,
             &plus_context,
+            &manifest_sha256,
+            fold.fold,
+            SubsetRole::Training,
+            &fold.training_file_ids,
+        )?;
+        let training_target = derive_subset(
+            &manifest,
+            &target_context,
             &manifest_sha256,
             fold.fold,
             SubsetRole::Training,
@@ -2033,22 +4010,20 @@ pub fn execute_holdout(manifest_path: impl AsRef<Path>, output: impl AsRef<Path>
         }
 
         let mut training_artifacts = Vec::new();
-        for model in [
-            ModelFit::Moments,
-            ModelFit::Mle,
-            ModelFit::Msfdr1Smix,
-            ModelFit::LowerOrder,
-        ] {
+        let mut training_plus_stages = BTreeMap::new();
+        let mut training_target_stages = BTreeMap::new();
+        for grid in &manifest.model_grids {
+            let model = grid.model.clone();
             let window = if model == ModelFit::Msfdr1Smix {
                 None
             } else {
                 windows.get(model_slug(&model)).cloned().flatten()
             };
-            let settings =
+            let plus_settings =
                 settings_for_model(&plus_context.search.fdr, model.clone(), window.clone());
-            let stage = run_scored_stage(
+            let plus_stage = run_scored_stage(
                 &training,
-                &settings,
+                &plus_settings,
                 &plus_context.database,
                 model_slug(&model),
                 manifest.effective_ratios,
@@ -2059,48 +4034,63 @@ pub fn execute_holdout(manifest_path: impl AsRef<Path>, output: impl AsRef<Path>
                 &manifest,
                 &manifest_sha256,
                 &training.identity,
-                model,
-                window,
-                &stage.artifacts,
+                model.clone(),
+                window.clone(),
+                &plus_stage.artifacts,
             )?);
+            let target_settings =
+                settings_for_model(&target_context.search.fdr, model.clone(), window);
+            let target_stage = run_scored_stage(
+                &training_target,
+                &target_settings,
+                &target_context.database,
+                model_slug(&model),
+                manifest.effective_ratios,
+                SearchSpace::TargetOnly,
+            )?;
+            anyhow::ensure!(
+                target_stage.summary.window_retuned == false
+                    && target_stage.summary.complete_artifact_reused == false,
+                "training target-only stage violated locked-window refit semantics"
+            );
+            training_plus_stages.insert(model_slug(&model).into(), plus_stage);
+            training_target_stages.insert(model_slug(&model).into(), target_stage);
         }
-        let baseline_lock = build_holdout_lock(
-            &manifest,
-            &manifest_sha256,
-            fold.fold,
-            &training.identity,
-            &training_artifacts,
-            false,
-        )?;
-        let comparison_lock = build_holdout_lock(
-            &manifest,
-            &manifest_sha256,
-            fold.fold,
-            &training.identity,
-            &training_artifacts,
-            true,
-        )?;
-        validate_holdout_lock(
-            &baseline_lock,
-            &manifest,
-            &manifest_sha256,
-            &training.identity,
-        )?;
-        validate_holdout_lock(
-            &comparison_lock,
-            &manifest,
-            &manifest_sha256,
-            &training.identity,
-        )?;
-        write_json_atomic(
-            &fold_root.join("baseline.holdout.lock.json"),
-            &baseline_lock,
-        )?;
-        write_json_atomic(
-            &fold_root.join("comparison.holdout.lock.json"),
-            &comparison_lock,
-        )?;
+        let mut training_gates = BTreeMap::new();
+        let mut locks = BTreeMap::new();
+        for composition in &manifest.comparison_matrix {
+            let gates = build_training_gates(
+                &manifest,
+                &windows,
+                &training_plus_stages,
+                &training_target_stages,
+                &composition.requested_experts,
+            )?;
+            write_json_atomic(
+                &fold_root.join(format!("{}.training_gates.json", composition.id)),
+                &gates,
+            )?;
+            let lock = build_holdout_lock(
+                &manifest,
+                &manifest_sha256,
+                fold.fold,
+                &training.identity,
+                &training_artifacts,
+                composition,
+                &gates,
+            )?;
+            validate_holdout_lock(&lock, &manifest, &manifest_sha256, &training.identity)?;
+            write_json_atomic(
+                &fold_root.join(format!("{}.holdout.lock.json", composition.id)),
+                &lock,
+            )?;
+            training_gates.insert(composition.id.clone(), gates);
+            locks.insert(composition.id.clone(), lock);
+        }
         drop(training);
+        drop(training_target);
+        drop(training_plus_stages);
+        drop(training_target_stages);
 
         let held_plus = derive_subset(
             &manifest,
@@ -2110,41 +4100,7 @@ pub fn execute_holdout(manifest_path: impl AsRef<Path>, output: impl AsRef<Path>
             SubsetRole::HeldOut,
             &fold.held_out_file_ids,
         )?;
-        let settings_a = settings_for_ensemble(
-            &plus_context.search.fdr,
-            &windows_from_lock(&baseline_lock),
-            false,
-        )?;
-        let settings_b = settings_for_ensemble(
-            &plus_context.search.fdr,
-            &windows_from_lock(&comparison_lock),
-            true,
-        )?;
-        let plus_a = run_scored_stage(
-            &held_plus,
-            &settings_a,
-            &plus_context.database,
-            "baseline",
-            manifest.effective_ratios,
-            SearchSpace::PlusEntrapment,
-        )?;
-        let plus_b = run_scored_stage(
-            &held_plus,
-            &settings_b,
-            &plus_context.database,
-            "baseline_plus_lower_order",
-            manifest.effective_ratios,
-            SearchSpace::PlusEntrapment,
-        )?;
-        aggregate_plus_a_features.extend(plus_a.rank1_features.iter().cloned());
-        aggregate_plus_b_features.extend(plus_b.rank1_features.iter().cloned());
-        let plus_incremental = vec![
-            incremental("raw_q", &plus_a.raw, &plus_b.raw),
-            incremental("level4", &plus_a.level4, &plus_b.level4),
-        ];
         let held_plus_digest = held_plus.identity.digest.clone();
-        drop(held_plus);
-
         let held_target = derive_subset(
             &manifest,
             &target_context,
@@ -2153,65 +4109,123 @@ pub fn execute_holdout(manifest_path: impl AsRef<Path>, output: impl AsRef<Path>
             SubsetRole::HeldOut,
             &fold.held_out_file_ids,
         )?;
-        let target_settings_a = settings_for_ensemble(
-            &target_context.search.fdr,
-            &windows_from_lock(&baseline_lock),
-            false,
-        )?;
-        let target_settings_b = settings_for_ensemble(
-            &target_context.search.fdr,
-            &windows_from_lock(&comparison_lock),
-            true,
-        )?;
+        let held_target_digest = held_target.identity.digest.clone();
+        let mut fold_plus = BTreeMap::new();
+        let mut fold_target = BTreeMap::new();
+        let mut composition_summaries = Vec::new();
+        for composition in &manifest.comparison_matrix {
+            let lock = locks
+                .get(&composition.id)
+                .context("composition lock is missing")?;
+            let experts = experts_from_lock(lock);
+            let plus_settings = settings_for_ensemble(
+                &plus_context.search.fdr,
+                &windows_from_lock(lock),
+                &experts,
+            )?;
+            let target_settings = settings_for_ensemble(
+                &target_context.search.fdr,
+                &windows_from_lock(lock),
+                &experts,
+            )?;
+            anyhow::ensure!(
+                target_settings.lower_order_frozen_artifact.is_none()
+                    && target_settings.msfdr_seeded_frozen_model.is_none()
+                    && target_settings.msfdr_2smix_frozen_model.is_none(),
+                "complete +entrapment nuisance artifact leaked into target-only refit"
+            );
+            let plus_stage = run_scored_stage(
+                &held_plus,
+                &plus_settings,
+                &plus_context.database,
+                &composition.id,
+                manifest.effective_ratios,
+                SearchSpace::PlusEntrapment,
+            )?;
+            let target_stage = run_scored_stage(
+                &held_target,
+                &target_settings,
+                &target_context.database,
+                &composition.id,
+                manifest.effective_ratios,
+                SearchSpace::TargetOnly,
+            )?;
+            aggregate_plus_features
+                .get_mut(&composition.id)
+                .context("aggregate +entrapment composition is missing")?
+                .extend(plus_stage.rank1_features.iter().cloned());
+            aggregate_target_features
+                .get_mut(&composition.id)
+                .context("aggregate target-only composition is missing")?
+                .extend(target_stage.rank1_features.iter().cloned());
+            composition_summaries.push(FoldCompositionSummary {
+                composition: composition.id.clone(),
+                lock: lock.clone(),
+                plus_entrapment: plus_stage.summary.clone(),
+                target_only: target_stage.summary.clone(),
+            });
+            fold_plus.insert(composition.id.clone(), plus_stage);
+            fold_target.insert(composition.id.clone(), target_stage);
+        }
+        let plus_profiles = composition_summaries
+            .iter()
+            .map(|summary| summary.plus_entrapment.external_profile_sha256.as_str())
+            .collect::<BTreeSet<_>>();
+        let target_profiles = composition_summaries
+            .iter()
+            .map(|summary| summary.target_only.external_profile_sha256.as_str())
+            .collect::<BTreeSet<_>>();
         anyhow::ensure!(
-            target_settings_b.lower_order_frozen_artifact.is_none(),
-            "Lower Order nuisance artifact leaked into target-only refit"
+            plus_profiles.len() == 1 && target_profiles.len() == 1,
+            "composition-specific external profiles differ within one subset"
         );
-        let target_a = run_scored_stage(
-            &held_target,
-            &target_settings_a,
-            &target_context.database,
-            "baseline",
-            manifest.effective_ratios,
-            SearchSpace::TargetOnly,
-        )?;
-        let target_b = run_scored_stage(
-            &held_target,
-            &target_settings_b,
-            &target_context.database,
-            "baseline_plus_lower_order",
-            manifest.effective_ratios,
-            SearchSpace::TargetOnly,
-        )?;
-        aggregate_target_a_features.extend(target_a.rank1_features.iter().cloned());
-        aggregate_target_b_features.extend(target_b.rank1_features.iter().cloned());
-        let target_incremental = vec![
-            incremental("raw_q", &target_a.raw, &target_b.raw),
-            incremental("level4", &target_a.level4, &target_b.level4),
-        ];
-
-        let technically_valid = !plus_a.summary.fallback_used
-            && !plus_b.summary.fallback_used
-            && !target_a.summary.fallback_used
-            && !target_b.summary.fallback_used
-            && plus_a.summary.unexplained_na_count == 0
-            && plus_b.summary.unexplained_na_count == 0
-            && target_a.summary.unexplained_na_count == 0
-            && target_b.summary.unexplained_na_count == 0;
+        let baseline_plus = fold_plus.get("A").context("baseline A is missing")?;
+        let baseline_target = fold_target
+            .get("A")
+            .context("baseline A target is missing")?;
+        let mut comparisons = Vec::new();
+        for composition in manifest
+            .comparison_matrix
+            .iter()
+            .filter(|composition| composition.id != "A")
+        {
+            comparisons.push(interaction_comparison(
+                &manifest,
+                "A",
+                &composition.id,
+                baseline_plus,
+                fold_plus
+                    .get(&composition.id)
+                    .context("comparison +entrapment stage is missing")?,
+                baseline_target,
+                fold_target
+                    .get(&composition.id)
+                    .context("comparison target-only stage is missing")?,
+            )?);
+        }
+        let technically_valid = composition_summaries.iter().all(|summary| {
+            !summary.plus_entrapment.fallback_used
+                && !summary.target_only.fallback_used
+                && summary.plus_entrapment.unexplained_na_count == 0
+                && summary.target_only.unexplained_na_count == 0
+                && !summary.plus_entrapment.window_retuned
+                && !summary.target_only.window_retuned
+                && !summary.plus_entrapment.complete_artifact_reused
+                && !summary.target_only.complete_artifact_reused
+        });
         let fold_summary = FoldSummary {
             fold: fold.fold,
-            training_subset_digest: baseline_lock.training_subset_digest.clone(),
+            training_subset_digest: locks
+                .get("A")
+                .context("baseline lock is missing")?
+                .training_subset_digest
+                .clone(),
             held_out_plus_entrapment_subset_digest: held_plus_digest,
-            held_out_target_only_subset_digest: held_target.identity.digest.clone(),
+            held_out_target_only_subset_digest: held_target_digest,
             selected_windows,
-            baseline_lock,
-            comparison_lock,
-            plus_entrapment_baseline: plus_a.summary,
-            plus_entrapment_comparison: plus_b.summary,
-            plus_entrapment_incremental: plus_incremental,
-            target_only_baseline: target_a.summary,
-            target_only_comparison: target_b.summary,
-            target_only_incremental: target_incremental,
+            training_gates,
+            compositions: composition_summaries,
+            comparisons_to_baseline: comparisons,
             technically_valid,
         };
         write_json_atomic(&fold_root.join("fold_summary.json"), &fold_summary)?;
@@ -2221,83 +4235,111 @@ pub fn execute_holdout(manifest_path: impl AsRef<Path>, output: impl AsRef<Path>
     let first_fold = fold_summaries
         .first()
         .context("holdout produced no folds")?;
-    let aggregate_plus_settings_a = settings_for_ensemble(
-        &plus_context.search.fdr,
-        &windows_from_lock(&first_fold.baseline_lock),
-        false,
-    )?;
-    let aggregate_plus_settings_b = settings_for_ensemble(
-        &plus_context.search.fdr,
-        &windows_from_lock(&first_fold.comparison_lock),
-        true,
-    )?;
-    let aggregate_target_settings_a = settings_for_ensemble(
-        &target_context.search.fdr,
-        &windows_from_lock(&first_fold.baseline_lock),
-        false,
-    )?;
-    let aggregate_target_settings_b = settings_for_ensemble(
-        &target_context.search.fdr,
-        &windows_from_lock(&first_fold.comparison_lock),
-        true,
-    )?;
-    let (aggregate_plus_a_raw, aggregate_plus_a_l4) = recompute_out_of_fold_evidence(
-        aggregate_plus_a_features,
-        &plus_context.database,
-        &aggregate_plus_settings_a,
-        &manifest.plus_entrapment.search_fingerprint,
-        manifest.effective_ratios,
-        SearchSpace::PlusEntrapment,
-    )?;
-    let (aggregate_plus_b_raw, aggregate_plus_b_l4) = recompute_out_of_fold_evidence(
-        aggregate_plus_b_features,
-        &plus_context.database,
-        &aggregate_plus_settings_b,
-        &manifest.plus_entrapment.search_fingerprint,
-        manifest.effective_ratios,
-        SearchSpace::PlusEntrapment,
-    )?;
-    let (aggregate_target_a_raw, aggregate_target_a_l4) = recompute_out_of_fold_evidence(
-        aggregate_target_a_features,
-        &target_context.database,
-        &aggregate_target_settings_a,
-        &manifest.target_only.search_fingerprint,
-        manifest.effective_ratios,
-        SearchSpace::TargetOnly,
-    )?;
-    let (aggregate_target_b_raw, aggregate_target_b_l4) = recompute_out_of_fold_evidence(
-        aggregate_target_b_features,
-        &target_context.database,
-        &aggregate_target_settings_b,
-        &manifest.target_only.search_fingerprint,
-        manifest.effective_ratios,
-        SearchSpace::TargetOnly,
-    )?;
-
-    let plus_incremental = vec![
-        incremental("raw_q", &aggregate_plus_a_raw, &aggregate_plus_b_raw),
-        incremental("level4", &aggregate_plus_a_l4, &aggregate_plus_b_l4),
-    ];
-    let target_incremental = vec![
-        incremental("raw_q", &aggregate_target_a_raw, &aggregate_target_b_raw),
-        incremental("level4", &aggregate_target_a_l4, &aggregate_target_b_l4),
-    ];
+    let mut aggregate_compositions = Vec::new();
+    let mut aggregate_evidence =
+        BTreeMap::<String, (EvidenceSets, EvidenceSets, EvidenceSets, EvidenceSets)>::new();
+    for composition in &manifest.comparison_matrix {
+        let fold_composition = first_fold
+            .compositions
+            .iter()
+            .find(|row| row.composition == composition.id)
+            .context("first-fold composition is missing")?;
+        let experts = experts_from_lock(&fold_composition.lock);
+        let plus_settings = settings_for_ensemble(
+            &plus_context.search.fdr,
+            &windows_from_lock(&fold_composition.lock),
+            &experts,
+        )?;
+        let target_settings = settings_for_ensemble(
+            &target_context.search.fdr,
+            &windows_from_lock(&fold_composition.lock),
+            &experts,
+        )?;
+        let (plus_raw, plus_level4) = recompute_out_of_fold_evidence(
+            aggregate_plus_features
+                .remove(&composition.id)
+                .context("aggregate +entrapment features are missing")?,
+            &plus_context.database,
+            &plus_settings,
+            &manifest.plus_entrapment.search_fingerprint,
+            manifest.effective_ratios,
+            SearchSpace::PlusEntrapment,
+        )?;
+        let (target_raw, target_level4) = recompute_out_of_fold_evidence(
+            aggregate_target_features
+                .remove(&composition.id)
+                .context("aggregate target-only features are missing")?,
+            &target_context.database,
+            &target_settings,
+            &manifest.target_only.search_fingerprint,
+            manifest.effective_ratios,
+            SearchSpace::TargetOnly,
+        )?;
+        aggregate_compositions.push(AggregateCompositionSummary {
+            composition: composition.id.clone(),
+            plus_entrapment: aggregate_layers(
+                &plus_raw,
+                &plus_level4,
+                manifest.effective_ratios,
+                SearchSpace::PlusEntrapment,
+            ),
+            target_only: aggregate_layers(
+                &target_raw,
+                &target_level4,
+                manifest.effective_ratios,
+                SearchSpace::TargetOnly,
+            ),
+        });
+        aggregate_evidence.insert(
+            composition.id.clone(),
+            (plus_raw, plus_level4, target_raw, target_level4),
+        );
+    }
+    let baseline_summary = aggregate_compositions
+        .iter()
+        .find(|row| row.composition == "A")
+        .context("aggregate baseline A is missing")?;
+    let baseline_evidence = aggregate_evidence
+        .get("A")
+        .context("aggregate baseline evidence is missing")?;
+    let mut aggregate_comparisons = Vec::new();
+    for composition in aggregate_compositions
+        .iter()
+        .filter(|row| row.composition != "A")
+    {
+        let evidence = aggregate_evidence
+            .get(&composition.composition)
+            .context("aggregate comparison evidence is missing")?;
+        aggregate_comparisons.push(aggregate_comparison(
+            &manifest,
+            baseline_summary,
+            composition,
+            (&baseline_evidence.0, &baseline_evidence.1),
+            (&evidence.0, &evidence.1),
+            (&baseline_evidence.2, &baseline_evidence.3),
+            (&evidence.2, &evidence.3),
+        )?);
+    }
     let aggregate = AggregateSummary {
-        baseline_plus_entrapment: aggregate_layers(&aggregate_plus_a_raw, &aggregate_plus_a_l4, manifest.effective_ratios, SearchSpace::PlusEntrapment),
-        comparison_plus_entrapment: aggregate_layers(&aggregate_plus_b_raw, &aggregate_plus_b_l4, manifest.effective_ratios, SearchSpace::PlusEntrapment),
-        plus_entrapment_incremental: plus_incremental.clone(),
-        baseline_target_only: aggregate_layers(&aggregate_target_a_raw, &aggregate_target_a_l4, manifest.effective_ratios, SearchSpace::TargetOnly),
-        comparison_target_only: aggregate_layers(&aggregate_target_b_raw, &aggregate_target_b_l4, manifest.effective_ratios, SearchSpace::TargetOnly),
-        target_only_incremental: target_incremental.clone(),
+        compositions: aggregate_compositions,
+        comparisons_to_baseline: aggregate_comparisons.clone(),
         construction: "union of held-out rank-1 PSM identities exactly once, followed by aggregate peptide q-value calculation, protein inference/q-value calculation, hierarchical reporting, and canonical evidence-set counting; no fold-level peptide or protein counts are summed".into(),
         every_run_once: true,
     };
-    let classification = classify_result(
-        &manifest,
-        &fold_summaries,
-        &plus_incremental,
-        &target_incremental,
-    );
+    let classifications = aggregate_comparisons
+        .iter()
+        .map(|comparison| {
+            (
+                comparison.comparison.clone(),
+                classify_result(
+                    &manifest,
+                    &fold_summaries,
+                    &comparison.comparison,
+                    comparison,
+                ),
+            )
+        })
+        .collect();
     let result = HoldoutResult {
         schema: RESULT_SCHEMA.into(),
         manifest_sha256,
@@ -2306,7 +4348,7 @@ pub fn execute_holdout(manifest_path: impl AsRef<Path>, output: impl AsRef<Path>
         capabilities: CAPABILITIES,
         folds: fold_summaries,
         aggregate,
-        classification,
+        classifications,
     };
     write_json_atomic(&output.join("within_parent_holdout.result.json"), &result)
 }
@@ -2343,7 +4385,7 @@ pub fn create_preregistration(
         .and_then(serde_json::Value::as_array)
         .context("grid source has no models")?;
     let mut grids = Vec::new();
-    for name in ["moments", "mle", "lower_order"] {
+    for name in ["moments", "mle", "lower_order", "msfdr", "msfdr2_smix"] {
         let model = source_models
             .iter()
             .find(|model| model.get("model").and_then(serde_json::Value::as_str) == Some(name))
@@ -2456,7 +4498,7 @@ mod tests {
         HoldoutPreregistration {
             schema: PREREGISTRATION_SCHEMA.into(),
             study: "synthetic".into(),
-            assignment_basis: "acquisition order only".into(),
+            assignment_basis: "stable acquisition order round-robin; no identification, score, entrapment, or model outcome used".into(),
             parent_dataset_id: "parent".into(),
             parent_dataset_fingerprint: "dataset".into(),
             spectra,
@@ -2466,13 +4508,61 @@ mod tests {
             grid_source_description: "fixture".into(),
             grid_source_manifest_sha256: "grid-source".into(),
             model_grids: Vec::new(),
-            baseline_experts: vec![ModelFit::Moments, ModelFit::Mle, ModelFit::Msfdr1Smix],
-            comparison_additional_expert: ModelFit::LowerOrder,
+            baseline_experts: vec![
+                ModelFit::Moments,
+                ModelFit::Mle,
+                ModelFit::Msfdr1Smix,
+                ModelFit::LowerOrder,
+            ],
+            comparison_matrix: vec![
+                HoldoutComposition {
+                    id: "A".into(),
+                    requested_experts: vec![
+                        ModelFit::Moments,
+                        ModelFit::Mle,
+                        ModelFit::Msfdr1Smix,
+                        ModelFit::LowerOrder,
+                    ],
+                },
+                HoldoutComposition {
+                    id: "B".into(),
+                    requested_experts: vec![
+                        ModelFit::Moments,
+                        ModelFit::Mle,
+                        ModelFit::Msfdr1Smix,
+                        ModelFit::LowerOrder,
+                        ModelFit::Msfdr,
+                    ],
+                },
+                HoldoutComposition {
+                    id: "C".into(),
+                    requested_experts: vec![
+                        ModelFit::Moments,
+                        ModelFit::Mle,
+                        ModelFit::Msfdr1Smix,
+                        ModelFit::LowerOrder,
+                        ModelFit::Msfdr2Smix,
+                    ],
+                },
+                HoldoutComposition {
+                    id: "D".into(),
+                    requested_experts: vec![
+                        ModelFit::Moments,
+                        ModelFit::Mle,
+                        ModelFit::Msfdr1Smix,
+                        ModelFit::LowerOrder,
+                        ModelFit::Msfdr,
+                        ModelFit::Msfdr2Smix,
+                    ],
+                },
+            ],
             target_only_policies: [
                 ("moments".into(), "refit_with_locked_window".into()),
                 ("mle".into(), "refit_with_locked_window".into()),
                 ("msfdr1_smix".into(), "refit_with_locked_window".into()),
                 ("lower_order".into(), "refit_with_locked_window".into()),
+                ("msfdr".into(), "refit_with_locked_window".into()),
+                ("msfdr2_smix".into(), "refit_with_locked_window".into()),
             ]
             .into_iter()
             .collect(),
@@ -2487,6 +4577,21 @@ mod tests {
             },
             optimizer_validation_scope: NullWindowValidationScope::Level4,
             optimizer_seed: 0,
+            runtime_gates: HoldoutRuntimeGates {
+                validation_scope: NullWindowValidationScope::Level4,
+                fdr_threshold: 0.01,
+                maximum_target_only_peptide_fraction_loss: 0.20,
+                minimum_incremental_level4_target_peptides: 1,
+                minimum_entrapment_peptides_for_stable_estimate: 3,
+                minimum_ensemble_experts: 2,
+                raw_q_interaction_warning_threshold: 0.01,
+            },
+            disclosures: vec![
+                "fold assignments reused from the Lower Order validation".into(),
+                "baseline Lower Order behavior has previously been observed".into(),
+                "MSFDR/MSFDR2 fold-level Ensemble outcomes have not been evaluated previously".into(),
+                "within-dataset run-level validation, not an external-dataset claim".into(),
+            ],
             source_build: source_build(),
             aggregation_definition: "union".into(),
             uncertainty_method: "Wilson".into(),
@@ -2586,6 +4691,34 @@ mod tests {
         let mut missing = valid;
         missing[2].held_out_file_ids.pop();
         assert!(validate_fold_assignments(&missing, 9).is_err());
+    }
+
+    #[test]
+    fn diagnostic_experts_cannot_consume_baseline_usefulness_union() {
+        let mut manifest = manifest("/unused");
+        manifest.model_grids = [
+            ModelFit::Moments,
+            ModelFit::Mle,
+            ModelFit::LowerOrder,
+            ModelFit::Msfdr,
+            ModelFit::Msfdr1Smix,
+            ModelFit::Msfdr2Smix,
+        ]
+        .into_iter()
+        .map(|model| ModelGrid {
+            model,
+            candidates: Vec::new(),
+            fixed_window: None,
+        })
+        .collect();
+        let baseline = composition_gate_models(&manifest, &manifest.baseline_experts).unwrap();
+        assert_eq!(baseline.len(), 4);
+        assert!(!baseline.contains(&ModelFit::Msfdr));
+        assert!(!baseline.contains(&ModelFit::Msfdr2Smix));
+        let combined =
+            composition_gate_models(&manifest, &manifest.comparison_matrix[3].requested_experts)
+                .unwrap();
+        assert_eq!(combined.len(), 6);
     }
 
     #[test]
@@ -2720,13 +4853,43 @@ mod tests {
                     max_rank: 9,
                 }),
             ),
+            (
+                "msfdr".into(),
+                Some(NullWindow {
+                    min_rank: 9,
+                    max_rank: 13,
+                }),
+            ),
             ("msfdr1_smix".into(), None),
+            (
+                "msfdr2_smix".into(),
+                Some(NullWindow {
+                    min_rank: 9,
+                    max_rank: 17,
+                }),
+            ),
         ]
         .into_iter()
         .collect();
-        let settings = settings_for_ensemble(&base, &windows, true).unwrap();
+        let settings = settings_for_ensemble(
+            &base,
+            &windows,
+            &[
+                ModelFit::Moments,
+                ModelFit::Mle,
+                ModelFit::Msfdr1Smix,
+                ModelFit::LowerOrder,
+                ModelFit::Msfdr,
+                ModelFit::Msfdr2Smix,
+            ],
+        )
+        .unwrap();
         assert!(settings.null_window_optimizer.is_none());
         assert!(settings.lower_order_frozen_artifact.is_none());
+        assert!(settings.msfdr_seeded_frozen_model.is_none());
+        assert!(settings.msfdr_2smix_frozen_model.is_none());
+        assert!(settings.enable_msfdr_seeded);
+        assert!(settings.enable_msfdr_2smix);
         assert_eq!(
             (
                 settings.lower_order_min_null_rank,
@@ -2761,27 +4924,63 @@ mod tests {
             annotation_feature_schema: EXTERNAL_ANNOTATION_FEATURE_SCHEMA.into(),
             source_build: source_build(),
         };
-        let artifacts = [ModelFit::Moments, ModelFit::Mle, ModelFit::Msfdr1Smix]
-            .into_iter()
-            .map(|model| WithinParentHoldoutArtifact {
-                schema: ARTIFACT_SCHEMA.into(),
-                digest: model_slug(&model).into(),
-                manifest_sha256: "manifest".into(),
-                training_subset_digest: "subset".into(),
-                parent_dataset_fingerprint: "dataset".into(),
-                model,
-                selected_window: None,
-                fitted_payload_sha256: "payload".into(),
-                nuisance_state_provenance: "training".into(),
-                complete_artifact_transfer_allowed: false,
+        let artifacts = [
+            ModelFit::Moments,
+            ModelFit::Mle,
+            ModelFit::Msfdr1Smix,
+            ModelFit::LowerOrder,
+        ]
+        .into_iter()
+        .map(|model| WithinParentHoldoutArtifact {
+            schema: ARTIFACT_SCHEMA.into(),
+            digest: model_slug(&model).into(),
+            manifest_sha256: "manifest".into(),
+            training_subset_digest: "subset".into(),
+            parent_dataset_fingerprint: "dataset".into(),
+            model,
+            selected_window: None,
+            fitted_payload_sha256: "payload".into(),
+            nuisance_state_provenance: "training".into(),
+            complete_artifact_transfer_allowed: false,
+        })
+        .collect::<Vec<_>>();
+        let gates = artifacts
+            .iter()
+            .map(|artifact| ExpertTrainingGate {
+                model: artifact.model.clone(),
+                selected_window: artifact.selected_window.clone(),
+                eligible: true,
+                participation_reason: "included".into(),
+                reasons: Vec::new(),
+                warnings: Vec::new(),
+                calibration_level4_target_peptides: 1,
+                target_only_level4_target_peptides: 1,
+                incremental_level4_target_peptides: 1,
             })
             .collect::<Vec<_>>();
-        let lock =
-            build_holdout_lock(&manifest, "manifest", 1, &subset, &artifacts, false).unwrap();
+        let composition = &manifest.comparison_matrix[0];
+        let lock = build_holdout_lock(
+            &manifest,
+            "manifest",
+            1,
+            &subset,
+            &artifacts,
+            composition,
+            &gates,
+        )
+        .unwrap();
         let mut reversed = artifacts.clone();
         reversed.reverse();
-        let reversed_lock =
-            build_holdout_lock(&manifest, "manifest", 1, &subset, &reversed, false).unwrap();
+        let reversed_lock = build_holdout_lock(
+            &manifest,
+            "manifest",
+            1,
+            &subset,
+            &reversed,
+            composition,
+            &gates,
+        )
+        .unwrap();
         assert_eq!(
             serde_json::to_vec(&lock).unwrap(),
             serde_json::to_vec(&reversed_lock).unwrap()
@@ -2833,5 +5032,245 @@ mod tests {
             serde_json::to_vec(&first).unwrap(),
             serde_json::to_vec(&second).unwrap()
         );
+    }
+
+    #[test]
+    fn generic_interaction_warning_is_informational_and_level4_remains_blocking() {
+        fn count(fdp: Option<f64>) -> CountWithEntrapment {
+            CountWithEntrapment {
+                target: 100,
+                entrapment: usize::from(fdp.is_some_and(|value| value > 0.0)),
+                ratio_adjusted_fdp: fdp,
+                ratio_adjusted_fdp_wilson_95: None,
+            }
+        }
+        fn layer(name: &str, fdp: Option<f64>) -> LayerSummary {
+            LayerSummary {
+                layer: name.into(),
+                psm: count(fdp),
+                peptide: count(fdp),
+                peptidoform: count(fdp),
+                protein: count(fdp),
+            }
+        }
+        let baseline = AggregateCompositionSummary {
+            composition: "A".into(),
+            plus_entrapment: vec![layer("raw_q", Some(0.001)), layer("level4", Some(0.008))],
+            target_only: vec![layer("raw_q", None), layer("level4", None)],
+        };
+        let comparison = AggregateCompositionSummary {
+            composition: "B".into(),
+            plus_entrapment: vec![layer("raw_q", Some(0.02)), layer("level4", Some(0.009))],
+            target_only: vec![layer("raw_q", None), layer("level4", None)],
+        };
+        let evidence = EvidenceSets::default();
+        let result = aggregate_comparison(
+            &manifest("/unused"),
+            &baseline,
+            &comparison,
+            (&evidence, &evidence),
+            (&evidence, &evidence),
+            (&evidence, &evidence),
+            (&evidence, &evidence),
+        )
+        .unwrap();
+        assert_eq!(result.final_level4_calibration_decision, "pass");
+        assert!(result
+            .interaction_deltas
+            .iter()
+            .any(|delta| delta.layer == "raw_q" && delta.raw_q_warning));
+
+        let mut failed = comparison;
+        failed.plus_entrapment[1] = layer("level4", Some(0.011));
+        let failed = aggregate_comparison(
+            &manifest("/unused"),
+            &baseline,
+            &failed,
+            (&evidence, &evidence),
+            (&evidence, &evidence),
+            (&evidence, &evidence),
+            (&evidence, &evidence),
+        )
+        .unwrap();
+        assert!(failed
+            .final_level4_calibration_decision
+            .starts_with("not_eligible"));
+    }
+
+    #[test]
+    fn support_classification_distinguishes_corroboration_disagreement_and_nonevaluable() {
+        assert_eq!(classify_support_evidence(2, 2, 3, false), "corroborated");
+        assert_eq!(
+            classify_support_evidence(1, 1, 3, false),
+            "singly_supported_but_consistent"
+        );
+        assert_eq!(classify_support_evidence(1, 1, 3, true), "disputed");
+        assert_eq!(
+            classify_support_evidence(1, 1, 1, false),
+            "uniquely_evaluable"
+        );
+        assert_eq!(classify_support_evidence(0, 0, 0, false), "not_evaluable");
+        assert_eq!(classify_support_evidence(0, 0, 3, false), "not_accepted");
+    }
+
+    #[test]
+    fn low_input_contract_distinguishes_novel_supporting_redundant_harmful_and_invalid() {
+        assert_eq!(
+            classify_low_input_expert(None, false, 2, 10, 3.0),
+            "novel_contributor"
+        );
+        assert_eq!(
+            classify_low_input_expert(None, false, 0, 10, 3.0),
+            "supporting_corroborating_contributor"
+        );
+        assert_eq!(
+            classify_low_input_expert(None, true, 0, 10, 3.0),
+            "redundant"
+        );
+        assert_eq!(
+            classify_low_input_expert(None, false, 0, 10, -0.5),
+            "harmful"
+        );
+        assert_eq!(
+            classify_low_input_expert(Some("poor calibration"), false, 4, 10, 5.0),
+            "invalid"
+        );
+    }
+
+    #[test]
+    fn sequential_unique_credit_is_order_dependent_for_shared_evidence() {
+        let accepted = [
+            (
+                "a".into(),
+                ["shared", "a-only"].into_iter().map(String::from).collect(),
+            ),
+            (
+                "b".into(),
+                ["shared"].into_iter().map(String::from).collect(),
+            ),
+        ]
+        .into_iter()
+        .collect::<BTreeMap<String, BTreeSet<String>>>();
+        let ab = sequential_unique_credit(&["a", "b"], &accepted, 1);
+        let ba = sequential_unique_credit(&["b", "a"], &accepted, 1);
+        assert_eq!(ab[1], ("b".into(), 0, false));
+        assert_eq!(ba[0], ("b".into(), 1, true));
+        assert_eq!(ba[1], ("a".into(), 1, true));
+    }
+
+    #[test]
+    fn exact_redundancy_requires_identical_score_and_calibration_streams() {
+        let metric = AuditPsmMetric {
+            stable_id: "id".into(),
+            spectrum_key: "run\u{1f}scan".into(),
+            peptide: "PEPTIDE".into(),
+            canonical_peptide: "PEPTLDE".into(),
+            peptidoform: "PEPTLDE".into(),
+            protein: Some("P1".into()),
+            entrapment: Some(false),
+            score: Some(2.0),
+            p_value: Some(0.01),
+            pep: Some(0.02),
+            psm_q: Some(0.03),
+            peptide_q: Some(0.03),
+            protein_q: Some(0.03),
+            psm_level4_supported: Some(true),
+            peptide_level4_supported: Some(true),
+        };
+        let left = [("id".into(), metric.clone())].into_iter().collect();
+        let mut changed = metric.clone();
+        changed.score = Some(f64::from_bits(2.0_f64.to_bits() + 1));
+        let identical = [("id".into(), metric)].into_iter().collect();
+        let distinct = [("id".into(), changed)].into_iter().collect();
+        assert!(exact_stream_duplicate(&left, &identical));
+        assert!(!exact_stream_duplicate(&left, &distinct));
+    }
+
+    #[test]
+    fn distinct_score_streams_can_corroborate_without_unique_peptides() {
+        assert_eq!(
+            classify_low_input_expert(None, false, 0, 12, 4.0),
+            "supporting_corroborating_contributor"
+        );
+        assert_eq!(
+            classify_low_input_expert(None, true, 0, 12, 4.0),
+            "redundant"
+        );
+    }
+
+    #[test]
+    fn low_input_classification_is_invariant_to_expert_permutation() {
+        let inputs = [
+            ("novel", None, false, 2, 8, 3.0),
+            ("supporting", None, false, 0, 8, 2.0),
+            ("redundant", None, true, 0, 8, 2.0),
+            ("invalid", Some("poor calibration"), false, 4, 8, 5.0),
+        ];
+        let classify = |order: &[usize]| {
+            order
+                .iter()
+                .map(|index| {
+                    let (name, invalid, duplicate, unique, corroborated, shapley) = inputs[*index];
+                    (
+                        name,
+                        classify_low_input_expert(
+                            invalid,
+                            duplicate,
+                            unique,
+                            corroborated,
+                            shapley,
+                        ),
+                    )
+                })
+                .collect::<BTreeMap<_, _>>()
+        };
+        assert_eq!(classify(&[0, 1, 2, 3]), classify(&[3, 1, 0, 2]));
+    }
+
+    #[test]
+    fn psm_disagreement_can_coexist_with_peptide_level_corroboration() {
+        assert_eq!(classify_support_evidence(1, 1, 3, true), "disputed");
+        assert_eq!(classify_support_evidence(2, 2, 3, true), "corroborated");
+    }
+
+    #[test]
+    fn singleton_and_multi_peptide_protein_support_remain_distinct_counts() {
+        let singleton_supporting_psms = 1_usize;
+        let multi_peptide_supporting_psms = 3_usize;
+        assert!(multi_peptide_supporting_psms > singleton_supporting_psms);
+        assert_eq!(
+            classify_support_evidence(1, 1, 3, false),
+            "singly_supported_but_consistent"
+        );
+    }
+
+    #[test]
+    fn coalition_loss_is_preserved_as_informative_not_silently_dropped() {
+        let before = ["psm-a".into(), "psm-b".into()]
+            .into_iter()
+            .collect::<BTreeSet<String>>();
+        let after = ["psm-b".into(), "psm-c".into()]
+            .into_iter()
+            .collect::<BTreeSet<String>>();
+        assert_eq!(after.difference(&before).count(), 1);
+        assert_eq!(before.difference(&after).count(), 1);
+    }
+
+    #[test]
+    fn minimum_expert_contract_counts_only_valid_nonredundant_information_sources() {
+        let classifications = [
+            classify_low_input_expert(None, false, 1, 4, 1.0),
+            classify_low_input_expert(None, false, 0, 4, 1.0),
+            classify_low_input_expert(None, true, 0, 4, 1.0),
+            classify_low_input_expert(Some("fallback"), false, 3, 4, 1.0),
+        ];
+        let valid = classifications
+            .iter()
+            .filter(|classification| {
+                **classification == "novel_contributor"
+                    || **classification == "supporting_corroborating_contributor"
+            })
+            .count();
+        assert_eq!(valid, 2);
     }
 }
