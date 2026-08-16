@@ -4474,6 +4474,25 @@ fn fit_engines(
             settings.lower_order_max_null_rank,
         );
 
+        if log::log_enabled!(log::Level::Info) {
+            let mut rank1_by_charge = std::collections::BTreeMap::<u8, usize>::new();
+            for &index in &work.rank1_indices {
+                *rank1_by_charge
+                    .entry(features[index].core.charge)
+                    .or_default() += 1;
+            }
+            let mut null_by_charge = std::collections::BTreeMap::<u8, usize>::new();
+            for &(_, _, _, charge) in &lo_raw {
+                *null_by_charge.entry(charge).or_default() += 1;
+            }
+            log::info!(
+                "LO population diagnostics: stratify={:?} rank1_by_precursor_charge={:?} null_window_by_precursor_charge={:?}",
+                settings.lo_stratify,
+                rank1_by_charge,
+                null_by_charge
+            );
+        }
+
         if settings.lower_order_frozen_artifact.is_some()
             || window_ok(
                 "LowerOrder",
@@ -11451,11 +11470,17 @@ pub fn run_df_layers_with_artifacts(
 
     match &engines.lo_model {
         Some(m) => log::info!(
-            "DF fit summary: LO fallback_params=(mu={:.6}, beta={:.6})",
+            "DF fit summary: LO stratify={:?} fitted_buckets={:?} max_fitted_bucket={} fallback_params=(mu={:.6}, beta={:.6})",
+            settings.lo_stratify,
+            m.fitted_charges_sorted,
+            m.max_fitted_charge,
             m.fallback_params.0,
             m.fallback_params.1
         ),
-        None => log::warn!("DF fail-closed: LO failed to fit (no fitted charges)."),
+        None if gates.run_lo => {
+            log::warn!("DF fail-closed: requested Lower Order fit produced no fitted buckets.")
+        }
+        None => log::info!("DF fit summary: Lower Order was not requested for this stage."),
     }
     match &engines.msfdr_seeded {
         Some(m) => log_fit_ok("MSFDR seeded", m),

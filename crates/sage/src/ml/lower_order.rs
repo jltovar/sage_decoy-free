@@ -678,7 +678,9 @@ pub struct LowerOrderModel {
     // metadata (computed once at fit-time)
     pub charge_fill_mode: ChargeFillMode,
     pub fitted_charges_sorted: Vec<u8>,
-    pub max_fitted_charge: u8, // 0 means "none fitted"
+    /// Maximum fitted bucket. Bucket 0 is the valid global (unstratified)
+    /// model; emptiness is represented only by `fitted_charges_sorted`.
+    pub max_fitted_charge: u8,
 }
 
 impl LowerOrderModel {
@@ -1934,5 +1936,28 @@ mod tests {
         let mut invalid_window = artifact;
         invalid_window.null_rank_min = 1;
         assert!(LowerOrderModel::from_artifact(&invalid_window).is_err());
+    }
+
+    #[test]
+    fn global_bucket_zero_is_a_fitted_lower_order_model() {
+        let mut params_by_charge = FnvHashMap::default();
+        params_by_charge.insert(0, (-0.5029983775326773, 1.3411185619457573));
+        let model = LowerOrderModel {
+            params_by_charge,
+            fallback_params: (f64::NAN, f64::NAN),
+            charge_fill_mode: ChargeFillMode::MinimalDelta,
+            fitted_charges_sorted: vec![0],
+            max_fitted_charge: 0,
+        };
+        let artifact = model.to_artifact(6, 9, 1.0, 1.0, "NegLogE".into(), 1.85, vec![1, 1, 2]);
+        let restored = LowerOrderModel::from_artifact(&artifact).unwrap();
+        assert_eq!(restored.fitted_charges_sorted, vec![0]);
+        assert_eq!(restored.max_fitted_charge, 0);
+        assert!(restored.p_value(3.0, 0).is_finite());
+
+        let mut empty = artifact;
+        empty.params_by_charge.clear();
+        empty.fitted_charges_sorted.clear();
+        assert!(LowerOrderModel::from_artifact(&empty).is_err());
     }
 }
