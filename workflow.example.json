@@ -84,8 +84,8 @@
     },
     {
       "model": "nokoi",
-      "ensemble_participation": "excluded",
-      "ensemble_exclusion_reason": "Nokoi v1 is diagnostic-only until its portable artifact and frozen parity are complete.",
+      "ensemble_participation": "auto",
+      "ensemble_interaction_baseline": false,
       "window_optimizer": {
         "strategy": "landscape_adaptive",
         "min_rank_range": [2, 10],

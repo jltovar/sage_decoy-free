@@ -1067,12 +1067,10 @@ fn artifact_contains_model(
                             .is_some_and(|(max, min)| max >= min)
                 })
         }
-        // The current v1 Nokoi artifact is useful diagnostic evidence, but the
-        // Phase 6 audit found that it lacks fold-specific models/membership,
-        // explicit training-rule provenance, complete calibration state, and
-        // source hashes. Do not silently treat it as portable for target-only
-        // reuse or Ensemble assembly.
-        ModelFit::Nokoi => false,
+        ModelFit::Nokoi => artifacts
+            .nokoi
+            .as_ref()
+            .is_some_and(|artifact| artifact.validate_portable().is_ok()),
         ModelFit::Ensemble => false,
     }
 }
@@ -1191,6 +1189,12 @@ fn apply_fitted_artifacts(
             let artifact = artifacts.nokoi.context("Nokoi artifact is missing")?;
             fdr.nokoi_min_null_rank = Some(artifact.min_null_rank);
             fdr.nokoi_max_null_rank = Some(artifact.max_null_rank);
+            fdr.nokoi_artifact_application_mode = Some(match target_only_policy {
+                Some(TargetOnlyCalibrationPolicy::ReuseDatasetArtifact) => {
+                    sage_core::ml::nokoi::NokoiArtifactApplicationMode::SameDatasetTargetOnly
+                }
+                _ => sage_core::ml::nokoi::NokoiArtifactApplicationMode::ExactFitPopulation,
+            });
             fdr.nokoi_frozen_artifact = Some(artifact);
         }
         ModelFit::Ensemble => anyhow::bail!("use an Ensemble lock for Ensemble artifacts"),
@@ -1207,6 +1211,7 @@ fn apply_ensemble_lock(
     reuse_fitted_artifacts: bool,
     target_only_policy: Option<TargetOnlyCalibrationPolicy>,
 ) -> Result<()> {
+    fdr.nokoi_application_dataset_fingerprint = Some(dataset.fingerprint.clone());
     anyhow::ensure!(
         lock.schema_version == 6,
         "unsupported Ensemble lock schema {}; schema 6 is required for configuration-controlled rosters",
@@ -2368,6 +2373,22 @@ fn validate_artifact_reuse(
     let dataset_matches = provenance.dataset_fingerprint == dataset.fingerprint;
     let config_matches = provenance.search_config_sha256 == dataset.search_config_sha256;
     let model_matches = provenance.model == model_slug(expected_model);
+    if expected_model == &ModelFit::Nokoi {
+        let artifact = artifacts
+            .nokoi
+            .as_ref()
+            .context("Nokoi fitted artifact is missing")?;
+        artifact.validate_portable().map_err(|error| {
+            anyhow::anyhow!("Nokoi portable artifact validation failed: {error}")
+        })?;
+        anyhow::ensure!(
+            artifact.identity.dataset_id == provenance.dataset_id
+                && artifact.identity.dataset_fingerprint == provenance.dataset_fingerprint
+                && artifact.identity.fit_search_fingerprint == provenance.fit_search_fingerprint
+                && artifact.identity.candidate_id_schema == provenance.candidate_id_schema,
+            "Nokoi internal identity disagrees with fitted-artifact provenance"
+        );
+    }
     match policy {
         ArtifactReusePolicy::DatasetLocalOnly => {
             anyhow::ensure!(
@@ -2442,6 +2463,7 @@ fn stamp_fitted_artifacts(
     model: &ModelFit,
     inherited: Option<FittedArtifactProvenance>,
     fit_search_fingerprint: &str,
+    fit_analysis_fingerprint: &str,
 ) -> Result<Option<FittedArtifactProvenance>> {
     let path = output_directory.join("fitted_model_artifacts.json");
     if !path.is_file() {
@@ -2449,6 +2471,7 @@ fn stamp_fitted_artifacts(
     }
     let mut artifacts: DfRunArtifacts = serde_json::from_slice(&std::fs::read(&path)?)
         .with_context(|| format!("invalid fitted artifacts {}", path.display()))?;
+    let inherited_fit = inherited.is_some();
     let mut provenance = inherited.unwrap_or_else(|| {
         fitted_artifact_provenance(dataset, stage, model, fit_search_fingerprint)
     });
@@ -2456,6 +2479,32 @@ fn stamp_fitted_artifacts(
         .external_ms2rescore
         .as_ref()
         .map(|profiles| profiles.calibration.clone());
+    if let Some(artifact) = artifacts.nokoi.as_mut() {
+        if inherited_fit {
+            artifact.validate_portable().map_err(|error| {
+                anyhow::anyhow!("inherited Nokoi portable artifact is invalid: {error}")
+            })?;
+            anyhow::ensure!(
+                artifact.identity.dataset_id == provenance.dataset_id
+                    && artifact.identity.dataset_fingerprint == provenance.dataset_fingerprint
+                    && artifact.identity.fit_search_fingerprint
+                        == provenance.fit_search_fingerprint
+                    && artifact.identity.candidate_id_schema == provenance.candidate_id_schema,
+                "inherited Nokoi internal fit identity disagrees with inherited provenance"
+            );
+        } else {
+            artifact
+                .stamp_workflow_identity(
+                    &dataset.dataset_id,
+                    &dataset.fingerprint,
+                    fit_search_fingerprint,
+                    fit_analysis_fingerprint,
+                )
+                .map_err(|error| {
+                    anyhow::anyhow!("could not stamp portable Nokoi artifact identity: {error}")
+                })?;
+        }
+    }
     artifacts.provenance = Some(provenance.clone());
     write_json_atomic(&path, &artifacts)?;
     Ok(Some(provenance))
@@ -2758,6 +2807,7 @@ fn run_search_stage(
     let fdr = input.fdr.get_or_insert_with(FdrOptions::default);
     fdr.mode = Some(FdrMode::DecoyFree);
     fdr.model_fit = Some(model.model.clone());
+    fdr.nokoi_application_dataset_fingerprint = Some(dataset.fingerprint.clone());
     if let Some(lock) = ensemble_lock {
         anyhow::ensure!(
             model.model == ModelFit::Ensemble,
@@ -3037,6 +3087,12 @@ fn run_search_stage(
             .as_ref()
             .context("fitted workflow stage has no candidate-pool provenance")?
             .search_fingerprint
+            .as_str(),
+        record
+            .candidate_pool
+            .as_ref()
+            .context("fitted workflow stage has no candidate-pool provenance")?
+            .analysis_fingerprint
             .as_str(),
     )?;
     record.artifact_fit_dataset_fingerprint = stamped
@@ -4287,9 +4343,11 @@ mod tests {
         }
     }
     use sage_core::ml::nokoi::{
-        LogisticRegression, NokoiArtifact, NokoiCalibrationPoint, NokoiConfig, NokoiNormalization,
-        NOKOI_FEATURE_SCHEMA,
+        fit_nokoi_artifact_with_metadata, LogisticRegression, NokoiArtifact,
+        NokoiArtifactApplicationMode, NokoiCalibrationPoint, NokoiConfig, NokoiFitMetadata,
+        NokoiNormalization, NOKOI_FEATURE_SCHEMA,
     };
+    use sage_core::scoring::FeatureCore;
     use std::time::{SystemTime, UNIX_EPOCH};
 
     fn test_directory(name: &str) -> PathBuf {
@@ -4303,6 +4361,77 @@ mod tests {
         ));
         std::fs::create_dir_all(&path).unwrap();
         path
+    }
+
+    fn portable_nokoi_artifacts() -> DfRunArtifacts {
+        let mut features = Vec::new();
+        let mut stable_ids = Vec::new();
+        for index in 0..300 {
+            let rank = if index < 75 {
+                1
+            } else {
+                2 + (index % 3) as u32
+            };
+            features.push(
+                FeatureCore {
+                    spec_id: format!("scan={index}"),
+                    file_id: index % 9,
+                    rank,
+                    label: 1,
+                    expmass: 500.0 + index as f32 / 100.0,
+                    charge: 2 + (index % 3) as u8,
+                    peptide_len: 8 + index % 10,
+                    hyperscore: if rank == 1 {
+                        80.0
+                    } else {
+                        8.0 + (index % 37) as f64
+                    },
+                    delta_next: (index % 29) as f64 / 10.0,
+                    matched_peaks: 5 + (index % 20) as u32,
+                    matched_intensity_pct: 0.1 + (index % 80) as f32 / 100.0,
+                    longest_y_pct: 0.1 + (index % 70) as f32 / 100.0,
+                    ms2_intensity: 1000.0 + index as f32,
+                    lo_spectrum_candidate_count: 100 + (index % 20) as u32,
+                    ..FeatureCore::default()
+                }
+                .to_df(),
+            );
+            stable_ids.push(format!("workflow-nokoi-{index:04}"));
+        }
+        let null_indices = features
+            .iter()
+            .enumerate()
+            .filter_map(|(index, feature)| (feature.core.rank > 1).then_some(index))
+            .collect::<Vec<_>>();
+        let config = NokoiConfig {
+            enabled: true,
+            epochs: 30,
+            patience: 4,
+            l1_lambda_steps: 3,
+            ..NokoiConfig::default()
+        };
+        let fitted = fit_nokoi_artifact_with_metadata(
+            &features,
+            &config,
+            2,
+            4,
+            5,
+            |feature| feature.core.rank == 1,
+            &null_indices,
+            NokoiFitMetadata {
+                stable_ids: &stable_ids,
+                positive_class_rule: "synthetic rank-1 positive",
+                positive_top_fraction: 0.25,
+                positive_threshold: 50.0,
+                null_purification_rule: "synthetic ranks 2-4",
+                null_purification_factor: 0.25,
+            },
+        )
+        .unwrap();
+        DfRunArtifacts {
+            nokoi: Some(fitted.artifact),
+            ..DfRunArtifacts::default()
+        }
     }
 
     fn peptide(mut index: usize) -> String {
@@ -4753,6 +4882,7 @@ mod tests {
             &ModelFit::LowerOrder,
             None,
             "search-fingerprint",
+            "analysis-fingerprint",
         )
         .unwrap();
         let restored: DfRunArtifacts = serde_json::from_slice(
@@ -5141,6 +5271,16 @@ mod tests {
             &model,
             "test-search-fingerprint",
         ));
+        if let Some(artifact) = artifacts.nokoi.as_mut() {
+            artifact
+                .stamp_workflow_identity(
+                    &dataset.dataset_id,
+                    &dataset.fingerprint,
+                    "test-search-fingerprint",
+                    "test-analysis-fingerprint",
+                )
+                .unwrap();
+        }
         let artifact_path = directory.join("artifacts.json");
         write_json_atomic(&artifact_path, &artifacts).unwrap();
         let calibration = directory.join("calibration.tsv");
@@ -5162,7 +5302,13 @@ mod tests {
             external_profile_identity_sha256: None,
             external_profile_calibration: None,
         };
-        let lock = build_ensemble_lock(&manifest, "manifest-hash", &dataset, &[expert]).unwrap();
+        let lock = build_ensemble_lock(
+            &manifest,
+            "manifest-hash",
+            &dataset,
+            std::slice::from_ref(&expert),
+        )
+        .unwrap();
         assert_eq!(lock.requested_roster, vec![model_slug(&model)]);
         assert_eq!(lock.actual_roster, lock.requested_roster);
         assert!(lock.experts[0].enabled);
@@ -5181,13 +5327,32 @@ mod tests {
         match model {
             ModelFit::Msfdr => assert_eq!(fdr.enable_msfdr_seeded, Some(true)),
             ModelFit::Msfdr2Smix => assert_eq!(fdr.enable_msfdr_2smix, Some(true)),
+            ModelFit::Nokoi => assert_eq!(fdr.enable_nokoi, Some(true)),
             _ => unreachable!(),
         }
+        manifest.models[0].ensemble_participation = EnsembleParticipation::Excluded;
+        manifest.models[0].ensemble_exclusion_reason = Some("explicit test exclusion".into());
+        let excluded = build_ensemble_lock(
+            &manifest,
+            "manifest-hash",
+            &dataset,
+            std::slice::from_ref(&expert),
+        )
+        .unwrap();
+        assert!(excluded.requested_roster.is_empty());
+        assert!(excluded.actual_roster.is_empty());
+        assert_eq!(
+            excluded
+                .explicit_exclusions
+                .get(model_slug(&model))
+                .map(String::as_str),
+            Some("explicit test exclusion")
+        );
         std::fs::remove_dir_all(directory).unwrap();
     }
 
     #[test]
-    fn repaired_msfdr_experts_vote_when_json_selected_and_technically_valid() {
+    fn repaired_secondary_experts_vote_when_json_selected_and_technically_valid() {
         assert_secondary_model_votes(
             "msfdr-configured-voter",
             ModelFit::Msfdr,
@@ -5239,6 +5404,15 @@ mod tests {
                 ..DfRunArtifacts::default()
             },
         );
+        assert_secondary_model_votes(
+            "nokoi-v2-configured-voter",
+            ModelFit::Nokoi,
+            NullWindow {
+                min_rank: 2,
+                max_rank: 12,
+            },
+            portable_nokoi_artifacts(),
+        );
     }
 
     #[test]
@@ -5246,6 +5420,8 @@ mod tests {
         let artifact = NokoiArtifact {
             schema_version: 1,
             model_version: "sage-nokoi-crossfit-portable-v1".into(),
+            identity: Default::default(),
+            feature_contract: Default::default(),
             feature_schema: NOKOI_FEATURE_SCHEMA
                 .iter()
                 .map(|name| (*name).to_string())
@@ -5256,11 +5432,14 @@ mod tests {
             k_folds: 5,
             fold_sizes: vec![10; 5],
             config: NokoiConfig::default(),
+            lambda_grid: Vec::new(),
+            fold_models: Vec::new(),
             selected_l1_lambda: 0.1,
             final_model: LogisticRegression {
                 weights: vec![0.0; NOKOI_FEATURE_SCHEMA.len()],
                 bias: 0.0,
             },
+            final_optimization: Default::default(),
             normalization: NokoiNormalization {
                 medians: vec![0.0; NOKOI_FEATURE_SCHEMA.len()],
                 means: vec![0.0; NOKOI_FEATURE_SCHEMA.len()],
@@ -5268,6 +5447,8 @@ mod tests {
             },
             null_scores_oof: vec![0.5; 50],
             development_pi0: 1.0,
+            calibration_contract: Default::default(),
+            grenander_blocks: Vec::new(),
             pep_calibration: vec![
                 NokoiCalibrationPoint {
                     p_value: 0.0,
@@ -5280,7 +5461,12 @@ mod tests {
             ],
             positive_training_count: 100,
             negative_training_count: 100,
+            training_contract: Default::default(),
+            training_completed: false,
+            training_fallback_used: false,
+            feature_selection_state: Vec::new(),
             reference_candidate_counts: vec![100; 50],
+            integrity: Default::default(),
         };
         let artifacts = DfRunArtifacts {
             nokoi: Some(artifact),
@@ -5289,6 +5475,103 @@ mod tests {
         assert!(!artifact_contains_model(&artifacts, &ModelFit::Nokoi));
         let mut fdr = FdrOptions::default();
         assert!(apply_fitted_artifacts(&mut fdr, &ModelFit::Nokoi, artifacts, true, None).is_err());
+    }
+
+    #[test]
+    fn nokoi_v2_is_portable_and_target_policy_is_explicit() {
+        let artifacts = portable_nokoi_artifacts();
+        assert!(artifact_contains_model(&artifacts, &ModelFit::Nokoi));
+
+        let mut same_pool = FdrOptions::default();
+        apply_fitted_artifacts(
+            &mut same_pool,
+            &ModelFit::Nokoi,
+            artifacts.clone(),
+            false,
+            None,
+        )
+        .unwrap();
+        assert_eq!(
+            same_pool.nokoi_artifact_application_mode,
+            Some(NokoiArtifactApplicationMode::ExactFitPopulation)
+        );
+
+        let mut target_reuse = FdrOptions::default();
+        apply_fitted_artifacts(
+            &mut target_reuse,
+            &ModelFit::Nokoi,
+            artifacts,
+            false,
+            Some(TargetOnlyCalibrationPolicy::ReuseDatasetArtifact),
+        )
+        .unwrap();
+        assert_eq!(
+            target_reuse.nokoi_artifact_application_mode,
+            Some(NokoiArtifactApplicationMode::SameDatasetTargetOnly)
+        );
+    }
+
+    #[test]
+    fn workflow_stamps_nokoi_v2_internal_and_outer_identity_together() {
+        let directory = test_directory("nokoi-v2-stamping");
+        write_json_atomic(
+            &directory.join("fitted_model_artifacts.json"),
+            &portable_nokoi_artifacts(),
+        )
+        .unwrap();
+        let dataset = DatasetIdentity {
+            schema_version: 1,
+            dataset_id: "dataset".into(),
+            fingerprint: "dataset-fingerprint".into(),
+            target_fasta_sha256: "target".into(),
+            spectra_sha256: vec!["spectra".into()],
+            search_config_sha256: "config".into(),
+        };
+        stamp_fitted_artifacts(
+            &directory,
+            &dataset,
+            "optimized",
+            &ModelFit::Nokoi,
+            None,
+            "search-fingerprint",
+            "analysis-fingerprint",
+        )
+        .unwrap();
+        let restored: DfRunArtifacts = serde_json::from_slice(
+            &std::fs::read(directory.join("fitted_model_artifacts.json")).unwrap(),
+        )
+        .unwrap();
+        validate_artifact_reuse(
+            &restored,
+            &dataset,
+            &ArtifactReusePolicy::DatasetLocalOnly,
+            &ModelFit::Nokoi,
+            Some("search-fingerprint"),
+        )
+        .unwrap();
+        let artifact = restored.nokoi.as_ref().unwrap();
+        artifact.validate_portable().unwrap();
+        assert_eq!(
+            artifact.identity.fit_analysis_fingerprint,
+            "analysis-fingerprint"
+        );
+        let other_dataset = DatasetIdentity {
+            schema_version: 1,
+            dataset_id: "other-dataset".into(),
+            fingerprint: "other-dataset-fingerprint".into(),
+            target_fasta_sha256: "other-target".into(),
+            spectra_sha256: vec!["other-spectra".into()],
+            search_config_sha256: dataset.search_config_sha256.clone(),
+        };
+        assert!(validate_artifact_reuse(
+            &restored,
+            &other_dataset,
+            &ArtifactReusePolicy::DatasetLocalOnly,
+            &ModelFit::Nokoi,
+            Some("search-fingerprint"),
+        )
+        .is_err());
+        std::fs::remove_dir_all(directory).unwrap();
     }
 
     #[test]

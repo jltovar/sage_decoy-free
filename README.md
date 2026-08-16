@@ -174,7 +174,7 @@ slightly exceeded 1%; this does not invalidate parity, but it prevents a broader
 | Lower Order | Selectable Ensemble voter after dataset-local optimization. Target-only supports `refit_with_locked_window` only; cross-space `reuse_dataset_artifact` is unsupported. |
 | MSFDR | Repaired, selectable Ensemble voter after dataset-local optimization and technical validation. |
 | MSFDR2-SMIX | Repaired, selectable Ensemble voter after dataset-local optimization and technical validation. |
-| Nokoi | Portable artifact and frozen parity are incomplete; diagnostic-only and excluded from Ensemble. |
+| Nokoi | Selectable Ensemble voter after deterministic dataset-local fitting and portable-artifact v2 technical validation. |
 | Ensemble | Optional; JSON selects the requested voters, technical fail-closed checks select the actual roster, and statistical validation measurements remain nonblocking diagnostics. |
 
 Release evaluation has three states:
@@ -440,8 +440,9 @@ dataset. Direct Ensemble mode uses static flags and does not construct a provena
 workflow roster. Use [`workflow.example.json`](workflow.example.json) for independently optimized
 dataset-local artifacts, technical fail-closed validation, and requested/actual roster provenance.
 
-The example disables Nokoi because its implementation and portable artifact repair remain
-incomplete. Statistical validation diagnostics do not select the other Ensemble voters.
+The example requests Nokoi as a normal voter. Its deterministic portable v2 artifact must pass the
+same technical fail-closed checks as every other requested voter; statistical validation
+diagnostics do not select Ensemble voters.
 
 ```json
 {
@@ -550,7 +551,7 @@ incomplete. Statistical validation diagnostics do not select the other Ensemble 
     "enable_msfdr_seeded": true,
     "enable_msfdr_1smix": true,
     "enable_msfdr_2smix": true,
-    "enable_nokoi": false,
+    "enable_nokoi": true,
 
     "ensemble_p_combiner": "second_best",
     "ensemble_cauchy_penalty": 1.0224,
@@ -566,7 +567,7 @@ incomplete. Statistical validation diagnostics do not select the other Ensemble 
     "ensemble_weight_msfdr_seeded": 1.0,
     "ensemble_weight_msfdr_1smix": 1.0,
     "ensemble_weight_msfdr_2smix": 1.0,
-    "ensemble_weight_nokoi": 0.0,
+    "ensemble_weight_nokoi": 1.0,
 
     "physical_rescue": {
       "rt_mode": "bounded_aux",
@@ -825,9 +826,11 @@ NOKOI uses lower-ranked null evidence and a rank-1 positive training class.  The
 Direct Ensemble mode combines the expert streams enabled in the search JSON. Explicit single-model
 modes ignore these enable flags because the selected model is mandatory and fails closed if it
 cannot produce a valid stream. The defaults below describe direct-search configuration only; they
-do not override `sage workflow` participation policy. The workflow automatically excludes declared
-deferred experts and applies artifact, parity, calibration, transfer, fallback, and yield gates
-before it writes an evaluable `ensemble.lock.json`.
+do not override `sage workflow` participation policy. The workflow records the requested JSON
+roster separately from the actual technically valid roster. Artifact/provenance integrity,
+supported target-only state, nonfallback finite fitted state, and duplicate-vote checks fail
+closed; parity, calibration, transfer, overlap, holdout, and yield measurements are nonblocking
+diagnostics and do not select voters.
 
 | Key | Type | Current default | Notes |
 |---|---:|---:|---|
@@ -1125,10 +1128,14 @@ controls.
 ### NOKOI
 
 NOKOI uses a cross-fit classifier-like approach with lower-rank null evidence and high-scoring
-rank-1 positives. Its current v1 artifact does not contain enough state for portable frozen reuse,
-and its frozen parity did not pass. The workflow therefore treats Nokoi as diagnostic-only and
-excludes it from production Ensemble participation rather than silently retraining it under reuse
-semantics.
+rank-1 positives. Portable artifact v2 stores the complete feature, fold, model, sampling,
+normalization, lambda-evaluation, convergence, empirical-null, pi0, Grenander, p-to-PEP,
+candidate-count, and integrity state needed for scoring without retraining. Stable candidate
+identities determine sampling and folds, numeric artifact state uses exact hexadecimal IEEE-754
+bits, and absolute paths do not affect identity.
+Wrong schemas, dimensions, windows, populations, provenance, nonfinite/nonmonotone calibration, or
+hash mismatches fail closed. Nokoi is a selectable continuous PSM p-value/PEP Ensemble voter; it has
+no statistical admission requirement beyond JSON selection and technical validity.
 
 ### Ensemble
 
@@ -1174,10 +1181,9 @@ The completed validation establishes engineering behavior, not general statistic
    must not be described as proof of calibrated 1% protein FDR.
 4. A matched TDC benchmark is still absent from the final release evidence. The repository therefore
    cannot yet evaluate whether Decoy-Free should replace TDC as a statistical default.
-5. Lower Order supports target-only `refit_with_locked_window` only. Lower Order, seeded MSFDR, and
-   MSFDR2-SMIX are selectable voters subject to technical fail-closed validation. Nokoi remains
-   excluded because its implementation and portable artifact are incomplete. Statistical-default
-   eligibility remains a separate, unevaluated question.
+5. Lower Order supports target-only `refit_with_locked_window` only. Lower Order, seeded MSFDR,
+   MSFDR2-SMIX, and Nokoi are selectable voters subject to technical fail-closed validation.
+   Statistical-default eligibility remains a separate, unevaluated question.
 6. The present evidence does not select a universally best Decoy-Free model. Model suitability must
    be assessed within each dataset using entrapment calibration and matched comparisons.
 
