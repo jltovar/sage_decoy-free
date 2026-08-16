@@ -1372,6 +1372,17 @@ fn apply_window(options: &mut FdrOptions, model: &ModelFit, window: &Option<Null
     }
 }
 
+fn resolved_expert_window(model: &ModelFit, window: &Option<NullWindow>) -> Option<NullWindow> {
+    if *model == ModelFit::Msfdr1Smix {
+        Some(NullWindow {
+            min_rank: 1,
+            max_rank: 1,
+        })
+    } else {
+        window.clone()
+    }
+}
+
 fn artifact_contains_model(
     artifacts: &sage_core::decoy_free_fdr::DfRunArtifacts,
     model: &ModelFit,
@@ -4449,7 +4460,7 @@ pub fn execute_workflow(
                     .and_then(|record| record.ms2rescore_annotation_cache.as_ref());
                 Ok(CompletedExpert {
                     model: locked_model.model.clone(),
-                    window: locked_model.window.clone(),
+                    window: resolved_expert_window(&locked_model.model, &locked_model.window),
                     optimized_artifacts: optimized_artifact.clone(),
                     optimized_results: optimized.results.clone(),
                     ms2rescore_artifacts: ms2_artifact.is_file().then_some(ms2_artifact.clone()),
@@ -5902,6 +5913,13 @@ mod tests {
         assert_eq!(fdr.moments_max_null_rank, Some(18));
         assert!(fdr.moments_frozen_parameters.is_some());
         assert!(fdr.external_ms2rescore_frozen_profiles.is_some());
+    }
+
+    #[test]
+    fn msfdr1_smix_lock_window_is_explicitly_fixed_at_rank_one() {
+        let window = resolved_expert_window(&ModelFit::Msfdr1Smix, &None).unwrap();
+        assert_eq!(window.min_rank, 1);
+        assert_eq!(window.max_rank, 1);
     }
 
     #[test]
