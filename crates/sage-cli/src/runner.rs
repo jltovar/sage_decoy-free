@@ -3,7 +3,8 @@ use super::output::SageResults;
 use super::telemetry;
 use crate::candidate_pool::{
     analysis_fingerprint, inspect_compatible_pool, load_pool, load_required_pool, manifest_path,
-    pool_directory, search_fingerprint, write_pool, CandidatePoolRequest, CandidatePoolUsage,
+    pool_directory, relocation_provenance, search_fingerprint, write_pool, CandidatePoolRequest,
+    CandidatePoolUsage,
 };
 use crate::external_feature_cache::{ExternalAnnotationCacheRequest, ExternalAnnotationCacheUsage};
 use crate::external_features::maybe_add_external_features;
@@ -150,6 +151,12 @@ impl Runner {
             request.required_rank_depth,
             &self.database,
         )?;
+        let (
+            original_source_uris,
+            current_source_uris,
+            portable_identity_valid,
+            relocation_detected,
+        ) = relocation_provenance(&manifest.search_fingerprint, &search);
         Ok((
             CandidatePoolUsage {
                 search_fingerprint: search.digest,
@@ -159,6 +166,10 @@ impl Runner {
                 reused: true,
                 candidate_count: manifest.candidate_count,
                 retained_rank_depth: manifest.capabilities.retained_rank_depth,
+                original_source_uris,
+                current_source_uris,
+                portable_identity_valid,
+                relocation_detected,
             },
             features,
         ))
@@ -745,6 +756,12 @@ impl Runner {
                     request.required_rank_depth,
                     &self.database,
                 )?;
+                let (
+                    original_source_uris,
+                    current_source_uris,
+                    portable_identity_valid,
+                    relocation_detected,
+                ) = relocation_provenance(&manifest.search_fingerprint, search);
                 pool_was_loaded = true;
                 log::info!(
                     "candidate pool: reused {} candidates from {} (fingerprint={}, ranks=1..={})",
@@ -761,6 +778,10 @@ impl Runner {
                     reused: true,
                     candidate_count: manifest.candidate_count,
                     retained_rank_depth: manifest.capabilities.retained_rank_depth,
+                    original_source_uris,
+                    current_source_uris,
+                    portable_identity_valid,
+                    relocation_detected,
                 });
                 SageResults {
                     features,
@@ -848,6 +869,18 @@ impl Runner {
                         reused: false,
                         candidate_count: manifest.candidate_count,
                         retained_rank_depth: manifest.capabilities.retained_rank_depth,
+                        original_source_uris: search
+                            .spectra
+                            .iter()
+                            .map(|spectrum| spectrum.source.clone())
+                            .collect(),
+                        current_source_uris: search
+                            .spectra
+                            .iter()
+                            .map(|spectrum| spectrum.source.clone())
+                            .collect(),
+                        portable_identity_valid: true,
+                        relocation_detected: false,
                     });
                     anyhow::ensure!(
                         request.required_rank_depth <= manifest.capabilities.retained_rank_depth,

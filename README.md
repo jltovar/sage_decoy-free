@@ -98,6 +98,13 @@ statistical settings create a new analysis fingerprint and refit the fixed candi
 the FASTA, spectra, digestion, modifications, tolerances, scoring, preprocessing, or retained rank
 depth create a different search fingerprint and therefore a different pool.
 
+Candidate pools are portable across filesystem relocation. The manifest retains both its original
+spectrum URIs and the current resolved URIs as provenance, but absolute path spelling is not
+scientific identity. Reuse instead requires the same portable fingerprint digest, FASTA hash,
+ordered spectrum ordinals and content hashes, normalized search configuration, candidate schema,
+rank depth, candidate count, and payload hash. A macOS path and a WSL path can therefore reference
+the same pool content; reordering or changing any input still fails closed.
+
 The optimizer has four interfaces:
 
 - `window_optimizer.strategy: "landscape_adaptive"` is the recommended new-dataset mode. It uses
@@ -133,12 +140,19 @@ generated; corrupt, incomplete, duplicate, or mismatched caches fail closed.
 `require_existing_annotation_cache` defaults to `false`, preserving ordinary from-scratch
 generation after a genuine cache miss. Set it to `true` for exact cache-only replay: every required
 +entrapment and target-only cache must pass schema, identity, population, stable-ID, payload, and
-durable package/model-provenance checks before execution. Any miss fails before candidate export,
-temporary-file creation, Python, the wrapper, MS2PIP, or DeepLC. This option is independent of
-`require_existing_candidate_pool`; enable both for a completely cache-only workflow. In strict
-mode, `workflow --plan-only` performs the same read-only resource preflight without creating the
-workflow output root. The execution control is recorded in workflow provenance but is excluded
-from search, candidate-pool, and annotation identities.
+durable package/model-provenance checks. Annotation identity includes the preliminary calibration
+stream, so preflight has two phases. Static `workflow --plan-only` validates the immutable inputs,
+pool, cache root, and catalog without fitting; model/window-dependent stages are explicitly
+reported as `deferred_until_calibration`, never as cache hits. After native Rust optimization and
+preliminary calibration, stage-local preflight derives the exact annotation fingerprint and
+requires that precise cache before any candidate export, temporary-file creation, Python, wrapper,
+MS2PIP, or DeepLC invocation. A different cache in the same root is never substituted.
+
+This option is independent of `require_existing_candidate_pool`; enable both for cache-only
+execution. Such an execution can still perform native model fitting before discovering that an
+exact model/window-specific annotation cache is absent. Strict mode guarantees zero annotation
+generation fallback, not zero native calibration work. The execution control is recorded in
+workflow provenance but is excluded from search, candidate-pool, and annotation identities.
 
 The target-only FASTA has a different candidate population and therefore uses a distinct candidate
 pool and, when requested, a distinct annotation cache.

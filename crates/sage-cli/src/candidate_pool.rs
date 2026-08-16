@@ -97,6 +97,19 @@ pub struct CandidatePoolUsage {
     pub reused: bool,
     pub candidate_count: usize,
     pub retained_rank_depth: usize,
+    /// Source locations recorded when the pool was created. These are
+    /// provenance only and are deliberately excluded from portable identity.
+    #[serde(default)]
+    pub original_source_uris: Vec<String>,
+    /// Source locations resolved by the current workflow invocation.
+    #[serde(default)]
+    pub current_source_uris: Vec<String>,
+    /// Whether every equality-defining portable search component matched.
+    #[serde(default)]
+    pub portable_identity_valid: bool,
+    /// True when portable identity matched but one or more source URIs moved.
+    #[serde(default)]
+    pub relocation_detected: bool,
 }
 
 /// Verify the durable identity and payload integrity recorded in a completed
@@ -368,8 +381,7 @@ pub fn inspect_compatible_pool(
         )
     })?;
     if manifest.schema_version != CANDIDATE_POOL_SCHEMA_VERSION
-        || manifest.search_fingerprint.digest != expected.digest
-        || manifest.search_fingerprint != *expected
+        || !portable_search_fingerprint_matches(&manifest.search_fingerprint, expected)
         || manifest.capabilities.retained_rank_depth < required_rank_depth
         || manifest.stable_candidate_id_schema != CANDIDATE_ID_SCHEMA
     {
@@ -380,6 +392,66 @@ pub fn inspect_compatible_pool(
         return Ok(None);
     }
     Ok(Some(manifest))
+}
+
+/// Compare the equality-defining, portable search identity. Source URIs are
+/// retained in both records for auditability, but content hashes and ordinals
+/// establish spectrum identity across filesystem relocation.
+pub fn portable_search_fingerprint_matches(
+    stored: &SearchFingerprint,
+    current: &SearchFingerprint,
+) -> bool {
+    let required_scalars_present = !stored.digest.is_empty()
+        && !stored.fasta_sha256.is_empty()
+        && !stored.normalized_search_sha256.is_empty()
+        && !stored.candidate_schema.is_empty()
+        && !current.digest.is_empty()
+        && !current.fasta_sha256.is_empty()
+        && !current.normalized_search_sha256.is_empty()
+        && !current.candidate_schema.is_empty();
+    required_scalars_present
+        && stored.schema_version == current.schema_version
+        && stored.digest == current.digest
+        && stored.fasta_sha256 == current.fasta_sha256
+        && stored.normalized_search_sha256 == current.normalized_search_sha256
+        && stored.retained_rank_depth == current.retained_rank_depth
+        && stored.candidate_schema == current.candidate_schema
+        && stored.spectra.len() == current.spectra.len()
+        && stored
+            .spectra
+            .iter()
+            .zip(&current.spectra)
+            .all(|(left, right)| {
+                !left.sha256.is_empty()
+                    && !right.sha256.is_empty()
+                    && left.ordinal == right.ordinal
+                    && left.sha256 == right.sha256
+            })
+}
+
+pub fn relocation_provenance(
+    stored: &SearchFingerprint,
+    current: &SearchFingerprint,
+) -> (Vec<String>, Vec<String>, bool, bool) {
+    let original_source_uris = stored
+        .spectra
+        .iter()
+        .map(|spectrum| spectrum.source.clone())
+        .collect::<Vec<_>>();
+    let current_source_uris = current
+        .spectra
+        .iter()
+        .map(|spectrum| spectrum.source.clone())
+        .collect::<Vec<_>>();
+    let portable_identity_valid = portable_search_fingerprint_matches(stored, current);
+    let relocation_detected =
+        portable_identity_valid && original_source_uris != current_source_uris;
+    (
+        original_source_uris,
+        current_source_uris,
+        portable_identity_valid,
+        relocation_detected,
+    )
 }
 
 pub fn write_pool(
@@ -487,10 +559,27 @@ pub fn load_pool_entries(
         decoded.records.len(),
         manifest.candidate_count
     );
+    let decoded_spectrum_count = decoded
+        .records
+        .iter()
+        .map(|record| (record.core.file_id, record.core.spec_id.as_str()))
+        .collect::<HashSet<_>>()
+        .len();
+    anyhow::ensure!(
+        decoded_spectrum_count == manifest.spectrum_count,
+        "candidate-pool spectrum count mismatch: payload={} manifest={}",
+        decoded_spectrum_count,
+        manifest.spectrum_count
+    );
 
     let mut ids = HashSet::with_capacity(decoded.records.len());
     let mut entries = Vec::with_capacity(decoded.records.len());
     for mut record in decoded.records {
+        anyhow::ensure!(
+            expected.spectra.is_empty() || (record.core.file_id as usize) < expected.spectra.len(),
+            "candidate-pool file ordinal {} is outside the portable spectrum identity",
+            record.core.file_id
+        );
         let peptide_idx = PeptideIx(record.peptide_index);
         anyhow::ensure!(
             (record.peptide_index as usize) < db.peptides.len(),
@@ -656,6 +745,10 @@ mod tests {
             reused: true,
             candidate_count: manifest.candidate_count,
             retained_rank_depth: manifest.capabilities.retained_rank_depth,
+            original_source_uris: Vec::new(),
+            current_source_uris: Vec::new(),
+            portable_identity_valid: true,
+            relocation_detected: false,
         };
         verify_usage(&usage).unwrap();
         assert!(inspect_compatible_pool(&directory, &fingerprint, 50)
@@ -671,6 +764,123 @@ mod tests {
         std::fs::write(directory.join(manifest.payload_file), b"corrupt").unwrap();
         assert!(verify_usage(&usage).is_err());
         assert!(inspect_compatible_pool(&directory, &fingerprint, 18)
+            .unwrap()
+            .is_none());
+        std::fs::remove_dir_all(root).unwrap();
+    }
+
+    fn portable_test_fingerprint(root: &str) -> SearchFingerprint {
+        SearchFingerprint {
+            schema_version: CANDIDATE_POOL_SCHEMA_VERSION,
+            digest: "portable-search".into(),
+            fasta_sha256: "fasta-content".into(),
+            spectra: vec![
+                SpectrumFingerprint {
+                    ordinal: 0,
+                    source: format!("file://{root}/first.mzML"),
+                    sha256: "first-content".into(),
+                },
+                SpectrumFingerprint {
+                    ordinal: 1,
+                    source: format!("file://{root}/second.mzML"),
+                    sha256: "second-content".into(),
+                },
+            ],
+            normalized_search_sha256: "search-configuration".into(),
+            retained_rank_depth: 50,
+            candidate_schema: CANDIDATE_ID_SCHEMA.into(),
+        }
+    }
+
+    #[test]
+    fn portable_pool_identity_ignores_only_source_relocation() {
+        let macos = portable_test_fingerprint("/Users/example/data");
+        let mut wsl = portable_test_fingerprint("/mnt/d/data");
+        assert!(portable_search_fingerprint_matches(&macos, &wsl));
+        let (original, current, valid, relocated) = relocation_provenance(&macos, &wsl);
+        assert!(valid);
+        assert!(relocated);
+        assert_ne!(original, current);
+
+        // Filenames are provenance as well: identical ordered content is the
+        // portable identity, not path spelling or the final path component.
+        wsl.spectra[0].source = "file:///mnt/e/renamed-one.raw".into();
+        wsl.spectra[1].source = "file:///mnt/e/renamed-two.raw".into();
+        assert!(portable_search_fingerprint_matches(&macos, &wsl));
+
+        let mut changed = wsl.clone();
+        changed.spectra[0].sha256 = "changed-content".into();
+        assert!(!portable_search_fingerprint_matches(&macos, &changed));
+
+        let mut reordered = wsl.clone();
+        reordered.spectra.swap(0, 1);
+        assert!(!portable_search_fingerprint_matches(&macos, &reordered));
+
+        let mut removed = wsl.clone();
+        removed.spectra.pop();
+        assert!(!portable_search_fingerprint_matches(&macos, &removed));
+
+        let mut added = wsl.clone();
+        added.spectra.push(SpectrumFingerprint {
+            ordinal: 2,
+            source: "file:///mnt/e/third.mzML".into(),
+            sha256: "third-content".into(),
+        });
+        assert!(!portable_search_fingerprint_matches(&macos, &added));
+
+        let mut fasta = wsl.clone();
+        fasta.fasta_sha256 = "different-fasta".into();
+        assert!(!portable_search_fingerprint_matches(&macos, &fasta));
+
+        let mut search = wsl.clone();
+        search.normalized_search_sha256 = "different-search".into();
+        assert!(!portable_search_fingerprint_matches(&macos, &search));
+
+        let mut rank = wsl.clone();
+        rank.retained_rank_depth = 49;
+        assert!(!portable_search_fingerprint_matches(&macos, &rank));
+
+        let mut schema = wsl.clone();
+        schema.candidate_schema = "different-candidate-schema".into();
+        assert!(!portable_search_fingerprint_matches(&macos, &schema));
+
+        let mut missing = wsl;
+        missing.spectra[0].sha256.clear();
+        assert!(!portable_search_fingerprint_matches(&macos, &missing));
+    }
+
+    #[test]
+    fn relocated_pool_loads_and_records_provenance_without_changing_identity() {
+        let root = std::env::temp_dir().join(format!(
+            "sage-candidate-pool-relocation-test-{}-{}",
+            std::process::id(),
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .unwrap()
+                .as_nanos()
+        ));
+        let stored = portable_test_fingerprint("/Users/example/data");
+        let current = portable_test_fingerprint("/mnt/d/data");
+        let directory = pool_directory(&root, &stored);
+        let manifest = write_pool(&directory, &stored, &[], &IndexedDatabase::default()).unwrap();
+        assert_eq!(stored.digest, current.digest);
+        assert!(inspect_compatible_pool(&directory, &current, 50)
+            .unwrap()
+            .is_some());
+        load_pool(&directory, &current, 50, &IndexedDatabase::default()).unwrap();
+        let (_, _, valid, relocated) =
+            relocation_provenance(&manifest.search_fingerprint, &current);
+        assert!(valid);
+        assert!(relocated);
+
+        let mut changed_manifest = manifest.clone();
+        changed_manifest.candidate_count = 1;
+        write_json_atomic(&manifest_path(&directory), &changed_manifest).unwrap();
+        assert!(load_pool(&directory, &current, 50, &IndexedDatabase::default()).is_err());
+
+        write_json_atomic(&manifest_path(&directory), &manifest).unwrap();
+        std::fs::write(directory.join(&manifest.payload_file), b"corrupt").unwrap();
+        assert!(inspect_compatible_pool(&directory, &current, 50)
             .unwrap()
             .is_none());
         std::fs::remove_dir_all(root).unwrap();

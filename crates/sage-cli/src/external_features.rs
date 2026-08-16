@@ -177,8 +177,7 @@ fn add_external_features_inner(
                 Ok(None) if request.require_existing => {
                     let actual = available_cache_identities(&request.root, search_fingerprint);
                     anyhow::bail!(
-                        "strict annotation-cache preflight failed: classification={} root={} search_space={} candidate_population={} expected_annotation_fingerprint={} expected_schema={} actual_fingerprints={} generation_prohibited=true",
-                        if actual == "<absent>" { "absent" } else { "identity_mismatch" },
+                        "strict annotation-cache preflight failed: classification=missing_exact root={} search_space={} candidate_population={} expected_annotation_fingerprint={} expected_schema={} actual_fingerprints={} generation_prohibited=true",
                         request.root.display(),
                         request.search_space,
                         search_fingerprint,
@@ -1190,6 +1189,8 @@ fn external_feature_auc(reference: &[f64], entrapment: &[f64], higher_is_better:
 #[cfg(test)]
 mod cache_tests {
     use super::*;
+    use sage_core::database::PeptideIx;
+    use sage_core::peptide::Peptide;
     use sage_core::scoring::FeatureCore;
 
     #[test]
@@ -1222,6 +1223,156 @@ mod cache_tests {
             }],
         )
         .is_err());
+    }
+
+    #[test]
+    fn strict_stage_rejects_another_calibration_cache_before_export() {
+        let root = std::env::temp_dir().join(format!(
+            "sage-stage-local-cache-test-{}-{}",
+            std::process::id(),
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .unwrap()
+                .as_nanos()
+        ));
+        let temp_output = root.join("must-not-be-created");
+        let database = IndexedDatabase {
+            peptides: vec![Peptide {
+                sequence: std::sync::Arc::from(&b"PEPTIDE"[..]),
+                ..Peptide::default()
+            }],
+            ..IndexedDatabase::default()
+        };
+        let mut core = FeatureCore::default();
+        core.peptide_idx = PeptideIx(0);
+        core.spec_id = "scan=1".into();
+        core.rank = 1;
+        core.charge = 2;
+        let mut features = vec![core.to_df()];
+        features[0].decoy_free_q_value = Some(0.01);
+        features[0].decoy_free_pep = Some(0.02);
+
+        let mut settings = ExternalFeatureGenerationSettings {
+            enabled: true,
+            max_rank: Some(1),
+            temp_directory: Some(temp_output.display().to_string()),
+            ..ExternalFeatureGenerationSettings::default()
+        };
+        let (mut wrong_inputs, _) = annotation_inputs(&features, &database, "search", 1);
+        wrong_inputs[0].q_value = Some(0.5);
+        let wrong_identity =
+            annotation_identity_with_probe_root("search", &settings, &wrong_inputs, 1, Some(&root))
+                .unwrap();
+        let wrong_directory = cache_directory(&root, &wrong_identity);
+        let mut annotation = ExternalPsmFeatures::default();
+        annotation.ms2rescore_feature_joined = true;
+        write_cache(
+            &wrong_directory,
+            &wrong_identity,
+            vec![ExternalAnnotationRecord {
+                stable_id: wrong_inputs[0].stable_id.clone(),
+                features: annotation,
+            }],
+        )
+        .unwrap();
+
+        // Changing execution-only paths cannot alter identity. Keep the
+        // generator probe durable while ensuring no export directory exists.
+        settings.output_directory = Some(root.join("unused-output").display().to_string());
+        let request = ExternalAnnotationCacheRequest {
+            root: root.clone(),
+            require_existing: true,
+            search_space: "+entrapment".into(),
+        };
+        let error = add_external_features_inner(
+            &mut features,
+            &settings,
+            &[],
+            &database,
+            Some("search"),
+            Some(&request),
+        )
+        .unwrap_err()
+        .to_string();
+        assert!(error.contains("missing_exact"));
+        assert!(error.contains("generation_prohibited=true"));
+        assert!(!temp_output.exists());
+        std::fs::remove_dir_all(root).unwrap();
+    }
+
+    #[test]
+    fn strict_stage_loads_only_the_exact_post_calibration_identity() {
+        let root = std::env::temp_dir().join(format!(
+            "sage-stage-local-exact-cache-test-{}-{}",
+            std::process::id(),
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .unwrap()
+                .as_nanos()
+        ));
+        let temp_output = root.join("must-not-be-created");
+        let database = IndexedDatabase {
+            peptides: vec![Peptide {
+                sequence: std::sync::Arc::from(&b"PEPTIDE"[..]),
+                ..Peptide::default()
+            }],
+            ..IndexedDatabase::default()
+        };
+        let mut core = FeatureCore::default();
+        core.peptide_idx = PeptideIx(0);
+        core.spec_id = "scan=1".into();
+        core.rank = 1;
+        core.charge = 2;
+        let mut features = vec![core.to_df()];
+        features[0].decoy_free_q_value = Some(0.01);
+        features[0].decoy_free_pep = Some(0.02);
+        let settings = ExternalFeatureGenerationSettings {
+            enabled: true,
+            max_rank: Some(1),
+            temp_directory: Some(temp_output.display().to_string()),
+            ..ExternalFeatureGenerationSettings::default()
+        };
+        let (inputs, _) = annotation_inputs(&features, &database, "search", 1);
+        let identity =
+            annotation_identity_with_probe_root("search", &settings, &inputs, 1, Some(&root))
+                .unwrap();
+        let directory = cache_directory(&root, &identity);
+        let mut annotation = ExternalPsmFeatures::default();
+        annotation.ms2rescore_feature_joined = true;
+        annotation.ms2rescore_ms2pip_pcc = 0.75;
+        write_cache(
+            &directory,
+            &identity,
+            vec![ExternalAnnotationRecord {
+                stable_id: inputs[0].stable_id.clone(),
+                features: annotation,
+            }],
+        )
+        .unwrap();
+        let request = ExternalAnnotationCacheRequest {
+            root: root.clone(),
+            require_existing: true,
+            search_space: "+entrapment".into(),
+        };
+        let usage = add_external_features_inner(
+            &mut features,
+            &settings,
+            &[],
+            &database,
+            Some("search"),
+            Some(&request),
+        )
+        .unwrap()
+        .unwrap();
+        assert_eq!(usage.annotation_fingerprint, identity.digest);
+        assert_eq!(usage.preflight_result, "validated_exact");
+        assert!(usage.reused);
+        assert_eq!(
+            features[0].core.external_features.ms2rescore_ms2pip_pcc,
+            0.75
+        );
+        assert!(!temp_output.exists());
+        std::fs::remove_dir_all(root).unwrap();
     }
 }
 

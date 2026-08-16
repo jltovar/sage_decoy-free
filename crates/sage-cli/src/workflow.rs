@@ -12,7 +12,8 @@ use crate::entrapment::{
 use crate::external_feature_cache::{
     generator_settings_sha256_with_existing_probe_root, generator_settings_sha256_with_probe_root,
     preflight_existing_cache_root, verify_usage as verify_annotation_cache_usage,
-    ExternalAnnotationCacheManifest, ExternalAnnotationCacheRequest, ExternalAnnotationCacheUsage,
+    ExternalAnnotationCacheRequest, ExternalAnnotationCacheUsage,
+    EXTERNAL_ANNOTATION_CACHE_SCHEMA_VERSION,
 };
 use crate::input::Input;
 use crate::provenance::{freeze_baseline, sha256_file, write_json_atomic, BaselineManifest};
@@ -570,6 +571,10 @@ pub struct PlannedModelReport {
 pub struct ResourcePreflightReport {
     pub resource_type: String,
     pub search_space: String,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub stage: Option<String>,
+    #[serde(default = "legacy_resource_preflight_status")]
+    pub status: String,
     pub requested_path: PathBuf,
     pub expected_fingerprint: String,
     pub actual_fingerprint: String,
@@ -582,8 +587,22 @@ pub struct ResourcePreflightReport {
     pub valid: bool,
     pub reused: bool,
     pub generation_allowed: bool,
+    #[serde(default)]
+    pub catalog_fingerprints: Vec<String>,
+    #[serde(default)]
+    pub original_source_uris: Vec<String>,
+    #[serde(default)]
+    pub current_source_uris: Vec<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub portable_identity_valid: Option<bool>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub relocation_detected: Option<bool>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub failure_reason: Option<String>,
+}
+
+fn legacy_resource_preflight_status() -> String {
+    "validated_exact".into()
 }
 
 #[derive(Clone, Debug, Serialize, Deserialize)]
@@ -1115,6 +1134,8 @@ fn candidate_preflight_report(
     Ok(ResourcePreflightReport {
         resource_type: "candidate_pool".into(),
         search_space: search_space.into(),
+        stage: None,
+        status: "validated_exact".into(),
         requested_path: requested_path.to_path_buf(),
         expected_fingerprint: usage.search_fingerprint.clone(),
         actual_fingerprint: manifest.search_fingerprint.digest,
@@ -1126,37 +1147,50 @@ fn candidate_preflight_report(
         valid: true,
         reused: true,
         generation_allowed,
+        catalog_fingerprints: Vec::new(),
+        original_source_uris: usage.original_source_uris.clone(),
+        current_source_uris: usage.current_source_uris.clone(),
+        portable_identity_valid: Some(usage.portable_identity_valid),
+        relocation_detected: Some(usage.relocation_detected),
         failure_reason: None,
     })
 }
 
-fn annotation_preflight_report(
-    usage: &ExternalAnnotationCacheUsage,
+fn deferred_annotation_preflight_report(
+    model: &ModelWorkflow,
     search_space: &str,
-) -> Result<ResourcePreflightReport> {
-    let manifest: ExternalAnnotationCacheManifest =
-        serde_json::from_slice(&std::fs::read(&usage.manifest)?).with_context(|| {
-            format!(
-                "invalid annotation-cache manifest {}",
-                usage.manifest.display()
-            )
-        })?;
-    Ok(ResourcePreflightReport {
+    requested_path: &Path,
+    candidate_count: usize,
+    requested_max_rank: usize,
+    generation_allowed: bool,
+    catalog_fingerprints: &[String],
+) -> ResourcePreflightReport {
+    ResourcePreflightReport {
         resource_type: "annotation_cache".into(),
         search_space: search_space.into(),
-        requested_path: usage.requested_root.clone(),
-        expected_fingerprint: usage.annotation_fingerprint.clone(),
-        actual_fingerprint: manifest.identity.digest,
-        schema_version: manifest.schema_version,
-        candidate_or_annotation_count: manifest.joined_annotation_count,
-        retained_rank_depth: Some(manifest.identity.requested_max_rank as usize),
-        manifest_sha256: sha256_file(&usage.manifest)?,
-        payload_sha256: manifest.payload_sha256,
-        valid: true,
-        reused: true,
-        generation_allowed: false,
-        failure_reason: None,
-    })
+        stage: Some(format!("{}:ms2rescore", model_slug(&model.model))),
+        status: "deferred_until_calibration".into(),
+        requested_path: requested_path.to_path_buf(),
+        expected_fingerprint: String::new(),
+        actual_fingerprint: String::new(),
+        schema_version: EXTERNAL_ANNOTATION_CACHE_SCHEMA_VERSION,
+        candidate_or_annotation_count: candidate_count,
+        retained_rank_depth: Some(requested_max_rank),
+        manifest_sha256: String::new(),
+        payload_sha256: String::new(),
+        valid: false,
+        reused: false,
+        generation_allowed,
+        catalog_fingerprints: catalog_fingerprints.to_vec(),
+        original_source_uris: Vec::new(),
+        current_source_uris: Vec::new(),
+        portable_identity_valid: None,
+        relocation_detected: None,
+        failure_reason: Some(
+            "exact annotation identity depends on the stage's preliminary calibration_input_sha256; stage-local exact preflight is required before annotation use"
+                .into(),
+        ),
+    }
 }
 
 /// Resolve strict immutable resources without writing workflow state or
@@ -1209,59 +1243,60 @@ fn strict_resource_preflight(
             !manifest.require_existing_candidate_pool,
         )?);
 
-        if manifest.require_existing_annotation_cache && annotation_required {
-            let cache_request = ExternalAnnotationCacheRequest {
-                root: manifest.resolved_annotation_cache_root(target_only),
-                require_existing: true,
-                search_space: search_space.into(),
-            };
+        if annotation_required {
+            let cache_root = manifest.resolved_annotation_cache_root(target_only);
             let max_rank = runner
                 .parameters
                 .external_features
                 .max_rank
                 .unwrap_or(runner.parameters.report_psms as u32);
-            let database = runner.shared_database();
-            let candidate_ids = candidates
-                .iter()
-                .map(|candidate| {
-                    stable_candidate_id(
-                        &candidate_usage.search_fingerprint,
-                        candidate,
-                        &database[candidate.peptide_idx].to_string(),
-                    )
-                })
-                .collect::<HashSet<_>>();
-            anyhow::ensure!(
-                candidate_ids.len() == candidates.len(),
-                "strict annotation-cache preflight found duplicate stable candidate IDs in {search_space} candidate pool"
-            );
-            let usages = preflight_existing_cache_root(
-                &cache_request,
-                &runner.parameters.external_features,
-                &candidate_usage.search_fingerprint,
-                &candidate_ids,
-                max_rank,
-            )?;
-            for usage in usages {
-                reports.push(annotation_preflight_report(&usage, search_space)?);
+            let catalog_fingerprints = if manifest.require_existing_annotation_cache {
+                let cache_request = ExternalAnnotationCacheRequest {
+                    root: cache_root.clone(),
+                    require_existing: true,
+                    search_space: search_space.into(),
+                };
+                let database = runner.shared_database();
+                let candidate_ids = candidates
+                    .iter()
+                    .map(|candidate| {
+                        stable_candidate_id(
+                            &candidate_usage.search_fingerprint,
+                            candidate,
+                            &database[candidate.peptide_idx].to_string(),
+                        )
+                    })
+                    .collect::<HashSet<_>>();
+                anyhow::ensure!(
+                    candidate_ids.len() == candidates.len(),
+                    "strict annotation-cache preflight found duplicate stable candidate IDs in {search_space} candidate pool"
+                );
+                preflight_existing_cache_root(
+                    &cache_request,
+                    &runner.parameters.external_features,
+                    &candidate_usage.search_fingerprint,
+                    &candidate_ids,
+                    max_rank,
+                )?
+                .into_iter()
+                .map(|usage| usage.annotation_fingerprint)
+                .collect::<Vec<_>>()
+            } else {
+                Vec::new()
+            };
+            for model in manifest.models.iter().filter(|model| {
+                model.enabled && !matches!(model.ms2rescore, Ms2RescorePolicy::Never)
+            }) {
+                reports.push(deferred_annotation_preflight_report(
+                    model,
+                    search_space,
+                    &cache_root,
+                    candidate_usage.candidate_count,
+                    max_rank as usize,
+                    !manifest.require_existing_annotation_cache,
+                    &catalog_fingerprints,
+                ));
             }
-        } else if annotation_required {
-            reports.push(ResourcePreflightReport {
-                resource_type: "annotation_cache".into(),
-                search_space: search_space.into(),
-                requested_path: manifest.resolved_annotation_cache_root(target_only),
-                expected_fingerprint: String::new(),
-                actual_fingerprint: String::new(),
-                schema_version: 0,
-                candidate_or_annotation_count: 0,
-                retained_rank_depth: None,
-                manifest_sha256: String::new(),
-                payload_sha256: String::new(),
-                valid: false,
-                reused: false,
-                generation_allowed: true,
-                failure_reason: Some("compatible cache may be created during execution".into()),
-            });
         }
     }
     Ok(reports)
@@ -5081,10 +5116,33 @@ mod tests {
             "dataset_local_explicit_grid"
         );
         assert_eq!(state.resource_preflight.len(), 4);
-        assert!(state
+        let pools = state
             .resource_preflight
             .iter()
-            .all(|resource| resource.valid && resource.reused && !resource.generation_allowed));
+            .filter(|resource| resource.resource_type == "candidate_pool")
+            .collect::<Vec<_>>();
+        assert_eq!(pools.len(), 2);
+        assert!(pools.iter().all(|resource| {
+            resource.status == "validated_exact"
+                && resource.valid
+                && resource.reused
+                && !resource.generation_allowed
+        }));
+        let annotations = state
+            .resource_preflight
+            .iter()
+            .filter(|resource| resource.resource_type == "annotation_cache")
+            .collect::<Vec<_>>();
+        assert_eq!(annotations.len(), 2);
+        assert!(annotations.iter().all(|resource| {
+            resource.status == "deferred_until_calibration"
+                && resource.expected_fingerprint.is_empty()
+                && resource.actual_fingerprint.is_empty()
+                && !resource.valid
+                && !resource.reused
+                && !resource.generation_allowed
+                && resource.catalog_fingerprints.len() == 1
+        }));
         assert!(!manifest.output_root.exists());
 
         std::fs::remove_dir_all(&target_annotation_root).unwrap();
