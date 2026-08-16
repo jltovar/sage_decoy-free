@@ -130,6 +130,16 @@ population, preliminary calibration values, retained depth, spectra, generator c
 wrapper and Python hashes, detected package versions, and annotation schema. Missing caches are
 generated; corrupt, incomplete, duplicate, or mismatched caches fail closed.
 
+`require_existing_annotation_cache` defaults to `false`, preserving ordinary from-scratch
+generation after a genuine cache miss. Set it to `true` for exact cache-only replay: every required
++entrapment and target-only cache must pass schema, identity, population, stable-ID, payload, and
+durable package/model-provenance checks before execution. Any miss fails before candidate export,
+temporary-file creation, Python, the wrapper, MS2PIP, or DeepLC. This option is independent of
+`require_existing_candidate_pool`; enable both for a completely cache-only workflow. In strict
+mode, `workflow --plan-only` performs the same read-only resource preflight without creating the
+workflow output root. The execution control is recorded in workflow provenance but is excluded
+from search, candidate-pool, and annotation identities.
+
 The target-only FASTA has a different candidate population and therefore uses a distinct candidate
 pool and, when requested, a distinct annotation cache.
 

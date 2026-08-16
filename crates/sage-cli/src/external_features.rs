@@ -9,8 +9,9 @@ use std::process::Command;
 
 use crate::candidate_pool::stable_candidate_id;
 use crate::external_feature_cache::{
-    annotation_identity_with_probe_root, cache_directory, load_cache, usage as cache_usage,
-    write_cache, ExternalAnnotationCacheRequest, ExternalAnnotationCacheUsage,
+    annotation_identity_with_existing_probe_root, annotation_identity_with_probe_root,
+    cache_directory, cache_manifest_path, load_cache, usage as cache_usage, write_cache,
+    ExternalAnnotationCacheManifest, ExternalAnnotationCacheRequest, ExternalAnnotationCacheUsage,
     ExternalAnnotationInput, ExternalAnnotationRecord,
 };
 use crate::input::{
@@ -37,6 +38,31 @@ pub struct ParsedExternalPsmFeatures {
 pub struct ParsedExternalFeatureTable {
     pub by_psm_id: HashMap<u64, ParsedExternalPsmFeatures>,
     pub by_key: HashMap<ExternalFeatureJoinKey, ParsedExternalPsmFeatures>,
+}
+
+fn available_cache_identities(root: &Path, search_fingerprint: &str) -> String {
+    let Ok(entries) = std::fs::read_dir(root) else {
+        return "<absent>".into();
+    };
+    let mut identities = entries
+        .filter_map(std::result::Result::ok)
+        .filter_map(|entry| std::fs::read(cache_manifest_path(&entry.path())).ok())
+        .filter_map(|bytes| serde_json::from_slice::<ExternalAnnotationCacheManifest>(&bytes).ok())
+        .filter(|manifest| manifest.identity.search_fingerprint == search_fingerprint)
+        .map(|manifest| {
+            format!(
+                "{}:schema{}",
+                manifest.identity.digest, manifest.schema_version
+            )
+        })
+        .collect::<Vec<_>>();
+    identities.sort();
+    identities.dedup();
+    if identities.is_empty() {
+        "<absent>".into()
+    } else {
+        identities.join(",")
+    }
 }
 
 pub fn maybe_add_external_features(
@@ -68,6 +94,10 @@ pub fn maybe_add_external_features(
         search_fingerprint,
         cache_request,
     );
+
+    if cache_request.is_some_and(|request| request.require_existing) {
+        return result;
+    }
 
     match (&settings.fail_policy, result) {
         (_, Ok(usage)) => Ok(usage),
@@ -107,25 +137,81 @@ fn add_external_features_inner(
         (Some(search_fingerprint), Some(request)) => {
             let (inputs, candidate_indices) =
                 annotation_inputs(features, db, search_fingerprint, requested_max_rank);
-            let identity = annotation_identity_with_probe_root(
-                search_fingerprint,
-                settings,
-                &inputs,
-                requested_max_rank,
-                Some(&request.root),
-            )?;
+            let identity = if request.require_existing {
+                annotation_identity_with_existing_probe_root(
+                    search_fingerprint,
+                    settings,
+                    &inputs,
+                    requested_max_rank,
+                    &request.root,
+                )
+                .with_context(|| {
+                    format!(
+                        "strict annotation-cache preflight failed: classification=generator_provenance_unavailable root={} search_space={} candidate_population={} generation_prohibited=true",
+                        request.root.display(), request.search_space, search_fingerprint
+                    )
+                })?
+            } else {
+                annotation_identity_with_probe_root(
+                    search_fingerprint,
+                    settings,
+                    &inputs,
+                    requested_max_rank,
+                    Some(&request.root),
+                )?
+            };
             let directory = cache_directory(&request.root, &identity);
-            if let Some((manifest, records)) = load_cache(&directory, &identity)? {
-                apply_cached_annotations(features, &candidate_indices, records)?;
-                log::info!(
-                    "MS2Rescore annotation cache: reused {}/{} joined annotations from {} (fingerprint={})",
-                    manifest.joined_annotation_count,
-                    manifest.annotation_count,
-                    directory.display(),
-                    identity.digest
-                );
-                log_external_feature_local_separation(features, db);
-                return Ok(Some(cache_usage(&directory, &manifest, true)));
+            match load_cache(&directory, &identity) {
+                Ok(Some((manifest, records))) => {
+                    apply_cached_annotations(features, &candidate_indices, records)?;
+                    log::info!(
+                        "MS2Rescore annotation cache: reused {}/{} joined annotations from {} (fingerprint={})",
+                        manifest.joined_annotation_count,
+                        manifest.annotation_count,
+                        directory.display(),
+                        identity.digest
+                    );
+                    log_external_feature_local_separation(features, db);
+                    return Ok(Some(cache_usage(&directory, &manifest, true, request)));
+                }
+                Ok(None) if request.require_existing => {
+                    let actual = available_cache_identities(&request.root, search_fingerprint);
+                    anyhow::bail!(
+                        "strict annotation-cache preflight failed: classification={} root={} search_space={} candidate_population={} expected_annotation_fingerprint={} expected_schema={} actual_fingerprints={} generation_prohibited=true",
+                        if actual == "<absent>" { "absent" } else { "identity_mismatch" },
+                        request.root.display(),
+                        request.search_space,
+                        search_fingerprint,
+                        identity.digest,
+                        identity.schema_version,
+                        actual
+                    );
+                }
+                Err(error) if request.require_existing => {
+                    let actual = std::fs::read(cache_manifest_path(&directory))
+                        .ok()
+                        .and_then(|bytes| {
+                            serde_json::from_slice::<ExternalAnnotationCacheManifest>(&bytes).ok()
+                        })
+                        .map(|manifest| {
+                            format!(
+                                "fingerprint={} schema={}",
+                                manifest.identity.digest, manifest.schema_version
+                            )
+                        })
+                        .unwrap_or_else(|| "fingerprint=<unreadable> schema=<unreadable>".into());
+                    anyhow::bail!(
+                        "strict annotation-cache preflight failed: classification=invalid_or_incompatible root={} search_space={} candidate_population={} expected_annotation_fingerprint={} expected_schema={} actual_{} generation_prohibited=true: {error:#}",
+                        request.root.display(),
+                        request.search_space,
+                        search_fingerprint,
+                        identity.digest,
+                        identity.schema_version,
+                        actual
+                    );
+                }
+                Err(error) => return Err(error),
+                Ok(None) => {}
             }
             Some((identity, directory, candidate_indices, inputs))
         }
@@ -252,7 +338,12 @@ fn add_external_features_inner(
                 }
             }
         }
-        return Ok(Some(cache_usage(&directory, &manifest, false)));
+        return Ok(Some(cache_usage(
+            &directory,
+            &manifest,
+            false,
+            cache_request.expect("prepared cache has a request"),
+        )));
     }
 
     Ok(None)

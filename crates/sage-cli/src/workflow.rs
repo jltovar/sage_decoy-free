@@ -1,6 +1,7 @@
 use crate::candidate_pool::{
-    content_sha256, search_fingerprint, verify_usage as verify_candidate_pool_usage,
-    CandidatePoolRequest, CandidatePoolUsage, CANDIDATE_ID_SCHEMA,
+    content_sha256, search_fingerprint, stable_candidate_id,
+    verify_usage as verify_candidate_pool_usage, CandidatePoolManifest, CandidatePoolRequest,
+    CandidatePoolUsage, CANDIDATE_ID_SCHEMA,
 };
 use crate::entrapment::{
     compare_generated_to_legacy, entrapment_generation_input_sha256, generate_foreign_entrapment,
@@ -9,8 +10,9 @@ use crate::entrapment::{
     LegacyEntrapmentReference, SharedPeptideExclusionMode,
 };
 use crate::external_feature_cache::{
-    generator_settings_sha256_with_probe_root, verify_usage as verify_annotation_cache_usage,
-    ExternalAnnotationCacheRequest, ExternalAnnotationCacheUsage,
+    generator_settings_sha256_with_existing_probe_root, generator_settings_sha256_with_probe_root,
+    preflight_existing_cache_root, verify_usage as verify_annotation_cache_usage,
+    ExternalAnnotationCacheManifest, ExternalAnnotationCacheRequest, ExternalAnnotationCacheUsage,
 };
 use crate::input::Input;
 use crate::provenance::{freeze_baseline, sha256_file, write_json_atomic, BaselineManifest};
@@ -33,7 +35,7 @@ use sage_core::input::{
 };
 use serde::{Deserialize, Serialize};
 use sha2::{Digest, Sha256};
-use std::collections::{BTreeMap, BTreeSet, HashMap};
+use std::collections::{BTreeMap, BTreeSet, HashMap, HashSet};
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
 
@@ -386,6 +388,18 @@ pub struct WorkflowManifest {
     pub target_fasta: PathBuf,
     pub spectra: Vec<String>,
     pub output_root: PathBuf,
+    /// Optional immutable candidate-pool root. When omitted, workflows retain
+    /// the historical output-root-local cache layout.
+    #[serde(default)]
+    pub candidate_pool_root: Option<PathBuf>,
+    /// Optional immutable MS2Rescore annotation-cache root. When omitted,
+    /// workflows retain the historical output-root-local cache layout.
+    #[serde(default)]
+    pub annotation_cache_root: Option<PathBuf>,
+    /// Optional target-only cache root when immutable +entrapment and
+    /// target-only caches are stored separately.
+    #[serde(default)]
+    pub target_only_annotation_cache_root: Option<PathBuf>,
     pub entrapment: EntrapmentWorkflow,
     pub models: Vec<ModelWorkflow>,
     #[serde(default)]
@@ -397,6 +411,10 @@ pub struct WorkflowManifest {
     /// This is intended for annotation-only and downstream replay workflows.
     #[serde(default)]
     pub require_existing_candidate_pool: bool,
+    /// Fail closed unless every required annotation cache is already present,
+    /// compatible, and integrity-valid. Defaults false for from-scratch work.
+    #[serde(default)]
+    pub require_existing_annotation_cache: bool,
     #[serde(default)]
     pub annotate_target_matches: bool,
     #[serde(default)]
@@ -466,6 +484,8 @@ pub struct StageRecord {
     #[serde(default)]
     pub require_existing_candidate_pool: bool,
     #[serde(default)]
+    pub require_existing_annotation_cache: bool,
+    #[serde(default)]
     pub ms2rescore_annotation_cache: Option<ExternalAnnotationCacheUsage>,
     #[serde(default)]
     pub target_only_calibration_policy: Option<TargetOnlyCalibrationPolicy>,
@@ -529,6 +549,41 @@ pub struct WorkflowState {
     pub pending_validation_gates: Vec<String>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub ensemble_interaction_calibration: Option<EnsembleInteractionCalibration>,
+    #[serde(default)]
+    pub resource_preflight: Vec<ResourcePreflightReport>,
+    #[serde(default)]
+    pub planned_models: Vec<PlannedModelReport>,
+}
+
+#[derive(Clone, Debug, Serialize, Deserialize, PartialEq, Eq)]
+pub struct PlannedModelReport {
+    pub order: usize,
+    pub model: String,
+    pub window_mode: String,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub fixed_window: Option<[u32; 2]>,
+    pub ms2rescore_policy: String,
+    pub requested_for_ensemble: bool,
+}
+
+#[derive(Clone, Debug, Serialize, Deserialize)]
+pub struct ResourcePreflightReport {
+    pub resource_type: String,
+    pub search_space: String,
+    pub requested_path: PathBuf,
+    pub expected_fingerprint: String,
+    pub actual_fingerprint: String,
+    pub schema_version: u32,
+    pub candidate_or_annotation_count: usize,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub retained_rank_depth: Option<usize>,
+    pub manifest_sha256: String,
+    pub payload_sha256: String,
+    pub valid: bool,
+    pub reused: bool,
+    pub generation_allowed: bool,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub failure_reason: Option<String>,
 }
 
 #[derive(Clone, Debug, Serialize, Deserialize)]
@@ -619,6 +674,25 @@ fn allow_target_candidate_pool_reuse(annotate_target_matches: bool, policy_index
 }
 
 impl WorkflowManifest {
+    fn resolved_candidate_pool_root(&self) -> PathBuf {
+        self.candidate_pool_root
+            .clone()
+            .unwrap_or_else(|| self.output_root.join("candidate_pools"))
+    }
+
+    fn resolved_annotation_cache_root(&self, target_only: bool) -> PathBuf {
+        if target_only {
+            self.target_only_annotation_cache_root
+                .clone()
+                .or_else(|| self.annotation_cache_root.clone())
+                .unwrap_or_else(|| self.output_root.join("ms2rescore_annotations"))
+        } else {
+            self.annotation_cache_root
+                .clone()
+                .unwrap_or_else(|| self.output_root.join("ms2rescore_annotations"))
+        }
+    }
+
     pub fn load(path: &Path) -> Result<Self> {
         let bytes = std::fs::read(path)
             .with_context(|| format!("failed to read workflow manifest {}", path.display()))?;
@@ -934,6 +1008,263 @@ fn model_slug(model: &ModelFit) -> &'static str {
         ModelFit::Nokoi => "nokoi",
         ModelFit::Ensemble => "ensemble",
     }
+}
+
+fn planned_model_reports(manifest: &WorkflowManifest) -> Vec<PlannedModelReport> {
+    manifest
+        .models
+        .iter()
+        .filter(|model| model.enabled)
+        .enumerate()
+        .map(|(order, model)| {
+            let (window_mode, fixed_window) = match model.model {
+                ModelFit::Msfdr1Smix => ("fixed_rank_1_1".into(), Some([1, 1])),
+                ModelFit::Ensemble => ("independent_constituent_artifacts".into(), None),
+                _ => {
+                    if model.window_optimizer.is_some() {
+                        ("dataset_local_optimizer".into(), None)
+                    } else if !model.candidate_windows.is_empty() {
+                        ("dataset_local_explicit_grid".into(), None)
+                    } else if let Some(window) = model.window.as_ref() {
+                        (
+                            "fixed_manifest_window".into(),
+                            Some([window.min_rank, window.max_rank]),
+                        )
+                    } else {
+                        ("search_configuration".into(), None)
+                    }
+                }
+            };
+            PlannedModelReport {
+                order,
+                model: model_slug(&model.model).into(),
+                window_mode,
+                fixed_window,
+                ms2rescore_policy: match model.ms2rescore {
+                    Ms2RescorePolicy::Never => "never",
+                    Ms2RescorePolicy::Measure => "measure",
+                    Ms2RescorePolicy::Always => "always",
+                }
+                .into(),
+                requested_for_ensemble: model.model != ModelFit::Ensemble
+                    && model.ensemble_participation == EnsembleParticipation::Auto,
+            }
+        })
+        .collect()
+}
+
+fn strict_preflight_fasta(manifest: &WorkflowManifest) -> Result<PathBuf> {
+    match manifest.entrapment.database_mode {
+        EntrapmentDatabaseMode::FrozenLegacy => manifest
+            .entrapment
+            .frozen_legacy_fasta
+            .clone()
+            .context("frozen legacy entrapment FASTA is required for strict preflight"),
+        EntrapmentDatabaseMode::NativeGenerated => {
+            anyhow::ensure!(
+                manifest.entrapment.output_fasta.is_file(),
+                "strict read-only preflight cannot generate the entrapment FASTA; expected existing {}",
+                manifest.entrapment.output_fasta.display()
+            );
+            Ok(manifest.entrapment.output_fasta.clone())
+        }
+    }
+}
+
+fn requested_rank_depth(manifest: &WorkflowManifest, runner: &Runner) -> usize {
+    let model_rank = manifest
+        .models
+        .iter()
+        .flat_map(|model| {
+            model
+                .candidate_windows
+                .iter()
+                .map(|window| window.max_rank as usize)
+                .chain(
+                    model
+                        .window_optimizer
+                        .iter()
+                        .map(|search| search.max_rank_range[1] as usize),
+                )
+                .chain(model.window.iter().map(|window| window.max_rank as usize))
+        })
+        .max()
+        .unwrap_or(1);
+    runner
+        .parameters
+        .external_features
+        .max_rank
+        .map(|rank| rank as usize)
+        .unwrap_or(runner.parameters.report_psms)
+        .max(model_rank)
+}
+
+fn candidate_preflight_report(
+    usage: &CandidatePoolUsage,
+    search_space: &str,
+    requested_path: &Path,
+    generation_allowed: bool,
+) -> Result<ResourcePreflightReport> {
+    let manifest: CandidatePoolManifest = serde_json::from_slice(&std::fs::read(&usage.manifest)?)
+        .with_context(|| {
+            format!(
+                "invalid candidate-pool manifest {}",
+                usage.manifest.display()
+            )
+        })?;
+    Ok(ResourcePreflightReport {
+        resource_type: "candidate_pool".into(),
+        search_space: search_space.into(),
+        requested_path: requested_path.to_path_buf(),
+        expected_fingerprint: usage.search_fingerprint.clone(),
+        actual_fingerprint: manifest.search_fingerprint.digest,
+        schema_version: manifest.schema_version,
+        candidate_or_annotation_count: manifest.candidate_count,
+        retained_rank_depth: Some(manifest.capabilities.retained_rank_depth),
+        manifest_sha256: sha256_file(&usage.manifest)?,
+        payload_sha256: manifest.payload_sha256,
+        valid: true,
+        reused: true,
+        generation_allowed,
+        failure_reason: None,
+    })
+}
+
+fn annotation_preflight_report(
+    usage: &ExternalAnnotationCacheUsage,
+    search_space: &str,
+) -> Result<ResourcePreflightReport> {
+    let manifest: ExternalAnnotationCacheManifest =
+        serde_json::from_slice(&std::fs::read(&usage.manifest)?).with_context(|| {
+            format!(
+                "invalid annotation-cache manifest {}",
+                usage.manifest.display()
+            )
+        })?;
+    Ok(ResourcePreflightReport {
+        resource_type: "annotation_cache".into(),
+        search_space: search_space.into(),
+        requested_path: usage.requested_root.clone(),
+        expected_fingerprint: usage.annotation_fingerprint.clone(),
+        actual_fingerprint: manifest.identity.digest,
+        schema_version: manifest.schema_version,
+        candidate_or_annotation_count: manifest.joined_annotation_count,
+        retained_rank_depth: Some(manifest.identity.requested_max_rank as usize),
+        manifest_sha256: sha256_file(&usage.manifest)?,
+        payload_sha256: manifest.payload_sha256,
+        valid: true,
+        reused: true,
+        generation_allowed: false,
+        failure_reason: None,
+    })
+}
+
+/// Resolve strict immutable resources without writing workflow state or
+/// starting a search/annotation child process.
+fn strict_resource_preflight(
+    manifest: &WorkflowManifest,
+    parallel: usize,
+) -> Result<Vec<ResourcePreflightReport>> {
+    let annotation_required = manifest
+        .models
+        .iter()
+        .any(|model| model.enabled && !matches!(model.ms2rescore, Ms2RescorePolicy::Never));
+    let entrapment_fasta = strict_preflight_fasta(manifest)?;
+    let spaces = [
+        ("+entrapment", entrapment_fasta, false),
+        ("target_only", manifest.target_fasta.clone(), true),
+    ];
+    let mut reports = Vec::new();
+    for (search_space, fasta, target_only) in spaces {
+        let mut input = Input::load(manifest.search_config.to_string_lossy().as_ref())?;
+        input.database.fasta = Some(fasta.display().to_string());
+        input.mzml_paths = Some(manifest.spectra.clone());
+        // `Input::build` creates a configured local output directory. Leave it
+        // unset so strict plan/preflight remains read-only.
+        input.output_directory = None;
+        input.annotate_matches = Some(false);
+        let fdr = input.fdr.get_or_insert_with(FdrOptions::default);
+        fdr.mode = Some(FdrMode::DecoyFree);
+        fdr.model_fit = Some(ModelFit::Moments);
+        let parameters = input.build()?;
+        let runner = Runner::new(parameters, parallel)?;
+        let candidate_root = manifest.resolved_candidate_pool_root();
+        let candidate_request = CandidatePoolRequest {
+            root: candidate_root.clone(),
+            required_rank_depth: requested_rank_depth(manifest, &runner),
+            allow_reuse: true,
+            require_existing: true,
+        };
+        let (candidate_usage, candidates) = runner
+            .preflight_existing_candidate_pool(&candidate_request)
+            .with_context(|| {
+                format!(
+                    "strict resource preflight failed for {search_space} candidate pool; generation_prohibited=true"
+                )
+            })?;
+        reports.push(candidate_preflight_report(
+            &candidate_usage,
+            search_space,
+            &candidate_root,
+            !manifest.require_existing_candidate_pool,
+        )?);
+
+        if manifest.require_existing_annotation_cache && annotation_required {
+            let cache_request = ExternalAnnotationCacheRequest {
+                root: manifest.resolved_annotation_cache_root(target_only),
+                require_existing: true,
+                search_space: search_space.into(),
+            };
+            let max_rank = runner
+                .parameters
+                .external_features
+                .max_rank
+                .unwrap_or(runner.parameters.report_psms as u32);
+            let database = runner.shared_database();
+            let candidate_ids = candidates
+                .iter()
+                .map(|candidate| {
+                    stable_candidate_id(
+                        &candidate_usage.search_fingerprint,
+                        candidate,
+                        &database[candidate.peptide_idx].to_string(),
+                    )
+                })
+                .collect::<HashSet<_>>();
+            anyhow::ensure!(
+                candidate_ids.len() == candidates.len(),
+                "strict annotation-cache preflight found duplicate stable candidate IDs in {search_space} candidate pool"
+            );
+            let usages = preflight_existing_cache_root(
+                &cache_request,
+                &runner.parameters.external_features,
+                &candidate_usage.search_fingerprint,
+                &candidate_ids,
+                max_rank,
+            )?;
+            for usage in usages {
+                reports.push(annotation_preflight_report(&usage, search_space)?);
+            }
+        } else if annotation_required {
+            reports.push(ResourcePreflightReport {
+                resource_type: "annotation_cache".into(),
+                search_space: search_space.into(),
+                requested_path: manifest.resolved_annotation_cache_root(target_only),
+                expected_fingerprint: String::new(),
+                actual_fingerprint: String::new(),
+                schema_version: 0,
+                candidate_or_annotation_count: 0,
+                retained_rank_depth: None,
+                manifest_sha256: String::new(),
+                payload_sha256: String::new(),
+                valid: false,
+                reused: false,
+                generation_allowed: true,
+                failure_reason: Some("compatible cache may be created during execution".into()),
+            });
+        }
+    }
+    Ok(reports)
 }
 
 fn apply_window(options: &mut FdrOptions, model: &ModelFit, window: &Option<NullWindow>) {
@@ -2561,13 +2892,13 @@ fn hash_stage(
         let input = Input::load(manifest.search_config.to_string_lossy().as_ref())?;
         let settings =
             crate::input::ExternalFeatureGenerationSettings::from(input.external_features);
-        hasher.update(
-            generator_settings_sha256_with_probe_root(
-                &settings,
-                &manifest.output_root.join("ms2rescore_annotations"),
-            )?
-            .as_bytes(),
-        );
+        let annotation_root = manifest.resolved_annotation_cache_root(target_only.is_some());
+        let settings_sha256 = if manifest.require_existing_annotation_cache {
+            generator_settings_sha256_with_existing_probe_root(&settings, &annotation_root)?
+        } else {
+            generator_settings_sha256_with_probe_root(&settings, &annotation_root)?
+        };
+        hasher.update(settings_sha256.as_bytes());
     }
     if fasta.is_file() {
         hasher.update(sha256_file(fasta)?.as_bytes());
@@ -2957,6 +3288,7 @@ fn run_search_stage(
             .map(|provenance| provenance.dataset_fingerprint.clone()),
         candidate_pool: None,
         require_existing_candidate_pool: manifest.require_existing_candidate_pool,
+        require_existing_annotation_cache: manifest.require_existing_annotation_cache,
         ms2rescore_annotation_cache: None,
         target_only_calibration_policy: target_only.map(|context| context.policy),
         release_candidate: target_only.is_none_or(|context| context.release_candidate),
@@ -3044,7 +3376,7 @@ fn run_search_stage(
                 .unwrap_or(runner.parameters.report_psms),
         );
         CandidatePoolRequest {
-            root: manifest.output_root.join("candidate_pools"),
+            root: manifest.resolved_candidate_pool_root(),
             required_rank_depth: requested_by_external
                 .map(|rank| rank.max(requested_by_model))
                 .unwrap_or(requested_by_model),
@@ -3056,7 +3388,13 @@ fn run_search_stage(
         }
     });
     let annotation_cache = external.then(|| ExternalAnnotationCacheRequest {
-        root: manifest.output_root.join("ms2rescore_annotations"),
+        root: manifest.resolved_annotation_cache_root(target_only.is_some()),
+        require_existing: manifest.require_existing_annotation_cache,
+        search_space: if target_only.is_some() {
+            "target_only".into()
+        } else {
+            "+entrapment".into()
+        },
     });
     let (_, candidate_usage, annotation_usage) =
         runner.run_with_workflow_caches(parallel, false, candidate_pool, annotation_cache)?;
@@ -3116,9 +3454,53 @@ pub fn execute_workflow(
     plan_only: bool,
 ) -> Result<WorkflowState> {
     let mut manifest = WorkflowManifest::load(manifest_path)?;
-    std::fs::create_dir_all(&manifest.output_root)?;
     let manifest_hash = sha256_file(manifest_path)?;
     let dataset = compute_dataset_identity(&manifest)?;
+    let strict_preflight_enabled =
+        manifest.require_existing_candidate_pool || manifest.require_existing_annotation_cache;
+    let resource_preflight = if strict_preflight_enabled {
+        strict_resource_preflight(&manifest, parallel)?
+    } else {
+        Vec::new()
+    };
+    if plan_only && strict_preflight_enabled {
+        let planned_models = planned_model_reports(&manifest);
+        return Ok(WorkflowState {
+            schema_version: 2,
+            manifest_hash,
+            dataset,
+            entrapment: None,
+            entrapment_fasta_parity: None,
+            baseline: None,
+            stages: Vec::new(),
+            candidate_pools: Vec::new(),
+            ms2rescore_annotation_caches: Vec::new(),
+            validation: Vec::new(),
+            missing_runs: Vec::new(),
+            invalid_runs: Vec::new(),
+            stage_comparisons: Vec::new(),
+            ensemble_expert_gates: Vec::new(),
+            ensemble_expert_gates_participation_effect: nonblocking_ensemble_gate_effect(),
+            parity_comparisons: Vec::new(),
+            tdc_benchmarks: Vec::new(),
+            release_gate: ReleaseGate {
+                status: ReleaseGateStatus::NotEvaluable,
+                eligible_for_statistical_default_change: false,
+                reasons: vec!["plan-only resource preflight; no scientific execution".into()],
+                not_evaluable_reasons: vec![
+                    "plan-only resource preflight; no scientific execution".into(),
+                ],
+                not_eligible_reasons: Vec::new(),
+                calibrated_tdc_improvements: 0,
+            },
+            transfer_stability: Vec::new(),
+            pending_validation_gates: Vec::new(),
+            ensemble_interaction_calibration: None,
+            resource_preflight,
+            planned_models,
+        });
+    }
+    std::fs::create_dir_all(&manifest.output_root)?;
     write_json_atomic(
         &manifest.output_root.join("workflow.dataset.json"),
         &dataset,
@@ -3779,6 +4161,7 @@ pub fn execute_workflow(
                         .as_ref()
                         .and_then(|stage: &StageRecord| stage.candidate_pool.clone()),
                     require_existing_candidate_pool: manifest.require_existing_candidate_pool,
+                    require_existing_annotation_cache: manifest.require_existing_annotation_cache,
                     ms2rescore_annotation_cache: release_target_only
                         .as_ref()
                         .and_then(|stage: &StageRecord| stage.ms2rescore_annotation_cache.clone()),
@@ -4302,6 +4685,8 @@ pub fn execute_workflow(
         transfer_stability: stability,
         pending_validation_gates,
         ensemble_interaction_calibration: ensemble_interaction_report,
+        resource_preflight,
+        planned_models: planned_model_reports(&manifest),
     };
     write_json_atomic(&manifest.output_root.join("workflow.state.json"), &state)?;
     Ok(state)
@@ -4490,6 +4875,9 @@ mod tests {
             target_fasta,
             spectra: vec!["unresolved-test.mzML".into()],
             output_root: directory.join("output"),
+            candidate_pool_root: None,
+            annotation_cache_root: None,
+            target_only_annotation_cache_root: None,
             entrapment: EntrapmentWorkflow {
                 database_mode: EntrapmentDatabaseMode::NativeGenerated,
                 foreign_fastas: vec![directory.join("foreign.fasta")],
@@ -4539,6 +4927,7 @@ mod tests {
             },
             resume: true,
             require_existing_candidate_pool: false,
+            require_existing_annotation_cache: false,
             annotate_target_matches: false,
             ensemble_lock: None,
             locked_expert_artifacts: BTreeMap::new(),
@@ -4576,6 +4965,135 @@ mod tests {
         manifest.models.push(manifest.models[0].clone());
         let error = manifest.validate().unwrap_err().to_string();
         assert!(error.contains("duplicate canonical model moments"));
+        std::fs::remove_dir_all(directory).unwrap();
+    }
+
+    #[test]
+    fn omitted_annotation_cache_requirement_defaults_false() {
+        let directory = test_directory("annotation-cache-requirement-default");
+        let manifest = minimal_manifest(&directory, ValidationDatasetRole::Development);
+        let mut value = serde_json::to_value(&manifest).unwrap();
+        value
+            .as_object_mut()
+            .unwrap()
+            .remove("require_existing_annotation_cache");
+        let restored: WorkflowManifest = serde_json::from_value(value).unwrap();
+        assert!(!restored.require_existing_annotation_cache);
+        std::fs::remove_dir_all(directory).unwrap();
+    }
+
+    #[test]
+    fn strict_plan_preflights_both_spaces_without_creating_output() {
+        let directory = test_directory("strict-resource-plan");
+        let workspace = Path::new(env!("CARGO_MANIFEST_DIR")).join("../..");
+        let search_config = workspace.join("tests/config.json");
+        let spectrum = workspace.join("tests/LQSRPAAPPAPGPGQLTLR.mzML");
+        let fasta = workspace.join("tests/Q99536.fasta");
+        let candidate_root = directory.join("immutable-candidates");
+        let annotation_root = directory.join("immutable-entrapment-annotations");
+        let target_annotation_root = directory.join("immutable-target-annotations");
+
+        let mut input = Input::load(search_config.to_string_lossy().as_ref()).unwrap();
+        input.database.fasta = Some(fasta.display().to_string());
+        input.mzml_paths = Some(vec![spectrum.display().to_string()]);
+        input.output_directory = Some(directory.join("unused").display().to_string());
+        let fdr = input.fdr.get_or_insert_with(FdrOptions::default);
+        fdr.mode = Some(FdrMode::DecoyFree);
+        fdr.model_fit = Some(ModelFit::Moments);
+        let runner = Runner::new(input.build().unwrap(), 1).unwrap();
+        let search = search_fingerprint(&runner.parameters).unwrap();
+        let mut candidate = sage_core::scoring::FeatureCore::default();
+        candidate.peptide_idx = sage_core::database::PeptideIx(0);
+        candidate.spec_id = "synthetic-scan".into();
+        candidate.rank = 1;
+        candidate.charge = 2;
+        let database = runner.shared_database();
+        let pool_directory = crate::candidate_pool::pool_directory(&candidate_root, &search);
+        crate::candidate_pool::write_pool(
+            &pool_directory,
+            &search,
+            &[candidate.clone()],
+            &database,
+        )
+        .unwrap();
+        let stable_id = stable_candidate_id(
+            &search.digest,
+            &candidate,
+            &database[candidate.peptide_idx].to_string(),
+        );
+        let settings = runner.parameters.external_features.clone();
+        let annotation_input = crate::external_feature_cache::ExternalAnnotationInput {
+            stable_id: stable_id.clone(),
+            score: candidate.hyperscore,
+            q_value: Some(0.01),
+            pep: Some(0.02),
+            retention_time: candidate.rt,
+            ion_mobility: candidate.ims,
+            precursor_mass: candidate.expmass,
+            charge: candidate.charge,
+            rank: candidate.rank,
+        };
+        for root in [&annotation_root, &target_annotation_root] {
+            let identity = crate::external_feature_cache::annotation_identity_with_probe_root(
+                &search.digest,
+                &settings,
+                std::slice::from_ref(&annotation_input),
+                runner.parameters.report_psms as u32,
+                Some(root),
+            )
+            .unwrap();
+            let cache_directory = crate::external_feature_cache::cache_directory(root, &identity);
+            let mut features = sage_core::scoring::ExternalPsmFeatures::default();
+            features.ms2rescore_feature_joined = true;
+            crate::external_feature_cache::write_cache(
+                &cache_directory,
+                &identity,
+                vec![crate::external_feature_cache::ExternalAnnotationRecord {
+                    stable_id: stable_id.clone(),
+                    features,
+                }],
+            )
+            .unwrap();
+        }
+
+        let mut manifest = minimal_manifest(&directory, ValidationDatasetRole::Development);
+        manifest.search_config = search_config;
+        manifest.target_fasta = fasta.clone();
+        manifest.spectra = vec![spectrum.display().to_string()];
+        manifest.output_root = directory.join("strict-output-must-not-exist");
+        manifest.candidate_pool_root = Some(candidate_root);
+        manifest.annotation_cache_root = Some(annotation_root);
+        manifest.target_only_annotation_cache_root = Some(target_annotation_root.clone());
+        manifest.entrapment.database_mode = EntrapmentDatabaseMode::FrozenLegacy;
+        manifest.entrapment.foreign_fastas.clear();
+        manifest.entrapment.frozen_legacy_fasta = Some(fasta);
+        manifest.models[0].ms2rescore = Ms2RescorePolicy::Always;
+        manifest.require_existing_candidate_pool = true;
+        manifest.require_existing_annotation_cache = true;
+        let manifest_path = directory.join("strict-workflow.json");
+        write_json_atomic(&manifest_path, &manifest).unwrap();
+
+        let state = execute_workflow(&manifest_path, &directory, 1, true).unwrap();
+        assert_eq!(state.planned_models.len(), 1);
+        assert_eq!(state.planned_models[0].model, "moments");
+        assert_eq!(
+            state.planned_models[0].window_mode,
+            "dataset_local_explicit_grid"
+        );
+        assert_eq!(state.resource_preflight.len(), 4);
+        assert!(state
+            .resource_preflight
+            .iter()
+            .all(|resource| resource.valid && resource.reused && !resource.generation_allowed));
+        assert!(!manifest.output_root.exists());
+
+        std::fs::remove_dir_all(&target_annotation_root).unwrap();
+        let error = execute_workflow(&manifest_path, &directory, 1, true)
+            .unwrap_err()
+            .to_string();
+        assert!(error.contains("target_only"));
+        assert!(error.contains("generation_prohibited=true"));
+        assert!(!manifest.output_root.exists());
         std::fs::remove_dir_all(directory).unwrap();
     }
 
@@ -4711,6 +5229,7 @@ mod tests {
             artifact_fit_dataset_fingerprint: None,
             candidate_pool: None,
             require_existing_candidate_pool: false,
+            require_existing_annotation_cache: false,
             ms2rescore_annotation_cache: None,
             target_only_calibration_policy: None,
             release_candidate: true,
@@ -5642,6 +6161,9 @@ mod tests {
             target_fasta: PathBuf::new(),
             spectra: vec!["test.mzML".into()],
             output_root: directory.clone(),
+            candidate_pool_root: None,
+            annotation_cache_root: None,
+            target_only_annotation_cache_root: None,
             entrapment: EntrapmentWorkflow {
                 database_mode: EntrapmentDatabaseMode::NativeGenerated,
                 foreign_fastas: Vec::new(),
@@ -5691,6 +6213,7 @@ mod tests {
             },
             resume: false,
             require_existing_candidate_pool: false,
+            require_existing_annotation_cache: false,
             annotate_target_matches: false,
             ensemble_lock: None,
             locked_expert_artifacts: BTreeMap::new(),
