@@ -273,9 +273,17 @@ pub struct EnsembleExpertLock {
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub target_only_policy_capability: Option<TargetOnlyPolicyCapability>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub external_profile_identity_sha256: Option<String>,
+    /// Content identity of this expert's independently fitted external profile.
+    /// This is expert provenance, not the shared Ensemble-profile identity.
+    pub fitted_external_profile_identity_sha256: Option<String>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub external_profile_calibration: Option<sage_core::input::ExternalProfileCalibration>,
+    pub fitted_external_profile_calibration: Option<sage_core::input::ExternalProfileCalibration>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub annotation_cache_fingerprint: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub annotation_cache_manifest_sha256: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub annotation_cache_payload_sha256: Option<String>,
 }
 
 #[derive(Clone, Debug, Serialize, Deserialize)]
@@ -311,9 +319,12 @@ pub struct EnsembleLock {
     #[serde(default = "default_ensemble_external_profile_contract")]
     pub external_profile_contract: String,
     #[serde(default)]
-    pub external_profile_identity_sha256: Option<String>,
+    /// Canonical identity of the shared Ensemble-profile fitting contract.
+    /// The fitted profile content is stage/search-space specific and is recorded
+    /// in the Ensemble stage artifact and checkpoint.
+    pub shared_external_profile_contract_sha256: Option<String>,
     #[serde(default)]
-    pub external_profile_calibration: Option<sage_core::input::ExternalProfileCalibration>,
+    pub shared_external_profile_calibration: Option<sage_core::input::ExternalProfileCalibration>,
     #[serde(default)]
     pub source_configuration_sha256: String,
     #[serde(default)]
@@ -349,6 +360,22 @@ fn resolved_ensemble_combiners(
     Ok((settings.ensemble_p_combiner, settings.ensemble_pep_combiner))
 }
 
+fn resolved_external_profile_calibration(
+    search_config: &Path,
+) -> Result<sage_core::input::ExternalProfileCalibration> {
+    let value: serde_json::Value = serde_json::from_slice(&std::fs::read(search_config)?)
+        .with_context(|| format!("invalid search configuration {}", search_config.display()))?;
+    let options: FdrOptions = serde_json::from_value(
+        value
+            .get("fdr")
+            .filter(|value| !value.is_null())
+            .cloned()
+            .unwrap_or_else(|| serde_json::json!({})),
+    )
+    .context("invalid fdr settings in search configuration")?;
+    Ok(FdrSettings::from(options).external_profile_calibration)
+}
+
 #[derive(Clone)]
 struct CompletedExpert {
     model: ModelFit,
@@ -362,8 +389,11 @@ struct CompletedExpert {
     target_only_results: PathBuf,
     target_only_calibration_policy: TargetOnlyCalibrationPolicy,
     calibration_search_fingerprint: String,
-    external_profile_identity_sha256: Option<String>,
-    external_profile_calibration: Option<sage_core::input::ExternalProfileCalibration>,
+    fitted_external_profile_identity_sha256: Option<String>,
+    fitted_external_profile_calibration: Option<sage_core::input::ExternalProfileCalibration>,
+    annotation_cache_fingerprint: Option<String>,
+    annotation_cache_manifest_sha256: Option<String>,
+    annotation_cache_payload_sha256: Option<String>,
 }
 
 struct SharedDatabase {
@@ -496,6 +526,13 @@ pub struct StageRecord {
     pub window_provenance: Option<WindowProvenance>,
     #[serde(default)]
     pub external_profile_calibration: Option<sage_core::input::ExternalProfileCalibration>,
+    /// Canonical shared-profile contract from the Ensemble lock, when this is
+    /// an external Ensemble stage.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub ensemble_shared_profile_contract_sha256: Option<String>,
+    /// Content identity of the one profile fitted by this stage/search space.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub fitted_external_profile_identity_sha256: Option<String>,
     /// Schema-v3 target-only evaluability. Older completed checkpoints default
     /// to evaluable and remain loadable.
     #[serde(default = "default_true")]
@@ -1335,6 +1372,17 @@ fn apply_window(options: &mut FdrOptions, model: &ModelFit, window: &Option<Null
     }
 }
 
+fn resolved_expert_window(model: &ModelFit, window: &Option<NullWindow>) -> Option<NullWindow> {
+    if *model == ModelFit::Msfdr1Smix {
+        Some(NullWindow {
+            min_rank: 1,
+            max_rank: 1,
+        })
+    } else {
+        window.clone()
+    }
+}
+
 fn artifact_contains_model(
     artifacts: &sage_core::decoy_free_fdr::DfRunArtifacts,
     model: &ModelFit,
@@ -1441,7 +1489,7 @@ fn artifact_contains_model(
     }
 }
 
-fn external_profile_identity(
+fn fitted_external_profile_identity(
     artifacts: &DfRunArtifacts,
 ) -> Result<Option<(String, sage_core::input::ExternalProfileCalibration)>> {
     artifacts
@@ -1449,7 +1497,7 @@ fn external_profile_identity(
         .as_ref()
         .map(|profiles| {
             let mut hasher = Sha256::new();
-            hasher.update(b"sage-external-profile-identity-v1\0");
+            hasher.update(b"sage-fitted-external-profile-content-identity-v1\0");
             hasher.update(serde_json::to_vec(profiles)?);
             Ok((
                 format!("{:x}", hasher.finalize()),
@@ -1457,6 +1505,46 @@ fn external_profile_identity(
             ))
         })
         .transpose()
+}
+
+fn shared_ensemble_profile_contract_identity(
+    dataset: &DatasetIdentity,
+    calibration: &sage_core::input::ExternalProfileCalibration,
+    experts: &[EnsembleExpertLock],
+) -> Result<String> {
+    let mut enabled = experts
+        .iter()
+        .filter(|expert| expert.enabled)
+        .map(|expert| {
+            serde_json::json!({
+                "model": expert.model,
+                "window": expert.window,
+                "fit_search_fingerprint": expert.fit_search_fingerprint,
+                "candidate_id_schema": expert.candidate_id_schema,
+                "optimized_fitted_artifacts_sha256": expert.optimized_fitted_artifacts_sha256,
+                "ms2rescore_fitted_artifacts_sha256": expert.ms2rescore_fitted_artifacts_sha256,
+                "annotation_cache_fingerprint": expert.annotation_cache_fingerprint,
+                "annotation_cache_manifest_sha256": expert.annotation_cache_manifest_sha256,
+                "annotation_cache_payload_sha256": expert.annotation_cache_payload_sha256,
+            })
+        })
+        .collect::<Vec<_>>();
+    enabled.sort_by(|left, right| {
+        left.get("model")
+            .and_then(serde_json::Value::as_str)
+            .cmp(&right.get("model").and_then(serde_json::Value::as_str))
+    });
+    let value = serde_json::json!({
+        "schema": "sage-ensemble-shared-external-profile-contract-v1",
+        "dataset_fingerprint": dataset.fingerprint,
+        "source_configuration_sha256": dataset.search_config_sha256,
+        "candidate_id_schema": CANDIDATE_ID_SCHEMA,
+        "calibration": calibration,
+        "experts": enabled,
+    });
+    let mut hasher = Sha256::new();
+    hasher.update(serde_json::to_vec(&value)?);
+    Ok(format!("{:x}", hasher.finalize()))
 }
 
 fn apply_fitted_artifacts(
@@ -1579,8 +1667,8 @@ fn apply_ensemble_lock(
 ) -> Result<()> {
     fdr.nokoi_application_dataset_fingerprint = Some(dataset.fingerprint.clone());
     anyhow::ensure!(
-        lock.schema_version == 6,
-        "unsupported Ensemble lock schema {}; schema 6 is required for configuration-controlled rosters",
+        lock.schema_version == 7,
+        "unsupported Ensemble lock schema {}; schema 7 is required for separated expert-profile provenance and shared-profile identity",
         lock.schema_version
     );
     anyhow::ensure!(
@@ -1618,12 +1706,12 @@ fn apply_ensemble_lock(
     );
     if external {
         anyhow::ensure!(
-            lock.external_profile_identity_sha256.is_some()
-                && lock.external_profile_calibration.is_some(),
+            lock.shared_external_profile_contract_sha256.is_some()
+                && lock.shared_external_profile_calibration.is_some(),
             "external Ensemble lock has no shared external-profile identity"
         );
         anyhow::ensure!(
-            lock.external_profile_calibration
+            lock.shared_external_profile_calibration
                 .as_ref()
                 .is_some_and(|calibration| {
                     calibration.min_null_rank == 9
@@ -1632,6 +1720,18 @@ fn apply_ensemble_lock(
                             == sage_core::input::ExternalProfileWindowProvenance::ExplicitConfiguration
                 }),
             "external Ensemble lock does not use the explicit shared 9-18 calibration contract"
+        );
+        anyhow::ensure!(
+            lock.shared_external_profile_contract_sha256.as_deref()
+                == Some(
+                    shared_ensemble_profile_contract_identity(
+                        dataset,
+                        lock.shared_external_profile_calibration.as_ref().unwrap(),
+                        &lock.experts,
+                    )?
+                    .as_str(),
+                ),
+            "Ensemble lock shared external-profile contract identity is stale or inconsistent"
         );
     }
     // The external empirical calibration is dataset-local auxiliary evidence
@@ -1793,12 +1893,43 @@ fn apply_ensemble_lock(
                 "Ensemble expert MS2Rescore artifact does not contain a valid {:?} model",
                 expert.model
             );
+            if external {
+                let (identity, calibration) = fitted_external_profile_identity(&artifacts)?
+                    .context(
+                        "Ensemble expert MS2Rescore artifact has no fitted external profile",
+                    )?;
+                anyhow::ensure!(
+                    expert.fitted_external_profile_identity_sha256.as_deref()
+                        == Some(identity.as_str())
+                        && expert.fitted_external_profile_calibration.as_ref()
+                            == Some(&calibration),
+                    "Ensemble expert {:?} fitted external-profile provenance disagrees with its artifact",
+                    expert.model
+                );
+            }
+        } else if external {
+            anyhow::bail!(
+                "Ensemble expert {:?} has no MS2Rescore fitted artifact",
+                expert.model
+            );
         }
         if external {
             anyhow::ensure!(
-                expert.external_profile_identity_sha256 == lock.external_profile_identity_sha256
-                    && expert.external_profile_calibration == lock.external_profile_calibration,
-                "Ensemble expert {:?} does not match the shared external-profile identity",
+                expert.fitted_external_profile_identity_sha256.is_some()
+                    && expert.fitted_external_profile_calibration.as_ref().is_some_and(|calibration| {
+                        calibration.min_null_rank == 9
+                            && calibration.max_null_rank == 18
+                            && calibration.provenance
+                                == sage_core::input::ExternalProfileWindowProvenance::ExplicitConfiguration
+                    }),
+                "Ensemble expert {:?} has invalid fitted external-profile provenance",
+                expert.model
+            );
+            anyhow::ensure!(
+                expert.annotation_cache_fingerprint.is_some()
+                    && expert.annotation_cache_manifest_sha256.is_some()
+                    && expert.annotation_cache_payload_sha256.is_some(),
+                "Ensemble expert {:?} has incomplete annotation-cache provenance",
                 expert.model
             );
         }
@@ -1943,13 +2074,16 @@ fn ensemble_lock_analysis_fingerprint(lock: &EnsembleLock) -> Result<String> {
                 "gate_warnings": expert.gate_warnings,
                 "fit_search_fingerprint": expert.fit_search_fingerprint,
                 "candidate_id_schema": expert.candidate_id_schema,
-                "external_profile_identity_sha256": expert.external_profile_identity_sha256,
-                "external_profile_calibration": expert.external_profile_calibration,
+                "fitted_external_profile_identity_sha256": expert.fitted_external_profile_identity_sha256,
+                "fitted_external_profile_calibration": expert.fitted_external_profile_calibration,
+                "annotation_cache_fingerprint": expert.annotation_cache_fingerprint,
+                "annotation_cache_manifest_sha256": expert.annotation_cache_manifest_sha256,
+                "annotation_cache_payload_sha256": expert.annotation_cache_payload_sha256,
             })
         })
         .collect::<Vec<_>>();
     let value = serde_json::json!({
-        "schema": "sage-ensemble-analysis-v2-configuration-controlled-roster",
+        "schema": "sage-ensemble-analysis-v3-separated-shared-profile-contract",
         "dataset_fingerprint": lock.dataset_fingerprint,
         "source_configuration_sha256": lock.source_configuration_sha256,
         "experts": experts,
@@ -1962,8 +2096,8 @@ fn ensemble_lock_analysis_fingerprint(lock: &EnsembleLock) -> Result<String> {
         "evaluable": lock.evaluable,
         "not_evaluable_reasons": lock.not_evaluable_reasons,
         "external_profile_contract": lock.external_profile_contract,
-        "external_profile_identity_sha256": lock.external_profile_identity_sha256,
-        "external_profile_calibration": lock.external_profile_calibration,
+        "shared_external_profile_contract_sha256": lock.shared_external_profile_contract_sha256,
+        "shared_external_profile_calibration": lock.shared_external_profile_calibration,
         "raw_q_interaction_warning_threshold": lock.raw_q_interaction_warning_threshold,
         "ensemble_p_combiner": lock.ensemble_p_combiner,
         "ensemble_pep_combiner": lock.ensemble_pep_combiner,
@@ -2116,6 +2250,18 @@ fn build_ensemble_lock_with_failures(
             && model.model == ModelFit::Ensemble
             && !matches!(model.ms2rescore, Ms2RescorePolicy::Never)
     });
+    let shared_external_profile_calibration = ensemble_uses_ms2
+        .then(|| resolved_external_profile_calibration(&manifest.search_config))
+        .transpose()?;
+    if let Some(calibration) = shared_external_profile_calibration.as_ref() {
+        anyhow::ensure!(
+            calibration.min_null_rank == 9
+                && calibration.max_null_rank == 18
+                && calibration.provenance
+                    == sage_core::input::ExternalProfileWindowProvenance::ExplicitConfiguration,
+            "Ensemble shared external profile must use the explicit dataset-local 9-18 calibration contract"
+        );
+    }
     for expert in experts {
         let mut failures = Vec::new();
         let mut warnings = Vec::new();
@@ -2192,11 +2338,11 @@ fn build_ensemble_lock_with_failures(
                                         "MS2Rescore artifact provenance is invalid: {error}"
                                     ));
                                 }
-                                match external_profile_identity(&artifact) {
+                                match fitted_external_profile_identity(&artifact) {
                                     Ok(Some((identity, calibration))) => {
-                                        if expert.external_profile_identity_sha256.as_deref()
+                                        if expert.fitted_external_profile_identity_sha256.as_deref()
                                             != Some(identity.as_str())
-                                            || expert.external_profile_calibration.as_ref()
+                                            || expert.fitted_external_profile_calibration.as_ref()
                                                 != Some(&calibration)
                                         {
                                             failures.push(
@@ -2206,7 +2352,7 @@ fn build_ensemble_lock_with_failures(
                                         }
                                     }
                                     Ok(None) => failures.push(
-                                        "MS2Rescore artifact has no shared external profile".into(),
+                                        "MS2Rescore artifact has no fitted external profile".into(),
                                     ),
                                     Err(error) => failures.push(format!(
                                         "MS2Rescore external-profile identity is invalid: {error}"
@@ -2232,12 +2378,12 @@ fn build_ensemble_lock_with_failures(
                     failures.push("MS2Rescore fitted artifact is missing".into());
                 }
             }
-            if expert.external_profile_identity_sha256.is_none()
-                || expert.external_profile_calibration.is_none()
+            if expert.fitted_external_profile_identity_sha256.is_none()
+                || expert.fitted_external_profile_calibration.is_none()
             {
-                failures.push("shared external-profile identity is missing".into());
+                failures.push("fitted external-profile provenance is missing".into());
             } else if !expert
-                .external_profile_calibration
+                .fitted_external_profile_calibration
                 .as_ref()
                 .is_some_and(|calibration| {
                     calibration.min_null_rank == 9
@@ -2247,8 +2393,15 @@ fn build_ensemble_lock_with_failures(
                 })
             {
                 failures.push(
-                    "shared external-profile calibration must be the explicit 9-18 contract".into(),
+                    "fitted external-profile calibration must use the explicit 9-18 contract"
+                        .into(),
                 );
+            }
+            if expert.annotation_cache_fingerprint.is_none()
+                || expert.annotation_cache_manifest_sha256.is_none()
+                || expert.annotation_cache_payload_sha256.is_none()
+            {
+                failures.push("MS2Rescore annotation-cache provenance is missing".into());
             }
         }
         let capability =
@@ -2524,18 +2677,19 @@ fn build_ensemble_lock_with_failures(
         }
     }
     if ensemble_uses_ms2 {
-        let shared_identities = candidates
+        let fit_search_fingerprints = candidates
             .iter()
             .filter(|candidate| candidate.requested && candidate.technical_failures.is_empty())
-            .filter_map(|candidate| candidate.expert.external_profile_identity_sha256.as_deref())
+            .map(|candidate| candidate.expert.calibration_search_fingerprint.as_str())
             .collect::<BTreeSet<_>>();
-        if shared_identities.len() > 1 {
+        if fit_search_fingerprints.len() > 1 {
             for candidate in candidates
                 .iter_mut()
                 .filter(|candidate| candidate.requested)
             {
                 candidate.technical_failures.push(
-                    "requested experts do not share one identical external-profile identity".into(),
+                    "requested experts do not share one dataset-local fit search fingerprint"
+                        .into(),
                 );
             }
         }
@@ -2631,8 +2785,13 @@ fn build_ensemble_lock_with_failures(
                 &expert.model,
                 expert.target_only_calibration_policy,
             )),
-            external_profile_identity_sha256: expert.external_profile_identity_sha256.clone(),
-            external_profile_calibration: expert.external_profile_calibration.clone(),
+            fitted_external_profile_identity_sha256: expert
+                .fitted_external_profile_identity_sha256
+                .clone(),
+            fitted_external_profile_calibration: expert.fitted_external_profile_calibration.clone(),
+            annotation_cache_fingerprint: expert.annotation_cache_fingerprint.clone(),
+            annotation_cache_manifest_sha256: expert.annotation_cache_manifest_sha256.clone(),
+            annotation_cache_payload_sha256: expert.annotation_cache_payload_sha256.clone(),
         });
     }
     let mut actual_roster = locked
@@ -2651,20 +2810,13 @@ fn build_ensemble_lock_with_failures(
             )]
         })
         .unwrap_or_default();
-    let external_profile_identities = locked
-        .iter()
-        .filter(|expert| expert.enabled)
-        .filter_map(|expert| expert.external_profile_identity_sha256.clone())
-        .collect::<BTreeSet<_>>();
-    let external_profile_identity_sha256 = (external_profile_identities.len() == 1)
-        .then(|| external_profile_identities.into_iter().next())
-        .flatten();
-    let external_profile_calibration = locked
-        .iter()
-        .find(|expert| expert.enabled)
-        .and_then(|expert| expert.external_profile_calibration.clone());
+    let shared_external_profile_contract_sha256 = shared_external_profile_calibration
+        .as_ref()
+        .filter(|_| enabled > 0)
+        .map(|calibration| shared_ensemble_profile_contract_identity(dataset, calibration, &locked))
+        .transpose()?;
     stamp_ensemble_lock_analysis_fingerprint(EnsembleLock {
-        schema_version: 6,
+        schema_version: 7,
         source_manifest_hash: manifest_hash.into(),
         dataset_fingerprint: dataset.fingerprint.clone(),
         experts: locked,
@@ -2677,8 +2829,8 @@ fn build_ensemble_lock_with_failures(
         evaluable,
         not_evaluable_reasons,
         external_profile_contract: default_ensemble_external_profile_contract(),
-        external_profile_identity_sha256,
-        external_profile_calibration,
+        shared_external_profile_contract_sha256,
+        shared_external_profile_calibration,
         source_configuration_sha256: dataset.search_config_sha256.clone(),
         analysis_fingerprint: String::new(),
         raw_q_interaction_warning_threshold: default_raw_q_interaction_warning_threshold(),
@@ -3329,6 +3481,9 @@ fn run_search_stage(
         release_candidate: target_only.is_none_or(|context| context.release_candidate),
         window_provenance: target_only.map(|context| context.window_provenance.clone()),
         external_profile_calibration: None,
+        ensemble_shared_profile_contract_sha256: ensemble_lock
+            .and_then(|lock| lock.shared_external_profile_contract_sha256.clone()),
+        fitted_external_profile_identity_sha256: None,
         evaluable: true,
         not_evaluable_reason: None,
         target_only_policy_capability: target_only
@@ -3474,6 +3629,17 @@ fn run_search_stage(
     record.external_profile_calibration = stamped
         .as_ref()
         .and_then(|provenance| provenance.external_profile_calibration.clone());
+    if external {
+        let artifact_path = output_directory.join("fitted_model_artifacts.json");
+        let artifacts: DfRunArtifacts = serde_json::from_slice(&std::fs::read(&artifact_path)?)
+            .with_context(|| format!("invalid fitted artifacts {}", artifact_path.display()))?;
+        record.fitted_external_profile_identity_sha256 =
+            fitted_external_profile_identity(&artifacts)?.map(|(identity, _)| identity);
+        anyhow::ensure!(
+            record.fitted_external_profile_identity_sha256.is_some(),
+            "external stage completed without a fitted external-profile identity"
+        );
+    }
     record.model_artifact_schema = fitted_model_artifact_schema(output_directory, &model.model)?;
     record.status = "complete".into();
     record.results_sha256 = sha256_file(&record.results)?;
@@ -4206,6 +4372,10 @@ pub fn execute_workflow(
                     external_profile_calibration: release_target_only
                         .as_ref()
                         .and_then(|stage: &StageRecord| stage.external_profile_calibration.clone()),
+                    ensemble_shared_profile_contract_sha256: ensemble_lock
+                        .as_ref()
+                        .and_then(|lock| lock.shared_external_profile_contract_sha256.clone()),
+                    fitted_external_profile_identity_sha256: None,
                     evaluable: false,
                     not_evaluable_reason: Some(reason),
                     target_only_policy_capability: Some(capability),
@@ -4273,21 +4443,24 @@ pub fn execute_workflow(
                     frozen_model_artifacts.is_some(),
                     "individual expert has no selected fitted artifact"
                 );
-                let (external_profile_identity_sha256, external_profile_calibration) =
+                let (fitted_external_profile_identity_sha256, fitted_external_profile_calibration) =
                     if ms2_artifact.is_file() {
                         let artifacts: DfRunArtifacts =
                             serde_json::from_slice(&std::fs::read(&ms2_artifact)?).with_context(
                                 || format!("invalid fitted artifacts {}", ms2_artifact.display()),
                             )?;
-                        external_profile_identity(&artifacts)?
+                        fitted_external_profile_identity(&artifacts)?
                             .map(|(identity, calibration)| (Some(identity), Some(calibration)))
                             .unwrap_or((None, None))
                     } else {
                         (None, None)
                     };
+                let annotation_cache = ms2_record
+                    .as_ref()
+                    .and_then(|record| record.ms2rescore_annotation_cache.as_ref());
                 Ok(CompletedExpert {
                     model: locked_model.model.clone(),
-                    window: locked_model.window.clone(),
+                    window: resolved_expert_window(&locked_model.model, &locked_model.window),
                     optimized_artifacts: optimized_artifact.clone(),
                     optimized_results: optimized.results.clone(),
                     ms2rescore_artifacts: ms2_artifact.is_file().then_some(ms2_artifact.clone()),
@@ -4314,8 +4487,16 @@ pub fn execute_workflow(
                         .context("calibration stage has no candidate-pool provenance")?
                         .search_fingerprint
                         .clone(),
-                    external_profile_identity_sha256,
-                    external_profile_calibration,
+                    fitted_external_profile_identity_sha256,
+                    fitted_external_profile_calibration,
+                    annotation_cache_fingerprint: annotation_cache
+                        .map(|usage| usage.annotation_fingerprint.clone()),
+                    annotation_cache_manifest_sha256: annotation_cache
+                        .map(|usage| sha256_file(&usage.manifest))
+                        .transpose()?,
+                    annotation_cache_payload_sha256: annotation_cache
+                        .map(|usage| sha256_file(&usage.payload))
+                        .transpose()?,
                 })
             })();
             match completed {
@@ -5293,6 +5474,8 @@ mod tests {
             release_candidate: true,
             window_provenance: None,
             external_profile_calibration: None,
+            ensemble_shared_profile_contract_sha256: None,
+            fitted_external_profile_identity_sha256: None,
             evaluable: true,
             not_evaluable_reason: None,
             target_only_policy_capability: None,
@@ -5733,6 +5916,13 @@ mod tests {
     }
 
     #[test]
+    fn msfdr1_smix_lock_window_is_explicitly_fixed_at_rank_one() {
+        let window = resolved_expert_window(&ModelFit::Msfdr1Smix, &None).unwrap();
+        assert_eq!(window.min_rank, 1);
+        assert_eq!(window.max_rank, 1);
+    }
+
+    #[test]
     fn ensemble_experts_cannot_overwrite_shared_external_profile() {
         let shared = external_profiles();
         let mut fdr = FdrOptions {
@@ -5767,14 +5957,14 @@ mod tests {
             external_ms2rescore: Some(second_profile),
             ..Default::default()
         };
-        let shared_identity = external_profile_identity(&DfRunArtifacts {
+        let shared_identity = fitted_external_profile_identity(&DfRunArtifacts {
             external_ms2rescore: Some(shared.clone()),
             ..Default::default()
         })
         .unwrap()
         .unwrap();
-        let first_identity = external_profile_identity(&first).unwrap().unwrap();
-        let second_identity = external_profile_identity(&second).unwrap().unwrap();
+        let first_identity = fitted_external_profile_identity(&first).unwrap().unwrap();
+        let second_identity = fitted_external_profile_identity(&second).unwrap().unwrap();
         assert_ne!(shared_identity.0, first_identity.0);
         assert_ne!(first_identity.0, second_identity.0);
         assert_eq!(shared_identity.1.min_null_rank, 9);
@@ -5788,6 +5978,69 @@ mod tests {
                 .ms2pip_pcc
                 .good_median,
             shared.ms2pip_pcc.good_median
+        );
+    }
+
+    #[test]
+    fn shared_ensemble_profile_contract_is_order_independent_of_expert_profiles() {
+        let dataset = DatasetIdentity {
+            schema_version: 1,
+            dataset_id: "dataset".into(),
+            fingerprint: "dataset-fingerprint".into(),
+            target_fasta_sha256: "target".into(),
+            spectra_sha256: vec!["spectrum".into()],
+            search_config_sha256: "configuration".into(),
+        };
+        let calibration = external_profiles().calibration;
+        let expert = |model, min_rank, max_rank, fitted_profile: &str| EnsembleExpertLock {
+            model,
+            window: Some(NullWindow { min_rank, max_rank }),
+            optimized_fitted_artifacts: PathBuf::from("artifact.json"),
+            optimized_fitted_artifacts_sha256: format!("optimized-{fitted_profile}"),
+            ms2rescore_fitted_artifacts: Some(PathBuf::from("ms2-artifact.json")),
+            ms2rescore_fitted_artifacts_sha256: Some(format!("ms2-{fitted_profile}")),
+            calibration_stage: "ms2rescore".into(),
+            calibration_results: PathBuf::from("calibration.tsv"),
+            target_only_results: PathBuf::from("target.tsv"),
+            target_only_calibration_policy: TargetOnlyCalibrationPolicy::RefitWithLockedWindow,
+            enabled: true,
+            target_peptides: 0,
+            incremental_target_peptides: 0,
+            gate_reasons: Vec::new(),
+            gate_warnings: Vec::new(),
+            fit_search_fingerprint: "shared-search-fingerprint".into(),
+            candidate_id_schema: CANDIDATE_ID_SCHEMA.into(),
+            interaction_baseline: true,
+            participation_decision: "included_technical_validation_passed".into(),
+            fallback_used: false,
+            fallback_reason: None,
+            target_only_policy_capability: None,
+            fitted_external_profile_identity_sha256: Some(fitted_profile.into()),
+            fitted_external_profile_calibration: Some(calibration.clone()),
+            annotation_cache_fingerprint: Some(format!("cache-{fitted_profile}")),
+            annotation_cache_manifest_sha256: Some(format!("manifest-{fitted_profile}")),
+            annotation_cache_payload_sha256: Some(format!("payload-{fitted_profile}")),
+        };
+        let experts = vec![
+            expert(ModelFit::Moments, 9, 18, "moments-profile"),
+            expert(ModelFit::Mle, 8, 25, "mle-profile"),
+        ];
+        let mut reversed = experts.clone();
+        reversed.reverse();
+        assert_eq!(
+            shared_ensemble_profile_contract_identity(&dataset, &calibration, &experts).unwrap(),
+            shared_ensemble_profile_contract_identity(&dataset, &calibration, &reversed).unwrap()
+        );
+        assert_ne!(
+            experts[0].fitted_external_profile_identity_sha256,
+            experts[1].fitted_external_profile_identity_sha256
+        );
+        let mut other_dataset = dataset.clone();
+        other_dataset.fingerprint = "other-dataset".into();
+        assert_ne!(
+            shared_ensemble_profile_contract_identity(&dataset, &calibration, &experts).unwrap(),
+            shared_ensemble_profile_contract_identity(&other_dataset, &calibration, &experts)
+                .unwrap()
         );
     }
 
@@ -5876,8 +6129,11 @@ mod tests {
             target_only_results: target,
             target_only_calibration_policy: TargetOnlyCalibrationPolicy::RefitWithLockedWindow,
             calibration_search_fingerprint: "test-search-fingerprint".into(),
-            external_profile_identity_sha256: None,
-            external_profile_calibration: None,
+            fitted_external_profile_identity_sha256: None,
+            fitted_external_profile_calibration: None,
+            annotation_cache_fingerprint: None,
+            annotation_cache_manifest_sha256: None,
+            annotation_cache_payload_sha256: None,
         };
         let lock = build_ensemble_lock(
             &manifest,
@@ -6314,8 +6570,11 @@ mod tests {
                 target_only_results: moments_target,
                 target_only_calibration_policy: TargetOnlyCalibrationPolicy::RefitWithLockedWindow,
                 calibration_search_fingerprint: "test-search-fingerprint".into(),
-                external_profile_identity_sha256: None,
-                external_profile_calibration: None,
+                fitted_external_profile_identity_sha256: None,
+                fitted_external_profile_calibration: None,
+                annotation_cache_fingerprint: None,
+                annotation_cache_manifest_sha256: None,
+                annotation_cache_payload_sha256: None,
             },
             CompletedExpert {
                 model: ModelFit::Mle,
@@ -6329,8 +6588,11 @@ mod tests {
                 target_only_results: mle_target,
                 target_only_calibration_policy: TargetOnlyCalibrationPolicy::RefitWithLockedWindow,
                 calibration_search_fingerprint: "test-search-fingerprint".into(),
-                external_profile_identity_sha256: None,
-                external_profile_calibration: None,
+                fitted_external_profile_identity_sha256: None,
+                fitted_external_profile_calibration: None,
+                annotation_cache_fingerprint: None,
+                annotation_cache_manifest_sha256: None,
+                annotation_cache_payload_sha256: None,
             },
         ];
         let lock = build_ensemble_lock(&manifest, "manifest-hash", &dataset, &experts).unwrap();
@@ -6352,7 +6614,7 @@ mod tests {
             canonical_bytes
         );
         assert_eq!(lock.dataset_fingerprint, dataset.fingerprint);
-        assert_eq!(lock.schema_version, 6);
+        assert_eq!(lock.schema_version, 7);
         assert_eq!(lock.requested_roster, vec!["mle", "moments"]);
         assert_eq!(lock.actual_roster, lock.requested_roster);
         assert!(lock.technical_failures.is_empty());
@@ -6409,7 +6671,7 @@ mod tests {
         assert!(refit.mle_frozen_parameters.is_none());
 
         let mut legacy_lock = lock.clone();
-        legacy_lock.schema_version = 5;
+        legacy_lock.schema_version = 6;
         assert!(apply_ensemble_lock(
             &mut FdrOptions::default(),
             &legacy_lock,
@@ -6698,8 +6960,11 @@ mod tests {
             target_only_results: target,
             target_only_calibration_policy: TargetOnlyCalibrationPolicy::RefitWithLockedWindow,
             calibration_search_fingerprint: "test-search-fingerprint".into(),
-            external_profile_identity_sha256: None,
-            external_profile_calibration: None,
+            fitted_external_profile_identity_sha256: None,
+            fitted_external_profile_calibration: None,
+            annotation_cache_fingerprint: None,
+            annotation_cache_manifest_sha256: None,
+            annotation_cache_payload_sha256: None,
         };
         let lock =
             build_ensemble_lock(&manifest, "manifest-hash", &dataset, &[expert.clone()]).unwrap();

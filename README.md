@@ -1168,8 +1168,11 @@ using the configured combiners. It then calculates Ensemble PSM q-values, derive
 from that combined PSM stream, and derives protein q-values downstream. The native workflow
 optimizes each constituent window independently within the current dataset; it never optimizes a
 combined Ensemble window. JSON configuration defines the requested roster. Artifact integrity,
-provenance, dataset/search/analysis identity, supported target-only semantics, fallback, shared
-external-profile identity, finite fitted state, and duplicate-vote checks define the actual roster.
+provenance, dataset/search/analysis identity, supported target-only semantics, fallback, fitted
+external-profile provenance, finite fitted state, and duplicate-vote checks define the actual
+roster. Schema-v7 locks preserve each expert's fitted-profile provenance separately from the one
+canonical dataset-local Ensemble profile contract. The Ensemble profile is fitted once at the
+explicit 9-18 window, independent of expert order; expert-specific profiles cannot overwrite it.
 Statistical diagnostics do not remove a technically valid requested voter. Native and
 MS2Rescore-fitted artifacts remain separate.
 

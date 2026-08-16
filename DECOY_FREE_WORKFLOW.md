@@ -411,7 +411,7 @@ The current production participation policy is:
 The Ensemble lock copies every actual voter's independently optimized dataset-local window and
 artifact; it never optimizes one combined window. A requested voter is excluded only for technical
 failures such as a missing/corrupt artifact, model or dataset/search/analysis mismatch, prohibited
-fallback, incompatible candidate/annotation/external-profile identity, unsupported target-only
+fallback, incompatible candidate/annotation/fitted-profile provenance, unsupported target-only
 state, nonfinite or invalid fitted state, or duplicate model/artifact vote. Statistical measures—
 including entrapment FDP, observation counts, transfer-loss percentage, parity, unique/incremental
 yield, interaction calibration, holdout outcome, and release/default eligibility—are nonblocking
@@ -425,8 +425,11 @@ denominators, and absolute/relative changes. Raw-q deterioration greater than `0
 a structured informational warning and is never mislabeled as a passing gate. Level-4 interaction
 calibration is also reported but does not change the roster or suppress results. The report is stored in
 `validation.ensemble_interaction.json`, the selected Ensemble stage checkpoint, and workflow state;
-the schema-v6 lock records requested and actual rosters, explicit exclusions, technical failures,
-constituent identities, independently selected windows, target policies, and combiner settings.
+the schema-v7 lock records requested and actual rosters, explicit exclusions, technical failures,
+constituent identities, independently selected windows, target policies, combiner settings, each
+expert's fitted-profile provenance, and a separate canonical shared-profile contract identity. The
+shared dataset-local profile is fitted once at the explicit 9-18 window and cannot be selected by
+expert ordering or overwritten by an expert artifact.
 
 Ensemble remains optional and cannot block the core refactor. If fewer than
 `minimum_ensemble_experts` are technically valid, `ensemble.lock.json` is still written with `evaluable: false` and
