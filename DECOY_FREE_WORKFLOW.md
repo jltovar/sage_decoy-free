@@ -184,12 +184,29 @@ normally enables both and may point `candidate_pool_root`, `annotation_cache_roo
 `target_only_annotation_cache_root` at immutable external resource roots.
 
 When either strict-reuse option is enabled, `workflow --plan-only` performs a read-only preflight
-of both +entrapment and target-only resources. Its structured report includes requested paths,
-expected and actual fingerprints, schemas, counts, retained depth, manifest and payload hashes,
-reuse/generation flags, and any failure reason. It creates no workflow output directory or
-temporary files and starts no search or annotation child process. Strict reuse changes workflow
-execution provenance and checkpoints, but not the strict search fingerprint, candidate IDs,
-candidate-pool identity, annotation fingerprint, or annotation payload identity.
+of both +entrapment and target-only resources. Candidate-pool compatibility is portable: original
+and current source URIs remain provenance, while equality uses the portable digest, FASTA content,
+ordered spectrum ordinals and content hashes, normalized search settings, schema, retained depth,
+counts, and manifest/payload integrity. Paths and filenames alone never establish equivalence.
+
+Annotation preflight is deliberately two-phase because the exact cache identity contains the
+preliminary model/window calibration stream:
+
+1. **Phase A — static read-only preflight.** Validate FASTAs, spectra, search identity, portable
+   candidate pools, counts, rank depth, payloads, cache roots/catalogs, and any annotation identity
+   already derivable. Dynamic annotation stages are reported as `deferred_until_calibration`; a
+   sole cache in a directory is not reported as the expected cache.
+2. **Phase B — stage-local exact preflight.** Native Rust optimization/fitting resolves the window,
+   preliminary stream, `calibration_input_sha256`, and complete annotation fingerprint. The stage
+   then requires that exact manifest/payload and full stable-ID join. In strict mode any miss or
+   mismatch stops before export, Python, wrapper, MS2PIP, DeepLC, or annotation generation.
+
+The structured statuses are `validated_exact`, `deferred_until_calibration`, `missing_exact`,
+`incompatible`, and `generation_planned`. Static plan-only creates no workflow output directory or
+temporary files and starts no search or annotation child process. Cache-only execution may perform
+native model fitting before a deferred exact-cache miss becomes knowable. Strict reuse changes
+workflow execution provenance and checkpoints, but not the strict search fingerprint, candidate
+IDs, candidate-pool identity, annotation fingerprint, or annotation payload identity.
 
 On macOS, the MS2PIP/XGBoost environment must be able to load `libomp.dylib`. Verify this with an
 `import xgboost` using the configured Python executable before a long workflow. If LLVM provides

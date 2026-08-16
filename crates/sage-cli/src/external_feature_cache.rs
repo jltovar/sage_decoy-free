@@ -869,7 +869,7 @@ pub fn usage(
         requested_root: request.root.clone(),
         generation_allowed: !request.require_existing,
         preflight_result: if reused {
-            "valid_existing_cache".into()
+            "validated_exact".into()
         } else {
             "generated_cache".into()
         },
@@ -911,7 +911,9 @@ pub fn verify_usage(usage: &ExternalAnnotationCacheUsage) -> Result<()> {
     anyhow::ensure!(
         legacy_execution_provenance
             || (usage.requested_root == directory.parent().unwrap_or(directory)
-                && (!usage.reused || usage.preflight_result == "valid_existing_cache")
+                && (!usage.reused
+                    || usage.preflight_result == "valid_existing_cache"
+                    || usage.preflight_result == "validated_exact")
                 && (usage.generation_allowed || usage.reused)),
         "MS2Rescore annotation cache execution provenance is inconsistent"
     );
@@ -1196,7 +1198,7 @@ mod tests {
         assert_eq!(usages.len(), 1);
         assert!(usages[0].reused);
         assert!(!usages[0].generation_allowed);
-        assert_eq!(usages[0].preflight_result, "valid_existing_cache");
+        assert_eq!(usages[0].preflight_result, "validated_exact");
 
         write_cache(
             &directory,
