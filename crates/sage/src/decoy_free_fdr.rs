@@ -13377,6 +13377,53 @@ mod tests {
     }
 
     #[test]
+    fn continuous_psm_first_ensemble_combination_is_independent_of_reporting_thresholds() {
+        let mut settings = FdrSettings::from(crate::input::FdrOptions {
+            ensemble_p_combiner: Some(EnsemblePCombiner::SecondBest),
+            ensemble_pep_combiner: Some(EnsemblePepCombiner::Median),
+            precursor_fdr: Some(0.01),
+            peptide_fdr: Some(0.01),
+            protein_fdr: Some(0.01),
+            ..Default::default()
+        });
+        let p_values = [0.004, 0.031, 0.70];
+        let peps = [0.02, 0.20, 0.11];
+        let weights = [1.0; 3];
+        let combined_p = combine_p_values_for_ensemble(&p_values, &settings);
+        let combined_pep = combine_peps(
+            &peps,
+            &weights,
+            settings.ensemble_pep_combiner.clone(),
+            settings.ensemble_pep_trim_frac,
+            settings.ensemble_pep_quantile,
+            settings.ensemble_pep_top_k,
+            settings.ensemble_pep_logit_eps,
+        );
+        assert_eq!(combined_p, 0.031);
+        assert_eq!(combined_pep, 0.11);
+
+        settings.precursor_fdr = 0.20;
+        settings.peptide_fdr = 0.15;
+        settings.protein_fdr = 0.10;
+        assert_eq!(
+            combine_p_values_for_ensemble(&p_values, &settings),
+            combined_p
+        );
+        assert_eq!(
+            combine_peps(
+                &peps,
+                &weights,
+                settings.ensemble_pep_combiner,
+                settings.ensemble_pep_trim_frac,
+                settings.ensemble_pep_quantile,
+                settings.ensemble_pep_top_k,
+                settings.ensemble_pep_logit_eps,
+            ),
+            combined_pep
+        );
+    }
+
+    #[test]
     fn winsorized_moments_remove_gumbel_location_scale_bias() {
         const N: usize = 1 << 16;
         let expected_mu = 12.25;

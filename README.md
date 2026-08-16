@@ -168,14 +168,14 @@ slightly exceeded 1%; this does not invalidate parity, but it prevents a broader
 
 | Model | Current workflow status |
 |---|---|
-| Moments | Required ISB and PXD Moments parity complete; still subject to dataset-local runtime gates. |
-| MLE | ISB parity complete; eligible for automatic Ensemble gates. No additional PXD model was required. |
-| MSFDR1-SMIX | Rank-1-only fitted-state, MS2Rescore, and target-only parity complete; eligible for automatic gates. |
-| Lower Order | Eligible for runtime-gated automatic Ensemble consideration after dataset-local optimization. Target-only supports `refit_with_locked_window` only; cross-space `reuse_dataset_artifact` is unsupported. |
-| MSFDR | Individual +entrapment and target-only parity passed in the reproduced WSL annotation environment; Ensemble participation remains excluded pending independent holdout evidence. |
-| MSFDR2-SMIX | Individual +entrapment and target-only parity passed in the reproduced WSL annotation environment; Ensemble participation remains excluded pending independent holdout evidence. |
+| Moments | Selectable Ensemble voter after dataset-local fitting and technical validation. |
+| MLE | Selectable Ensemble voter after dataset-local fitting and technical validation. |
+| MSFDR1-SMIX | Selectable rank-1-only Ensemble voter; its window remains fixed at 1-1. |
+| Lower Order | Selectable Ensemble voter after dataset-local optimization. Target-only supports `refit_with_locked_window` only; cross-space `reuse_dataset_artifact` is unsupported. |
+| MSFDR | Repaired, selectable Ensemble voter after dataset-local optimization and technical validation. |
+| MSFDR2-SMIX | Repaired, selectable Ensemble voter after dataset-local optimization and technical validation. |
 | Nokoi | Portable artifact and frozen parity are incomplete; diagnostic-only and excluded from Ensemble. |
-| Ensemble | Optional; assembled only when enough dataset-local experts pass provenance, parity, calibration, transfer, fallback, and incremental-yield gates. |
+| Ensemble | Optional; JSON selects the requested voters, technical fail-closed checks select the actual roster, and statistical validation measurements remain nonblocking diagnostics. |
 
 Release evaluation has three states:
 
@@ -226,8 +226,9 @@ This branch is experimental. The DF code is designed to fail closed whenever the
 
 Direct one-off Ensemble searches honor only the static enable/disable flags and weights in the
 search JSON; their code defaults enable all seven experts. They do not apply the workflow's current
-secondary-model exclusions or runtime admission policy automatically. The native `sage workflow`
-path adds the fail-closed expert-quality gates and writes the dataset-local expert set. Holdout
+secondary-model exclusions or workflow roster policy automatically. The native `sage workflow`
+path adds fail-closed artifact/provenance validation and writes the requested and actual
+dataset-local expert rosters. Holdout
 datasets run the same predeclared optimization procedure; they do not import another dataset's
 selected windows or fitted experts.
 
@@ -435,12 +436,12 @@ evidence. The setting does not run picked target-decoy group FDR. Leave it off
 
 The following block illustrates the broad direct-search configuration surface. It is not a
 workflow manifest, a recommended production configuration, or a validated parameter set for a new
-dataset. In particular, direct Ensemble mode does not run the workflow's automatic expert-quality
-gates. Use [`workflow.example.json`](workflow.example.json) for dataset-local optimization and
-release evaluation.
+dataset. Direct Ensemble mode uses static flags and does not construct a provenance-bearing
+workflow roster. Use [`workflow.example.json`](workflow.example.json) for independently optimized
+dataset-local artifacts, technical fail-closed validation, and requested/actual roster provenance.
 
-The example disables experts currently excluded by the documented first-release policy. Even the
-remaining experts require dataset-local runtime gates before an Ensemble result is evaluable.
+The example disables Nokoi because its implementation and portable artifact repair remain
+incomplete. Statistical validation diagnostics do not select the other Ensemble voters.
 
 ```json
 {
@@ -545,13 +546,13 @@ remaining experts require dataset-local runtime gates before an Ensemble result 
 
     "enable_moments": true,
     "enable_mle": true,
-    "enable_lower_order": false,
-    "enable_msfdr_seeded": false,
+    "enable_lower_order": true,
+    "enable_msfdr_seeded": true,
     "enable_msfdr_1smix": true,
-    "enable_msfdr_2smix": false,
+    "enable_msfdr_2smix": true,
     "enable_nokoi": false,
 
-    "ensemble_p_combiner": "cauchy",
+    "ensemble_p_combiner": "second_best",
     "ensemble_cauchy_penalty": 1.0224,
     "ensemble_pep_combiner": "median",
     "ensemble_pep_trim_frac": 0.2,
@@ -561,10 +562,10 @@ remaining experts require dataset-local runtime gates before an Ensemble result 
 
     "ensemble_weight_moments": 1.0,
     "ensemble_weight_mle": 1.0,
-    "ensemble_weight_lower_order": 0.0,
-    "ensemble_weight_msfdr_seeded": 0.0,
+    "ensemble_weight_lower_order": 1.0,
+    "ensemble_weight_msfdr_seeded": 1.0,
     "ensemble_weight_msfdr_1smix": 1.0,
-    "ensemble_weight_msfdr_2smix": 0.0,
+    "ensemble_weight_msfdr_2smix": 1.0,
     "ensemble_weight_nokoi": 0.0,
 
     "physical_rescue": {
@@ -1106,8 +1107,8 @@ The ensemble combines expert p-value streams and/or expert PEP-like streams depe
 
 These models produce fitted-null tail p-value streams and calibrated local-FDR/PEP-like streams derived from those p-values.  They are useful for decoy-free modeling of lower-rank null evidence, but their calibration should be checked with entrapment or other external validation.
 
-Lower Order is eligible for runtime-gated automatic Ensemble consideration after dataset-local
-window optimization. Its target-only contract is `refit_with_locked_window`: the selected
+Lower Order is available for JSON-selected Ensemble voting after dataset-local window optimization
+and technical validation. Its target-only contract is `refit_with_locked_window`: the selected
 +entrapment window is retained, nuisance state is refitted in the target-only candidate space, and
 target-only outcomes never retune the window. Complete-artifact cross-space reuse remains
 unsupported and fails closed.
@@ -1117,8 +1118,9 @@ unsupported and fails closed.
 The MSFDR family produces fitted or empirical null-survival p-like streams and derived PEP-like
 streams. The SMIX variants use mixture-model fitting and can be sensitive to initialization and
 rank-window choices. Seeded MSFDR and MSFDR2-SMIX passed individual +entrapment and target-only
-parity in the reproduced WSL annotation environment, but remain excluded from production Ensemble
-participation pending independent holdout evidence.
+parity in the reproduced WSL annotation environment and are available as JSON-selected Ensemble
+voters. Their validation and holdout measurements remain reportable diagnostics rather than roster
+controls.
 
 ### NOKOI
 
@@ -1130,14 +1132,34 @@ semantics.
 
 ### Ensemble
 
-The ensemble is designed to combine evidence from multiple experts. Direct searches use static flags and weights. The native workflow optimizes each constituent window independently within the current dataset, rejects experts that fail calibration, stability, usefulness, fallback, artifact, or provenance gates, and creates `ensemble.lock.json` automatically. It keeps native and MS2Rescore-fitted artifacts separate. A holdout dataset applies the same locked expert-selection procedure to its own independently optimized experts; it never imports another dataset's expert windows or fitted models in normal operation.
+The Ensemble combines continuous PSM-level p-values and PEP-like values from every actual voter
+using the configured combiners. It then calculates Ensemble PSM q-values, derives peptide q-values
+from that combined PSM stream, and derives protein q-values downstream. The native workflow
+optimizes each constituent window independently within the current dataset; it never optimizes a
+combined Ensemble window. JSON configuration defines the requested roster. Artifact integrity,
+provenance, dataset/search/analysis identity, supported target-only semantics, fallback, shared
+external-profile identity, finite fitted state, and duplicate-vote checks define the actual roster.
+Statistical diagnostics do not remove a technically valid requested voter. Native and
+MS2Rescore-fitted artifacts remain separate.
+
+Each distinct canonical model contributes one continuous PSM-level vote. Canonical ordering is
+used only for deterministic serialization; models are not ordered by discovery counts. Duplicate
+canonical models and duplicate artifact instances fail closed. `precursor_fdr`, `peptide_fdr`, and
+`protein_fdr` control reported PSM/precursor, peptide, and protein identifications respectively;
+they do not select voters.
+
+The legacy workflow fields `minimum_incremental_ensemble_peptides` and
+`maximum_transfer_fraction_loss` remain readable for compatibility and validation reporting, but
+are deprecated as runtime admission controls. Parity pairs, entrapment observation minima, holdout
+status, and release/default eligibility likewise do not alter the roster.
 
 When an automatically eligible expert is outside the declared established interaction baseline,
 the workflow also reports the baseline-to-final raw-q and Level-4 entrapment FDP changes for PSMs,
 canonical peptides, and peptidoforms. An absolute raw-q deterioration above `0.01` produces a
-structured informational warning; it is not recorded as a passing gate and is distinct from the
-final Level-4 peptide-calibration release check. The diagnostic is deterministic, provenance
-bearing, and does not use target-only outcomes to decide participation.
+structured informational warning. Raw-q and Level-4 interaction measurements are explicitly
+nonblocking validation diagnostics: they neither change the roster nor suppress target-only
+execution. The diagnostic is deterministic, provenance bearing, and does not use target-only
+outcomes to decide participation.
 
 ---
 
@@ -1152,10 +1174,10 @@ The completed validation establishes engineering behavior, not general statistic
    must not be described as proof of calibrated 1% protein FDR.
 4. A matched TDC benchmark is still absent from the final release evidence. The repository therefore
    cannot yet evaluate whether Decoy-Free should replace TDC as a statistical default.
-5. Lower Order supports target-only `refit_with_locked_window` only and is eligible for automatic
-   consideration subject to every runtime Ensemble gate. Seeded MSFDR and MSFDR2-SMIX remain
-   excluded pending independent holdout evidence, and Nokoi portability/parity remains deferred.
-   Ensemble is optional and cannot promote any expert around its gates.
+5. Lower Order supports target-only `refit_with_locked_window` only. Lower Order, seeded MSFDR, and
+   MSFDR2-SMIX are selectable voters subject to technical fail-closed validation. Nokoi remains
+   excluded because its implementation and portable artifact are incomplete. Statistical-default
+   eligibility remains a separate, unevaluated question.
 6. The present evidence does not select a universally best Decoy-Free model. Model suitability must
    be assessed within each dataset using entrapment calibration and matched comparisons.
 
@@ -1188,7 +1210,10 @@ EM convergence stability
 
 ### 3. Additional Ensemble diagnostics and weighting
 
-The native workflow now vetoes experts with missing/fallback artifacts, failed entrapment calibration, underpowered accepted-entrapment counts, unstable target-only transfer, or no incremental Level-4 peptide yield. Additional diagnostics could include:
+The native workflow now vetoes a requested voter only for technical failures such as missing,
+corrupt, mismatched, fallback, unsupported, or duplicate artifacts/state. Entrapment calibration,
+observation counts, transfer-loss percentages, parity, unique/incremental yield, holdout outcomes,
+and interaction changes remain nonblocking diagnostics. Additional diagnostics could include:
 
 ```text
 finite-value fraction

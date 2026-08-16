@@ -1,9 +1,17 @@
 {
-  "schema_version": 1,
+  "schema_version": 2,
   "policy_date": "2026-08-15",
   "statistical_default": {
     "status": "not_evaluated",
-    "note": "Runtime-gated expert eligibility does not establish superiority over TDC or change the statistical default."
+    "note": "Configuration-controlled Ensemble voting does not establish superiority over TDC or change the statistical default."
+  },
+  "roster_contract": {
+    "requested_roster": "enabled JSON models with ensemble_participation=auto",
+    "actual_roster": "requested models whose independently fitted artifacts pass technical fail-closed validation",
+    "one_vote_per_canonical_model": true,
+    "duplicate_model_or_artifact_votes": "fail_closed",
+    "canonical_ordering": "model_name_for_serialization_only",
+    "lock_schema_version": 6
   },
   "experts": {
     "moments": {
@@ -16,40 +24,59 @@
     },
     "msfdr1_smix": {
       "participation": "auto",
-      "interaction_baseline": true
+      "interaction_baseline": true,
+      "window": "1-1_fixed"
     },
     "lower_order": {
       "participation": "auto",
       "interaction_baseline": false,
       "target_only_calibration_policy": "refit_with_locked_window",
-      "reuse_dataset_artifact": "unsupported",
-      "decision": "eligible_for_runtime_gated_consideration",
-      "note": "The preregistered Fold 3 raw-q calibration gate remains FAIL; forensic review found sparse boundary crossings and no software/model defect or broad systematic deterioration."
+      "reuse_dataset_artifact": "unsupported"
     },
     "msfdr": {
-      "participation": "excluded",
-      "reason": "independent holdout evidence is pending"
+      "participation": "auto",
+      "interaction_baseline": false
     },
     "msfdr2_smix": {
-      "participation": "excluded",
-      "reason": "independent holdout evidence is pending"
+      "participation": "auto",
+      "interaction_baseline": false
     },
     "nokoi": {
       "participation": "excluded",
-      "reason": "portable artifact and parity work remains incomplete"
+      "reason": "portable artifact and implementation repair remain incomplete"
     }
   },
-  "runtime_gates": [
-    "dataset-local calibration",
-    "target-only transfer stability",
-    "incremental Level-4 canonical-peptide usefulness",
-    "no fit fallback",
-    "artifact and provenance integrity",
-    "minimum eligible expert count"
+  "technical_fail_closed_checks": [
+    "fitted model and artifact availability",
+    "artifact hash and schema integrity",
+    "dataset, search, analysis, candidate-ID, and annotation identity",
+    "no prohibited fit fallback",
+    "supported target-only policy and state",
+    "shared external-profile identity",
+    "finite and dimensionally valid fitted state",
+    "unique canonical model and artifact votes",
+    "structural minimum voter count"
+  ],
+  "nonblocking_statistical_diagnostics": [
+    "raw-q and Level-4 entrapment FDP",
+    "minimum entrapment observations",
+    "target-only transfer-loss percentage",
+    "frozen parity comparison",
+    "unique and incremental identifications",
+    "post-assembly interaction calibration",
+    "holdout outcome",
+    "release and statistical-default eligibility"
   ],
   "ensemble_interaction_reporting": {
     "raw_q_absolute_deterioration_warning": 0.01,
     "warning_is_informational": true,
-    "final_level4_peptide_calibration_is_release_gate": true
+    "level4_is_nonblocking_validation_diagnostic": true,
+    "participation_effect": "none"
+  },
+  "reporting_thresholds": {
+    "precursor_fdr": 0.01,
+    "peptide_fdr": 0.01,
+    "protein_fdr": 0.01,
+    "select_ensemble_voters": false
   }
 }

@@ -206,10 +206,18 @@ pub struct EnsembleInteractionCalibration {
     pub raw_q: Option<EnsembleInteractionLayer>,
     pub level4: Option<EnsembleInteractionLayer>,
     pub raw_q_warning: Option<EnsembleInteractionWarning>,
+    /// Diagnostic comparison only. This value never changes the requested or
+    /// actual Ensemble roster and never suppresses results.
     pub final_level4_calibration_pass: bool,
     pub evaluable: bool,
+    #[serde(default = "nonblocking_interaction_effect")]
+    pub participation_effect: String,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub not_evaluable_reason: Option<String>,
+}
+
+fn nonblocking_interaction_effect() -> String {
+    "none_nonblocking_diagnostic".into()
 }
 
 fn interaction_level(
@@ -336,16 +344,16 @@ pub fn ensemble_interaction_calibration(
         affected_levels,
         message: "post-assembly raw-q entrapment FDP deterioration exceeds the informational validation reference; this warning is not a passing calibration gate".into(),
     });
-    // The production release policy gates peptide calibration. PSM and
-    // peptidoform FDP remain fully reported without creating a new,
-    // post-observation admission threshold.
+    // This is a validation diagnostic, not a voter-admission decision. PSM,
+    // peptide, and peptidoform FDP remain fully reported without changing the
+    // JSON-requested technically valid roster.
     let final_level4_calibration_pass = level4
         .peptide
         .final_fdp
         .is_some_and(|fdp| fdp <= fdr_threshold);
     let evaluable = level4.peptide.final_fdp.is_some();
     Ok(EnsembleInteractionCalibration {
-        schema_version: 1,
+        schema_version: 2,
         baseline_lock_analysis_fingerprint: None,
         final_lock_analysis_fingerprint: None,
         baseline_experts,
@@ -356,6 +364,7 @@ pub fn ensemble_interaction_calibration(
         raw_q_warning,
         final_level4_calibration_pass,
         evaluable,
+        participation_effect: nonblocking_interaction_effect(),
         not_evaluable_reason: (!evaluable)
             .then(|| "final Ensemble Level-4 peptide entrapment FDP is missing".into()),
     })
@@ -1612,6 +1621,8 @@ mod tests {
         assert_eq!(report.baseline_experts, vec!["mle", "moments"]);
         assert_eq!(report.newly_participating_experts, vec!["lower_order"]);
         assert!(report.final_level4_calibration_pass);
+        assert_eq!(report.schema_version, 2);
+        assert_eq!(report.participation_effect, "none_nonblocking_diagnostic");
         assert_eq!(
             serde_json::to_vec(&report).unwrap(),
             serde_json::to_vec(&repeated).unwrap()
@@ -1631,7 +1642,7 @@ mod tests {
     }
 
     #[test]
-    fn invalid_final_level4_peptide_calibration_does_not_pass() {
+    fn invalid_final_level4_peptide_calibration_is_nonblocking_but_not_evaluable() {
         let baseline = vec![
             summary("baseline", "optimized", "raw_q", 1_000, 1),
             summary("baseline", "optimized", "level4", 900, 1),
@@ -1653,6 +1664,7 @@ mod tests {
         .unwrap();
         assert!(!report.evaluable);
         assert!(!report.final_level4_calibration_pass);
+        assert_eq!(report.participation_effect, "none_nonblocking_diagnostic");
         assert!(report
             .not_evaluable_reason
             .as_deref()
