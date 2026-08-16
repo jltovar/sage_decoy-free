@@ -45,6 +45,7 @@
     },
     {
       "model": "lower_order",
+      "ensemble_participation": "auto",
       "target_only_calibration_policy": "refit_with_locked_window",
       "ensemble_interaction_baseline": false,
       "window_optimizer": {
@@ -56,8 +57,8 @@
     },
     {
       "model": "msfdr",
-      "ensemble_participation": "excluded",
-      "ensemble_exclusion_reason": "MSFDR remains excluded pending independent holdout evidence.",
+      "ensemble_participation": "auto",
+      "ensemble_interaction_baseline": false,
       "window_optimizer": {
         "strategy": "landscape_adaptive",
         "min_rank_range": [2, 10],
@@ -72,8 +73,8 @@
     },
     {
       "model": "msfdr2_smix",
-      "ensemble_participation": "excluded",
-      "ensemble_exclusion_reason": "MSFDR2-SMIX remains excluded pending independent holdout evidence.",
+      "ensemble_participation": "auto",
+      "ensemble_interaction_baseline": false,
       "window_optimizer": {
         "strategy": "landscape_adaptive",
         "min_rank_range": [2, 10],

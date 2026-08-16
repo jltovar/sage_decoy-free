@@ -30,11 +30,12 @@ species FASTAs, and a workflow JSON. The workflow will:
 9. measure MS2Rescore and retain it only when its configured gain/calibration gates pass;
 10. run the target-only search under an explicit calibration policy, defaulting to a locked
     dataset-local window with nuisance parameters refit in the target-only candidate space;
-11. assemble Ensemble automatically from the independently selected expert windows and
-    stage-matched frozen artifacts;
+11. assemble the JSON-requested Ensemble roster from technically valid, independently selected
+    expert windows and stage-matched frozen artifacts;
 12. emit raw-q and Level-4/reportable counts, FDP, direct optimized/MS2Rescore/target-only
     comparisons, missing-run reports, transfer-stability results, parity checks, constrained TDC
-    comparisons, Ensemble expert-quality gates, and a release gate.
+    comparisons, nonblocking Ensemble validation diagnostics, technical roster decisions, and a
+    separate statistical release/default report.
 
 The primary invariant is **dataset-local optimization**. Every dataset and every individual model
 fit creates or selects its own entrapment FASTA, measures its own ratios, and selects its own null
@@ -277,11 +278,10 @@ the locked `6-9` window. Bitwise historical grid parity and complete frozen anno
 and the required historical non-rank-1 Linux annotations were not preserved. Preserved rank-1
 annotations match exactly.
 
-Lower Order completed the controlled within-parent ISB holdout and is now eligible for automatic
-Ensemble consideration through the normal runtime gates. Eligibility is not unconditional
-inclusion: dataset-local calibration, stability, incremental usefulness, fallback, artifact, and
-provenance checks still determine participation. This engineering evidence does not establish
-statistical superiority over TDC or eligibility for the statistical default.
+Lower Order is available for JSON-selected Ensemble voting after dataset-local optimization and
+technical fail-closed validation. Its target-only policy remains `refit_with_locked_window`;
+statistical diagnostics do not authorize complete cross-space nuisance-artifact reuse. This does
+not establish statistical superiority over TDC or eligibility for the statistical default.
 
 ## Frozen ISB parity status
 
@@ -293,8 +293,9 @@ also passed the applicable downstream count comparisons; the Moments MS2Rescore 
 by only two PSMs with exact peptide and protein counts.
 
 Seeded MSFDR and MSFDR2-SMIX later passed individual +entrapment and target-only parity after the
-frozen Linux annotation environment was reproduced under WSL. Both remain excluded from automatic
-Ensemble participation pending independent holdout evidence.
+frozen Linux annotation environment was reproduced under WSL. Both are available as JSON-selected
+Ensemble voters after technical validation. Parity, holdout, calibration, and yield measurements
+remain validation diagnostics rather than voter-admission controls.
 Nokoi failed the frozen fit, selected-window, and target-only checks and is deferred as described
 above. The production Ensemble is not assembled from these incomplete experts. Full evidence is
 recorded in `validation/reports/phase6_isb_model_parity_2026-08-07.json`.
@@ -334,43 +335,56 @@ PXD models; decide later whether one is scientifically or technically necessary.
 
 ## Secondary-model and Ensemble release policy
 
-The secondary-model audit does not reinterpret the frozen parity failures as passes. It makes their release consequences
-explicit and fail-closed. Each individual model may declare `ensemble_participation: auto`, or
-`ensemble_participation: excluded` with a required `ensemble_exclusion_reason`. An automatic model
-must still pass all applicable runtime gates; the field is eligibility for evaluation, not an
-override or guarantee of admission.
+The core Ensemble is continuous and PSM-first. Every requested, technically valid model supplies
+its continuous PSM p-value and PEP-like streams. The configured Ensemble combiners operate on
+those streams, Ensemble PSM q-values are calculated, peptide q-values are derived from the combined
+PSM stream, and protein q-values are derived downstream. No accepted-list masking or model-level
+peptide/protein voting is performed.
+
+Each enabled individual model may declare `ensemble_participation: auto` to request one vote, or
+`ensemble_participation: excluded` with a required `ensemble_exclusion_reason`. Technical
+fail-closed validation produces a separate actual roster. Canonical sorting exists only for
+serialization and reproducibility; it never assigns credit by discovery count. Duplicate canonical
+models and duplicate artifact votes fail closed.
+
+`minimum_incremental_ensemble_peptides` and `maximum_transfer_fraction_loss` remain accepted for
+backward-compatible JSON loading and validation reports, but are deprecated as runtime admission
+controls. They cannot change `expert.enabled`, the requested roster, or the actual roster.
 
 The current production participation policy is:
 
-- Moments, MLE, and rank-1-only MSFDR1-SMIX remain eligible for automatic Ensemble gates.
-- Lower Order is eligible for the same automatic runtime gates after dataset-local window
-  optimization. It supports target-only `refit_with_locked_window` only; cross-space
+- Moments, MLE, rank-1-only MSFDR1-SMIX, seeded MSFDR, MSFDR2-SMIX, and Lower Order are selectable
+  voters. MSFDR1-SMIX remains fixed at 1-1; every variable-window model independently optimizes its
+  own dataset-local window.
+- Lower Order supports target-only `refit_with_locked_window` only; cross-space
   `reuse_dataset_artifact` is explicitly unsupported, and target-only outcomes never tune its
   window.
-- Seeded MSFDR and MSFDR2-SMIX remain excluded pending independent holdout evidence.
 - Nokoi v1 is diagnostic-only. The workflow refuses to reuse it as a portable artifact because
   it lacks the complete state required to reconstruct the frozen procedure, and its ISB fit and
   target-only parity also failed.
 
-The Ensemble lock copies every accepted expert's independently optimized dataset-local window and
-artifact; it never optimizes one combined window. It rejects experts with missing or unreadable
-evidence, invalid provenance or artifact schemas, fit fallback, failed declared parity,
-unacceptable gate-layer entrapment FDP, unstable target-only transfer, or insufficient incremental
-peptide yield. A declared frozen parity pair is an admission gate rather than a reporting-only
-comparison.
+The Ensemble lock copies every actual voter's independently optimized dataset-local window and
+artifact; it never optimizes one combined window. A requested voter is excluded only for technical
+failures such as a missing/corrupt artifact, model or dataset/search/analysis mismatch, prohibited
+fallback, incompatible candidate/annotation/external-profile identity, unsupported target-only
+state, nonfinite or invalid fitted state, or duplicate model/artifact vote. Statistical measures—
+including entrapment FDP, observation counts, transfer-loss percentage, parity, unique/incremental
+yield, interaction calibration, holdout outcome, and release/default eligibility—are nonblocking
+diagnostics.
 
 For newly eligible experts, `ensemble_interaction_baseline` distinguishes the established
 counterfactual Ensemble from the final assembled Ensemble without changing any gate. The workflow
 reuses the same candidate pool and annotation cache to report baseline and final raw-q and Level-4
 PSM, canonical-peptide, and peptidoform entrapment FDP, including measured-ratio numerators,
 denominators, and absolute/relative changes. Raw-q deterioration greater than `0.01` is emitted as
-a structured informational warning and is never mislabeled as a passing calibration gate. Final
-Level-4 peptide calibration remains a release check. The report is stored in
+a structured informational warning and is never mislabeled as a passing gate. Level-4 interaction
+calibration is also reported but does not change the roster or suppress results. The report is stored in
 `validation.ensemble_interaction.json`, the selected Ensemble stage checkpoint, and workflow state;
-the schema-v5 lock records the baseline membership and warning contract.
+the schema-v6 lock records requested and actual rosters, explicit exclusions, technical failures,
+constituent identities, independently selected windows, target policies, and combiner settings.
 
 Ensemble remains optional and cannot block the core refactor. If fewer than
-`minimum_ensemble_experts` pass, `ensemble.lock.json` is still written with `evaluable: false` and
+`minimum_ensemble_experts` are technically valid, `ensemble.lock.json` is still written with `evaluable: false` and
 the reasons, and Ensemble stages are skipped without invalidating completed individual-model
 stages. Applying a non-evaluable lock fails closed. The historical Phase 8 policy remains preserved
 in `validation/policies/phase8_isb_ensemble_expert_policy_2026-08-08.json`. The current status is in
@@ -380,6 +394,11 @@ the original secondary-expert repair is in
 
 No additional PXD model search was run for the secondary-model audit. PXD Moments remains the only required PXD
 parity run for this refactor.
+
+`precursor_fdr`, `peptide_fdr`, and `protein_fdr` control reported PSM/precursor, peptide, and
+protein identifications respectively. They are downstream reporting thresholds and never select
+Ensemble voters. Entrapment FDP and related validation measurements may be written to reports, but
+they cannot alter the requested or actual roster.
 
 ## Final release evaluation and resumption integrity
 
