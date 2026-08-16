@@ -53,7 +53,7 @@
     "dataset, search, analysis, candidate-ID, and annotation identity",
     "no prohibited fit fallback",
     "supported target-only policy and state",
-    "shared external-profile identity",
+    "per-expert fitted-profile provenance and canonical shared Ensemble-profile contract identity",
     "finite and dimensionally valid fitted state",
     "unique canonical model and artifact votes",
     "structural minimum voter count"
