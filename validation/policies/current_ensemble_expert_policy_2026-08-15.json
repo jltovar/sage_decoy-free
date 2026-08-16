@@ -42,8 +42,9 @@
       "interaction_baseline": false
     },
     "nokoi": {
-      "participation": "excluded",
-      "reason": "portable artifact and implementation repair remain incomplete"
+      "participation": "auto",
+      "interaction_baseline": false,
+      "artifact_schema": "sage-nokoi-crossfit-portable-v2"
     }
   },
   "technical_fail_closed_checks": [

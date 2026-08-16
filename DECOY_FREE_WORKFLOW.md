@@ -229,21 +229,30 @@ legacy shell workflow retained the window and refit the target-only nuisance par
 
 ## Portable Nokoi
 
-Nokoi now writes its final logistic model, exact feature schema, imputation medians,
-normalization means/standard deviations, selected L1 penalty, deterministic fold metadata,
-out-of-fold null-score distribution, dataset-local pi0, and frozen monotone p-to-PEP calibration.
-The `reuse_dataset_artifact` target-only policy may evaluate the artifact fitted earlier in the
-same dataset workflow without training a new classifier or re-estimating the null/PEP calibration.
-The default `refit_with_locked_window` interpretation instead refits Nokoi in the target-only
-candidate space and must be evaluated during model-specific parity. A separate holdout
-dataset fits its own Nokoi model and null window under the same predeclared procedure. Missing,
-cross-dataset, incompatible, or incomplete artifacts fail closed.
+Nokoi uses `sage-nokoi-crossfit-portable-v2`. The artifact freezes the exact ordered feature
+contract, imputation and normalization state, deterministic stable-ID fold construction,
+fold-specific and final weights/intercepts, complete lambda-evaluation and early-stopping state,
+the lambda grid, class construction and sampling rules, the sorted out-of-fold null-score
+distribution, pi0, complete Grenander blocks,
+the monotone p-to-PEP mapping, candidate-count reference state, source/configuration identities,
+and hashes for every state block and the complete canonical payload. Artifact floating-point state
+is serialized as hexadecimal IEEE-754 bits; legacy decimal v1 payloads remain readable for
+diagnosis but cannot pass v2 portability validation. Absolute paths never participate in identity.
 
-The frozen ISB audit found that this is not yet a complete portable artifact for release. It does
-not retain fold-specific weights/intercepts, an explicit fold-membership reconstruction rule,
-complete training-rule and Grenander state, or source hashes. Its native frozen-grid result also
-selected `2-12` rather than legacy `2-15`. Nokoi is therefore explicitly deferred; target-only
-must not silently retrain it for the first refactor release.
+Training, sampling, fold assignment, lambda tie-breaking, model initialization, early stopping,
+and calibration use stable deterministic ordering. Applying v2 extracts the frozen feature order,
+uses only the frozen model and calibration, and performs no training, cross-validation, lambda
+selection, or calibration refit. Missing, corrupt, nonfinite, dimensionally invalid, nonmonotone,
+wrong-window, wrong-population, or provenance-incompatible state fails closed.
+
+`refit_with_locked_window` retains the +entrapment-selected window but fits a separate complete v2
+artifact in target-only candidate space. `reuse_dataset_artifact` applies the complete +entrapment
+artifact without refitting and is restricted to the corresponding target-only population of the
+same parent dataset. `compare_both` preserves the two interpretations in separate stages. A
+separate dataset must fit its own Nokoi artifact. The historical ISB `2-15` window remains
+diagnostic evidence: its seeded shuffle and contiguous folds were still keyed to process-local row
+order, while v2 uses stable-candidate-ID sampling and fold assignment. V2 selection follows that
+corrected deterministic optimizer contract and is not forced to the historical value.
 
 ## Development, holdout, and artifact scope
 
@@ -296,9 +305,11 @@ Seeded MSFDR and MSFDR2-SMIX later passed individual +entrapment and target-only
 frozen Linux annotation environment was reproduced under WSL. Both are available as JSON-selected
 Ensemble voters after technical validation. Parity, holdout, calibration, and yield measurements
 remain validation diagnostics rather than voter-admission controls.
-Nokoi failed the frozen fit, selected-window, and target-only checks and is deferred as described
-above. The production Ensemble is not assembled from these incomplete experts. Full evidence is
-recorded in `validation/reports/phase6_isb_model_parity_2026-08-07.json`.
+The historical Nokoi v1 comparison selected `2-12` rather than legacy `2-15` and failed its old
+target-only checks. That result remains diagnostic evidence and is not relabeled. Portable v2
+repairs the incomplete, nondeterministic implementation contract; JSON selection plus current
+technical validation now controls whether Nokoi votes. Full historical evidence is recorded in
+`validation/reports/phase6_isb_model_parity_2026-08-07.json`.
 
 ## Independent PXD001468 Moments parity status
 
@@ -353,15 +364,14 @@ controls. They cannot change `expert.enabled`, the requested roster, or the actu
 
 The current production participation policy is:
 
-- Moments, MLE, rank-1-only MSFDR1-SMIX, seeded MSFDR, MSFDR2-SMIX, and Lower Order are selectable
-  voters. MSFDR1-SMIX remains fixed at 1-1; every variable-window model independently optimizes its
-  own dataset-local window.
+- Moments, MLE, rank-1-only MSFDR1-SMIX, seeded MSFDR, MSFDR2-SMIX, Lower Order, and Nokoi are
+  selectable voters. MSFDR1-SMIX remains fixed at 1-1; every variable-window model independently
+  optimizes its own dataset-local window.
 - Lower Order supports target-only `refit_with_locked_window` only; cross-space
   `reuse_dataset_artifact` is explicitly unsupported, and target-only outcomes never tune its
   window.
-- Nokoi v1 is diagnostic-only. The workflow refuses to reuse it as a portable artifact because
-  it lacks the complete state required to reconstruct the frozen procedure, and its ISB fit and
-  target-only parity also failed.
+- Nokoi requires a complete `sage-nokoi-crossfit-portable-v2` artifact. Legacy v1 artifacts remain
+  readable as historical diagnostics but cannot enter an Ensemble or target-only reuse path.
 
 The Ensemble lock copies every actual voter's independently optimized dataset-local window and
 artifact; it never optimizes one combined window. A requested voter is excluded only for technical

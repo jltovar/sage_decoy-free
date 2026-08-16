@@ -4269,6 +4269,7 @@ fn fit_engines(
     work: &WorkSet,
     settings: &FdrSettings,
     gates: RunGates,
+    db: &IndexedDatabase,
 ) -> Option<Engines> {
     let min_null_size = settings.min_null_size;
     let null_source = RankNullSource::build(features, work, settings);
@@ -4327,6 +4328,17 @@ fn fit_engines(
     } else {
         None
     };
+    let nokoi_stable_ids = gates.run_nokoi.then(|| {
+        features
+            .iter()
+            .map(|feature| {
+                nokoi::stable_candidate_identity(
+                    &feature.core,
+                    &db[feature.core.peptide_idx].to_string(),
+                )
+            })
+            .collect::<Vec<_>>()
+    });
 
     let window_ok = |method: &str, window_min: u32, window_max: u32, count: usize| -> bool {
         if count < min_null_size {
@@ -4785,14 +4797,28 @@ fn fit_engines(
                 || artifact.max_null_rank != settings.nokoi_max_null_rank
             {
                 log::error!("Nokoi frozen artifact window is incompatible; failing closed");
-            } else if let Some(evidence) = nokoi::apply_nokoi_artifact(features, artifact) {
-                log::info!(
-                    "Nokoi using frozen portable artifact model_version={}; refit=false",
-                    artifact.model_version
-                );
-                nokoi_p_values = Some(Arc::new(evidence.p_values));
-                nokoi_peps = Some(Arc::new(evidence.peps));
-                nokoi_artifact = Some(artifact.clone());
+            } else {
+                match nokoi::apply_nokoi_artifact_with_mode(
+                    features,
+                    nokoi_stable_ids.as_deref().unwrap_or_default(),
+                    artifact,
+                    settings.nokoi_artifact_application_mode,
+                    settings.nokoi_application_dataset_fingerprint.as_deref(),
+                ) {
+                    Ok(evidence) => {
+                        log::info!(
+                            "Nokoi using frozen portable artifact model_version={}; refit=false application_mode={:?}",
+                            artifact.model_version,
+                            settings.nokoi_artifact_application_mode
+                        );
+                        nokoi_p_values = Some(Arc::new(evidence.p_values));
+                        nokoi_peps = Some(Arc::new(evidence.peps));
+                        nokoi_artifact = Some(artifact.clone());
+                    }
+                    Err(error) => {
+                        log::error!("Nokoi frozen artifact rejected: {error}");
+                    }
+                }
             }
         } else if let Some(nokoi_pool) = nokoi_pool.as_ref() {
             let nokoi_count = nokoi_pool
@@ -4846,7 +4872,7 @@ fn fit_engines(
                 };
 
                 let nokoi_null_indices = nokoi_pool.feature_indices();
-                if let Some(fitted) = nokoi::fit_nokoi_artifact(
+                match nokoi::fit_nokoi_artifact_with_metadata(
                     features,
                     &config,
                     settings.nokoi_min_null_rank,
@@ -4854,7 +4880,18 @@ fn fit_engines(
                     settings.nokoi_k_folds,
                     is_positive,
                     &nokoi_null_indices,
+                    nokoi::NokoiFitMetadata {
+                        stable_ids: nokoi_stable_ids.as_deref().unwrap_or_default(),
+                        positive_class_rule:
+                            "rank-1 TEV is greater than or equal to the deterministic top-fraction threshold",
+                        positive_top_fraction: settings.nokoi_positive_top_fraction,
+                        positive_threshold: threshold,
+                        null_purification_rule:
+                            "method-specific rank-null pool excludes peptides in the configured purified top rank-1 fraction and falls back only under the shared min-null-size rule",
+                        null_purification_factor: settings.nokoi_null_purification_factor,
+                    },
                 ) {
+                    Ok(fitted) => {
                     let nokoi_evidence = fitted.evidence;
 
                     if nokoi_evidence.p_values.len() != features.len()
@@ -4884,8 +4921,10 @@ fn fit_engines(
                         ));
                         nokoi_artifact = Some(fitted.artifact);
                     }
-                } else {
-                    log::warn!("Nokoi disabled: crossfit failed.");
+                    }
+                    Err(error) => {
+                        log::error!("Nokoi technical fit failure: {error}");
+                    }
                 }
             }
         } else {
@@ -5010,8 +5049,9 @@ fn fit_base_experts(
     work: &WorkSet,
     settings: &FdrSettings,
     gates: RunGates,
+    db: &IndexedDatabase,
 ) -> Option<Engines> {
-    fit_engines(features, work, settings, gates)
+    fit_engines(features, work, settings, gates, db)
 }
 
 fn score_base_rank1(
@@ -6023,6 +6063,43 @@ fn finalize_base_q_values(
                 p_nokoi_ref.push(p);
             }
         }
+    }
+
+    // Nokoi's empirical p-values are intentionally discrete, so many PSMs can
+    // share an identical value.  The generic Storey implementation uses an
+    // unstable sort internally; feeding tied values in process-local row order
+    // can therefore assign adjacent diagnostic q-values to different candidates
+    // after an otherwise exact artifact replay. Canonical stable-candidate
+    // ordering removes that row-order component without changing the fitted
+    // evidence or the generic q-value implementation. A fit-versus-reload
+    // comparison may still expose bounded last-bit arithmetic in this derived
+    // diagnostic; the controlling p/PEP and final q streams are unaffected.
+    if !nokoi_pos.is_empty() {
+        let mut rows = nokoi_pos
+            .into_iter()
+            .zip(p_nokoi_present)
+            .map(|(k, p)| {
+                let i = work.rank1_indices[k];
+                let feature = &features[i];
+                let protein =
+                    db[feature.core.peptide_idx].proteins(&db.decoy_tag, db.generate_decoys);
+                let is_ref = feature.core.label == 1
+                    && !is_contam_str(&protein)
+                    && !is_entrapment_str(&protein);
+                let stable_id = nokoi::stable_candidate_identity(
+                    &feature.core,
+                    &db[feature.core.peptide_idx].to_string(),
+                );
+                (stable_id, k, p, is_ref)
+            })
+            .collect::<Vec<_>>();
+        rows.sort_by(|a, b| a.0.cmp(&b.0));
+        nokoi_pos = rows.iter().map(|row| row.1).collect();
+        p_nokoi_present = rows.iter().map(|row| row.2).collect();
+        p_nokoi_ref = rows
+            .iter()
+            .filter_map(|row| row.3.then_some(row.2))
+            .collect();
     }
 
     let compute_q_present = |p_present: &Vec<f64>, p_ref: &Vec<f64>| -> Vec<f64> {
@@ -11258,7 +11335,7 @@ pub fn run_df_layers_with_artifacts(
     //
     // Each expert now builds its own method-specific rank-null pool using its own
     // purification factor. There is intentionally no shared/global null pool here.
-    let engines = match fit_base_experts(&new_features, &work, settings, gates) {
+    let engines = match fit_base_experts(&new_features, &work, settings, gates, db) {
         Some(e) => e,
         None => {
             log::error!("Invalid null fit. FDR will fail closed.");

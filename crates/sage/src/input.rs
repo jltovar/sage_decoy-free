@@ -1,6 +1,6 @@
 use crate::ml::lower_order::LowerOrderArtifact;
 use crate::ml::msfdr::{Msfdr1SmixModel, Msfdr2SmixModel, MsfdrSeededModel};
-use crate::ml::nokoi::NokoiArtifact;
+use crate::ml::nokoi::{NokoiArtifact, NokoiArtifactApplicationMode};
 use serde::{Deserialize, Serialize};
 
 #[derive(Clone, Serialize, Deserialize, Debug, Default, PartialEq, Eq)]
@@ -1122,6 +1122,13 @@ pub struct FdrOptions {
     pub msfdr_1smix_frozen_model: Option<Msfdr1SmixModel>,
     pub msfdr_2smix_frozen_model: Option<Msfdr2SmixModel>,
     pub nokoi_frozen_artifact: Option<NokoiArtifact>,
+    /// Controls whether a frozen Nokoi artifact is applied to its exact fit
+    /// population or to the corresponding target-only population of the same
+    /// parent dataset. The latter is set only by the explicit workflow policy.
+    pub nokoi_artifact_application_mode: Option<NokoiArtifactApplicationMode>,
+    /// Parent dataset identity required for portable target-only Nokoi reuse.
+    /// Exact-population application remains protected by its stable-ID digest.
+    pub nokoi_application_dataset_fingerprint: Option<String>,
     /// Frozen empirical MS2Rescore profiles for leakage-free search-space and
     /// holdout transfer.
     pub external_ms2rescore_frozen_profiles: Option<ExternalMs2RescoreProfiles>,
@@ -1404,6 +1411,8 @@ pub struct FdrSettings {
     pub msfdr_1smix_frozen_model: Option<Msfdr1SmixModel>,
     pub msfdr_2smix_frozen_model: Option<Msfdr2SmixModel>,
     pub nokoi_frozen_artifact: Option<NokoiArtifact>,
+    pub nokoi_artifact_application_mode: NokoiArtifactApplicationMode,
+    pub nokoi_application_dataset_fingerprint: Option<String>,
     pub external_ms2rescore_frozen_profiles: Option<ExternalMs2RescoreProfiles>,
 
     // =========================================================================
@@ -1906,6 +1915,10 @@ impl From<FdrOptions> for FdrSettings {
         let msfdr_1smix_frozen_model = options.msfdr_1smix_frozen_model.clone();
         let msfdr_2smix_frozen_model = options.msfdr_2smix_frozen_model.clone();
         let nokoi_frozen_artifact = options.nokoi_frozen_artifact.clone();
+        let nokoi_artifact_application_mode =
+            options.nokoi_artifact_application_mode.unwrap_or_default();
+        let nokoi_application_dataset_fingerprint =
+            options.nokoi_application_dataset_fingerprint.clone();
         let external_ms2rescore_frozen_profiles =
             options.external_ms2rescore_frozen_profiles.clone();
 
@@ -2207,6 +2220,8 @@ impl From<FdrOptions> for FdrSettings {
             msfdr_1smix_frozen_model,
             msfdr_2smix_frozen_model,
             nokoi_frozen_artifact,
+            nokoi_artifact_application_mode,
+            nokoi_application_dataset_fingerprint,
             external_ms2rescore_frozen_profiles,
 
             // =========================================================================
