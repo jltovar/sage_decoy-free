@@ -211,6 +211,9 @@ fn main() -> anyhow::Result<()> {
             parallel,
             plan_only,
         )?;
+        if plan_only {
+            println!("{}", serde_json::to_string_pretty(&state)?);
+        }
         log::info!(
             "workflow complete: stages={} validation_summaries={} pending_gates={}",
             state.stages.len(),

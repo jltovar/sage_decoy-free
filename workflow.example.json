@@ -9,6 +9,9 @@
     "/path/to/development_02.mzML"
   ],
   "output_root": "/path/to/native_workflow/development",
+  "candidate_pool_root": null,
+  "annotation_cache_root": null,
+  "target_only_annotation_cache_root": null,
   "target_only_calibration_policy": "refit_with_locked_window",
   "entrapment": {
     "database_mode": "native_generated",
@@ -142,6 +145,7 @@
   },
   "resume": true,
   "require_existing_candidate_pool": false,
+  "require_existing_annotation_cache": false,
   "annotate_target_matches": true,
   "ensemble_lock": null,
   "locked_expert_artifacts": {},

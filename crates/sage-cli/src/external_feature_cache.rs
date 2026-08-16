@@ -28,6 +28,11 @@ pub struct ModelComponentIdentity {
 #[derive(Clone, Debug)]
 pub struct ExternalAnnotationCacheRequest {
     pub root: PathBuf,
+    /// Require a complete compatible cache and prohibit every annotation
+    /// generation path. This execution control is excluded from cache identity.
+    pub require_existing: bool,
+    /// Durable search-space label used only in fail-closed provenance.
+    pub search_space: String,
 }
 
 #[derive(Clone, Debug)]
@@ -90,6 +95,12 @@ pub struct ExternalAnnotationCacheUsage {
     pub annotation_count: usize,
     pub joined_annotation_count: usize,
     pub requested_max_rank: u32,
+    #[serde(default)]
+    pub requested_root: PathBuf,
+    #[serde(default)]
+    pub generation_allowed: bool,
+    #[serde(default)]
+    pub preflight_result: String,
 }
 
 #[derive(Serialize)]
@@ -433,7 +444,7 @@ print(json.dumps(out, sort_keys=True))
 }
 
 pub fn generator_settings_sha256(settings: &ExternalFeatureGenerationSettings) -> Result<String> {
-    Ok(generator_identity(settings, None)?.0)
+    Ok(generator_identity(settings, None, false)?.0)
 }
 
 /// Resolve the portable generator identity through the same durable probe
@@ -444,12 +455,22 @@ pub fn generator_settings_sha256_with_probe_root(
     settings: &ExternalFeatureGenerationSettings,
     probe_root: &Path,
 ) -> Result<String> {
-    Ok(generator_identity(settings, Some(probe_root))?.0)
+    Ok(generator_identity(settings, Some(probe_root), false)?.0)
+}
+
+/// Resolve the durable generator identity without probing Python or writing a
+/// probe record. Strict cache-only workflows use this before stage execution.
+pub fn generator_settings_sha256_with_existing_probe_root(
+    settings: &ExternalFeatureGenerationSettings,
+    probe_root: &Path,
+) -> Result<String> {
+    Ok(generator_identity(settings, Some(probe_root), true)?.0)
 }
 
 fn generator_identity(
     settings: &ExternalFeatureGenerationSettings,
     probe_root: Option<&Path>,
+    require_existing_probe: bool,
 ) -> Result<(String, Vec<ModelComponentIdentity>)> {
     let probe_key = generator_probe_key(settings)?;
     let probe_path = probe_root.map(|root| {
@@ -473,6 +494,13 @@ fn generator_identity(
         });
     let probe = if let Some(probe) = cached {
         probe
+    } else if require_existing_probe {
+        anyhow::bail!(
+            "required annotation cache has no valid durable package/model identity probe under {}; Python/model resolution and annotation generation are prohibited",
+            probe_root
+                .map(|path| path.display().to_string())
+                .unwrap_or_else(|| "<no probe root>".into())
+        );
     } else {
         let (python_environment, package_metadata) =
             python_environment_identity(settings.python_executable.as_deref())?;
@@ -622,7 +650,45 @@ pub fn annotation_identity_with_probe_root(
     requested_max_rank: u32,
     probe_root: Option<&Path>,
 ) -> Result<ExternalAnnotationIdentity> {
-    let (generator_settings_sha256, model_components) = generator_identity(settings, probe_root)?;
+    let (generator_settings_sha256, model_components) =
+        generator_identity(settings, probe_root, false)?;
+    build_annotation_identity(
+        search_fingerprint,
+        inputs,
+        requested_max_rank,
+        generator_settings_sha256,
+        model_components,
+    )
+}
+
+/// Resolve an annotation identity only from an existing durable generator
+/// probe. This path performs no Python or model-resolution invocation and no
+/// writes, so strict cache replay can fail before generation is possible.
+pub fn annotation_identity_with_existing_probe_root(
+    search_fingerprint: &str,
+    settings: &ExternalFeatureGenerationSettings,
+    inputs: &[ExternalAnnotationInput],
+    requested_max_rank: u32,
+    probe_root: &Path,
+) -> Result<ExternalAnnotationIdentity> {
+    let (generator_settings_sha256, model_components) =
+        generator_identity(settings, Some(probe_root), true)?;
+    build_annotation_identity(
+        search_fingerprint,
+        inputs,
+        requested_max_rank,
+        generator_settings_sha256,
+        model_components,
+    )
+}
+
+fn build_annotation_identity(
+    search_fingerprint: &str,
+    inputs: &[ExternalAnnotationInput],
+    requested_max_rank: u32,
+    generator_settings_sha256: String,
+    model_components: Vec<ModelComponentIdentity>,
+) -> Result<ExternalAnnotationIdentity> {
     let calibration_input_sha256 = calibration_input_sha256(inputs);
     let mut hasher = Sha256::new();
     hasher.update(EXTERNAL_ANNOTATION_FINGERPRINT_SCHEMA.as_bytes());
@@ -789,6 +855,7 @@ pub fn usage(
     directory: &Path,
     manifest: &ExternalAnnotationCacheManifest,
     reused: bool,
+    request: &ExternalAnnotationCacheRequest,
 ) -> ExternalAnnotationCacheUsage {
     ExternalAnnotationCacheUsage {
         annotation_fingerprint: manifest.identity.digest.clone(),
@@ -799,6 +866,13 @@ pub fn usage(
         annotation_count: manifest.annotation_count,
         joined_annotation_count: manifest.joined_annotation_count,
         requested_max_rank: manifest.identity.requested_max_rank,
+        requested_root: request.root.clone(),
+        generation_allowed: !request.require_existing,
+        preflight_result: if reused {
+            "valid_existing_cache".into()
+        } else {
+            "generated_cache".into()
+        },
     }
 }
 
@@ -831,6 +905,16 @@ pub fn verify_usage(usage: &ExternalAnnotationCacheUsage) -> Result<()> {
             && manifest.identity.requested_max_rank == usage.requested_max_rank,
         "MS2Rescore annotation cache usage record does not match its verified manifest"
     );
+    let legacy_execution_provenance = usage.requested_root.as_os_str().is_empty()
+        && usage.preflight_result.is_empty()
+        && !usage.generation_allowed;
+    anyhow::ensure!(
+        legacy_execution_provenance
+            || (usage.requested_root == directory.parent().unwrap_or(directory)
+                && (!usage.reused || usage.preflight_result == "valid_existing_cache")
+                && (usage.generation_allowed || usage.reused)),
+        "MS2Rescore annotation cache execution provenance is inconsistent"
+    );
     anyhow::ensure!(
         usage.payload.is_file() && sha256_file(&usage.payload)? == manifest.payload_sha256,
         "MS2Rescore annotation cache payload hash mismatch"
@@ -844,9 +928,134 @@ pub fn verify_usage(usage: &ExternalAnnotationCacheUsage) -> Result<()> {
     Ok(())
 }
 
+/// Read-only inventory preflight for a strict annotation-cache root. The
+/// model-specific calibration-input identity is re-derived and checked again
+/// at stage execution; this preflight inventories every complete cache for the
+/// requested search population and durable generator identity without invoking
+/// Python or writing probe state.
+pub fn preflight_existing_cache_root(
+    request: &ExternalAnnotationCacheRequest,
+    settings: &ExternalFeatureGenerationSettings,
+    search_fingerprint: &str,
+    candidate_ids: &HashSet<String>,
+    requested_max_rank: u32,
+) -> Result<Vec<ExternalAnnotationCacheUsage>> {
+    anyhow::ensure!(
+        request.require_existing,
+        "strict annotation preflight requires require_existing=true"
+    );
+    let (generator_settings_sha256, _) = generator_identity(settings, Some(&request.root), true)
+        .with_context(|| {
+            format!(
+                "strict annotation-cache preflight failed: classification=generator_provenance_unavailable root={} search_space={} candidate_population={} generation_prohibited=true",
+                request.root.display(), request.search_space, search_fingerprint
+            )
+        })?;
+    let entries = std::fs::read_dir(&request.root).with_context(|| {
+        format!(
+            "strict annotation-cache preflight failed: classification=absent root={} search_space={} candidate_population={} generation_prohibited=true",
+            request.root.display(), request.search_space, search_fingerprint
+        )
+    })?;
+    let mut matches = Vec::new();
+    let mut incompatible = Vec::new();
+    for entry in entries {
+        let entry = entry?;
+        if !entry.file_type()?.is_dir() {
+            continue;
+        }
+        let directory = entry.path();
+        let manifest_path = cache_manifest_path(&directory);
+        if !manifest_path.is_file() {
+            continue;
+        }
+        let manifest: ExternalAnnotationCacheManifest = match std::fs::read(&manifest_path)
+            .ok()
+            .and_then(|bytes| serde_json::from_slice(&bytes).ok())
+        {
+            Some(manifest) => manifest,
+            None => {
+                incompatible.push(format!("{}:unreadable_manifest", directory.display()));
+                continue;
+            }
+        };
+        if manifest.identity.search_fingerprint == search_fingerprint
+            && manifest.identity.requested_candidate_count == candidate_ids.len()
+            && manifest.identity.requested_max_rank == requested_max_rank
+            && manifest.identity.generator_settings_sha256 == generator_settings_sha256
+        {
+            match load_cache(&directory, &manifest.identity) {
+                Ok(Some((verified, records))) => {
+                    let joined_ids = records
+                        .iter()
+                        .filter(|record| record.features.ms2rescore_feature_joined)
+                        .map(|record| record.stable_id.clone())
+                        .collect::<HashSet<_>>();
+                    if joined_ids == *candidate_ids {
+                        matches.push((directory, verified));
+                    } else {
+                        incompatible.push(format!(
+                            "{}:candidate_population_mismatch:expected={} actual={}",
+                            manifest.identity.digest,
+                            candidate_ids.len(),
+                            joined_ids.len()
+                        ));
+                    }
+                }
+                Ok(None) => incompatible.push(format!("{}:missing", manifest.identity.digest)),
+                Err(error) => {
+                    incompatible.push(format!("{}:invalid:{}", manifest.identity.digest, error))
+                }
+            }
+        } else {
+            incompatible.push(format!(
+                "{}:identity_mismatch:search={} schema={} candidates={} rank={}",
+                manifest.identity.digest,
+                manifest.identity.search_fingerprint,
+                manifest.schema_version,
+                manifest.identity.requested_candidate_count,
+                manifest.identity.requested_max_rank
+            ));
+        }
+    }
+    anyhow::ensure!(
+        !matches.is_empty(),
+        "strict annotation-cache preflight failed: classification=absent_or_incompatible root={} search_space={} candidate_population={} expected_schema={} matching_cache_count=0 incompatible=[{}] generation_prohibited=true",
+        request.root.display(),
+        request.search_space,
+        search_fingerprint,
+        EXTERNAL_ANNOTATION_CACHE_SCHEMA_VERSION,
+        incompatible.join("; ")
+    );
+    matches.sort_by(|left, right| left.1.identity.digest.cmp(&right.1.identity.digest));
+    Ok(matches
+        .into_iter()
+        .map(|(directory, manifest)| usage(&directory, &manifest, true, request))
+        .collect())
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    fn write_empty_probe(root: &Path, settings: &ExternalFeatureGenerationSettings) {
+        let probe_key = generator_probe_key(settings).unwrap();
+        let path = root
+            .join("generator_identity_probes")
+            .join(format!("{probe_key}.json"));
+        write_json_atomic(
+            &path,
+            &GeneratorProbeCache {
+                schema_version: 2,
+                probe_key,
+                python_environment: None,
+                package_metadata: Vec::new(),
+                model_components: Vec::new(),
+                model_files: Vec::new(),
+            },
+        )
+        .unwrap();
+    }
 
     fn identity() -> ExternalAnnotationIdentity {
         ExternalAnnotationIdentity {
@@ -890,8 +1099,21 @@ mod tests {
         let (loaded, records) = load_cache(&directory, &identity).unwrap().unwrap();
         assert_eq!(loaded.payload_sha256, written.payload_sha256);
         assert_eq!(records[0].stable_id, "candidate");
-        let recorded_usage = usage(&directory, &written, false);
+        let request = ExternalAnnotationCacheRequest {
+            root: root.clone(),
+            require_existing: false,
+            search_space: "+entrapment".into(),
+        };
+        let recorded_usage = usage(&directory, &written, false, &request);
         verify_usage(&recorded_usage).unwrap();
+        let mut legacy_value = serde_json::to_value(&recorded_usage).unwrap();
+        let legacy_object = legacy_value.as_object_mut().unwrap();
+        legacy_object.remove("requested_root");
+        legacy_object.remove("generation_allowed");
+        legacy_object.remove("preflight_result");
+        let legacy_usage: ExternalAnnotationCacheUsage =
+            serde_json::from_value(legacy_value).unwrap();
+        verify_usage(&legacy_usage).unwrap();
 
         std::fs::write(directory.join(&written.payload_file), b"corrupt").unwrap();
         assert!(load_cache(&directory, &identity).is_err());
@@ -917,6 +1139,146 @@ mod tests {
         input.q_value = Some(0.05);
         let second = annotation_identity("search", &settings, &[input], 10).unwrap();
         assert_ne!(first.digest, second.digest);
+    }
+
+    #[test]
+    fn strict_preflight_reuses_complete_cache_without_identity_probe() {
+        let root = std::env::temp_dir().join(format!(
+            "sage-strict-annotation-preflight-test-{}-{}",
+            std::process::id(),
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .unwrap()
+                .as_nanos()
+        ));
+        let settings = ExternalFeatureGenerationSettings::default();
+        write_empty_probe(&root, &settings);
+        let inputs = vec![ExternalAnnotationInput {
+            stable_id: "candidate".into(),
+            score: 10.0,
+            q_value: Some(0.01),
+            pep: Some(0.02),
+            retention_time: 12.0,
+            ion_mobility: 1.1,
+            precursor_mass: 900.0,
+            charge: 2,
+            rank: 1,
+        }];
+        let identity = annotation_identity_with_existing_probe_root(
+            "search-digest",
+            &settings,
+            &inputs,
+            10,
+            &root,
+        )
+        .unwrap();
+        let directory = cache_directory(&root, &identity);
+        let mut features = ExternalPsmFeatures::default();
+        features.ms2rescore_feature_joined = true;
+        write_cache(
+            &directory,
+            &identity,
+            vec![ExternalAnnotationRecord {
+                stable_id: "candidate".into(),
+                features,
+            }],
+        )
+        .unwrap();
+        let request = ExternalAnnotationCacheRequest {
+            root: root.clone(),
+            require_existing: true,
+            search_space: "+entrapment".into(),
+        };
+        let candidate_ids = ["candidate".to_string()].into_iter().collect();
+        let usages =
+            preflight_existing_cache_root(&request, &settings, "search-digest", &candidate_ids, 10)
+                .unwrap();
+        assert_eq!(usages.len(), 1);
+        assert!(usages[0].reused);
+        assert!(!usages[0].generation_allowed);
+        assert_eq!(usages[0].preflight_result, "valid_existing_cache");
+
+        write_cache(
+            &directory,
+            &identity,
+            vec![ExternalAnnotationRecord {
+                stable_id: "different-candidate".into(),
+                features,
+            }],
+        )
+        .unwrap();
+        let error =
+            preflight_existing_cache_root(&request, &settings, "search-digest", &candidate_ids, 10)
+                .unwrap_err()
+                .to_string();
+        assert!(error.contains("candidate_population_mismatch"));
+        write_cache(
+            &directory,
+            &identity,
+            vec![ExternalAnnotationRecord {
+                stable_id: "candidate".into(),
+                features,
+            }],
+        )
+        .unwrap();
+
+        std::fs::write(&usages[0].payload, b"corrupt").unwrap();
+        let error =
+            preflight_existing_cache_root(&request, &settings, "search-digest", &candidate_ids, 10)
+                .unwrap_err()
+                .to_string();
+        assert!(error.contains("absent_or_incompatible"));
+        assert!(error.contains("invalid"));
+        std::fs::remove_dir_all(root).unwrap();
+    }
+
+    #[test]
+    fn strict_preflight_missing_cache_fails_without_creating_root() {
+        let root = std::env::temp_dir().join(format!(
+            "sage-strict-annotation-missing-test-{}-{}",
+            std::process::id(),
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .unwrap()
+                .as_nanos()
+        ));
+        let request = ExternalAnnotationCacheRequest {
+            root: root.clone(),
+            require_existing: true,
+            search_space: "target_only".into(),
+        };
+        let error = preflight_existing_cache_root(
+            &request,
+            &ExternalFeatureGenerationSettings::default(),
+            "search",
+            &["candidate".to_string()].into_iter().collect(),
+            10,
+        )
+        .unwrap_err()
+        .to_string();
+        assert!(error.contains("generator_provenance_unavailable"));
+        assert!(error.contains("generation_prohibited=true"));
+        assert!(!root.exists());
+    }
+
+    #[test]
+    fn strict_execution_control_does_not_change_annotation_identity() {
+        let identity = identity();
+        let root = PathBuf::from("portable-cache-root");
+        let relaxed = ExternalAnnotationCacheRequest {
+            root: root.clone(),
+            require_existing: false,
+            search_space: "+entrapment".into(),
+        };
+        let strict = ExternalAnnotationCacheRequest {
+            root,
+            require_existing: true,
+            search_space: "+entrapment".into(),
+        };
+        assert_eq!(
+            cache_directory(&relaxed.root, &identity),
+            cache_directory(&strict.root, &identity)
+        );
     }
 
     #[test]

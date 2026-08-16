@@ -2,8 +2,8 @@ use super::input::{ExternalFeatureUseMode, Search};
 use super::output::SageResults;
 use super::telemetry;
 use crate::candidate_pool::{
-    analysis_fingerprint, inspect_compatible_pool, load_pool, manifest_path, pool_directory,
-    search_fingerprint, write_pool, CandidatePoolRequest, CandidatePoolUsage,
+    analysis_fingerprint, inspect_compatible_pool, load_pool, load_required_pool, manifest_path,
+    pool_directory, search_fingerprint, write_pool, CandidatePoolRequest, CandidatePoolUsage,
 };
 use crate::external_feature_cache::{ExternalAnnotationCacheRequest, ExternalAnnotationCacheUsage};
 use crate::external_features::maybe_add_external_features;
@@ -128,6 +128,42 @@ enum DfDynamicColumn {
 }
 
 impl Runner {
+    /// Read-only strict candidate-pool preflight. It validates the complete
+    /// manifest, compressed payload, stable IDs, count, schema, and rank depth
+    /// without searching spectra or writing workflow state.
+    pub(crate) fn preflight_existing_candidate_pool(
+        &self,
+        request: &CandidatePoolRequest,
+    ) -> anyhow::Result<(CandidatePoolUsage, Vec<FeatureCore>)> {
+        let search = search_fingerprint(&self.parameters)?;
+        anyhow::ensure!(
+            request.required_rank_depth <= search.retained_rank_depth,
+            "candidate pool retains ranks 1..={} but preflight requires rank {}",
+            search.retained_rank_depth,
+            request.required_rank_depth
+        );
+        let analysis = analysis_fingerprint(&self.parameters, &search)?;
+        let directory = pool_directory(&request.root, &search);
+        let (manifest, features) = load_required_pool(
+            &directory,
+            &search,
+            request.required_rank_depth,
+            &self.database,
+        )?;
+        Ok((
+            CandidatePoolUsage {
+                search_fingerprint: search.digest,
+                analysis_fingerprint: analysis.digest,
+                manifest: manifest_path(&directory),
+                payload: directory.join(&manifest.payload_file),
+                reused: true,
+                candidate_count: manifest.candidate_count,
+                retained_rank_depth: manifest.capabilities.retained_rank_depth,
+            },
+            features,
+        ))
+    }
+
     pub fn new(parameters: Search, parallel: usize) -> anyhow::Result<Self> {
         let mut parameters = parameters.clone();
         let start = Instant::now();

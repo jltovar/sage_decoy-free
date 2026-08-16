@@ -173,6 +173,24 @@ table, wrapper configuration, and feature-rich TSV; direct one-off searches with
 their historical temporary-file behavior, as do configurations that explicitly request an
 external output directory.
 
+Workflow manifests may set `require_existing_annotation_cache: true` to prohibit annotation
+generation. The default is `false`, so new datasets retain the existing generate-on-miss behavior.
+Strict mode accepts only a complete compatible cache hit; absence, schema or identity mismatch,
+candidate-population/count mismatch, duplicate stable IDs, manifest/payload disagreement,
+payload corruption, or unavailable package/model-resolution provenance fails closed before Sage
+exports candidates, writes annotation temporary files, invokes Python/the wrapper, or starts
+MS2PIP or DeepLC. The setting is independent of `require_existing_candidate_pool`; exact replay
+normally enables both and may point `candidate_pool_root`, `annotation_cache_root`, and
+`target_only_annotation_cache_root` at immutable external resource roots.
+
+When either strict-reuse option is enabled, `workflow --plan-only` performs a read-only preflight
+of both +entrapment and target-only resources. Its structured report includes requested paths,
+expected and actual fingerprints, schemas, counts, retained depth, manifest and payload hashes,
+reuse/generation flags, and any failure reason. It creates no workflow output directory or
+temporary files and starts no search or annotation child process. Strict reuse changes workflow
+execution provenance and checkpoints, but not the strict search fingerprint, candidate IDs,
+candidate-pool identity, annotation fingerprint, or annotation payload identity.
+
 On macOS, the MS2PIP/XGBoost environment must be able to load `libomp.dylib`. Verify this with an
 `import xgboost` using the configured Python executable before a long workflow. If LLVM provides
 OpenMP outside the loader's default path, launch Sage with `DYLD_LIBRARY_PATH` set to LLVM's `lib`
