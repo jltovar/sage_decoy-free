@@ -10,10 +10,10 @@ use crate::entrapment::{
     LegacyEntrapmentReference, SharedPeptideExclusionMode,
 };
 use crate::external_feature_cache::{
-    generator_settings_sha256_with_existing_probe_root, generator_settings_sha256_with_probe_root,
-    preflight_existing_cache_root, verify_usage as verify_annotation_cache_usage,
+    preflight_existing_cache_root, raw_generator_settings_sha256_with_existing_probe_root,
+    raw_generator_settings_sha256_with_probe_root, verify_usage as verify_annotation_cache_usage,
     ExternalAnnotationCacheRequest, ExternalAnnotationCacheUsage,
-    EXTERNAL_ANNOTATION_CACHE_SCHEMA_VERSION,
+    RAW_EXTERNAL_PREDICTION_CACHE_SCHEMA_VERSION,
 };
 use crate::input::Input;
 use crate::provenance::{freeze_baseline, sha256_file, write_json_atomic, BaselineManifest};
@@ -450,6 +450,10 @@ pub struct WorkflowManifest {
     /// compatible, and integrity-valid. Defaults false for from-scratch work.
     #[serde(default)]
     pub require_existing_annotation_cache: bool,
+    /// Migrate an exact schema-v2 cache to the layered raw schema, but never
+    /// invoke an annotation generator. Defaults false.
+    #[serde(default)]
+    pub migrate_schema_v2_annotation_cache_only: bool,
     #[serde(default)]
     pub annotate_target_matches: bool,
     #[serde(default)]
@@ -764,6 +768,15 @@ impl WorkflowManifest {
 
     fn validate(&self) -> Result<()> {
         anyhow::ensure!(self.schema_version == 1, "unsupported workflow schema");
+        anyhow::ensure!(
+            !(self.require_existing_annotation_cache
+                && self.migrate_schema_v2_annotation_cache_only),
+            "require_existing_annotation_cache and migrate_schema_v2_annotation_cache_only are mutually exclusive: strict reuse is read-only"
+        );
+        anyhow::ensure!(
+            !self.migrate_schema_v2_annotation_cache_only || self.require_existing_candidate_pool,
+            "schema-v2 annotation-cache migration requires require_existing_candidate_pool=true"
+        );
         anyhow::ensure!(!self.name.trim().is_empty(), "workflow name is required");
         anyhow::ensure!(self.search_config.is_file(), "search_config does not exist");
         anyhow::ensure!(self.target_fasta.is_file(), "target_fasta does not exist");
@@ -1207,14 +1220,14 @@ fn deferred_annotation_preflight_report(
     catalog_fingerprints: &[String],
 ) -> ResourcePreflightReport {
     ResourcePreflightReport {
-        resource_type: "annotation_cache".into(),
+        resource_type: "stage_external_calibration".into(),
         search_space: search_space.into(),
         stage: Some(format!("{}:ms2rescore", model_slug(&model.model))),
         status: "deferred_until_calibration".into(),
         requested_path: requested_path.to_path_buf(),
         expected_fingerprint: String::new(),
         actual_fingerprint: String::new(),
-        schema_version: EXTERNAL_ANNOTATION_CACHE_SCHEMA_VERSION,
+        schema_version: RAW_EXTERNAL_PREDICTION_CACHE_SCHEMA_VERSION,
         candidate_or_annotation_count: candidate_count,
         retained_rank_depth: Some(requested_max_rank),
         manifest_sha256: String::new(),
@@ -1228,10 +1241,45 @@ fn deferred_annotation_preflight_report(
         portable_identity_valid: None,
         relocation_detected: None,
         failure_reason: Some(
-            "exact annotation identity depends on the stage's preliminary calibration_input_sha256; stage-local exact preflight is required before annotation use"
+            "raw external predictions were validated independently; this compact stage calibration identity depends on the stage's preliminary calibration_input_sha256 and is derived after native fitting"
                 .into(),
         ),
     }
+}
+
+fn raw_prediction_preflight_report(
+    usage: &ExternalAnnotationCacheUsage,
+    search_space: &str,
+    requested_path: &Path,
+    generation_allowed: bool,
+) -> Result<ResourcePreflightReport> {
+    anyhow::ensure!(
+        !usage.raw_prediction_cache_fingerprint.is_empty(),
+        "strict raw-prediction preflight returned a legacy annotation cache"
+    );
+    Ok(ResourcePreflightReport {
+        resource_type: "raw_external_prediction_cache".into(),
+        search_space: search_space.into(),
+        stage: None,
+        status: "validated_exact".into(),
+        requested_path: requested_path.to_path_buf(),
+        expected_fingerprint: usage.raw_prediction_cache_fingerprint.clone(),
+        actual_fingerprint: usage.raw_prediction_cache_fingerprint.clone(),
+        schema_version: usage.raw_prediction_cache_schema_version,
+        candidate_or_annotation_count: usage.annotation_count,
+        retained_rank_depth: Some(usage.requested_max_rank as usize),
+        manifest_sha256: sha256_file(&usage.manifest)?,
+        payload_sha256: sha256_file(&usage.payload)?,
+        valid: true,
+        reused: true,
+        generation_allowed,
+        catalog_fingerprints: Vec::new(),
+        original_source_uris: Vec::new(),
+        current_source_uris: Vec::new(),
+        portable_identity_valid: Some(true),
+        relocation_detected: None,
+        failure_reason: None,
+    })
 }
 
 /// Resolve strict immutable resources without writing workflow state or
@@ -1296,6 +1344,9 @@ fn strict_resource_preflight(
                     root: cache_root.clone(),
                     require_existing: true,
                     search_space: search_space.into(),
+                    stage: "static_preflight".into(),
+                    analysis_fingerprint: candidate_usage.search_fingerprint.clone(),
+                    migration_only: false,
                 };
                 let database = runner.shared_database();
                 let candidate_ids = candidates
@@ -1312,16 +1363,25 @@ fn strict_resource_preflight(
                     candidate_ids.len() == candidates.len(),
                     "strict annotation-cache preflight found duplicate stable candidate IDs in {search_space} candidate pool"
                 );
-                preflight_existing_cache_root(
+                let usages = preflight_existing_cache_root(
                     &cache_request,
                     &runner.parameters.external_features,
                     &candidate_usage.search_fingerprint,
                     &candidate_ids,
                     max_rank,
-                )?
-                .into_iter()
-                .map(|usage| usage.annotation_fingerprint)
-                .collect::<Vec<_>>()
+                )?;
+                anyhow::ensure!(
+                    usages.len() == 1,
+                    "strict raw-prediction preflight returned {} cache records; expected exactly one",
+                    usages.len()
+                );
+                reports.push(raw_prediction_preflight_report(
+                    &usages[0],
+                    search_space,
+                    &cache_root,
+                    false,
+                )?);
+                vec![usages[0].raw_prediction_cache_fingerprint.clone()]
             } else {
                 Vec::new()
             };
@@ -3076,9 +3136,9 @@ fn hash_stage(
             crate::input::ExternalFeatureGenerationSettings::from(input.external_features);
         let annotation_root = manifest.resolved_annotation_cache_root(target_only.is_some());
         let settings_sha256 = if manifest.require_existing_annotation_cache {
-            generator_settings_sha256_with_existing_probe_root(&settings, &annotation_root)?
+            raw_generator_settings_sha256_with_existing_probe_root(&settings, &annotation_root)?
         } else {
-            generator_settings_sha256_with_probe_root(&settings, &annotation_root)?
+            raw_generator_settings_sha256_with_probe_root(&settings, &annotation_root)?
         };
         hasher.update(settings_sha256.as_bytes());
     }
@@ -3580,6 +3640,9 @@ fn run_search_stage(
         } else {
             "+entrapment".into()
         },
+        stage: format!("{}:{stage}", model_slug(&model.model)),
+        analysis_fingerprint: record.input_hash.clone(),
+        migration_only: manifest.migrate_schema_v2_annotation_cache_only,
     });
     let (_, candidate_usage, annotation_usage) =
         runner.run_with_workflow_caches(parallel, false, candidate_pool, annotation_cache)?;
@@ -5139,6 +5202,7 @@ mod tests {
             resume: true,
             require_existing_candidate_pool: false,
             require_existing_annotation_cache: false,
+            migrate_schema_v2_annotation_cache_only: false,
             annotate_target_matches: false,
             ensemble_lock: None,
             locked_expert_artifacts: BTreeMap::new(),
@@ -5190,6 +5254,22 @@ mod tests {
             .remove("require_existing_annotation_cache");
         let restored: WorkflowManifest = serde_json::from_value(value).unwrap();
         assert!(!restored.require_existing_annotation_cache);
+        assert!(!restored.migrate_schema_v2_annotation_cache_only);
+        std::fs::remove_dir_all(directory).unwrap();
+    }
+
+    #[test]
+    fn annotation_cache_migration_is_explicit_and_incompatible_with_strict_mode() {
+        let directory = test_directory("annotation-cache-migration-contract");
+        let mut manifest = minimal_manifest(&directory, ValidationDatasetRole::Development);
+        manifest.migrate_schema_v2_annotation_cache_only = true;
+        let error = manifest.validate().unwrap_err().to_string();
+        assert!(error.contains("require_existing_candidate_pool=true"));
+
+        manifest.require_existing_candidate_pool = true;
+        manifest.require_existing_annotation_cache = true;
+        let error = manifest.validate().unwrap_err().to_string();
+        assert!(error.contains("mutually exclusive"));
         std::fs::remove_dir_all(directory).unwrap();
     }
 
@@ -5197,7 +5277,12 @@ mod tests {
     fn strict_plan_preflights_both_spaces_without_creating_output() {
         let directory = test_directory("strict-resource-plan");
         let workspace = Path::new(env!("CARGO_MANIFEST_DIR")).join("../..");
-        let search_config = workspace.join("tests/config.json");
+        let source_search_config = workspace.join("tests/config.json");
+        let search_config = directory.join("search.config.json");
+        let mut search_value: serde_json::Value =
+            serde_json::from_slice(&std::fs::read(&source_search_config).unwrap()).unwrap();
+        search_value["external_features"] = serde_json::json!({"deeplc_calibration_set_size": 10});
+        write_json_atomic(&search_config, &search_value).unwrap();
         let spectrum = workspace.join("tests/LQSRPAAPPAPGPGQLTLR.mzML");
         let fasta = workspace.join("tests/Q99536.fasta");
         let candidate_root = directory.join("immutable-candidates");
@@ -5245,24 +5330,37 @@ mod tests {
             rank: candidate.rank,
         };
         for root in [&annotation_root, &target_annotation_root] {
-            let identity = crate::external_feature_cache::annotation_identity_with_probe_root(
+            let identity = crate::external_feature_cache::raw_prediction_identity_with_probe_root(
                 &search.digest,
                 &settings,
                 std::slice::from_ref(&annotation_input),
                 runner.parameters.report_psms as u32,
-                Some(root),
+                root,
+                false,
             )
             .unwrap();
-            let cache_directory = crate::external_feature_cache::cache_directory(root, &identity);
-            let mut features = sage_core::scoring::ExternalPsmFeatures::default();
-            features.ms2rescore_feature_joined = true;
-            crate::external_feature_cache::write_cache(
+            let cache_directory =
+                crate::external_feature_cache::raw_cache_directory(root, &identity);
+            let features = sage_core::scoring::ExternalPsmFeatures {
+                ms2rescore_ms2pip_pcc: 0.8,
+                ms2rescore_spectral_angle: 0.7,
+                ms2rescore_fragment_intensity_agreement: 0.6,
+                ms2rescore_deeplc_predicted_rt: 12.5,
+                ms2rescore_deeplc_calibrated_rt: 12.0,
+                ms2rescore_deeplc_rt_error: 0.5,
+                ms2rescore_deeplc_abs_rt_error: 0.5,
+                tims2rescore_observed_ion_mobility: 0.0,
+                ms2rescore_feature_joined: true,
+                ..sage_core::scoring::ExternalPsmFeatures::default()
+            };
+            crate::external_feature_cache::write_raw_cache(
                 &cache_directory,
                 &identity,
                 vec![crate::external_feature_cache::ExternalAnnotationRecord {
                     stable_id: stable_id.clone(),
                     features,
                 }],
+                None,
             )
             .unwrap();
         }
@@ -5291,7 +5389,7 @@ mod tests {
             state.planned_models[0].window_mode,
             "dataset_local_explicit_grid"
         );
-        assert_eq!(state.resource_preflight.len(), 4);
+        assert_eq!(state.resource_preflight.len(), 6);
         let pools = state
             .resource_preflight
             .iter()
@@ -5304,13 +5402,27 @@ mod tests {
                 && resource.reused
                 && !resource.generation_allowed
         }));
-        let annotations = state
+        let raw_predictions = state
             .resource_preflight
             .iter()
-            .filter(|resource| resource.resource_type == "annotation_cache")
+            .filter(|resource| resource.resource_type == "raw_external_prediction_cache")
             .collect::<Vec<_>>();
-        assert_eq!(annotations.len(), 2);
-        assert!(annotations.iter().all(|resource| {
+        assert_eq!(raw_predictions.len(), 2);
+        assert!(raw_predictions.iter().all(|resource| {
+            resource.status == "validated_exact"
+                && !resource.expected_fingerprint.is_empty()
+                && resource.expected_fingerprint == resource.actual_fingerprint
+                && resource.valid
+                && resource.reused
+                && !resource.generation_allowed
+        }));
+        let calibrations = state
+            .resource_preflight
+            .iter()
+            .filter(|resource| resource.resource_type == "stage_external_calibration")
+            .collect::<Vec<_>>();
+        assert_eq!(calibrations.len(), 2);
+        assert!(calibrations.iter().all(|resource| {
             resource.status == "deferred_until_calibration"
                 && resource.expected_fingerprint.is_empty()
                 && resource.actual_fingerprint.is_empty()
@@ -6598,6 +6710,7 @@ mod tests {
             resume: false,
             require_existing_candidate_pool: false,
             require_existing_annotation_cache: false,
+            migrate_schema_v2_annotation_cache_only: false,
             annotate_target_matches: false,
             ensemble_lock: None,
             locked_expert_artifacts: BTreeMap::new(),

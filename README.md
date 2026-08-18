@@ -129,33 +129,39 @@ declared universe. MSFDR1-SMIX is always rank `1-1`. Ensemble does not optimize 
 every constituent expert must supply its own independently optimized dataset-local window and
 artifact.
 
-### Separate MS2Rescore annotation cache
+### Layered MS2Rescore prediction cache
 
-MS2Rescore annotations are stored outside the immutable Sage candidate pool and joined with
-`sage-candidate-id-v1`, never with a process-local `psm_id`. Cache identity includes the candidate
-population, preliminary calibration values, retained depth, spectra, generator configuration,
-wrapper and Python hashes, detected package versions, and annotation schema. Missing caches are
-generated; corrupt, incomplete, duplicate, or mismatched caches fail closed.
+Expensive MS2PIP and DeepLC outputs are stored outside the immutable Sage candidate pool and joined
+with `sage-candidate-id-v1`, never with a process-local `psm_id`. The raw-cache identity includes
+the exact candidate population and retained depth, spectra, portable generator/model-file content,
+wrapper and relevant Python/package identities, and the raw feature schema. It deliberately
+excludes the Decoy-Free model, null window, preliminary q/PEP stream, target-only policy, and
+Ensemble roster. Sage derives each model/window-specific external empirical profile from this raw
+layer. Consequently a dataset ordinarily needs one raw +entrapment cache and one raw target-only
+cache, even when many models or windows are evaluated.
+
+When DeepLC is enabled, layered caching requires an explicit positive `calibration_set_size`.
+This makes its dataset-level calibration selection deterministic from the native candidate score
+instead of allowing an implicit q-value filter to make raw predictions stage-dependent.
 
 `require_existing_annotation_cache` defaults to `false`, preserving ordinary from-scratch
 generation after a genuine cache miss. Set it to `true` for exact cache-only replay: every required
-+entrapment and target-only cache must pass schema, identity, population, stable-ID, payload, and
-durable package/model-provenance checks. Annotation identity includes the preliminary calibration
-stream, so preflight has two phases. Static `workflow --plan-only` validates the immutable inputs,
-pool, cache root, and catalog without fitting; model/window-dependent stages are explicitly
-reported as `deferred_until_calibration`, never as cache hits. After native Rust optimization and
-preliminary calibration, stage-local preflight derives the exact annotation fingerprint and
-requires that precise cache before any candidate export, temporary-file creation, Python, wrapper,
-MS2PIP, or DeepLC invocation. A different cache in the same root is never substituted.
++entrapment and target-only raw cache must pass schema, identity, population, stable-ID, payload,
+and durable package/model-provenance checks. Static `workflow --plan-only` can validate the raw
+prediction identity before fitting because it has no preliminary-calibration dependency. Native
+Rust then computes a separate deterministic stage-calibration identity and fits the compact
+external empirical profile. A raw hit starts no Python, wrapper, MS2PIP, or DeepLC process.
 
 This option is independent of `require_existing_candidate_pool`; enable both for cache-only
-execution. Such an execution can still perform native model fitting before discovering that an
-exact model/window-specific annotation cache is absent. Strict mode guarantees zero annotation
-generation fallback, not zero native calibration work. The execution control is recorded in
-workflow provenance but is excluded from search, candidate-pool, and annotation identities.
+execution. Strict mode guarantees zero external prediction-generation fallback, while native
+model/profile calibration remains ordinary inexpensive scientific computation. Set
+`migrate_schema_v2_annotation_cache_only: true` for an explicit one-time conversion of an exact,
+valid schema-v2 cache into the raw layer without permitting external generation; strict mode itself
+never writes or migrates. Execution controls are recorded in workflow provenance but excluded from
+raw scientific identity.
 
 The target-only FASTA has a different candidate population and therefore uses a distinct candidate
-pool and, when requested, a distinct annotation cache.
+pool and raw prediction cache.
 
 ### Explicit target-only calibration
 
@@ -352,8 +358,8 @@ checkpoint is also reused after its candidate-population and analysis fingerprin
 
 ### Workflow outputs
 
-The output root contains the generated FASTA and provenance, immutable candidate pools, separate
-MS2Rescore annotation caches, per-model stage directories, fitted artifacts, and validation
+The output root contains the generated FASTA and provenance, immutable candidate pools, layered
+raw MS2Rescore prediction caches, per-model stage calibrations, fitted artifacts, and validation
 reports. Important top-level reports include:
 
 ```text
@@ -1381,7 +1387,7 @@ msfdr1_pi_clamp_max
 | [`crates/sage-cli/src/workflow.rs`](crates/sage-cli/src/workflow.rs) | Native orchestration, stage checkpoints, calibration policies, Ensemble locks, and release evaluation. |
 | [`crates/sage-cli/src/entrapment.rs`](crates/sage-cli/src/entrapment.rs) | Native foreign-source selection, protein entrapment generation, ratio measurement, and FASTA provenance. |
 | [`crates/sage-cli/src/candidate_pool.rs`](crates/sage-cli/src/candidate_pool.rs) | Immutable candidate-pool persistence, fingerprints, stable IDs, and integrity checks. |
-| [`crates/sage-cli/src/external_feature_cache.rs`](crates/sage-cli/src/external_feature_cache.rs) | Separate MS2Rescore annotation cache and stable-ID joins. |
+| [`crates/sage-cli/src/external_feature_cache.rs`](crates/sage-cli/src/external_feature_cache.rs) | Layered raw MS2Rescore prediction caches, stage-calibration identities, schema-v2 migration, and stable-ID joins. |
 | [`crates/sage-cli/src/validation.rs`](crates/sage-cli/src/validation.rs) | Identification counting, parity, transfer, TDC, and expert-quality comparisons. |
 | [`crates/sage/src/input.rs`](crates/sage/src/input.rs) | Search JSON surface, enums, defaults, clamping, and resolved `FdrSettings`. |
 | [`crates/sage/src/decoy_free_fdr.rs`](crates/sage/src/decoy_free_fdr.rs) | Decoy-Free model fitting, active evidence pipeline, null-window evaluation, inference, and reporting. |

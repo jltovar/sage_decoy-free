@@ -9,10 +9,10 @@ use std::process::Command;
 
 use crate::candidate_pool::stable_candidate_id;
 use crate::external_feature_cache::{
-    annotation_identity_with_existing_probe_root, annotation_identity_with_probe_root,
-    cache_directory, cache_manifest_path, load_cache, usage as cache_usage, write_cache,
-    ExternalAnnotationCacheManifest, ExternalAnnotationCacheRequest, ExternalAnnotationCacheUsage,
-    ExternalAnnotationInput, ExternalAnnotationRecord,
+    annotation_identity_with_probe_root, cache_directory, load_cache, load_raw_cache,
+    raw_cache_directory, raw_cache_usage, raw_prediction_identity_with_probe_root,
+    stage_calibration_identity, write_raw_cache, ExternalAnnotationCacheRequest,
+    ExternalAnnotationCacheUsage, ExternalAnnotationInput, ExternalAnnotationRecord,
 };
 use crate::input::{
     ExternalFeatureEngine, ExternalFeatureFailPolicy, ExternalFeatureGenerationSettings,
@@ -38,31 +38,6 @@ pub struct ParsedExternalPsmFeatures {
 pub struct ParsedExternalFeatureTable {
     pub by_psm_id: HashMap<u64, ParsedExternalPsmFeatures>,
     pub by_key: HashMap<ExternalFeatureJoinKey, ParsedExternalPsmFeatures>,
-}
-
-fn available_cache_identities(root: &Path, search_fingerprint: &str) -> String {
-    let Ok(entries) = std::fs::read_dir(root) else {
-        return "<absent>".into();
-    };
-    let mut identities = entries
-        .filter_map(std::result::Result::ok)
-        .filter_map(|entry| std::fs::read(cache_manifest_path(&entry.path())).ok())
-        .filter_map(|bytes| serde_json::from_slice::<ExternalAnnotationCacheManifest>(&bytes).ok())
-        .filter(|manifest| manifest.identity.search_fingerprint == search_fingerprint)
-        .map(|manifest| {
-            format!(
-                "{}:schema{}",
-                manifest.identity.digest, manifest.schema_version
-            )
-        })
-        .collect::<Vec<_>>();
-    identities.sort();
-    identities.dedup();
-    if identities.is_empty() {
-        "<absent>".into()
-    } else {
-        identities.join(",")
-    }
 }
 
 pub fn maybe_add_external_features(
@@ -95,7 +70,7 @@ pub fn maybe_add_external_features(
         cache_request,
     );
 
-    if cache_request.is_some_and(|request| request.require_existing) {
+    if cache_request.is_some_and(|request| request.require_existing || request.migration_only) {
         return result;
     }
 
@@ -137,86 +112,126 @@ fn add_external_features_inner(
         (Some(search_fingerprint), Some(request)) => {
             let (inputs, candidate_indices) =
                 annotation_inputs(features, db, search_fingerprint, requested_max_rank);
-            let identity = if request.require_existing {
-                annotation_identity_with_existing_probe_root(
-                    search_fingerprint,
-                    settings,
-                    &inputs,
-                    requested_max_rank,
-                    &request.root,
+            let raw_identity = raw_prediction_identity_with_probe_root(
+                search_fingerprint,
+                settings,
+                &inputs,
+                requested_max_rank,
+                &request.root,
+                request.require_existing,
+            )
+            .with_context(|| {
+                format!(
+                    "strict raw-prediction-cache preflight failed: classification=generator_provenance_unavailable root={} search_space={} candidate_population={} generation_prohibited={}",
+                    request.root.display(), request.search_space, search_fingerprint, request.require_existing
                 )
-                .with_context(|| {
-                    format!(
-                        "strict annotation-cache preflight failed: classification=generator_provenance_unavailable root={} search_space={} candidate_population={} generation_prohibited=true",
-                        request.root.display(), request.search_space, search_fingerprint
-                    )
-                })?
-            } else {
-                annotation_identity_with_probe_root(
-                    search_fingerprint,
-                    settings,
-                    &inputs,
-                    requested_max_rank,
-                    Some(&request.root),
-                )?
-            };
-            let directory = cache_directory(&request.root, &identity);
-            match load_cache(&directory, &identity) {
+            })?;
+            let calibration_identity = stage_calibration_identity(&raw_identity, &inputs, request)?;
+            let directory = raw_cache_directory(&request.root, &raw_identity);
+            match load_raw_cache(&directory, &raw_identity) {
                 Ok(Some((manifest, records))) => {
                     apply_cached_annotations(features, &candidate_indices, records)?;
                     log::info!(
-                        "MS2Rescore annotation cache: reused {}/{} joined annotations from {} (fingerprint={})",
-                        manifest.joined_annotation_count,
-                        manifest.annotation_count,
+                        "raw MS2Rescore prediction cache: reused {}/{} predictions from {} (raw_fingerprint={}, calibration_fingerprint={})",
+                        manifest.joined_prediction_count,
+                        manifest.prediction_count,
                         directory.display(),
-                        identity.digest
+                        raw_identity.digest,
+                        calibration_identity.digest
                     );
                     log_external_feature_local_separation(features, db);
-                    return Ok(Some(cache_usage(&directory, &manifest, true, request)));
+                    return Ok(Some(raw_cache_usage(
+                        &directory,
+                        &manifest,
+                        Some(calibration_identity),
+                        true,
+                        request,
+                    )));
                 }
                 Ok(None) if request.require_existing => {
-                    let actual = available_cache_identities(&request.root, search_fingerprint);
                     anyhow::bail!(
-                        "strict annotation-cache preflight failed: classification=missing_exact root={} search_space={} candidate_population={} expected_annotation_fingerprint={} expected_schema={} actual_fingerprints={} generation_prohibited=true",
+                        "strict raw-prediction-cache preflight failed: classification=missing_exact root={} search_space={} candidate_population={} expected_raw_fingerprint={} expected_schema={} generation_prohibited=true",
                         request.root.display(),
                         request.search_space,
                         search_fingerprint,
-                        identity.digest,
-                        identity.schema_version,
-                        actual
+                        raw_identity.digest,
+                        raw_identity.schema_version
                     );
                 }
                 Err(error) if request.require_existing => {
-                    let actual = std::fs::read(cache_manifest_path(&directory))
-                        .ok()
-                        .and_then(|bytes| {
-                            serde_json::from_slice::<ExternalAnnotationCacheManifest>(&bytes).ok()
-                        })
-                        .map(|manifest| {
-                            format!(
-                                "fingerprint={} schema={}",
-                                manifest.identity.digest, manifest.schema_version
-                            )
-                        })
-                        .unwrap_or_else(|| "fingerprint=<unreadable> schema=<unreadable>".into());
                     anyhow::bail!(
-                        "strict annotation-cache preflight failed: classification=invalid_or_incompatible root={} search_space={} candidate_population={} expected_annotation_fingerprint={} expected_schema={} actual_{} generation_prohibited=true: {error:#}",
+                        "strict raw-prediction-cache preflight failed: classification=invalid_or_incompatible root={} search_space={} candidate_population={} expected_raw_fingerprint={} expected_schema={} generation_prohibited=true: {error:#}",
                         request.root.display(),
                         request.search_space,
                         search_fingerprint,
-                        identity.digest,
-                        identity.schema_version,
-                        actual
+                        raw_identity.digest,
+                        raw_identity.schema_version
                     );
                 }
                 Err(error) => return Err(error),
                 Ok(None) => {}
             }
-            Some((identity, directory, candidate_indices, inputs))
+
+            // Explicit one-time compatibility path: only migration mode may
+            // extract an exact, integrity-valid schema-v2 stage cache into the
+            // model-independent raw layer. Normal cache misses keep the
+            // established generation behavior; strict mode never writes.
+            if request.migration_only {
+                let legacy_identity = annotation_identity_with_probe_root(
+                    search_fingerprint,
+                    settings,
+                    &inputs,
+                    requested_max_rank,
+                    Some(&request.root),
+                )?;
+                let legacy_directory = cache_directory(&request.root, &legacy_identity);
+                if let Some((legacy_manifest, records)) =
+                    load_cache(&legacy_directory, &legacy_identity)?
+                {
+                    apply_cached_annotations(features, &candidate_indices, records.clone())?;
+                    let raw_manifest = write_raw_cache(
+                        &directory,
+                        &raw_identity,
+                        records,
+                        Some(&legacy_manifest),
+                    )?;
+                    log::info!(
+                        "raw MS2Rescore prediction cache: migrated schema-v2 cache {} to {} (raw_fingerprint={}, calibration_fingerprint={})",
+                        legacy_identity.digest,
+                        directory.display(),
+                        raw_identity.digest,
+                        calibration_identity.digest
+                    );
+                    log_external_feature_local_separation(features, db);
+                    return Ok(Some(raw_cache_usage(
+                        &directory,
+                        &raw_manifest,
+                        Some(calibration_identity),
+                        false,
+                        request,
+                    )));
+                }
+            }
+
+            Some((
+                raw_identity,
+                calibration_identity,
+                directory,
+                candidate_indices,
+                inputs,
+            ))
         }
         (None, None) => None,
         _ => unreachable!("cache arguments were validated by caller"),
     };
+
+    if cache_request.is_some_and(|request| request.migration_only) {
+        let request = cache_request.expect("migration-only request exists");
+        anyhow::bail!(
+            "schema-v2 raw-cache migration failed: classification=missing_exact_legacy_cache root={} search_space={} generation_prohibited=true",
+            request.root.display(), request.search_space
+        );
+    }
 
     let tmp_dir = settings
         .temp_directory
@@ -232,7 +247,14 @@ fn add_external_features_inner(
     let output_root = tmp_dir.join("sage_decoy_free_external_features.output");
     let output_tsv = PathBuf::from(format!("{}.psms.tsv", output_root.display()));
 
-    export_candidate_table(features, &psm_path, mzml_paths, db, settings.max_rank)?;
+    export_candidate_table(
+        features,
+        &psm_path,
+        mzml_paths,
+        db,
+        settings.max_rank,
+        prepared_cache.is_some(),
+    )?;
 
     write_feature_config(settings, &psm_path, &output_root, &config_path, mzml_paths)?;
 
@@ -248,15 +270,16 @@ fn add_external_features_inner(
         })?;
     }
 
-    if let (Some((expected, _, _, inputs)), Some(search_fingerprint), Some(cache_request)) =
+    if let (Some((expected, _, _, _, inputs)), Some(search_fingerprint), Some(cache_request)) =
         (&prepared_cache, search_fingerprint, cache_request)
     {
-        let current = annotation_identity_with_probe_root(
+        let current = raw_prediction_identity_with_probe_root(
             search_fingerprint,
             settings,
             inputs,
             requested_max_rank,
-            Some(&cache_request.root),
+            &cache_request.root,
+            false,
         )?;
         anyhow::ensure!(
             current == *expected,
@@ -294,17 +317,18 @@ fn add_external_features_inner(
         }
     }
 
-    if let Some((identity, directory, candidate_indices, inputs)) = prepared_cache {
-        let current = annotation_identity_with_probe_root(
+    if let Some((identity, calibration_identity, directory, candidate_indices, inputs)) =
+        prepared_cache
+    {
+        let current = raw_prediction_identity_with_probe_root(
             search_fingerprint.expect("prepared cache has a search fingerprint"),
             settings,
             &inputs,
             requested_max_rank,
-            Some(
-                &cache_request
-                    .expect("prepared cache has a cache request")
-                    .root,
-            ),
+            &cache_request
+                .expect("prepared cache has a cache request")
+                .root,
+            false,
         )?;
         anyhow::ensure!(
             current == identity,
@@ -317,13 +341,14 @@ fn add_external_features_inner(
                 features: features[index].core.external_features,
             })
             .collect();
-        let manifest = write_cache(&directory, &identity, records)?;
+        let manifest = write_raw_cache(&directory, &identity, records, None)?;
         log::info!(
-            "MS2Rescore annotation cache: wrote {}/{} joined annotations to {} (fingerprint={})",
-            manifest.joined_annotation_count,
-            manifest.annotation_count,
+            "raw MS2Rescore prediction cache: wrote {}/{} joined predictions to {} (raw_fingerprint={}, calibration_fingerprint={})",
+            manifest.joined_prediction_count,
+            manifest.prediction_count,
             directory.display(),
-            identity.digest
+            identity.digest,
+            calibration_identity.digest
         );
         if settings.output_directory.is_none() {
             for intermediate in [&psm_path, &config_path, &output_tsv] {
@@ -337,9 +362,10 @@ fn add_external_features_inner(
                 }
             }
         }
-        return Ok(Some(cache_usage(
+        return Ok(Some(raw_cache_usage(
             &directory,
             &manifest,
+            Some(calibration_identity),
             false,
             cache_request.expect("prepared cache has a request"),
         )));
@@ -411,6 +437,7 @@ fn export_candidate_table(
     mzml_paths: &[Url],
     db: &IndexedDatabase,
     max_rank: Option<u32>,
+    model_independent_raw: bool,
 ) -> Result<()> {
     let mut writer = WriterBuilder::new().delimiter(b'\t').from_path(path)?;
 
@@ -437,17 +464,19 @@ fn export_candidate_table(
         let peptide = db[f.core.peptide_idx].to_string();
         let raw_file = raw_file_name(mzml_paths, f.core.file_id);
 
-        // DeepLC/IM2Deep need a confident calibration subset.
-        // Use Decoy-Free q/PEP for rank-1 candidates only.
-        // Lower-rank null candidates remain exported for feature generation,
-        // but they must not become calibration anchors.
-        let export_qvalue = if f.core.rank == 1 {
+        // Layered raw inference is deliberately independent of the preliminary
+        // statistical model/window. Preserve the historical standalone
+        // (non-cache) export contract for callers outside the workflow.
+        let export_qvalue = if model_independent_raw {
+            1.0
+        } else if f.core.rank == 1 {
             f.decoy_free_q_value.unwrap_or(1.0)
         } else {
             1.0
         };
-
-        let export_pep = if f.core.rank == 1 {
+        let export_pep = if model_independent_raw {
+            1.0
+        } else if f.core.rank == 1 {
             f.decoy_free_pep.unwrap_or(1.0)
         } else {
             1.0
@@ -1189,9 +1218,25 @@ fn external_feature_auc(reference: &[f64], entrapment: &[f64], higher_is_better:
 #[cfg(test)]
 mod cache_tests {
     use super::*;
+    use crate::external_feature_cache::{write_cache, write_raw_cache};
     use sage_core::database::PeptideIx;
     use sage_core::peptide::Peptide;
     use sage_core::scoring::FeatureCore;
+
+    fn complete_annotation() -> ExternalPsmFeatures {
+        ExternalPsmFeatures {
+            ms2rescore_ms2pip_pcc: 0.75,
+            ms2rescore_spectral_angle: 0.7,
+            ms2rescore_fragment_intensity_agreement: 0.6,
+            ms2rescore_deeplc_predicted_rt: 12.5,
+            ms2rescore_deeplc_calibrated_rt: 12.0,
+            ms2rescore_deeplc_rt_error: 0.5,
+            ms2rescore_deeplc_abs_rt_error: 0.5,
+            tims2rescore_observed_ion_mobility: 0.0,
+            ms2rescore_feature_joined: true,
+            ..ExternalPsmFeatures::default()
+        }
+    }
 
     #[test]
     fn cached_annotations_join_only_by_stable_candidate_id() {
@@ -1226,6 +1271,63 @@ mod cache_tests {
     }
 
     #[test]
+    fn layered_export_is_neutral_while_standalone_export_remains_compatible() {
+        let root = std::env::temp_dir().join(format!(
+            "sage-layered-export-contract-test-{}-{}",
+            std::process::id(),
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .unwrap()
+                .as_nanos()
+        ));
+        std::fs::create_dir_all(&root).unwrap();
+        let database = IndexedDatabase {
+            peptides: vec![Peptide {
+                sequence: std::sync::Arc::from(&b"PEPTIDE"[..]),
+                ..Peptide::default()
+            }],
+            ..IndexedDatabase::default()
+        };
+        let mut core = FeatureCore::default();
+        core.peptide_idx = PeptideIx(0);
+        core.spec_id = "scan=1".into();
+        core.rank = 1;
+        core.charge = 2;
+        core.expmass = 900.0;
+        let mut feature = core.to_df();
+        feature.decoy_free_q_value = Some(0.01);
+        feature.decoy_free_pep = Some(0.02);
+
+        let standalone = root.join("standalone.tsv");
+        let layered = root.join("layered.tsv");
+        export_candidate_table(
+            std::slice::from_ref(&feature),
+            &standalone,
+            &[],
+            &database,
+            Some(1),
+            false,
+        )
+        .unwrap();
+        export_candidate_table(&[feature], &layered, &[], &database, Some(1), true).unwrap();
+
+        let read_q_pep = |path: &Path| {
+            let mut reader = ReaderBuilder::new()
+                .delimiter(b'\t')
+                .from_path(path)
+                .unwrap();
+            let headers = reader.headers().unwrap().clone();
+            let q = headers.iter().position(|value| value == "qvalue").unwrap();
+            let pep = headers.iter().position(|value| value == "pep").unwrap();
+            let row = reader.records().next().unwrap().unwrap();
+            (row[q].to_string(), row[pep].to_string())
+        };
+        assert_eq!(read_q_pep(&standalone), ("0.01".into(), "0.02".into()));
+        assert_eq!(read_q_pep(&layered), ("1".into(), "1".into()));
+        std::fs::remove_dir_all(root).unwrap();
+    }
+
+    #[test]
     fn strict_stage_rejects_another_calibration_cache_before_export() {
         let root = std::env::temp_dir().join(format!(
             "sage-stage-local-cache-test-{}-{}",
@@ -1255,6 +1357,7 @@ mod cache_tests {
         let mut settings = ExternalFeatureGenerationSettings {
             enabled: true,
             max_rank: Some(1),
+            deeplc_calibration_set_size: Some(10),
             temp_directory: Some(temp_output.display().to_string()),
             ..ExternalFeatureGenerationSettings::default()
         };
@@ -1283,6 +1386,9 @@ mod cache_tests {
             root: root.clone(),
             require_existing: true,
             search_space: "+entrapment".into(),
+            stage: "moments:ms2rescore".into(),
+            analysis_fingerprint: "analysis".into(),
+            migration_only: false,
         };
         let error = add_external_features_inner(
             &mut features,
@@ -1301,7 +1407,7 @@ mod cache_tests {
     }
 
     #[test]
-    fn strict_stage_loads_only_the_exact_post_calibration_identity() {
+    fn strict_stage_loads_shared_raw_cache_and_derives_calibration_identity() {
         let root = std::env::temp_dir().join(format!(
             "sage-stage-local-exact-cache-test-{}-{}",
             std::process::id(),
@@ -1329,30 +1435,33 @@ mod cache_tests {
         let settings = ExternalFeatureGenerationSettings {
             enabled: true,
             max_rank: Some(1),
+            deeplc_calibration_set_size: Some(10),
             temp_directory: Some(temp_output.display().to_string()),
             ..ExternalFeatureGenerationSettings::default()
         };
         let (inputs, _) = annotation_inputs(&features, &database, "search", 1);
         let identity =
-            annotation_identity_with_probe_root("search", &settings, &inputs, 1, Some(&root))
+            raw_prediction_identity_with_probe_root("search", &settings, &inputs, 1, &root, false)
                 .unwrap();
-        let directory = cache_directory(&root, &identity);
-        let mut annotation = ExternalPsmFeatures::default();
-        annotation.ms2rescore_feature_joined = true;
-        annotation.ms2rescore_ms2pip_pcc = 0.75;
-        write_cache(
+        let directory = raw_cache_directory(&root, &identity);
+        let annotation = complete_annotation();
+        write_raw_cache(
             &directory,
             &identity,
             vec![ExternalAnnotationRecord {
                 stable_id: inputs[0].stable_id.clone(),
                 features: annotation,
             }],
+            None,
         )
         .unwrap();
         let request = ExternalAnnotationCacheRequest {
             root: root.clone(),
             require_existing: true,
             search_space: "+entrapment".into(),
+            stage: "moments:ms2rescore".into(),
+            analysis_fingerprint: "analysis".into(),
+            migration_only: false,
         };
         let usage = add_external_features_inner(
             &mut features,
@@ -1364,13 +1473,111 @@ mod cache_tests {
         )
         .unwrap()
         .unwrap();
-        assert_eq!(usage.annotation_fingerprint, identity.digest);
-        assert_eq!(usage.preflight_result, "validated_exact");
+        assert_eq!(usage.raw_prediction_cache_fingerprint, identity.digest);
+        assert_eq!(usage.preflight_result, "validated_raw_prediction_cache");
+        assert_ne!(usage.annotation_fingerprint, identity.digest);
+        assert!(usage.stage_calibration_identity.is_some());
         assert!(usage.reused);
         assert_eq!(
             features[0].core.external_features.ms2rescore_ms2pip_pcc,
             0.75
         );
+        assert!(!temp_output.exists());
+        std::fs::remove_dir_all(root).unwrap();
+    }
+
+    #[test]
+    fn schema_v2_migration_seeds_one_raw_cache_for_multiple_models() {
+        let root = std::env::temp_dir().join(format!(
+            "sage-layered-migration-test-{}-{}",
+            std::process::id(),
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .unwrap()
+                .as_nanos()
+        ));
+        let temp_output = root.join("must-not-be-created");
+        let database = IndexedDatabase {
+            peptides: vec![Peptide {
+                sequence: std::sync::Arc::from(&b"PEPTIDE"[..]),
+                ..Peptide::default()
+            }],
+            ..IndexedDatabase::default()
+        };
+        let mut core = FeatureCore::default();
+        core.peptide_idx = PeptideIx(0);
+        core.spec_id = "scan=1".into();
+        core.rank = 1;
+        core.charge = 2;
+        let mut features = vec![core.to_df()];
+        features[0].decoy_free_q_value = Some(0.01);
+        features[0].decoy_free_pep = Some(0.02);
+        let settings = ExternalFeatureGenerationSettings {
+            enabled: true,
+            max_rank: Some(1),
+            deeplc_calibration_set_size: Some(10),
+            temp_directory: Some(temp_output.display().to_string()),
+            ..ExternalFeatureGenerationSettings::default()
+        };
+        let (inputs, _) = annotation_inputs(&features, &database, "search", 1);
+        let legacy =
+            annotation_identity_with_probe_root("search", &settings, &inputs, 1, Some(&root))
+                .unwrap();
+        write_cache(
+            &cache_directory(&root, &legacy),
+            &legacy,
+            vec![ExternalAnnotationRecord {
+                stable_id: inputs[0].stable_id.clone(),
+                features: complete_annotation(),
+            }],
+        )
+        .unwrap();
+        let first_request = ExternalAnnotationCacheRequest {
+            root: root.clone(),
+            require_existing: false,
+            search_space: "+entrapment".into(),
+            stage: "moments:ms2rescore".into(),
+            analysis_fingerprint: "moments-analysis".into(),
+            migration_only: true,
+        };
+        let first = add_external_features_inner(
+            &mut features,
+            &settings,
+            &[],
+            &database,
+            Some("search"),
+            Some(&first_request),
+        )
+        .unwrap()
+        .unwrap();
+        assert!(first.migrated_from_schema_v2);
+        assert!(!first.reused);
+        assert!(!temp_output.exists());
+
+        features[0].decoy_free_q_value = Some(0.9);
+        features[0].decoy_free_pep = Some(0.8);
+        let second_request = ExternalAnnotationCacheRequest {
+            require_existing: true,
+            stage: "mle:ms2rescore".into(),
+            analysis_fingerprint: "mle-analysis".into(),
+            ..first_request
+        };
+        let second = add_external_features_inner(
+            &mut features,
+            &settings,
+            &[],
+            &database,
+            Some("search"),
+            Some(&second_request),
+        )
+        .unwrap()
+        .unwrap();
+        assert!(second.reused);
+        assert_eq!(
+            first.raw_prediction_cache_fingerprint,
+            second.raw_prediction_cache_fingerprint
+        );
+        assert_ne!(first.annotation_fingerprint, second.annotation_fingerprint);
         assert!(!temp_output.exists());
         std::fs::remove_dir_all(root).unwrap();
     }

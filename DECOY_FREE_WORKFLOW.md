@@ -109,8 +109,8 @@ reread or rescore spectra.
 
 Every cached record carries a stable SHA-256 candidate ID derived from the search fingerprint,
 spectrum identity, peptidoform, charge, rank, label, precursor mass, and isotope error. Process-
-local `psm_id` values are not cache identity. The separate MS2Rescore annotation cache uses this
-stable ID.
+local `psm_id` values are not cache identity. Both candidate pools and the layered raw MS2Rescore
+prediction cache use this stable ID.
 
 New datasets normally declare a compact `window_optimizer` with inclusive `min_rank_range` and
 `max_rank_range`. `strategy: landscape_adaptive` uses a compact coarse probe to classify the
@@ -145,43 +145,49 @@ the individual experts and writes `ensemble.lock.json`; manually copying windows
 JSON is no longer required. Native and MS2Rescore artifacts are kept separate so an artifact fit
 after rescoring cannot be used silently in the native comparison.
 
-## Separately cached MS2Rescore annotations
+## Layered MS2Rescore prediction and calibration caches
 
-An MS2Rescore stage now consumes the same immutable native candidate pool as its optimized stage,
-so Sage does not reread or rescore the spectra. External feature generation still reads the
-spectra it needs, but the resulting annotations are stored independently under
-`OUTPUT_ROOT/ms2rescore_annotations/ANNOTATION_FINGERPRINT/`. The native pool continues to declare
+An MS2Rescore stage consumes the same immutable native candidate pool as its optimized stage, so
+Sage does not reread or rescore the spectra. Expensive MS2PIP and DeepLC inference is stored under
+`RAW_ROOT/raw_predictions/RAW_FINGERPRINT/`. The native pool continues to declare
 `external_annotations: false`.
 
-The annotation fingerprint contains the strict search fingerprint, ordered stable candidate IDs,
-the exact preliminary score/q-value/PEP calibration input exported to MS2Rescore, the requested
-rank depth, generator configuration, mapped spectrum-source hashes, wrapper and Python hashes,
-detected Python/package versions, and annotation schema. Temp/output locations, failure policy,
-and downstream evidence-use policy are not generator identity. Changing a model, selected null
-window, or another setting that changes preliminary q/PEP values selects a new annotation cache.
-This model/window-local behavior preserves the pre-refactor DeepLC calibration semantics; sharing
-only model-independent MS2PIP components can be considered later as a separately validated
-optimization.
+The portable raw identity contains the strict search/candidate-population fingerprint, stable
+candidate-ID schema, requested rank depth, candidate count, mapped spectrum-source content,
+generator configuration, wrapper and Python content, relevant package versions, selected logical
+model names/files/sizes/content hashes, and raw schema. Absolute paths remain provenance only. The
+raw identity excludes the Decoy-Free model, selected null window, preliminary q/PEP stream,
+target-only policy, Ensemble roster, fitted artifact, and analysis fingerprint.
 
-Annotations are joined only by `sage-candidate-id-v1`. Process-local `psm_id` values may still be
-used while parsing one freshly generated external table, but they are never persisted as cache
-identity. Cache manifests and compressed payloads are count-, schema-, identity-, and SHA-256-
-checked. A missing annotation set is generated; an existing corrupt or mismatched set fails
-closed. Workflow stages that claim MS2Rescore must record at least one joined annotation. After a
-new cache has been written and verified, the workflow removes its temporary exported candidate
-table, wrapper configuration, and feature-rich TSV; direct one-off searches without a cache retain
-their historical temporary-file behavior, as do configurations that explicitly request an
-external output directory.
+DeepLC must declare a positive `calibration_set_size` when it participates in the raw layer. An
+implicit q-value-selected calibration set is rejected because it would couple raw prediction to a
+model/window-specific preliminary stream.
 
-Workflow manifests may set `require_existing_annotation_cache: true` to prohibit annotation
-generation. The default is `false`, so new datasets retain the existing generate-on-miss behavior.
-Strict mode accepts only a complete compatible cache hit; absence, schema or identity mismatch,
-candidate-population/count mismatch, duplicate stable IDs, manifest/payload disagreement,
-payload corruption, or unavailable package/model-resolution provenance fails closed before Sage
-exports candidates, writes annotation temporary files, invokes Python/the wrapper, or starts
-MS2PIP or DeepLC. The setting is independent of `require_existing_candidate_pool`; exact replay
-normally enables both and may point `candidate_pool_root`, `annotation_cache_root`, and
-`target_only_annotation_cache_root` at immutable external resource roots.
+Sage joins raw predictions only by `sage-candidate-id-v1`, then deterministically derives each
+model/window-specific external empirical profile in Rust. A separate compact stage-calibration
+identity binds the raw fingerprint, preliminary calibration stream, model/stage, and analysis
+fingerprint. Process-local `psm_id` values may be used while parsing one newly generated table, but
+are never durable identity. A dataset ordinarily needs one raw +entrapment cache and one raw
+target-only cache even when many models or windows are evaluated.
+
+Raw manifests and compressed payloads are count-, schema-, identity-, finite-value-, and SHA-256-
+checked. A genuine raw miss is generated by default; an existing corrupt or mismatched cache fails
+closed. After a new raw cache is written and verified, workflow-managed candidate exports, wrapper
+configuration, and feature TSVs are removed.
+
+Workflow manifests may set `require_existing_annotation_cache: true` to prohibit raw prediction
+generation. Strict mode accepts only a complete compatible raw hit; absence, schema or identity
+mismatch, candidate-population/count mismatch, duplicate or missing stable IDs,
+manifest/payload disagreement, corruption, nonfinite required values, or unavailable durable
+package/model provenance fails closed before export, temporary files, Python, the wrapper, MS2PIP,
+or DeepLC. The option is independent of `require_existing_candidate_pool`; exact replay normally
+enables both and may use external candidate and raw-cache roots.
+
+`migrate_schema_v2_annotation_cache_only` is an explicit compatibility path. With
+`require_existing_candidate_pool: true`, it may extract the raw payload from an exact,
+integrity-valid schema-v2 cache, but it never invokes an external generator. It is mutually
+exclusive with strict read-only annotation reuse. Schema-v2 caches are never silently
+reinterpreted or overwritten.
 
 When either strict-reuse option is enabled, `workflow --plan-only` performs a read-only preflight
 of both +entrapment and target-only resources. Candidate-pool compatibility is portable: original
@@ -189,24 +195,19 @@ and current source URIs remain provenance, while equality uses the portable dige
 ordered spectrum ordinals and content hashes, normalized search settings, schema, retained depth,
 counts, and manifest/payload integrity. Paths and filenames alone never establish equivalence.
 
-Annotation preflight is deliberately two-phase because the exact cache identity contains the
-preliminary model/window calibration stream:
+Layered preflight distinguishes raw inference from stage calibration:
 
 1. **Phase A — static read-only preflight.** Validate FASTAs, spectra, search identity, portable
-   candidate pools, counts, rank depth, payloads, cache roots/catalogs, and any annotation identity
-   already derivable. Dynamic annotation stages are reported as `deferred_until_calibration`; a
-   sole cache in a directory is not reported as the expected cache.
-2. **Phase B — stage-local exact preflight.** Native Rust optimization/fitting resolves the window,
-   preliminary stream, `calibration_input_sha256`, and complete annotation fingerprint. The stage
-   then requires that exact manifest/payload and full stable-ID join. In strict mode any miss or
-   mismatch stops before export, Python, wrapper, MS2PIP, DeepLC, or annotation generation.
+   candidate pools, counts, rank depth, durable generator/model provenance, and the exact raw
+   manifest/payload/full stable-ID join. A strict hit is reported as `validated_exact`.
+2. **Phase B — stage-local calibration.** Native Rust optimization/fitting resolves the window and
+   preliminary stream, derives the stage-calibration identity, and fits the compact external
+   profile from the joined raw values. Plan-only reports these stages as
+   `deferred_until_calibration`; this is not a missing raw cache and never authorizes generation.
 
-The structured statuses are `validated_exact`, `deferred_until_calibration`, `missing_exact`,
-`incompatible`, and `generation_planned`. Static plan-only creates no workflow output directory or
-temporary files and starts no search or annotation child process. Cache-only execution may perform
-native model fitting before a deferred exact-cache miss becomes knowable. Strict reuse changes
-workflow execution provenance and checkpoints, but not the strict search fingerprint, candidate
-IDs, candidate-pool identity, annotation fingerprint, or annotation payload identity.
+Static plan-only creates no workflow output directory or temporary files and starts no search or
+annotation child process. Strict reuse changes workflow execution provenance and checkpoints, but
+not the search fingerprint, stable IDs, candidate-pool identity, raw-cache identity, or raw payload.
 
 On macOS, the MS2PIP/XGBoost environment must be able to load `libomp.dylib`. Verify this with an
 `import xgboost` using the configured Python executable before a long workflow. If LLVM provides
@@ -215,10 +216,9 @@ directory; this affects runtime loading only and does not weaken the annotation 
 
 The target-only stage remains a distinct target-FASTA candidate population. It performs a fresh
 search when no exact pool exists or when matched-fragment annotation is requested; otherwise the
-immutable target-only pool can be reused. If MS2Rescore is selected for that stage, its external
-annotations are still independently cacheable under the target-only search fingerprint. No
-annotation cache can cross a FASTA, dataset, candidate calibration, generator environment, or
-rank-depth boundary.
+immutable target-only pool can be reused. Its raw predictions are cached separately under the
+target-only search fingerprint. No raw cache can cross a FASTA, dataset, candidate population,
+generator environment, or rank-depth boundary.
 
 ## Explicit target-only calibration
 
@@ -251,9 +251,9 @@ fingerprint, and candidate-ID schema. Fitted nuisance-state provenance remains i
 The target FASTA produces a strict search fingerprint distinct from +entrapment. If no exact
 target-only pool exists, the first interpretation performs a fresh spectrum search and writes one;
 subsequent models and `compare_both` interpretations reuse that exact target population. Thus the
-policy comparison cannot be confounded by a second spectrum search. An MS2Rescore annotation cache
-is reused only when the preliminary calibration inputs are identical; otherwise the annotation
-fingerprint correctly generates a policy-specific annotation set. If matched-fragment output is
+policy comparison cannot be confounded by a second spectrum search. The target-only raw prediction
+cache is reused across model/window-specific preliminary calibration streams; each stream still
+produces a distinct compact stage-calibration identity and fitted profile. If matched-fragment output is
 requested, the release interpretation performs a fresh search because immutable candidate pools
 deliberately do not persist fragment payloads; the diagnostic second stage remains unannotated and
 may reuse the pool.
@@ -482,7 +482,8 @@ Peptidoform FDP uses the measured peptidoform ratio already stored as the workfl
 
 Stage checkpoint schema 2 hashes both the result table and resolved search configuration. A cache
 hit also verifies candidate-pool schema, identity, capability, count, and payload hash; annotated
-stages additionally verify the separate MS2Rescore annotation cache. A checkpoint left `running`
+stages additionally verify the layered raw MS2Rescore prediction cache and stage-calibration
+identity. A checkpoint left `running`
 by interruption is never resumed as complete, and a changed durable output invalidates the stage.
 Compatible schema-1 checkpoints are migrated once after their existing dataset, input, output,
 candidate-pool, and annotation identities pass.
@@ -506,8 +507,8 @@ match. Important workflow reports include:
 - `candidate_pools/<search fingerprint>/candidate_pool.json`
 - `candidate_pools/<search fingerprint>/candidate_pool.bin.zst`
 - `workflow.candidate_pools.json` with per-stage search and analysis fingerprints and reuse status
-- `ms2rescore_annotations/<annotation fingerprint>/ms2rescore_annotations.json`
-- `ms2rescore_annotations/<annotation fingerprint>/ms2rescore_annotations.bin.zst`
+- `ms2rescore_annotations/raw_predictions/<raw fingerprint>/raw_external_predictions.json`
+- `ms2rescore_annotations/raw_predictions/<raw fingerprint>/raw_external_predictions.bin.zst`
 - `workflow.ms2rescore_annotations.json` with per-stage generation/reuse and joined counts
 - `validation.summary.json`
 - `validation.stage_comparisons.json`
