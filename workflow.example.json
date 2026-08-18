@@ -14,6 +14,7 @@
   "target_only_annotation_cache_root": null,
   "require_existing_candidate_pool": false,
   "require_existing_annotation_cache": false,
+  "migrate_schema_v2_annotation_cache_only": false,
   "target_only_calibration_policy": "refit_with_locked_window",
   "entrapment": {
     "database_mode": "native_generated",

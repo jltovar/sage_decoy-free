@@ -43,3 +43,6 @@ sha2 = "0.10"
 sysinfo = "0.29"
 url = "2.0"
 zstd = "0.13"
+
+[build-dependencies]
+sha2 = "0.10"
