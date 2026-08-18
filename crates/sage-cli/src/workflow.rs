@@ -320,14 +320,18 @@ pub struct EnsembleLock {
     pub external_profile_contract: String,
     #[serde(default)]
     /// Canonical identity of the shared Ensemble-profile fitting contract.
-    /// The fitted profile content is stage/search-space specific and is recorded
-    /// in the Ensemble stage artifact and checkpoint.
+    /// It binds the common dataset/search/candidate identity and calibration,
+    /// but intentionally excludes expert-specific artifacts and annotation
+    /// caches. Fitted profile content is stage/search-space specific and is
+    /// recorded in the Ensemble stage artifact and checkpoint.
     pub shared_external_profile_contract_sha256: Option<String>,
     #[serde(default)]
     pub shared_external_profile_calibration: Option<sage_core::input::ExternalProfileCalibration>,
     #[serde(default)]
     pub source_configuration_sha256: String,
     #[serde(default)]
+    /// Complete lock/provenance identity. Unlike the shared-profile contract,
+    /// this binds the roster and every expert's artifact and annotation cache.
     pub analysis_fingerprint: String,
     #[serde(default = "default_raw_q_interaction_warning_threshold")]
     pub raw_q_interaction_warning_threshold: f64,
@@ -1512,35 +1516,26 @@ fn shared_ensemble_profile_contract_identity(
     calibration: &sage_core::input::ExternalProfileCalibration,
     experts: &[EnsembleExpertLock],
 ) -> Result<String> {
-    let mut enabled = experts
+    let fit_search_fingerprints = experts
         .iter()
         .filter(|expert| expert.enabled)
-        .map(|expert| {
-            serde_json::json!({
-                "model": expert.model,
-                "window": expert.window,
-                "fit_search_fingerprint": expert.fit_search_fingerprint,
-                "candidate_id_schema": expert.candidate_id_schema,
-                "optimized_fitted_artifacts_sha256": expert.optimized_fitted_artifacts_sha256,
-                "ms2rescore_fitted_artifacts_sha256": expert.ms2rescore_fitted_artifacts_sha256,
-                "annotation_cache_fingerprint": expert.annotation_cache_fingerprint,
-                "annotation_cache_manifest_sha256": expert.annotation_cache_manifest_sha256,
-                "annotation_cache_payload_sha256": expert.annotation_cache_payload_sha256,
-            })
-        })
-        .collect::<Vec<_>>();
-    enabled.sort_by(|left, right| {
-        left.get("model")
-            .and_then(serde_json::Value::as_str)
-            .cmp(&right.get("model").and_then(serde_json::Value::as_str))
-    });
+        .map(|expert| expert.fit_search_fingerprint.as_str())
+        .collect::<BTreeSet<_>>();
+    anyhow::ensure!(
+        fit_search_fingerprints.len() == 1,
+        "shared Ensemble external profile requires exactly one fit search fingerprint"
+    );
+    let fit_search_fingerprint = fit_search_fingerprints
+        .into_iter()
+        .next()
+        .context("shared Ensemble external profile has no fit search fingerprint")?;
     let value = serde_json::json!({
-        "schema": "sage-ensemble-shared-external-profile-contract-v1",
+        "schema": "sage-ensemble-shared-external-profile-contract-v2",
         "dataset_fingerprint": dataset.fingerprint,
         "source_configuration_sha256": dataset.search_config_sha256,
+        "fit_search_fingerprint": fit_search_fingerprint,
         "candidate_id_schema": CANDIDATE_ID_SCHEMA,
         "calibration": calibration,
-        "experts": enabled,
     });
     let mut hasher = Sha256::new();
     hasher.update(serde_json::to_vec(&value)?);
@@ -1667,8 +1662,8 @@ fn apply_ensemble_lock(
 ) -> Result<()> {
     fdr.nokoi_application_dataset_fingerprint = Some(dataset.fingerprint.clone());
     anyhow::ensure!(
-        lock.schema_version == 7,
-        "unsupported Ensemble lock schema {}; schema 7 is required for separated expert-profile provenance and shared-profile identity",
+        lock.schema_version == 8,
+        "unsupported Ensemble lock schema {}; schema 8 is required for independent shared-profile and complete input-provenance identities",
         lock.schema_version
     );
     anyhow::ensure!(
@@ -2083,7 +2078,7 @@ fn ensemble_lock_analysis_fingerprint(lock: &EnsembleLock) -> Result<String> {
         })
         .collect::<Vec<_>>();
     let value = serde_json::json!({
-        "schema": "sage-ensemble-analysis-v3-separated-shared-profile-contract",
+        "schema": "sage-ensemble-analysis-v4-independent-shared-profile-contract",
         "dataset_fingerprint": lock.dataset_fingerprint,
         "source_configuration_sha256": lock.source_configuration_sha256,
         "experts": experts,
@@ -2816,7 +2811,7 @@ fn build_ensemble_lock_with_failures(
         .map(|calibration| shared_ensemble_profile_contract_identity(dataset, calibration, &locked))
         .transpose()?;
     stamp_ensemble_lock_analysis_fingerprint(EnsembleLock {
-        schema_version: 7,
+        schema_version: 8,
         source_manifest_hash: manifest_hash.into(),
         dataset_fingerprint: dataset.fingerprint.clone(),
         experts: locked,
@@ -5982,7 +5977,7 @@ mod tests {
     }
 
     #[test]
-    fn shared_ensemble_profile_contract_is_order_independent_of_expert_profiles() {
+    fn shared_ensemble_profile_contract_is_independent_of_expert_specific_provenance() {
         let dataset = DatasetIdentity {
             schema_version: 1,
             dataset_id: "dataset".into(),
@@ -6024,12 +6019,79 @@ mod tests {
         let experts = vec![
             expert(ModelFit::Moments, 9, 18, "moments-profile"),
             expert(ModelFit::Mle, 8, 25, "mle-profile"),
+            expert(ModelFit::LowerOrder, 6, 9, "lower-order-profile"),
+            expert(ModelFit::Msfdr, 9, 13, "msfdr-profile"),
+            expert(ModelFit::Msfdr1Smix, 1, 1, "msfdr1-profile"),
+            expert(ModelFit::Msfdr2Smix, 9, 17, "msfdr2-profile"),
+            expert(ModelFit::Nokoi, 4, 5, "nokoi-profile"),
         ];
+        let identity =
+            shared_ensemble_profile_contract_identity(&dataset, &calibration, &experts).unwrap();
         let mut reversed = experts.clone();
         reversed.reverse();
         assert_eq!(
-            shared_ensemble_profile_contract_identity(&dataset, &calibration, &experts).unwrap(),
+            identity,
             shared_ensemble_profile_contract_identity(&dataset, &calibration, &reversed).unwrap()
+        );
+        let mut different_expert_provenance = experts.clone();
+        for expert in &mut different_expert_provenance {
+            expert.optimized_fitted_artifacts_sha256 = format!("other-{:?}", expert.model);
+            expert.ms2rescore_fitted_artifacts_sha256 =
+                Some(format!("other-ms2-{:?}", expert.model));
+            expert.annotation_cache_fingerprint = Some(format!("other-cache-{:?}", expert.model));
+            expert.annotation_cache_manifest_sha256 =
+                Some(format!("other-manifest-{:?}", expert.model));
+            expert.annotation_cache_payload_sha256 =
+                Some(format!("other-payload-{:?}", expert.model));
+        }
+        assert_eq!(
+            identity,
+            shared_ensemble_profile_contract_identity(
+                &dataset,
+                &calibration,
+                &different_expert_provenance,
+            )
+            .unwrap()
+        );
+        let requested_roster = experts
+            .iter()
+            .map(|expert| model_slug(&expert.model).to_owned())
+            .collect::<Vec<_>>();
+        let lock = stamp_ensemble_lock_analysis_fingerprint(EnsembleLock {
+            schema_version: 8,
+            source_manifest_hash: "manifest".into(),
+            dataset_fingerprint: dataset.fingerprint.clone(),
+            experts: experts.clone(),
+            requested_roster: requested_roster.clone(),
+            actual_roster: requested_roster,
+            explicit_exclusions: BTreeMap::new(),
+            technical_failures: BTreeMap::new(),
+            roster_contract: default_ensemble_roster_contract(),
+            minimum_required_experts: 2,
+            evaluable: true,
+            not_evaluable_reasons: Vec::new(),
+            external_profile_contract: default_ensemble_external_profile_contract(),
+            shared_external_profile_contract_sha256: Some(identity.clone()),
+            shared_external_profile_calibration: Some(calibration.clone()),
+            source_configuration_sha256: dataset.search_config_sha256.clone(),
+            analysis_fingerprint: String::new(),
+            raw_q_interaction_warning_threshold: default_raw_q_interaction_warning_threshold(),
+            ensemble_p_combiner: EnsemblePCombiner::SecondBest,
+            ensemble_pep_combiner: EnsemblePepCombiner::Median,
+        })
+        .unwrap();
+        let mut changed_lock_provenance = lock.clone();
+        changed_lock_provenance.experts[0].annotation_cache_fingerprint =
+            Some("changed-cache".into());
+        let changed_lock_provenance =
+            stamp_ensemble_lock_analysis_fingerprint(changed_lock_provenance).unwrap();
+        assert_eq!(
+            changed_lock_provenance.shared_external_profile_contract_sha256,
+            lock.shared_external_profile_contract_sha256
+        );
+        assert_ne!(
+            changed_lock_provenance.analysis_fingerprint,
+            lock.analysis_fingerprint
         );
         assert_ne!(
             experts[0].fitted_external_profile_identity_sha256,
@@ -6042,6 +6104,14 @@ mod tests {
             shared_ensemble_profile_contract_identity(&other_dataset, &calibration, &experts)
                 .unwrap()
         );
+        let mut mismatched_search = experts.clone();
+        mismatched_search[0].fit_search_fingerprint = "other-search".into();
+        assert!(shared_ensemble_profile_contract_identity(
+            &dataset,
+            &calibration,
+            &mismatched_search,
+        )
+        .is_err());
     }
 
     #[test]
@@ -6614,7 +6684,7 @@ mod tests {
             canonical_bytes
         );
         assert_eq!(lock.dataset_fingerprint, dataset.fingerprint);
-        assert_eq!(lock.schema_version, 7);
+        assert_eq!(lock.schema_version, 8);
         assert_eq!(lock.requested_roster, vec!["mle", "moments"]);
         assert_eq!(lock.actual_roster, lock.requested_roster);
         assert!(lock.technical_failures.is_empty());
@@ -6671,7 +6741,7 @@ mod tests {
         assert!(refit.mle_frozen_parameters.is_none());
 
         let mut legacy_lock = lock.clone();
-        legacy_lock.schema_version = 6;
+        legacy_lock.schema_version = 7;
         assert!(apply_ensemble_lock(
             &mut FdrOptions::default(),
             &legacy_lock,
