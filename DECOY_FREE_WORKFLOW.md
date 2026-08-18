@@ -425,9 +425,12 @@ denominators, and absolute/relative changes. Raw-q deterioration greater than `0
 a structured informational warning and is never mislabeled as a passing gate. Level-4 interaction
 calibration is also reported but does not change the roster or suppress results. The report is stored in
 `validation.ensemble_interaction.json`, the selected Ensemble stage checkpoint, and workflow state;
-the schema-v7 lock records requested and actual rosters, explicit exclusions, technical failures,
+the schema-v8 lock records requested and actual rosters, explicit exclusions, technical failures,
 constituent identities, independently selected windows, target policies, combiner settings, each
-expert's fitted-profile provenance, and a separate canonical shared-profile contract identity. The
+expert's fitted-profile and annotation-cache provenance, and a separate canonical shared-profile
+contract identity that binds only the shared dataset/search/candidate and explicit calibration
+inputs. The complete lock analysis fingerprint separately binds the roster and every expert's
+artifact and annotation provenance. The
 shared dataset-local profile is fitted once at the explicit 9-18 window and cannot be selected by
 expert ordering or overwritten by an expert artifact.
 
