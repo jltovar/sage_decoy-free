@@ -1670,4 +1670,42 @@ mod tests {
             .as_deref()
             .is_some_and(|reason| reason.contains("missing")));
     }
+
+    #[test]
+    fn statistical_conformance_measured_ratio_correction_is_level_specific() {
+        let count = IdentificationCount {
+            target: 90,
+            entrapment: 10,
+            combined_entrapment_fdp: None,
+        };
+        let ratios = EffectiveRatios {
+            // PSM space is the measured peptidoform search-space ratio.
+            psm: 2.0,
+            peptide: 4.0,
+            protein: 9.0,
+        };
+
+        let psm = combined_fdp(&count, ratios.psm, true).unwrap();
+        let peptide = combined_fdp(&count, ratios.peptide, true).unwrap();
+        let protein = combined_fdp(&count, ratios.protein, true).unwrap();
+        assert!((psm - 0.15).abs() <= 1e-15);
+        assert!((peptide - 0.125).abs() <= 1e-15);
+        assert!((protein - (1.0 / 9.0)).abs() <= 1e-15);
+        assert!(psm > peptide && peptide > protein);
+
+        assert_eq!(combined_fdp(&count, 0.0, true), None);
+        assert_eq!(combined_fdp(&count, ratios.psm, false), None);
+        assert_eq!(
+            combined_fdp(
+                &IdentificationCount {
+                    target: 0,
+                    entrapment: 0,
+                    combined_entrapment_fdp: None,
+                },
+                ratios.psm,
+                true,
+            ),
+            None
+        );
+    }
 }

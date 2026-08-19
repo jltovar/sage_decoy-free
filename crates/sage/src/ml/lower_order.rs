@@ -1960,4 +1960,77 @@ mod tests {
         empty.fitted_charges_sorted.clear();
         assert!(LowerOrderModel::from_artifact(&empty).is_err());
     }
+
+    #[test]
+    fn statistical_conformance_gumbel_parameter_recovery() {
+        // Predeclared in validation/statistical_conformance/simulation_plan.json.
+        let mu_true = 7.5;
+        let beta_true = 1.8;
+        let mut rng = XorShift64::new(0x5354_4154_5f47_554d);
+        let scores: Vec<f64> = (0..20_000)
+            .map(|_| sample_gumbel(mu_true, beta_true, rng.next_f64()))
+            .collect();
+
+        for (name, fit) in [
+            ("moments", Some(fit_gumbel_moments(&scores))),
+            ("mle", fit_gumbel_mle(&scores)),
+        ] {
+            let (mu, beta) = fit.unwrap_or_else(|| panic!("{name} fit failed"));
+            assert!((mu - mu_true).abs() <= 0.08, "{name} mu={mu}");
+            assert!(
+                ((beta - beta_true) / beta_true).abs() <= 0.04,
+                "{name} beta={beta}"
+            );
+        }
+
+        let (mu, beta) = fit_gumbel_mle(&scores).expect("MLE fit for p-value check");
+        let mut p_values: Vec<f64> = scores
+            .iter()
+            .map(|&x| {
+                let z = (x - mu) / beta;
+                (1.0 - (-(-z).exp()).exp()).clamp(0.0, 1.0)
+            })
+            .collect();
+        p_values.sort_by(|a, b| a.total_cmp(b));
+        let n = p_values.len() as f64;
+        let ks = p_values
+            .iter()
+            .enumerate()
+            .map(|(i, &p)| {
+                let lo = i as f64 / n;
+                let hi = (i + 1) as f64 / n;
+                (p - lo).abs().max((hi - p).abs())
+            })
+            .fold(0.0_f64, f64::max);
+        assert!(ks <= 0.02, "fitted-null p-value KS distance={ks}");
+    }
+
+    #[test]
+    fn statistical_conformance_tev_k_parameter_recovery() {
+        // If Y~Gamma(k,1), X=mu-beta*ln(Y) has the asymptotic TEV-k density.
+        let mu_true = 4.0;
+        let beta_true = 1.25;
+        let mut rng = XorShift64::new(0x5354_4154_5f54_4556);
+
+        for k in [2_u32, 3, 5, 8] {
+            let scores: Vec<f64> = (0..12_000)
+                .map(|_| {
+                    let gamma = (0..k).map(|_| -rng.next_f64().ln()).sum::<f64>();
+                    mu_true - beta_true * gamma.ln()
+                })
+                .collect();
+
+            for (name, fit) in [
+                ("moments", fit_tev_k_moments(&scores, k)),
+                ("mle", fit_tev_k_mle(&scores, k)),
+            ] {
+                let (mu, beta) = fit.unwrap_or_else(|| panic!("{name} TEV-{k} fit failed"));
+                assert!((mu - mu_true).abs() <= 0.12, "{name} TEV-{k} mu={mu}");
+                assert!(
+                    ((beta - beta_true) / beta_true).abs() <= 0.07,
+                    "{name} TEV-{k} beta={beta}"
+                );
+            }
+        }
+    }
 }

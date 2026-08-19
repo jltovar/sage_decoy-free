@@ -16,6 +16,8 @@ data/
 !validation/manifests/*.json
 !validation/policies/
 !validation/policies/*.json
+!validation/statistical_conformance/
+!validation/statistical_conformance/*.json
 !validation/reports/
 !validation/reports/**/
 !validation/reports/**/*.json
