@@ -79,8 +79,19 @@ as yield-optimization variables.
 Technical validity, empirical feasibility, ranking, complexity, and deterministic ties are
 separate. A failed fit—including the retained MSFDR mixture-identifiability rules—is an infeasible
 trial with its technical reason. No fallback model is substituted. A valid trial that violates a
-declared entrapment constraint is `empirically_infeasible`; insufficient evidence is
-`not_evaluable`. Failure of every empirical trial never changes the Ensemble roster.
+declared entrapment FDP ceiling is `empirically_infeasible`.
+
+Schema v3 separates empirical point-estimate compliance from empirical power with
+`underpowered_trial_policy`. Omitting it, or setting `not_evaluable`, preserves the historical
+behavior: fewer than `minimum_entrapment_observations_for_power` accepted entrapments makes the
+trial non-selectable. The explicit `development_eligible` policy keeps a technically valid trial
+selectable when its finite adjusted-FDP point estimate is within the declared ceiling, while
+recording `empirical_calibration_power: underpowered`,
+`statistical_validation_status: not_evaluable_underpowered`, and
+`statistical_default_eligibility: not_evaluated`. Zero observed entrapments remain zero—no
+pseudocount is invented—and never establish calibration. The policy is accepted only with
+`classification: development_only`; holdout, release, statistical-default, and production-default
+claims remain prohibited. Failure of every empirical trial never changes the Ensemble roster.
 
 Structural method-family comparisons set `structural_comparison: true`. Score/evidence-related
 q-value covariates and other conditional choices marked by the catalog additionally require an
@@ -120,9 +131,13 @@ schema, fingerprint, and payload integrity, then reuses completed trial identiti
 Nonwinner result/artifact payloads are removed after completion; full diagnostics and fitted state
 remain only for each block winner.
 
-Outcomes distinguish `exhaustive_bounded_optimum`, `completed_heuristic_local`,
+Legacy outcomes distinguish `exhaustive_bounded_optimum`, `completed_heuristic_local`,
 `trial_budget_exhausted`, `no_technically_valid_solution`, `no_empirically_feasible_solution`,
-`interrupted_resumable`, and `not_evaluable`.
+`interrupted_resumable`, and `not_evaluable`. Schema-v3 development-eligible runs additionally
+use `underpowered_development_winner` when the selected development winner is underpowered and
+`completed_development_optimization` when the run completes without that condition. Powered,
+underpowered, and not-assessed trial counts are serialized separately. Neither completion status
+asserts statistical-default eligibility.
 
 `implementation_smoke_only: true` is a bounded infrastructure-test mode limited to 16 trials and
 non-Ensemble blocks. It writes optimizer/checkpoint evidence but skips ordinary and target-only

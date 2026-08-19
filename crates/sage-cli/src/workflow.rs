@@ -17,10 +17,11 @@ use crate::external_feature_cache::{
 };
 use crate::input::Input;
 use crate::parameter_optimizer::{
-    apply_fdr_overrides, parameter_catalog_fingerprint, run_optimizer, OptimizerBlock,
-    OptimizerExecutionMode, OptimizerExpert, OptimizerIdentity, OptimizerOutcome,
+    apply_fdr_overrides, parameter_catalog_fingerprint, run_optimizer, EmpiricalCalibrationPower,
+    OptimizerBlock, OptimizerExecutionMode, OptimizerExpert, OptimizerIdentity, OptimizerOutcome,
     OptimizerRunResult, OptimizerWindowSearch, ParameterOptimizerConfig, ParameterValue,
-    TrialEvaluation, TrialEvaluator, TrialMetrics, TrialRecord, TrialRequest, TrialStatus,
+    StatisticalDefaultEligibility, StatisticalValidationStatus, TrialEvaluation, TrialEvaluator,
+    TrialMetrics, TrialRecord, TrialRequest, TrialStatus,
 };
 use crate::provenance::{freeze_baseline, sha256_file, write_json_atomic, BaselineManifest};
 use crate::runner::Runner;
@@ -636,6 +637,10 @@ pub struct OptimizerWinnerSummary {
     pub winner_trial_id: String,
     pub scientific_result_sha256: String,
     pub outcome: OptimizerOutcome,
+    pub development_selection_eligible: bool,
+    pub empirical_calibration_power: EmpiricalCalibrationPower,
+    pub statistical_validation_status: StatisticalValidationStatus,
+    pub statistical_default_eligibility: StatisticalDefaultEligibility,
     pub winner_artifacts: BTreeMap<String, serde_json::Value>,
 }
 
@@ -644,6 +649,8 @@ pub struct OptimizerExecutionReport {
     pub schema_version: u32,
     pub execution_mode: OptimizerExecutionMode,
     pub optimization_status: String,
+    pub powered_trial_count: usize,
+    pub underpowered_trial_count: usize,
     pub selected_entrapment_winners: BTreeMap<String, OptimizerWinnerSummary>,
     pub post_selection_stages: String,
     pub target_only_evaluation: String,
@@ -664,22 +671,54 @@ fn optimizer_execution_report(
                 .requested_parameter_space
                 .iter()
                 .find_map(|block| block.expert)?;
+            let winner = result.winner_trial_id.as_ref().and_then(|winner| {
+                result
+                    .trials
+                    .iter()
+                    .find(|trial| &trial.request.trial_id == winner)
+            })?;
             Some((
                 expert.slug().to_owned(),
                 OptimizerWinnerSummary {
-                    winner_trial_id: result.winner_trial_id.clone()?,
+                    winner_trial_id: winner.request.trial_id.clone(),
                     scientific_result_sha256: result.scientific_result_sha256.clone(),
                     outcome: result.outcome.clone(),
+                    development_selection_eligible: winner
+                        .evaluation
+                        .development_selection_eligible,
+                    empirical_calibration_power: winner.evaluation.empirical_calibration_power,
+                    statistical_validation_status: winner.evaluation.statistical_validation_status,
+                    statistical_default_eligibility: winner
+                        .evaluation
+                        .statistical_default_eligibility,
                     winner_artifacts: result.winner_artifacts.clone(),
                 },
             ))
         })
         .collect();
     let optimization_only = config.optimization_only();
+    let powered_trial_count = results
+        .iter()
+        .map(|result| result.powered_trial_count)
+        .sum();
+    let underpowered_trial_count = results
+        .iter()
+        .map(|result| result.underpowered_trial_count)
+        .sum();
+    let optimization_status = if results
+        .iter()
+        .any(|result| result.outcome == OptimizerOutcome::UnderpoweredDevelopmentWinner)
+    {
+        "underpowered_development_winner".to_owned()
+    } else {
+        optimization_status.into()
+    };
     OptimizerExecutionReport {
-        schema_version: 1,
+        schema_version: 2,
         execution_mode: config.execution_mode,
-        optimization_status: optimization_status.into(),
+        optimization_status,
+        powered_trial_count,
+        underpowered_trial_count,
         selected_entrapment_winners,
         post_selection_stages: if optimization_only {
             "not_run_by_execution_scope"
@@ -4025,6 +4064,14 @@ impl TrialEvaluator for InfrastructureSmokeEvaluator<'_> {
                 entrapment_count_by_level: BTreeMap::new(),
                 model_complexity: request.parameters.len(),
             }),
+            development_selection_eligible: false,
+            empirical_point_estimate_within_limit: None,
+            empirical_calibration_power:
+                crate::parameter_optimizer::EmpiricalCalibrationPower::NotAssessed,
+            statistical_validation_status:
+                crate::parameter_optimizer::StatisticalValidationStatus::NotEvaluated,
+            statistical_default_eligibility:
+                crate::parameter_optimizer::StatisticalDefaultEligibility::NotEvaluated,
             compact_diagnostics: BTreeMap::from([
                 ("implementation_smoke_only".into(), serde_json::json!(true)),
                 ("biological_metrics_used".into(), serde_json::json!(false)),
@@ -4115,6 +4162,14 @@ impl TrialEvaluator for WorkflowTrialEvaluator<'_> {
                     technical_reason: Some(format!("{error:#}")),
                     empirical_reason: None,
                     metrics: None,
+                    development_selection_eligible: false,
+                    empirical_point_estimate_within_limit: None,
+                    empirical_calibration_power:
+                        crate::parameter_optimizer::EmpiricalCalibrationPower::NotAssessed,
+                    statistical_validation_status:
+                        crate::parameter_optimizer::StatisticalValidationStatus::NotEvaluated,
+                    statistical_default_eligibility:
+                        crate::parameter_optimizer::StatisticalDefaultEligibility::NotEvaluated,
                     compact_diagnostics: BTreeMap::from([
                         ("fallback_used".into(), serde_json::json!(false)),
                         ("model_substitution".into(), serde_json::json!(false)),
@@ -4133,6 +4188,14 @@ impl TrialEvaluator for WorkflowTrialEvaluator<'_> {
                 ),
                 empirical_reason: None,
                 metrics: None,
+                development_selection_eligible: false,
+                empirical_point_estimate_within_limit: None,
+                empirical_calibration_power:
+                    crate::parameter_optimizer::EmpiricalCalibrationPower::NotAssessed,
+                statistical_validation_status:
+                    crate::parameter_optimizer::StatisticalValidationStatus::NotEvaluated,
+                statistical_default_eligibility:
+                    crate::parameter_optimizer::StatisticalDefaultEligibility::NotEvaluated,
                 compact_diagnostics: BTreeMap::from([
                     ("fallback_used".into(), serde_json::json!(true)),
                     ("model_substitution".into(), serde_json::json!(false)),
@@ -4154,6 +4217,14 @@ impl TrialEvaluator for WorkflowTrialEvaluator<'_> {
                 ),
                 empirical_reason: None,
                 metrics: None,
+                development_selection_eligible: false,
+                empirical_point_estimate_within_limit: None,
+                empirical_calibration_power:
+                    crate::parameter_optimizer::EmpiricalCalibrationPower::NotAssessed,
+                statistical_validation_status:
+                    crate::parameter_optimizer::StatisticalValidationStatus::NotEvaluated,
+                statistical_default_eligibility:
+                    crate::parameter_optimizer::StatisticalDefaultEligibility::NotEvaluated,
                 compact_diagnostics: BTreeMap::from([
                     ("fallback_used".into(), serde_json::json!(false)),
                     ("model_substitution".into(), serde_json::json!(false)),
@@ -4293,6 +4364,14 @@ impl TrialEvaluator for WorkflowTrialEvaluator<'_> {
                 entrapment_count_by_level,
                 model_complexity: request.parameters.len(),
             }),
+            development_selection_eligible: false,
+            empirical_point_estimate_within_limit: None,
+            empirical_calibration_power:
+                crate::parameter_optimizer::EmpiricalCalibrationPower::NotAssessed,
+            statistical_validation_status:
+                crate::parameter_optimizer::StatisticalValidationStatus::NotEvaluated,
+            statistical_default_eligibility:
+                crate::parameter_optimizer::StatisticalDefaultEligibility::NotEvaluated,
             compact_diagnostics: diagnostics,
         })
     }
@@ -4583,7 +4662,10 @@ fn optimize_model_parameters(
     anyhow::ensure!(
         matches!(
             result.outcome,
-            OptimizerOutcome::ExhaustiveBoundedOptimum | OptimizerOutcome::CompletedHeuristicLocal
+            OptimizerOutcome::ExhaustiveBoundedOptimum
+                | OptimizerOutcome::CompletedHeuristicLocal
+                | OptimizerOutcome::CompletedDevelopmentOptimization
+                | OptimizerOutcome::UnderpoweredDevelopmentWinner
         ),
         "parameter optimizer for {} ended as {:?}; no baseline substitution is permitted",
         model_slug(&model.model),
@@ -6043,6 +6125,8 @@ mod tests {
             objective: crate::parameter_optimizer::default_objective(),
             fixed_evaluation_threshold: 0.01,
             empirical_entrapment_constraints: Vec::new(),
+            underpowered_trial_policy:
+                crate::parameter_optimizer::UnderpoweredTrialPolicy::NotEvaluable,
             statistical_validity_contracts: BTreeMap::new(),
             resume: true,
             materialize_winner: true,

@@ -162,6 +162,15 @@ the final Ensemble winner through the ordinary production optimizer, records dow
 `optimization_and_post_selection` retains existing workflow behavior for manifests that omit the
 field.
 
+Schema v3 independently controls underpowered entrapment evidence. The backward-compatible
+`underpowered_trial_policy: not_evaluable` keeps the previous selection block. The explicit
+development-only `development_eligible` policy treats
+`minimum_entrapment_observations_for_power` as a power/precision diagnostic rather than an FDP
+point-estimate ceiling: within-ceiling trials remain rankable, but their validation status is
+`not_evaluable_underpowered` and cannot support a statistical-default claim. The policy does not
+alter expert participation, objective order, target-only isolation, technical fail-closed rules,
+or the adjusted-FDP ceiling.
+
 ## Layered MS2Rescore prediction and calibration caches
 
 An MS2Rescore stage consumes the same immutable native candidate pool as its optimized stage, so

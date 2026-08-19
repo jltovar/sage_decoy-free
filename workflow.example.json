@@ -152,7 +152,7 @@
   "locked_expert_artifacts": {},
   "artifact_reuse_policy": "dataset_local_only",
   "parameter_optimizer": {
-    "schema_version": 2,
+    "schema_version": 3,
     "enabled": false,
     "classification": "development_only",
     "selected_experts": [
@@ -179,7 +179,14 @@
       {"metric": "deterministic_parameter_order", "direction": "minimize"}
     ],
     "fixed_evaluation_threshold": 0.01,
-    "empirical_entrapment_constraints": [],
+    "empirical_entrapment_constraints": [
+      {
+        "level": "protein",
+        "maximum_adjusted_fdp": 0.01,
+        "minimum_entrapment_observations_for_power": 3
+      }
+    ],
+    "underpowered_trial_policy": "not_evaluable",
     "statistical_validity_contracts": {},
     "resume": true,
     "materialize_winner": true,
