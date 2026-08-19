@@ -129,6 +129,17 @@ declared universe. MSFDR1-SMIX is always rank `1-1`. Ensemble does not optimize 
 every constituent expert must supply its own independently optimized dataset-local window and
 artifact.
 
+The versioned workflow `parameter_optimizer` is a separate development-only optimizer for bounded
+analysis parameters. It supports independent per-expert grids or staged-coordinate blocks,
+per-expert q/calibration settings, final Ensemble-only combination and aggregation blocks, exact
+checkpoint resume, and strict immutable candidate/raw-cache reuse. It never treats reporting FDR
+thresholds as tunable variables and never consumes target-only outcomes. See
+[PARAMETER_OPTIMIZER.md](PARAMETER_OPTIMIZER.md) for the schema, ownership and precedence rules,
+objective semantics, portable fingerprint, and failure classifications.
+Every executable candidate has serialized production-binding coverage. A bounded
+production-smoke mode verifies real +entrapment fitting and objective selection without entering
+target-only reporting.
+
 ### Layered MS2Rescore prediction cache
 
 Expensive MS2PIP and DeepLC outputs are stored outside the immutable Sage candidate pool and joined

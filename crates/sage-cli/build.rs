@@ -19,4 +19,18 @@ fn main() {
         "cargo:rustc-env=SAGE_EXTERNAL_CACHE_SOURCE_SHA256={:x}",
         hasher.finalize()
     );
+
+    let optimizer_sources = ["src/parameter_optimizer.rs", "src/workflow.rs"];
+    let mut optimizer_hasher = Sha256::new();
+    optimizer_hasher.update(b"sage-parameter-optimizer-source-v1\0");
+    for source in optimizer_sources {
+        println!("cargo:rerun-if-changed={source}");
+        let content = fs::read(source).unwrap_or_else(|error| panic!("reading {source}: {error}"));
+        optimizer_hasher.update((content.len() as u64).to_le_bytes());
+        optimizer_hasher.update(content);
+    }
+    println!(
+        "cargo:rustc-env=SAGE_PARAMETER_OPTIMIZER_SOURCE_SHA256={:x}",
+        optimizer_hasher.finalize()
+    );
 }

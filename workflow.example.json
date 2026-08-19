@@ -150,5 +150,86 @@
   "annotate_target_matches": true,
   "ensemble_lock": null,
   "locked_expert_artifacts": {},
-  "artifact_reuse_policy": "dataset_local_only"
+  "artifact_reuse_policy": "dataset_local_only",
+  "parameter_optimizer": {
+    "schema_version": 1,
+    "enabled": false,
+    "classification": "development_only",
+    "selected_experts": [
+      "moments", "mle", "lower_order", "msfdr_seeded",
+      "msfdr_1smix", "msfdr_2smix", "nokoi", "ensemble"
+    ],
+    "compiled_defaults": {},
+    "workflow_defaults": {
+      "psm_q_method": "storey",
+      "peptide_q_method": "storey",
+      "protein_q_method": "storey"
+    },
+    "fixed_baseline_values": {},
+    "seed": 42,
+    "maximum_trial_budget": 32,
+    "maximum_optimization_passes": 2,
+    "objective": [
+      {"metric": "level4_proteins", "direction": "maximize"},
+      {"metric": "level4_canonical_peptides", "direction": "maximize"},
+      {"metric": "level4_peptidoforms", "direction": "maximize"},
+      {"metric": "level4_psms", "direction": "maximize"},
+      {"metric": "adjusted_entrapment_fdp", "direction": "minimize"},
+      {"metric": "model_complexity", "direction": "minimize"},
+      {"metric": "deterministic_parameter_order", "direction": "minimize"}
+    ],
+    "fixed_evaluation_threshold": 0.01,
+    "empirical_entrapment_constraints": [],
+    "statistical_validity_contracts": {},
+    "resume": true,
+    "materialize_winner": true,
+    "implementation_smoke_only": false,
+    "production_smoke_only": false,
+    "require_existing_candidate_pool": true,
+    "require_existing_raw_annotation_cache": true,
+    "target_only_outcomes_excluded": true,
+    "block_order": ["moments_model", "mle_model"],
+    "blocks": [
+      {
+        "id": "moments_model",
+        "enabled": true,
+        "scope": "per_expert",
+        "expert": "moments",
+        "strategy": "exhaustive_grid",
+        "structural_comparison": true,
+        "fixed": {},
+        "space": {
+          "moments_robust_fit": [false, true],
+          "moments_winsor_upper_q": [0.9, 0.95]
+        },
+        "window_search": {
+          "strategy": "landscape_adaptive",
+          "min_rank_range": [2, 10],
+          "max_rank_range": [2, 25]
+        },
+        "use_external_features": false,
+        "max_trials": 4
+      },
+      {
+        "id": "mle_model",
+        "enabled": true,
+        "scope": "per_expert",
+        "expert": "mle",
+        "strategy": "staged_coordinate",
+        "structural_comparison": false,
+        "fixed": {},
+        "space": {
+          "mle_purification_factor": [0.1, 0.25, 0.35]
+        },
+        "window_search": {
+          "strategy": "landscape_adaptive",
+          "min_rank_range": [2, 10],
+          "max_rank_range": [2, 25]
+        },
+        "use_external_features": true,
+        "max_trials": 6,
+        "max_passes": 2
+      }
+    ]
+  }
 }

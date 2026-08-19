@@ -5,6 +5,7 @@ pub mod external_feature_cache;
 pub mod external_features;
 pub mod input;
 pub mod output;
+pub mod parameter_optimizer;
 pub mod provenance;
 pub mod runner;
 pub mod telemetry;
