@@ -1,0 +1,159 @@
+{
+  "schema_version": 1,
+  "status": "predeclared_before_execution",
+  "predeclared_on": "2026-08-18",
+  "amended_before_targeted_real_data_inspection_on": "2026-08-18",
+  "scope": "Step 2 deterministic statistical-conformance tests only",
+  "observed_results": {
+    "recorded_after_execution_on": "2026-08-18",
+    "msfdr_post_fit_validity_gate": "passed: all invalid cases return explicit technical failures; valid separated and low-variance models pass unchanged; repeated fitting is deterministic",
+    "coincident_regression": "active and passed for both MSFDR1-SMIX and MSFDR2-SMIX",
+    "targeted_isb_regression": "exit 0; six of six stages complete and evaluable; no fallback; six of six fitted artifacts and result tables byte-identical; MSFDR2 selected ranks 9-17; execve trace contains Sage only"
+  },
+  "prohibitions": [
+    "no spectrum search",
+    "no MS2Rescore generation",
+    "no external biological dataset",
+    "no ISB or PXD workflow",
+    "no reporting-threshold optimization"
+  ],
+  "numeric_policy": {
+    "probability_bounds": "finite and in [0,1]",
+    "monotonicity_tolerance": 1e-12,
+    "closed_form_tolerance": 1e-12,
+    "monte_carlo_reporting": "report the estimate and a Wilson 95% interval; judge against the predeclared finite-sample band",
+    "order_invariance": "exact equality after restoring stable identity order"
+  },
+  "msfdr_mixture_validity_contract": {
+    "scope": ["MSFDR1-SMIX", "MSFDR2-SMIX"],
+    "evaluation_point": "after each deterministic fit trial and before ranking, acceptance, probability production, or serialization; frozen artifacts are revalidated before use",
+    "floating_point_basis": "Sage stores and fits hyperscores and skew-normal parameters as IEEE-754 binary64. A numerical-resolution unit is 64*f64::EPSILON*max(observed absolute score, observed score range, 1). The factor 64 covers the fixed sequence of subtraction, moment, square-root, and skew-normal transforms without creating a data-derived scientific cutoff.",
+    "input": {
+      "all_scores_finite": true,
+      "minimum_count_per_required_population": 20,
+      "nondegenerate_population": "observed range and stable population standard deviation must both be greater than the numerical-resolution unit"
+    },
+    "parameters": {
+      "all_location_scale_shape_and_weights_finite": true,
+      "component_scale": "strictly greater than the numerical-resolution unit",
+      "weight_resolution": "64*f64::EPSILON",
+      "one_sample_weights": "a and 1-a must each be greater than weight_resolution",
+      "two_sample_weights": "a, 1-a, a*s2_balance, b, and 1-a*s2_balance-b must each be greater than weight_resolution",
+      "effective_support": "each fitted three-parameter skew-normal component must have expected aggregate support >= 3 observations; this is the number of free component parameters, not an empirical power threshold"
+    },
+    "identifiability": {
+      "component_distinctness": "for every semantically distinct component pair, at least one of location, scale, or shape must differ by more than 64*f64::EPSILON times the corresponding parameter scale; location and scale also use the observed-score resolution",
+      "canonical_order": "1SMix retains its existing deterministic upper-tail orientation. 2SMix labels are fixed by their non-exchangeable joint roles and deterministic initialization. No mean-order constraint is added because the primary author implementation defaults to unconstrained component locations and such a condition would alter the estimator.",
+      "nested_model_improvement": "no positive likelihood-ratio cutoff is added: Peng et al. and the author implementation do not specify one, and distinct, effectively supported component parameters are identifiable in the declared family. Numerically equal likelihoods caused by coincident components are already rejected by the parameter-resolution rule."
+    },
+    "outcomes": {
+      "valid_fitted_mixture": "all checks pass; fitted parameters are returned unchanged",
+      "reduced_model": "not supported by MSFDR1-SMIX or MSFDR2-SMIX; a boundary-weight solution is not relabelled as a successful reduced model",
+      "nonidentifiable_fit": "returns an explicit technical failure and produces no model or p-value/PEP/q-value stream",
+      "optimizer_failure": "no prospectively configured fit trial produced an otherwise valid model; distinct from nonidentifiability in the failure reason",
+      "fallback": "none inside these model fitters; workflow/Ensemble handling may only use existing explicit technical-failure provenance"
+    }
+  },
+  "experiments": [
+    {
+      "id": "gumbel_parameter_recovery",
+      "seed": "0x535441545f47554d",
+      "population": 20000,
+      "generator": "Gumbel(mu=7.5,beta=1.8) by inverse CDF",
+      "criteria": {"absolute_mu_error_max": 0.08, "relative_beta_error_max": 0.04, "null_p_ks_distance_max": 0.02}
+    },
+    {
+      "id": "tev_k_parameter_recovery",
+      "seed": "0x535441545f544556",
+      "population_per_rank": 12000,
+      "ranks": [2, 3, 5, 8],
+      "generator": "asymptotic TEV-k(mu=4.0,beta=1.25), sampled through Gamma(k,1) then x=mu-beta*ln(Gamma)",
+      "criteria": {"absolute_mu_error_max": 0.12, "relative_beta_error_max": 0.07}
+    },
+    {
+      "id": "evidence_strength_monotonicity",
+      "seed": null,
+      "population": 401,
+      "generator": "fixed score grid [-8,12]",
+      "criteria": {"p_value_increases_allowed": 0, "pep_increases_allowed_when_components_are_ordered": 0}
+    },
+    {
+      "id": "q_value_and_tie_contract",
+      "seed": null,
+      "population": 12,
+      "generator": "fixed p-value and PEP vectors containing duplicates, NaN, zero, and one",
+      "criteria": {"all_outputs_bounded": true, "ordered_q_monotone": true, "permutation_invariant_by_stable_identity": true, "equal_evidence_equal_q": true}
+    },
+    {
+      "id": "sparse_and_zero_null",
+      "seed": null,
+      "population": 0,
+      "generator": "empty and below-minimum fixed null pools",
+      "criteria": {"empty_fit_is_unavailable": true, "below_minimum_fit_is_unavailable": true, "fallback_provenance_names_actual_method": true, "not_evaluable_is_never_passing": true}
+    },
+    {
+      "id": "candidate_count_scaling",
+      "seed": null,
+      "population": 8,
+      "generator": "fixed spectrum-tail probabilities crossed with candidate counts [1,10,100,1000]",
+      "criteria": {"constructed_e_value_matches_declared_formula": true, "larger_candidate_count_does_not_strengthen_evidence_when_power_is_positive": true, "frozen_reference_normalization_is_replayable": true}
+    },
+    {
+      "id": "measured_entrapment_ratio_levels",
+      "seed": null,
+      "population": 9,
+      "generator": "fixed target/entrapment counts at PSM, canonical-peptide, peptidoform, and protein levels with distinct measured ratios",
+      "criteria": {"formula": "E*(1+1/r)/(T+E)", "level_specific_ratio_required": true, "zero_denominator_is_not_evaluable": true}
+    },
+    {
+      "id": "nokoi_crossfit_and_replay",
+      "seed": "0x5EED5EED5EED5EED",
+      "population": 320,
+      "effect_distribution": "fixed synthetic positive/null feature construction already used by the Nokoi portable-v2 fixture",
+      "criteria": {"held_out_null_never_in_its_training_fold": true, "stable_id_fold_is_permutation_invariant": true, "artifact_replay_matches_fit_evidence": true, "tampered_or_wrong_population_artifact_fails_closed": true}
+    },
+    {
+      "id": "mixture_identifiability",
+      "seed": "0x535441545f4d4958",
+      "population_per_component": 3000,
+      "effect_distributions": ["well-separated normal-limit skew-normal components at means -1 and 3 with scale 0.8", "coincident components at mean 0 and scale 1", "pooled-S2 exact replication factors 1,2,4"],
+      "criteria": {"separated_fit_outputs_bounded": true, "coincident_components_are_reported_as_nonidentifiable_or_demonstrably unstable": true, "pooled_replication_parameter_drift_max": 0.03}
+    },
+    {
+      "id": "msfdr_post_fit_validity_gate",
+      "seed": "0x535441545f4d4958",
+      "population_per_required_sample": 600,
+      "generators": [
+        "constant score populations at 0 and 37",
+        "nonfinite contamination at one fixed index",
+        "manually constructed invalid scale, weight, coincident, and label-order artifacts",
+        "well-separated deterministic normal-quantile mixtures C~N(4,0.7), I1~N(0,0.7), I2~N(-2.5,0.6)",
+        "low-variance but representable deterministic mixtures C centered 1+8e-8 and I1 centered 1 with scale 1e-8",
+        "label-permuted 1SMix construction restored through the existing upper-tail canonical representation; deterministic fixed-role 2SMix construction"
+      ],
+      "criteria": {
+        "every_invalid_case_returns_explicit_reason": true,
+        "invalid_fit_produces_no_model_or_probability_stream": true,
+        "valid_fits_pass_without_parameter_mutation": true,
+        "repeated_fit_is_exactly_deterministic": true,
+        "canonical_representation_is_label_order_invariant": true,
+        "no_threshold_selected_from_isb_outcomes": true
+      }
+    },
+    {
+      "id": "ensemble_dependence",
+      "seed": "0x535441545f454e53",
+      "replicates": 100000,
+      "expert_counts": [1, 2, 3, 7],
+      "dependence_scenarios": ["independent uniforms", "exact duplicates", "Gaussian-copula equicorrelation 0.9"],
+      "criteria": {"bounds_and_order_invariance": true, "duplicate_second_best_equals_single_expert_for_at_least_two_copies": true, "raw_second_best_is_labelled_calibrated_only_if_superuniform_at alpha=[0.01,0.05,0.10,0.50,0.90] within Wilson uncertainty": true, "median_pep_is_labelled_posterior_only_if a declared joint model supports that interpretation": true}
+    },
+    {
+      "id": "target_only_window_lock",
+      "seed": null,
+      "population": 6,
+      "generator": "fixed workflow stage records with optimized, refit-with-locked-window, and artifact-reuse policies",
+      "criteria": {"selected_window_identity_unchanged": true, "target_only_rows_cannot_supply_entrapment_objective": true, "lower_order_complete_artifact_reuse_rejected": true, "nokoi_reuse_requires_same_parent_dataset_identity": true}
+    }
+  ]
+}
