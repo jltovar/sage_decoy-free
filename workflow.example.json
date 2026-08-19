@@ -152,7 +152,7 @@
   "locked_expert_artifacts": {},
   "artifact_reuse_policy": "dataset_local_only",
   "parameter_optimizer": {
-    "schema_version": 1,
+    "schema_version": 2,
     "enabled": false,
     "classification": "development_only",
     "selected_experts": [
@@ -183,6 +183,7 @@
     "statistical_validity_contracts": {},
     "resume": true,
     "materialize_winner": true,
+    "execution_mode": "optimization_and_post_selection",
     "implementation_smoke_only": false,
     "production_smoke_only": false,
     "require_existing_candidate_pool": true,

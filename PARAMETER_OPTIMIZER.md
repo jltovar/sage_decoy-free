@@ -92,10 +92,19 @@ the null-independence or cross-fitting validity of `matched_peaks`, `best_longes
 
 Only the +entrapment development population contributes feasibility, objective values, ranking,
 early stopping, window selection, or parameter selection. Each trial request records
-`target_only_outcomes_allowed: false`. Target-only output is generated only after a winner is
-frozen, under the model's existing supported reporting policy.
+`target_only_outcomes_allowed: false`.
 
-The portable optimizer fingerprint binds dataset, candidate pool, raw annotation cache, optional
+Schema v2 adds an explicit `execution_mode`. `optimization_and_post_selection` is the default,
+including for schema-v1 manifests that omit the field, and preserves the historical behavior of
+continuing into ordinary post-selection and target-only reporting after winners are frozen.
+`optimization_only` runs the same production evaluator, optimizer, objective, bindings, and
+checkpoint engine, but its execution boundary ends after all +entrapment winners—including the
+final Ensemble winner—are materialized. In that mode strict preflight resolves only the
++entrapment pool and layered raw cache; target-only pool/cache paths are not opened or hashed, and
+ordinary MS2Rescore, target-only, interaction-diagnostic, and validation stages are explicitly
+reported as `not_run_by_execution_scope` rather than failed or completed.
+
+The portable optimizer fingerprint binds execution mode, dataset, candidate pool, raw annotation cache, optional
 calibrated-annotation identity, model/artifact and optimizer schemas, requested/resolved settings,
 parameter spaces, scopes, precedence, strategy, block order, objective, constraints, budgets,
 seed, source configuration, and catalog contract. Absolute paths, usernames, hostnames, wall-clock
@@ -124,6 +133,8 @@ manifest.
 production trial evaluator and real +entrapment Level-4 metrics before stopping after winner
 materialization. It exists only for cache-only integration acceptance. It never runs an ordinary
 post-winner or target-only stage and is mutually exclusive with `implementation_smoke_only`.
+It is not a substitute for `execution_mode: optimization_only`: the latter supports Ensemble,
+normal scientific trial budgets, every production search strategy, and exact resume.
 
 ## Parameter classes
 

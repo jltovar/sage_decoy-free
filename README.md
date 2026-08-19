@@ -139,6 +139,10 @@ objective semantics, portable fingerprint, and failure classifications.
 Every executable candidate has serialized production-binding coverage. A bounded
 production-smoke mode verifies real +entrapment fitting and objective selection without entering
 target-only reporting.
+Schema-v2 optimizer manifests can additionally set `execution_mode: optimization_only` for a full
+development run that materializes all individual and final Ensemble +entrapment winners and then
+returns successfully without resolving or executing any target-only resource or stage. Omitting
+the field preserves the historical `optimization_and_post_selection` behavior.
 
 ### Layered MS2Rescore prediction cache
 

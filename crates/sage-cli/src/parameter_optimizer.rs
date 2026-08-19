@@ -11,7 +11,7 @@ use sha2::{Digest, Sha256};
 use std::collections::{BTreeMap, BTreeSet};
 use std::path::Path;
 
-pub const PARAMETER_OPTIMIZER_SCHEMA_VERSION: u32 = 1;
+pub const PARAMETER_OPTIMIZER_SCHEMA_VERSION: u32 = 2;
 pub const PARAMETER_CATALOG_SCHEMA_VERSION: u32 = 2;
 pub const PARAMETER_OPTIMIZER_IMPLEMENTATION_SOURCE_SHA256: &str =
     env!("SAGE_PARAMETER_OPTIMIZER_SOURCE_SHA256");
@@ -2616,6 +2616,17 @@ pub enum OptimizationClassification {
     DevelopmentOnly,
 }
 
+/// Controls whether a completed production optimization exits with its
+/// +entrapment winners or continues into the historical post-selection and
+/// target-only workflow. The default preserves schema-v1 manifest behavior.
+#[derive(Clone, Copy, Debug, Default, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(rename_all = "snake_case")]
+pub enum OptimizerExecutionMode {
+    OptimizationOnly,
+    #[default]
+    OptimizationAndPostSelection,
+}
+
 #[derive(Clone, Copy, Debug, Serialize, Deserialize, PartialEq, Eq)]
 #[serde(rename_all = "snake_case")]
 pub enum ObjectiveDirection {
@@ -2743,6 +2754,10 @@ pub struct ParameterOptimizerConfig {
     pub statistical_validity_contracts: BTreeMap<String, String>,
     pub resume: bool,
     pub materialize_winner: bool,
+    /// Versioned production execution boundary. Missing in schema-v1
+    /// manifests and therefore defaults to the historical full workflow.
+    #[serde(default)]
+    pub execution_mode: OptimizerExecutionMode,
     /// Bounded infrastructure verification: run declared non-Ensemble
     /// optimizer blocks, write their artifacts, and skip ordinary/target-only
     /// workflow stages. Never use this for scientific optimization.
@@ -2762,9 +2777,20 @@ pub struct ParameterOptimizerConfig {
 }
 
 impl ParameterOptimizerConfig {
+    pub fn optimization_only(&self) -> bool {
+        self.enabled && self.execution_mode == OptimizerExecutionMode::OptimizationOnly
+    }
+
+    pub fn stops_after_optimization(&self) -> bool {
+        self.enabled
+            && (self.optimization_only()
+                || self.implementation_smoke_only
+                || self.production_smoke_only)
+    }
+
     pub fn validate(&self) -> Result<()> {
         anyhow::ensure!(
-            self.schema_version == PARAMETER_OPTIMIZER_SCHEMA_VERSION,
+            (1..=PARAMETER_OPTIMIZER_SCHEMA_VERSION).contains(&self.schema_version),
             "unsupported parameter_optimizer schema {}",
             self.schema_version
         );
@@ -3485,6 +3511,7 @@ pub struct OptimizerCheckpoint {
 #[derive(Clone, Debug, Serialize, Deserialize)]
 pub struct OptimizerIdentity {
     pub schema_version: u32,
+    pub execution_mode: OptimizerExecutionMode,
     pub dataset_identity: String,
     pub candidate_pool_identity: String,
     pub raw_annotation_cache_identity: String,
@@ -3561,6 +3588,7 @@ pub struct OptimizerRunResult {
     pub scientific_result_sha256: String,
     pub parameter_binding_coverage: Vec<ParameterProductionBinding>,
     pub classification: OptimizationClassification,
+    pub execution_mode: OptimizerExecutionMode,
     pub outcome: OptimizerOutcome,
     pub strategy_classification: String,
     pub requested_parameter_space: Vec<OptimizerBlock>,
@@ -4228,6 +4256,7 @@ fn finish_result<E: TrialEvaluator>(
         scientific_result_sha256,
         parameter_binding_coverage: parameter_production_bindings(),
         classification: config.classification,
+        execution_mode: config.execution_mode,
         outcome: payload.outcome,
         strategy_classification: if any_heuristic { "deterministic_staged_or_coordinate_local_not_global" } else if any_exhaustive { "bounded_grid_global_within_single_declared_block" } else { "not_evaluable" }.into(),
         requested_parameter_space: config.blocks.clone(),
@@ -4278,6 +4307,7 @@ mod tests {
             statistical_validity_contracts: BTreeMap::new(),
             resume: true,
             materialize_winner: true,
+            execution_mode: OptimizerExecutionMode::OptimizationAndPostSelection,
             implementation_smoke_only: false,
             production_smoke_only: false,
             require_existing_candidate_pool: true,
@@ -4313,12 +4343,13 @@ mod tests {
     fn identity() -> OptimizerIdentity {
         OptimizerIdentity {
             schema_version: 1,
+            execution_mode: OptimizerExecutionMode::OptimizationAndPostSelection,
             dataset_identity: "dataset".into(),
             candidate_pool_identity: "candidate".into(),
             raw_annotation_cache_identity: "raw".into(),
             calibrated_annotation_identity: None,
             model_artifact_schema: 2,
-            optimizer_schema: 1,
+            optimizer_schema: PARAMETER_OPTIMIZER_SCHEMA_VERSION,
             optimizer_source_sha256: PARAMETER_OPTIMIZER_IMPLEMENTATION_SOURCE_SHA256.into(),
             source_configuration_sha256: "config".into(),
             catalog_sha256: "catalog".into(),
@@ -4337,7 +4368,7 @@ mod tests {
                 .parameters
                 .get("moments_purification_factor")
                 .and_then(ParameterValue::as_f64)
-                .unwrap();
+                .unwrap_or(0.1);
             Ok(TrialEvaluation {
                 status: TrialStatus::Feasible,
                 technical_reason: None,
@@ -4362,6 +4393,201 @@ mod tests {
         ) -> Result<Option<serde_json::Value>> {
             Ok(Some(serde_json::json!({"winner": record.request.trial_id})))
         }
+    }
+
+    #[test]
+    fn execution_mode_is_backward_compatible_and_changes_identity() {
+        let mut value = serde_json::to_value(config()).unwrap();
+        value.as_object_mut().unwrap().remove("execution_mode");
+        value["schema_version"] = serde_json::json!(1);
+        let legacy: ParameterOptimizerConfig = serde_json::from_value(value).unwrap();
+        assert_eq!(
+            legacy.execution_mode,
+            OptimizerExecutionMode::OptimizationAndPostSelection
+        );
+        legacy.validate().unwrap();
+
+        let normal = config();
+        let mut only = normal.clone();
+        only.schema_version = PARAMETER_OPTIMIZER_SCHEMA_VERSION;
+        only.execution_mode = OptimizerExecutionMode::OptimizationOnly;
+        let mut only_identity = identity();
+        only_identity.execution_mode = OptimizerExecutionMode::OptimizationOnly;
+        assert_ne!(
+            optimizer_fingerprint(&identity(), &normal).unwrap(),
+            optimizer_fingerprint(&only_identity, &only).unwrap()
+        );
+
+        let directory = temp("execution-mode-checkpoint");
+        std::fs::create_dir_all(&directory).unwrap();
+        let checkpoint = directory.join("checkpoint.json");
+        run_optimizer(&normal, &identity(), &checkpoint, &mut Evaluator::default()).unwrap();
+        let error = run_optimizer(
+            &only,
+            &only_identity,
+            &checkpoint,
+            &mut Evaluator::default(),
+        )
+        .unwrap_err()
+        .to_string();
+        assert!(error.contains("fingerprint mismatch"));
+        std::fs::remove_dir_all(directory).unwrap();
+    }
+
+    #[test]
+    fn optimization_only_accepts_ensemble_and_more_than_sixteen_trials() {
+        let mut cfg = config();
+        cfg.schema_version = PARAMETER_OPTIMIZER_SCHEMA_VERSION;
+        cfg.execution_mode = OptimizerExecutionMode::OptimizationOnly;
+        cfg.maximum_trial_budget = 32;
+        cfg.selected_experts = vec![OptimizerExpert::Moments, OptimizerExpert::Ensemble];
+        cfg.block_order = vec!["ensemble".into()];
+        cfg.blocks = vec![OptimizerBlock {
+            id: "ensemble".into(),
+            enabled: true,
+            scope: ParameterScope::EnsembleFinal,
+            expert: Some(OptimizerExpert::Ensemble),
+            strategy: OptimizerStrategy::ExhaustiveGrid,
+            structural_comparison: false,
+            fixed: BTreeMap::new(),
+            space: BTreeMap::from([(
+                "ensemble_weight_moments".into(),
+                (1..=17)
+                    .map(|value| ParameterValue::Float(value as f64 / 10.0))
+                    .collect(),
+            )]),
+            window_search: None,
+            use_external_features: false,
+            max_trials: Some(17),
+            max_passes: None,
+        }];
+        cfg.validate().unwrap();
+
+        let directory = temp("optimization-only-over-sixteen");
+        std::fs::create_dir_all(&directory).unwrap();
+        let mut evaluator = Evaluator::default();
+        let mut optimizer_identity = identity();
+        optimizer_identity.execution_mode = OptimizerExecutionMode::OptimizationOnly;
+        let result = run_optimizer(
+            &cfg,
+            &optimizer_identity,
+            &directory.join("checkpoint.json"),
+            &mut evaluator,
+        )
+        .unwrap();
+        assert_eq!(
+            result.execution_mode,
+            OptimizerExecutionMode::OptimizationOnly
+        );
+        assert_eq!(evaluator.calls.len(), 17);
+        assert!(evaluator.calls.iter().all(|_| true));
+        assert_eq!(result.trials.len(), 17);
+
+        cfg.production_smoke_only = true;
+        assert!(cfg
+            .validate()
+            .unwrap_err()
+            .to_string()
+            .contains("cannot assemble or optimize Ensemble"));
+        std::fs::remove_dir_all(directory).unwrap();
+    }
+
+    #[test]
+    fn optimization_only_represents_all_experts_without_admission_gates() {
+        let mut cfg = config();
+        cfg.schema_version = PARAMETER_OPTIMIZER_SCHEMA_VERSION;
+        cfg.execution_mode = OptimizerExecutionMode::OptimizationOnly;
+        cfg.maximum_trial_budget = 64;
+        cfg.selected_experts = vec![
+            OptimizerExpert::Moments,
+            OptimizerExpert::Mle,
+            OptimizerExpert::LowerOrder,
+            OptimizerExpert::MsfdrSeeded,
+            OptimizerExpert::Msfdr1Smix,
+            OptimizerExpert::Msfdr2Smix,
+            OptimizerExpert::Nokoi,
+            OptimizerExpert::Ensemble,
+        ];
+        let declarations = [
+            (
+                OptimizerExpert::Moments,
+                ParameterScope::PerExpert,
+                "moments_purification_factor",
+                ParameterValue::Float(0.2),
+            ),
+            (
+                OptimizerExpert::Mle,
+                ParameterScope::PerExpert,
+                "mle_purification_factor",
+                ParameterValue::Float(0.2),
+            ),
+            (
+                OptimizerExpert::LowerOrder,
+                ParameterScope::PerExpert,
+                "lower_order_purification_factor",
+                ParameterValue::Float(0.25),
+            ),
+            (
+                OptimizerExpert::MsfdrSeeded,
+                ParameterScope::PerExpert,
+                "msfdr_multistart",
+                ParameterValue::Integer(2),
+            ),
+            (
+                OptimizerExpert::Msfdr1Smix,
+                ParameterScope::PerExpert,
+                "msfdr1_top_frac_init",
+                ParameterValue::Float(0.2),
+            ),
+            (
+                OptimizerExpert::Msfdr2Smix,
+                ParameterScope::PerExpert,
+                "msfdr2_top_frac_init",
+                ParameterValue::Float(0.2),
+            ),
+            (
+                OptimizerExpert::Nokoi,
+                ParameterScope::PerExpert,
+                "nokoi_k_folds",
+                ParameterValue::Integer(5),
+            ),
+            (
+                OptimizerExpert::Ensemble,
+                ParameterScope::EnsembleFinal,
+                "ensemble_p_combiner",
+                ParameterValue::String("second_best".into()),
+            ),
+        ];
+        cfg.blocks = declarations
+            .into_iter()
+            .map(|(expert, scope, parameter, value)| OptimizerBlock {
+                id: expert.slug().into(),
+                enabled: true,
+                scope,
+                expert: Some(expert),
+                strategy: OptimizerStrategy::ExhaustiveGrid,
+                structural_comparison: parameter == "ensemble_p_combiner",
+                fixed: BTreeMap::new(),
+                space: BTreeMap::from([(parameter.into(), vec![value])]),
+                window_search: None,
+                use_external_features: true,
+                max_trials: Some(1),
+                max_passes: None,
+            })
+            .collect();
+        cfg.block_order = cfg.blocks.iter().map(|block| block.id.clone()).collect();
+        cfg.validate().unwrap();
+        assert!(cfg
+            .blocks
+            .iter()
+            .find(|block| block.expert == Some(OptimizerExpert::Msfdr1Smix))
+            .unwrap()
+            .window_search
+            .is_none());
+        assert!(cfg.blocks.iter().all(|block| !block
+            .space
+            .keys()
+            .any(|name| name.contains("admission") || name.contains("exclude"))));
     }
 
     fn temp(name: &str) -> PathBuf {
