@@ -11,7 +11,7 @@ use sha2::{Digest, Sha256};
 use std::collections::{BTreeMap, BTreeSet};
 use std::path::Path;
 
-pub const PARAMETER_OPTIMIZER_SCHEMA_VERSION: u32 = 2;
+pub const PARAMETER_OPTIMIZER_SCHEMA_VERSION: u32 = 3;
 pub const PARAMETER_CATALOG_SCHEMA_VERSION: u32 = 2;
 pub const PARAMETER_OPTIMIZER_IMPLEMENTATION_SOURCE_SHA256: &str =
     env!("SAGE_PARAMETER_OPTIMIZER_SOURCE_SHA256");
@@ -2614,6 +2614,21 @@ pub enum OptimizerStrategy {
 #[serde(rename_all = "snake_case")]
 pub enum OptimizationClassification {
     DevelopmentOnly,
+    Holdout,
+    Release,
+    StatisticalDefault,
+    ProductionDefault,
+}
+
+/// Controls whether an underpowered empirical entrapment estimate blocks a
+/// technically valid trial from development-only ranking. The default is the
+/// historical fail-closed behavior.
+#[derive(Clone, Copy, Debug, Default, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(rename_all = "snake_case")]
+pub enum UnderpoweredTrialPolicy {
+    #[default]
+    NotEvaluable,
+    DevelopmentEligible,
 }
 
 /// Controls whether a completed production optimization exits with its
@@ -2691,7 +2706,10 @@ pub fn default_objective() -> Vec<ObjectiveTerm> {
 pub struct EmpiricalEntrapmentConstraint {
     pub level: String,
     pub maximum_adjusted_fdp: f64,
-    pub minimum_entrapment_count: usize,
+    /// Schema-v3 name. Schema-v1/v2 manifests using
+    /// `minimum_entrapment_count` remain loadable through the alias.
+    #[serde(alias = "minimum_entrapment_count")]
+    pub minimum_entrapment_observations_for_power: usize,
 }
 
 #[derive(Clone, Debug, Serialize, Deserialize)]
@@ -2750,6 +2768,11 @@ pub struct ParameterOptimizerConfig {
     pub fixed_evaluation_threshold: f64,
     #[serde(default)]
     pub empirical_entrapment_constraints: Vec<EmpiricalEntrapmentConstraint>,
+    /// Schema-v3 policy separating development selection from the power of
+    /// empirical calibration evidence. Missing preserves schema-v1/v2
+    /// behavior.
+    #[serde(default)]
+    pub underpowered_trial_policy: UnderpoweredTrialPolicy,
     #[serde(default)]
     pub statistical_validity_contracts: BTreeMap<String, String>,
     pub resume: bool,
@@ -2801,6 +2824,16 @@ impl ParameterOptimizerConfig {
             self.classification == OptimizationClassification::DevelopmentOnly,
             "parameter optimizer must be development_only"
         );
+        if self.underpowered_trial_policy == UnderpoweredTrialPolicy::DevelopmentEligible {
+            anyhow::ensure!(
+                self.schema_version >= 3,
+                "underpowered_trial_policy=development_eligible requires parameter_optimizer schema_version 3"
+            );
+            anyhow::ensure!(
+                self.classification == OptimizationClassification::DevelopmentOnly,
+                "underpowered development eligibility is prohibited for holdout, release, statistical-default, and production-default claims"
+            );
+        }
         anyhow::ensure!(
             self.maximum_trial_budget > 0,
             "maximum_trial_budget must be positive"
@@ -3433,6 +3466,32 @@ pub enum TrialStatus {
     NotEvaluable,
 }
 
+#[derive(Clone, Copy, Debug, Default, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(rename_all = "snake_case")]
+pub enum EmpiricalCalibrationPower {
+    #[default]
+    NotAssessed,
+    Underpowered,
+    AdequatelyPowered,
+}
+
+#[derive(Clone, Copy, Debug, Default, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(rename_all = "snake_case")]
+pub enum StatisticalValidationStatus {
+    #[default]
+    NotEvaluated,
+    NotEvaluableUnderpowered,
+    EmpiricallyEvaluable,
+    EmpiricallyInfeasible,
+}
+
+#[derive(Clone, Copy, Debug, Default, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(rename_all = "snake_case")]
+pub enum StatisticalDefaultEligibility {
+    #[default]
+    NotEvaluated,
+}
+
 #[derive(Clone, Debug, Serialize, Deserialize)]
 pub struct TrialEvaluation {
     pub status: TrialStatus,
@@ -3442,6 +3501,16 @@ pub struct TrialEvaluation {
     pub empirical_reason: Option<String>,
     #[serde(default)]
     pub metrics: Option<TrialMetrics>,
+    #[serde(default)]
+    pub development_selection_eligible: bool,
+    #[serde(default)]
+    pub empirical_point_estimate_within_limit: Option<bool>,
+    #[serde(default)]
+    pub empirical_calibration_power: EmpiricalCalibrationPower,
+    #[serde(default)]
+    pub statistical_validation_status: StatisticalValidationStatus,
+    #[serde(default)]
+    pub statistical_default_eligibility: StatisticalDefaultEligibility,
     #[serde(default)]
     pub compact_diagnostics: BTreeMap<String, serde_json::Value>,
 }
@@ -3479,6 +3548,8 @@ pub struct AcceptedTransition {
 pub enum OptimizerOutcome {
     ExhaustiveBoundedOptimum,
     CompletedHeuristicLocal,
+    CompletedDevelopmentOptimization,
+    UnderpoweredDevelopmentWinner,
     TrialBudgetExhausted,
     NoTechnicallyValidSolution,
     NoEmpiricallyFeasibleSolution,
@@ -3598,6 +3669,10 @@ pub struct OptimizerRunResult {
     pub parameter_precedence: Vec<String>,
     pub objective: Vec<ObjectiveTerm>,
     pub empirical_constraints: Vec<EmpiricalEntrapmentConstraint>,
+    pub underpowered_trial_policy: UnderpoweredTrialPolicy,
+    pub powered_trial_count: usize,
+    pub underpowered_trial_count: usize,
+    pub empirical_power_not_assessed_trial_count: usize,
     pub trials: Vec<TrialRecord>,
     pub accepted_transitions: Vec<AcceptedTransition>,
     pub winner_trial_id: Option<String>,
@@ -3892,14 +3967,15 @@ pub fn run_optimizer<E: TrialEvaluator>(
                 .values()
                 .filter(|record| record.request.block_id == block.id)
                 .collect::<Vec<_>>();
-            payload.outcome = if records
+            let nontechnical = records
                 .iter()
-                .all(|record| record.evaluation.status == TrialStatus::TechnicalFailure)
-            {
+                .filter(|record| record.evaluation.status != TrialStatus::TechnicalFailure)
+                .collect::<Vec<_>>();
+            payload.outcome = if nontechnical.is_empty() {
                 OptimizerOutcome::NoTechnicallyValidSolution
-            } else if records
+            } else if nontechnical
                 .iter()
-                .any(|record| record.evaluation.status == TrialStatus::EmpiricallyInfeasible)
+                .all(|record| record.evaluation.status == TrialStatus::EmpiricallyInfeasible)
             {
                 OptimizerOutcome::NoEmpiricallyFeasibleSolution
             } else {
@@ -3925,6 +4001,20 @@ pub fn run_optimizer<E: TrialEvaluator>(
         OptimizerOutcome::NoTechnicallyValidSolution
     } else if !any_empirical {
         OptimizerOutcome::NoEmpiricallyFeasibleSolution
+    } else if config.underpowered_trial_policy == UnderpoweredTrialPolicy::DevelopmentEligible {
+        let winner_is_underpowered = payload
+            .winner_trial_id
+            .as_ref()
+            .and_then(|winner| payload.completed_trials.get(winner))
+            .is_some_and(|record| {
+                record.evaluation.empirical_calibration_power
+                    == EmpiricalCalibrationPower::Underpowered
+            });
+        if winner_is_underpowered {
+            OptimizerOutcome::UnderpoweredDevelopmentWinner
+        } else {
+            OptimizerOutcome::CompletedDevelopmentOptimization
+        }
     } else if any_heuristic {
         OptimizerOutcome::CompletedHeuristicLocal
     } else {
@@ -4070,6 +4160,11 @@ fn evaluate_or_resume<E: TrialEvaluator>(
             )),
             empirical_reason: None,
             metrics: None,
+            development_selection_eligible: false,
+            empirical_point_estimate_within_limit: None,
+            empirical_calibration_power: EmpiricalCalibrationPower::NotAssessed,
+            statistical_validation_status: StatisticalValidationStatus::NotEvaluated,
+            statistical_default_eligibility: StatisticalDefaultEligibility::NotEvaluated,
             compact_diagnostics: BTreeMap::from([
                 (
                     "production_evaluation_started".into(),
@@ -4095,7 +4190,28 @@ fn apply_empirical_constraints(
     config: &ParameterOptimizerConfig,
     evaluation: &mut TrialEvaluation,
 ) {
+    evaluation.development_selection_eligible = false;
+    evaluation.empirical_point_estimate_within_limit = None;
+    evaluation.empirical_calibration_power = EmpiricalCalibrationPower::NotAssessed;
+    evaluation.statistical_validation_status = StatisticalValidationStatus::NotEvaluated;
+    evaluation.statistical_default_eligibility = StatisticalDefaultEligibility::NotEvaluated;
     if evaluation.status != TrialStatus::Feasible {
+        return;
+    }
+    if evaluation
+        .compact_diagnostics
+        .get("fallback_used")
+        .and_then(serde_json::Value::as_bool)
+        .unwrap_or(false)
+        || evaluation
+            .compact_diagnostics
+            .get("model_substitution")
+            .and_then(serde_json::Value::as_bool)
+            .unwrap_or(false)
+    {
+        evaluation.status = TrialStatus::TechnicalFailure;
+        evaluation.technical_reason =
+            Some("prohibited fallback or model substitution in optimizer trial".into());
         return;
     }
     let Some(metrics) = evaluation.metrics.as_ref() else {
@@ -4103,6 +4219,23 @@ fn apply_empirical_constraints(
         evaluation.empirical_reason = Some("feasible trial did not provide metrics".into());
         return;
     };
+    if !config.implementation_smoke_only
+        && config
+            .objective
+            .iter()
+            .any(|term| term.metric == ObjectiveMetric::AdjustedEntrapmentFdp)
+        && metrics
+            .adjusted_entrapment_fdp
+            .is_none_or(|fdp| !fdp.is_finite())
+    {
+        evaluation.status = TrialStatus::NotEvaluable;
+        evaluation.empirical_reason =
+            Some("adjusted entrapment FDP objective is missing or nonfinite".into());
+        return;
+    }
+    evaluation.development_selection_eligible = true;
+    let mut underpowered = false;
+    let mut adequately_powered = false;
     for constraint in &config.empirical_entrapment_constraints {
         let count = metrics
             .entrapment_count_by_level
@@ -4114,22 +4247,70 @@ fn apply_empirical_constraints(
             .get(&constraint.level)
             .copied()
             .unwrap_or(metrics.adjusted_entrapment_fdp);
-        if count < constraint.minimum_entrapment_count {
+        let target_count = match constraint.level.as_str() {
+            "psm" => metrics.level4_psms,
+            "peptide" => metrics.level4_canonical_peptides,
+            "peptidoform" => metrics.level4_peptidoforms,
+            "protein" => metrics.level4_proteins,
+            _ => 0,
+        };
+        if target_count == 0 {
             evaluation.status = TrialStatus::NotEvaluable;
+            evaluation.development_selection_eligible = false;
             evaluation.empirical_reason = Some(format!(
-                "{} entrapment count below declared minimum",
+                "{} has no accepted target discoveries",
                 constraint.level
             ));
             return;
         }
-        if fdp.is_none_or(|fdp| fdp > constraint.maximum_adjusted_fdp) {
+        let Some(fdp) = fdp.filter(|fdp| fdp.is_finite()) else {
+            evaluation.status = TrialStatus::NotEvaluable;
+            evaluation.development_selection_eligible = false;
+            evaluation.empirical_reason = Some(format!(
+                "{} adjusted entrapment FDP is missing or nonfinite",
+                constraint.level
+            ));
+            return;
+        };
+        let constraint_underpowered = count < constraint.minimum_entrapment_observations_for_power;
+        if constraint_underpowered {
+            underpowered = true;
+        } else {
+            adequately_powered = true;
+        }
+        if fdp > constraint.maximum_adjusted_fdp {
             evaluation.status = TrialStatus::EmpiricallyInfeasible;
+            evaluation.development_selection_eligible = false;
+            evaluation.empirical_point_estimate_within_limit = Some(false);
+            evaluation.empirical_calibration_power = if underpowered {
+                EmpiricalCalibrationPower::Underpowered
+            } else {
+                EmpiricalCalibrationPower::AdequatelyPowered
+            };
+            evaluation.statistical_validation_status =
+                StatisticalValidationStatus::EmpiricallyInfeasible;
             evaluation.empirical_reason = Some(format!(
                 "{} adjusted entrapment FDP violates declared maximum",
                 constraint.level
             ));
             return;
         }
+        evaluation.empirical_point_estimate_within_limit = Some(true);
+    }
+    if underpowered {
+        evaluation.empirical_calibration_power = EmpiricalCalibrationPower::Underpowered;
+        evaluation.statistical_validation_status =
+            StatisticalValidationStatus::NotEvaluableUnderpowered;
+        evaluation.empirical_reason =
+            Some("empirical entrapment evidence is below the declared power threshold".into());
+        if config.underpowered_trial_policy == UnderpoweredTrialPolicy::NotEvaluable {
+            evaluation.status = TrialStatus::NotEvaluable;
+            evaluation.development_selection_eligible = false;
+        }
+    } else if adequately_powered {
+        evaluation.empirical_calibration_power = EmpiricalCalibrationPower::AdequatelyPowered;
+        evaluation.statistical_validation_status =
+            StatisticalValidationStatus::EmpiricallyEvaluable;
     }
 }
 
@@ -4250,6 +4431,22 @@ fn finish_result<E: TrialEvaluator>(
         "winner_artifacts": &winner_artifacts,
     }))?);
     let scientific_result_sha256 = format!("{:x}", result_hasher.finalize());
+    let powered_trial_count = trials
+        .iter()
+        .filter(|trial| {
+            trial.evaluation.empirical_calibration_power
+                == EmpiricalCalibrationPower::AdequatelyPowered
+        })
+        .count();
+    let underpowered_trial_count = trials
+        .iter()
+        .filter(|trial| {
+            trial.evaluation.empirical_calibration_power == EmpiricalCalibrationPower::Underpowered
+        })
+        .count();
+    let empirical_power_not_assessed_trial_count = trials
+        .len()
+        .saturating_sub(powered_trial_count + underpowered_trial_count);
     Ok(OptimizerRunResult {
         schema_version: PARAMETER_OPTIMIZER_SCHEMA_VERSION,
         optimizer_fingerprint: fingerprint,
@@ -4266,6 +4463,10 @@ fn finish_result<E: TrialEvaluator>(
         parameter_precedence: vec!["compiled_default".into(), "workflow_default".into(), "per_expert_fixed_override".into(), "per_expert_optimizer_trial".into(), "ensemble_final".into()],
         objective: config.objective.clone(),
         empirical_constraints: config.empirical_entrapment_constraints.clone(),
+        underpowered_trial_policy: config.underpowered_trial_policy,
+        powered_trial_count,
+        underpowered_trial_count,
+        empirical_power_not_assessed_trial_count,
         trials,
         accepted_transitions: payload.accepted_transitions,
         winner_trial_id: payload.winner_trial_id,
@@ -4274,7 +4475,14 @@ fn finish_result<E: TrialEvaluator>(
         target_only_non_leakage: "target-only outcomes excluded from feasibility, objective, ranking, early stopping, and selection".into(),
         development_only: true,
         independent_evaluation_status: "not_run_reserved_for_step4".into(),
-        statistical_default_status: "development_candidate_not_a_default".into(),
+        statistical_default_status: if config.underpowered_trial_policy
+            == UnderpoweredTrialPolicy::DevelopmentEligible
+        {
+            "not_evaluated"
+        } else {
+            "development_candidate_not_a_default"
+        }
+        .into(),
     })
 }
 
@@ -4304,6 +4512,7 @@ mod tests {
             objective: default_objective(),
             fixed_evaluation_threshold: 0.01,
             empirical_entrapment_constraints: vec![],
+            underpowered_trial_policy: UnderpoweredTrialPolicy::NotEvaluable,
             statistical_validity_contracts: BTreeMap::new(),
             resume: true,
             materialize_winner: true,
@@ -4384,6 +4593,11 @@ mod tests {
                     entrapment_count_by_level: BTreeMap::new(),
                     model_complexity: 1,
                 }),
+                development_selection_eligible: false,
+                empirical_point_estimate_within_limit: None,
+                empirical_calibration_power: EmpiricalCalibrationPower::NotAssessed,
+                statistical_validation_status: StatisticalValidationStatus::NotEvaluated,
+                statistical_default_eligibility: StatisticalDefaultEligibility::NotEvaluated,
                 compact_diagnostics: BTreeMap::new(),
             })
         }
@@ -5197,6 +5411,11 @@ mod tests {
                 empirical_reason: (self.status == TrialStatus::EmpiricallyInfeasible)
                     .then(|| "declared protein FDP constraint".into()),
                 metrics: None,
+                development_selection_eligible: false,
+                empirical_point_estimate_within_limit: None,
+                empirical_calibration_power: EmpiricalCalibrationPower::NotAssessed,
+                statistical_validation_status: StatisticalValidationStatus::NotEvaluated,
+                statistical_default_eligibility: StatisticalDefaultEligibility::NotEvaluated,
                 compact_diagnostics: BTreeMap::from([
                     ("fallback_used".into(), serde_json::json!(false)),
                     ("model_substitution".into(), serde_json::json!(false)),
@@ -5260,6 +5479,381 @@ mod tests {
                 && trial.evaluation.technical_reason.is_none()
         }));
         std::fs::remove_dir_all(path).unwrap();
+    }
+
+    fn empirical_constraint_config(policy: UnderpoweredTrialPolicy) -> ParameterOptimizerConfig {
+        let mut cfg = config();
+        cfg.schema_version = if policy == UnderpoweredTrialPolicy::DevelopmentEligible {
+            3
+        } else {
+            2
+        };
+        cfg.underpowered_trial_policy = policy;
+        cfg.empirical_entrapment_constraints = vec![EmpiricalEntrapmentConstraint {
+            level: "protein".into(),
+            maximum_adjusted_fdp: 0.01,
+            minimum_entrapment_observations_for_power: 3,
+        }];
+        cfg
+    }
+
+    fn empirical_evaluation(entrapments: usize, fdp: f64) -> TrialEvaluation {
+        TrialEvaluation {
+            status: TrialStatus::Feasible,
+            technical_reason: None,
+            empirical_reason: None,
+            metrics: Some(TrialMetrics {
+                level4_proteins: 17,
+                level4_canonical_peptides: 343,
+                level4_peptidoforms: 421,
+                level4_psms: 10_141,
+                adjusted_entrapment_fdp: Some(fdp),
+                entrapment_count: entrapments,
+                adjusted_entrapment_fdp_by_level: BTreeMap::from([("protein".into(), Some(fdp))]),
+                entrapment_count_by_level: BTreeMap::from([("protein".into(), entrapments)]),
+                model_complexity: 1,
+            }),
+            development_selection_eligible: false,
+            empirical_point_estimate_within_limit: None,
+            empirical_calibration_power: EmpiricalCalibrationPower::NotAssessed,
+            statistical_validation_status: StatisticalValidationStatus::NotEvaluated,
+            statistical_default_eligibility: StatisticalDefaultEligibility::NotEvaluated,
+            compact_diagnostics: BTreeMap::from([
+                ("fallback_used".into(), serde_json::json!(false)),
+                ("model_substitution".into(), serde_json::json!(false)),
+                ("target_only_outcomes_used".into(), serde_json::json!(false)),
+            ]),
+        }
+    }
+
+    #[test]
+    fn zero_entrapments_are_development_eligible_only_under_explicit_policy() {
+        let mut development = empirical_evaluation(0, 0.0);
+        apply_empirical_constraints(
+            &empirical_constraint_config(UnderpoweredTrialPolicy::DevelopmentEligible),
+            &mut development,
+        );
+        assert_eq!(development.status, TrialStatus::Feasible);
+        assert!(development.development_selection_eligible);
+        assert_eq!(
+            development.empirical_point_estimate_within_limit,
+            Some(true)
+        );
+        assert_eq!(
+            development.empirical_calibration_power,
+            EmpiricalCalibrationPower::Underpowered
+        );
+        assert_eq!(
+            development.statistical_validation_status,
+            StatisticalValidationStatus::NotEvaluableUnderpowered
+        );
+        assert_eq!(
+            development.statistical_default_eligibility,
+            StatisticalDefaultEligibility::NotEvaluated
+        );
+
+        let mut legacy = empirical_evaluation(0, 0.0);
+        apply_empirical_constraints(
+            &empirical_constraint_config(UnderpoweredTrialPolicy::NotEvaluable),
+            &mut legacy,
+        );
+        assert_eq!(legacy.status, TrialStatus::NotEvaluable);
+        assert!(!legacy.development_selection_eligible);
+        assert_eq!(
+            legacy.empirical_calibration_power,
+            EmpiricalCalibrationPower::Underpowered
+        );
+    }
+
+    #[test]
+    fn empirical_point_limit_and_power_are_independent() {
+        let config = empirical_constraint_config(UnderpoweredTrialPolicy::DevelopmentEligible);
+
+        let mut underpowered_within = empirical_evaluation(1, 0.005);
+        apply_empirical_constraints(&config, &mut underpowered_within);
+        assert_eq!(underpowered_within.status, TrialStatus::Feasible);
+        assert!(underpowered_within.development_selection_eligible);
+        assert_eq!(
+            underpowered_within.empirical_calibration_power,
+            EmpiricalCalibrationPower::Underpowered
+        );
+
+        let mut underpowered_above = empirical_evaluation(1, 0.02);
+        apply_empirical_constraints(&config, &mut underpowered_above);
+        assert_eq!(
+            underpowered_above.status,
+            TrialStatus::EmpiricallyInfeasible
+        );
+        assert!(!underpowered_above.development_selection_eligible);
+        assert_eq!(
+            underpowered_above.empirical_calibration_power,
+            EmpiricalCalibrationPower::Underpowered
+        );
+        assert_eq!(
+            underpowered_above.empirical_point_estimate_within_limit,
+            Some(false)
+        );
+
+        let mut powered_within = empirical_evaluation(3, 0.005);
+        apply_empirical_constraints(&config, &mut powered_within);
+        assert_eq!(powered_within.status, TrialStatus::Feasible);
+        assert!(powered_within.development_selection_eligible);
+        assert_eq!(
+            powered_within.empirical_calibration_power,
+            EmpiricalCalibrationPower::AdequatelyPowered
+        );
+        assert_eq!(
+            powered_within.statistical_validation_status,
+            StatisticalValidationStatus::EmpiricallyEvaluable
+        );
+
+        let mut powered_above = empirical_evaluation(3, 0.02);
+        apply_empirical_constraints(&config, &mut powered_above);
+        assert_eq!(powered_above.status, TrialStatus::EmpiricallyInfeasible);
+        assert!(!powered_above.development_selection_eligible);
+        assert_eq!(
+            powered_above.empirical_calibration_power,
+            EmpiricalCalibrationPower::AdequatelyPowered
+        );
+    }
+
+    #[test]
+    fn development_eligible_policy_is_versioned_and_development_only() {
+        let mut legacy_json = serde_json::to_value(config()).unwrap();
+        legacy_json
+            .as_object_mut()
+            .unwrap()
+            .remove("underpowered_trial_policy");
+        let legacy: ParameterOptimizerConfig = serde_json::from_value(legacy_json).unwrap();
+        assert_eq!(
+            legacy.underpowered_trial_policy,
+            UnderpoweredTrialPolicy::NotEvaluable
+        );
+
+        let mut old_schema =
+            empirical_constraint_config(UnderpoweredTrialPolicy::DevelopmentEligible);
+        old_schema.schema_version = 2;
+        assert!(old_schema
+            .validate()
+            .unwrap_err()
+            .to_string()
+            .contains("requires parameter_optimizer schema_version 3"));
+
+        for classification in [
+            OptimizationClassification::Holdout,
+            OptimizationClassification::Release,
+            OptimizationClassification::StatisticalDefault,
+            OptimizationClassification::ProductionDefault,
+        ] {
+            let mut nondevelopment =
+                empirical_constraint_config(UnderpoweredTrialPolicy::DevelopmentEligible);
+            nondevelopment.classification = classification;
+            assert!(nondevelopment
+                .validate()
+                .unwrap_err()
+                .to_string()
+                .contains("must be development_only"));
+        }
+
+        let serialized = serde_json::to_value(empirical_constraint_config(
+            UnderpoweredTrialPolicy::DevelopmentEligible,
+        ))
+        .unwrap();
+        assert_eq!(
+            serialized["empirical_entrapment_constraints"][0]
+                ["minimum_entrapment_observations_for_power"],
+            serde_json::json!(3)
+        );
+        assert!(serialized["empirical_entrapment_constraints"][0]
+            .get("minimum_entrapment_count")
+            .is_none());
+        let old_constraint: EmpiricalEntrapmentConstraint =
+            serde_json::from_value(serde_json::json!({
+                "level": "protein",
+                "maximum_adjusted_fdp": 0.01,
+                "minimum_entrapment_count": 3
+            }))
+            .unwrap();
+        assert_eq!(old_constraint.minimum_entrapment_observations_for_power, 3);
+    }
+
+    struct Step4MomentsEvaluator {
+        calls: usize,
+    }
+
+    impl TrialEvaluator for Step4MomentsEvaluator {
+        fn evaluate(&mut self, request: &TrialRequest) -> Result<TrialEvaluation> {
+            self.calls += 1;
+            assert!(!request.target_only_outcomes_allowed);
+            let purification = request
+                .parameters
+                .get("moments_purification_factor")
+                .and_then(ParameterValue::as_f64)
+                .unwrap();
+            let mut evaluation = empirical_evaluation(0, 0.0);
+            if (purification - 0.2).abs() < f64::EPSILON {
+                let metrics = evaluation.metrics.as_mut().unwrap();
+                metrics.level4_canonical_peptides = 344;
+                metrics.level4_peptidoforms = 422;
+            }
+            Ok(evaluation)
+        }
+    }
+
+    #[test]
+    fn step4_underpowered_moments_example_selects_by_existing_objective() {
+        let path = temp("underpowered-step4-example");
+        std::fs::create_dir_all(&path).unwrap();
+        let mut cfg = empirical_constraint_config(UnderpoweredTrialPolicy::DevelopmentEligible);
+        cfg.maximum_trial_budget = 2;
+        cfg.maximum_optimization_passes = 1;
+        cfg.compiled_defaults.insert(
+            "moments_purification_factor".into(),
+            ParameterValue::Float(0.25),
+        );
+        cfg.block_order = vec!["moments".into()];
+        cfg.blocks = vec![OptimizerBlock {
+            id: "moments".into(),
+            enabled: true,
+            scope: ParameterScope::PerExpert,
+            expert: Some(OptimizerExpert::Moments),
+            strategy: OptimizerStrategy::ExhaustiveGrid,
+            structural_comparison: false,
+            fixed: BTreeMap::new(),
+            space: BTreeMap::from([(
+                "moments_purification_factor".into(),
+                vec![ParameterValue::Float(0.25), ParameterValue::Float(0.2)],
+            )]),
+            window_search: None,
+            use_external_features: false,
+            max_trials: Some(2),
+            max_passes: None,
+        }];
+        let mut evaluator = Step4MomentsEvaluator { calls: 0 };
+        let checkpoint = path.join("checkpoint.json");
+        let result = run_optimizer(&cfg, &identity(), &checkpoint, &mut evaluator).unwrap();
+        assert_eq!(evaluator.calls, 2);
+        assert_eq!(
+            result.outcome,
+            OptimizerOutcome::UnderpoweredDevelopmentWinner
+        );
+        assert_eq!(result.underpowered_trial_count, 2);
+        assert_eq!(result.powered_trial_count, 0);
+        let winner = result
+            .trials
+            .iter()
+            .find(|trial| Some(&trial.request.trial_id) == result.winner_trial_id.as_ref())
+            .unwrap();
+        assert_eq!(
+            winner.request.parameters["moments_purification_factor"],
+            ParameterValue::Float(0.2)
+        );
+        assert!(winner.evaluation.development_selection_eligible);
+        assert_eq!(
+            winner.evaluation.statistical_validation_status,
+            StatisticalValidationStatus::NotEvaluableUnderpowered
+        );
+        assert_eq!(result.statistical_default_status, "not_evaluated");
+
+        let first_fingerprint = result.optimizer_fingerprint.clone();
+        let first_scientific_hash = result.scientific_result_sha256.clone();
+        let mut replay = Step4MomentsEvaluator { calls: 0 };
+        let resumed = run_optimizer(&cfg, &identity(), &checkpoint, &mut replay).unwrap();
+        assert_eq!(replay.calls, 0);
+        assert_eq!(resumed.optimizer_fingerprint, first_fingerprint);
+        assert_eq!(resumed.scientific_result_sha256, first_scientific_hash);
+        assert!(resumed
+            .trials
+            .iter()
+            .all(|trial| trial.reused_from_checkpoint));
+
+        let mut blocking = cfg.clone();
+        blocking.underpowered_trial_policy = UnderpoweredTrialPolicy::NotEvaluable;
+        assert_ne!(
+            optimizer_fingerprint(&identity(), &cfg).unwrap(),
+            optimizer_fingerprint(&identity(), &blocking).unwrap()
+        );
+        let error = load_checkpoint(
+            &checkpoint,
+            &optimizer_fingerprint(&identity(), &blocking).unwrap(),
+        )
+        .unwrap_err()
+        .to_string();
+        assert!(error.contains("fingerprint mismatch"));
+        let mut changed_power_threshold = cfg.clone();
+        changed_power_threshold.empirical_entrapment_constraints[0]
+            .minimum_entrapment_observations_for_power = 4;
+        assert_ne!(
+            optimizer_fingerprint(&identity(), &cfg).unwrap(),
+            optimizer_fingerprint(&identity(), &changed_power_threshold).unwrap()
+        );
+        assert_eq!(
+            cfg.selected_experts,
+            vec![OptimizerExpert::Moments, OptimizerExpert::Mle]
+        );
+        std::fs::remove_dir_all(path).unwrap();
+    }
+
+    struct FixedEmpiricalEvaluator {
+        entrapments: usize,
+        fdp: f64,
+    }
+
+    impl TrialEvaluator for FixedEmpiricalEvaluator {
+        fn evaluate(&mut self, request: &TrialRequest) -> Result<TrialEvaluation> {
+            assert!(!request.target_only_outcomes_allowed);
+            Ok(empirical_evaluation(self.entrapments, self.fdp))
+        }
+    }
+
+    #[test]
+    fn development_terminal_outcomes_distinguish_power_from_fdp_failure() {
+        let powered_path = temp("powered-development-outcome");
+        std::fs::create_dir_all(&powered_path).unwrap();
+        let powered_config =
+            empirical_constraint_config(UnderpoweredTrialPolicy::DevelopmentEligible);
+        let powered = run_optimizer(
+            &powered_config,
+            &identity(),
+            &powered_path.join("checkpoint.json"),
+            &mut FixedEmpiricalEvaluator {
+                entrapments: 3,
+                fdp: 0.005,
+            },
+        )
+        .unwrap();
+        assert_eq!(
+            powered.outcome,
+            OptimizerOutcome::CompletedDevelopmentOptimization
+        );
+        assert_eq!(powered.powered_trial_count, powered.trials.len());
+        assert_eq!(powered.underpowered_trial_count, 0);
+
+        let infeasible_path = temp("fdp-infeasible-development-outcome");
+        std::fs::create_dir_all(&infeasible_path).unwrap();
+        let infeasible = run_optimizer(
+            &powered_config,
+            &identity(),
+            &infeasible_path.join("checkpoint.json"),
+            &mut FixedEmpiricalEvaluator {
+                entrapments: 1,
+                fdp: 0.02,
+            },
+        )
+        .unwrap();
+        assert_eq!(
+            infeasible.outcome,
+            OptimizerOutcome::NoEmpiricallyFeasibleSolution
+        );
+        assert!(infeasible.winner_trial_id.is_none());
+        assert!(infeasible.trials.iter().all(|trial| {
+            trial.evaluation.status == TrialStatus::EmpiricallyInfeasible
+                && !trial.evaluation.development_selection_eligible
+                && trial.evaluation.empirical_calibration_power
+                    == EmpiricalCalibrationPower::Underpowered
+        }));
+        std::fs::remove_dir_all(powered_path).unwrap();
+        std::fs::remove_dir_all(infeasible_path).unwrap();
     }
 
     #[test]

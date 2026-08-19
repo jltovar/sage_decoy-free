@@ -143,6 +143,11 @@ Schema-v2 optimizer manifests can additionally set `execution_mode: optimization
 development run that materializes all individual and final Ensemble +entrapment winners and then
 returns successfully without resolving or executing any target-only resource or stage. Omitting
 the field preserves the historical `optimization_and_post_selection` behavior.
+Schema v3 also adds an explicit `underpowered_trial_policy`. Its default `not_evaluable` preserves
+historical blocking behavior. `development_eligible` may be requested only for development-only
+runs: a technically valid, within-ceiling zero/sparse-entrapment trial may enter the unchanged
+development objective, but remains `not_evaluable_underpowered` for empirical validation and
+`not_evaluated` for statistical-default eligibility.
 
 ### Layered MS2Rescore prediction cache
 
