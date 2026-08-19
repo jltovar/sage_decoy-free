@@ -154,6 +154,13 @@ resume/fingerprint contract are documented in [PARAMETER_OPTIMIZER.md](PARAMETER
 Machine-readable binding coverage prevents a catalogued parameter from becoming a silent no-op.
 The bounded production-smoke mode evaluates real +entrapment trials, materializes winners, and
 then stops before ordinary post-winner or target-only stages.
+For complete development optimization, schema v2 provides
+`execution_mode: optimization_only`. Unlike the bounded smoke flag, this mode accepts Ensemble and
+normal trial budgets. It preflights only +entrapment resources, materializes each expert winner and
+the final Ensemble winner through the ordinary production optimizer, records downstream stages as
+`not_run_by_execution_scope`, and returns before target-only resource resolution. The default
+`optimization_and_post_selection` retains existing workflow behavior for manifests that omit the
+field.
 
 ## Layered MS2Rescore prediction and calibration caches
 

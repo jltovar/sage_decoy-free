@@ -18,9 +18,9 @@ use crate::external_feature_cache::{
 use crate::input::Input;
 use crate::parameter_optimizer::{
     apply_fdr_overrides, parameter_catalog_fingerprint, run_optimizer, OptimizerBlock,
-    OptimizerExpert, OptimizerIdentity, OptimizerOutcome, OptimizerRunResult,
-    OptimizerWindowSearch, ParameterOptimizerConfig, ParameterValue, TrialEvaluation,
-    TrialEvaluator, TrialMetrics, TrialRecord, TrialRequest, TrialStatus,
+    OptimizerExecutionMode, OptimizerExpert, OptimizerIdentity, OptimizerOutcome,
+    OptimizerRunResult, OptimizerWindowSearch, ParameterOptimizerConfig, ParameterValue,
+    TrialEvaluation, TrialEvaluator, TrialMetrics, TrialRecord, TrialRequest, TrialStatus,
 };
 use crate::provenance::{freeze_baseline, sha256_file, write_json_atomic, BaselineManifest};
 use crate::runner::Runner;
@@ -256,6 +256,7 @@ pub struct EnsembleExpertLock {
     pub ms2rescore_fitted_artifacts_sha256: Option<String>,
     pub calibration_stage: String,
     pub calibration_results: PathBuf,
+    #[serde(default, skip_serializing_if = "path_buf_is_empty")]
     pub target_only_results: PathBuf,
     #[serde(default)]
     pub target_only_calibration_policy: TargetOnlyCalibrationPolicy,
@@ -295,6 +296,10 @@ pub struct EnsembleExpertLock {
 #[derive(Clone, Debug, Serialize, Deserialize)]
 pub struct EnsembleLock {
     pub schema_version: u32,
+    /// False for optimizer-only locks, whose provenance and diagnostics are
+    /// intentionally restricted to the +entrapment development population.
+    #[serde(default = "default_true")]
+    pub post_selection_in_scope: bool,
     pub source_manifest_hash: String,
     #[serde(default)]
     pub dataset_fingerprint: String,
@@ -347,6 +352,10 @@ pub struct EnsembleLock {
 
 fn default_ensemble_external_profile_contract() -> String {
     "shared_dataset_local".into()
+}
+
+fn path_buf_is_empty(path: &PathBuf) -> bool {
+    path.as_os_str().is_empty()
 }
 
 fn default_ensemble_roster_contract() -> String {
@@ -618,6 +627,76 @@ pub struct WorkflowState {
     /// stages never contribute to these records.
     #[serde(default)]
     pub parameter_optimization: Vec<OptimizerRunResult>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub parameter_optimizer_execution: Option<OptimizerExecutionReport>,
+}
+
+#[derive(Clone, Debug, Serialize, Deserialize)]
+pub struct OptimizerWinnerSummary {
+    pub winner_trial_id: String,
+    pub scientific_result_sha256: String,
+    pub outcome: OptimizerOutcome,
+    pub winner_artifacts: BTreeMap<String, serde_json::Value>,
+}
+
+#[derive(Clone, Debug, Serialize, Deserialize)]
+pub struct OptimizerExecutionReport {
+    pub schema_version: u32,
+    pub execution_mode: OptimizerExecutionMode,
+    pub optimization_status: String,
+    pub selected_entrapment_winners: BTreeMap<String, OptimizerWinnerSummary>,
+    pub post_selection_stages: String,
+    pub target_only_evaluation: String,
+    pub matched_tdc_evaluation: String,
+    pub independent_validation: String,
+    pub statistical_default_eligibility: String,
+}
+
+fn optimizer_execution_report(
+    config: &ParameterOptimizerConfig,
+    results: &[OptimizerRunResult],
+    optimization_status: impl Into<String>,
+) -> OptimizerExecutionReport {
+    let selected_entrapment_winners = results
+        .iter()
+        .filter_map(|result| {
+            let expert = result
+                .requested_parameter_space
+                .iter()
+                .find_map(|block| block.expert)?;
+            Some((
+                expert.slug().to_owned(),
+                OptimizerWinnerSummary {
+                    winner_trial_id: result.winner_trial_id.clone()?,
+                    scientific_result_sha256: result.scientific_result_sha256.clone(),
+                    outcome: result.outcome.clone(),
+                    winner_artifacts: result.winner_artifacts.clone(),
+                },
+            ))
+        })
+        .collect();
+    let optimization_only = config.optimization_only();
+    OptimizerExecutionReport {
+        schema_version: 1,
+        execution_mode: config.execution_mode,
+        optimization_status: optimization_status.into(),
+        selected_entrapment_winners,
+        post_selection_stages: if optimization_only {
+            "not_run_by_execution_scope"
+        } else {
+            "in_scope"
+        }
+        .into(),
+        target_only_evaluation: if optimization_only {
+            "not_run_by_execution_scope"
+        } else {
+            "in_scope"
+        }
+        .into(),
+        matched_tdc_evaluation: "not_run".into(),
+        independent_validation: "not_run".into(),
+        statistical_default_eligibility: "not_evaluated".into(),
+    }
 }
 
 #[derive(Clone, Debug, Serialize, Deserialize, PartialEq, Eq)]
@@ -1028,18 +1107,24 @@ impl WorkflowManifest {
                     );
                 }
             }
-            let requested_policy = model
-                .target_only_calibration_policy
-                .unwrap_or(self.target_only_calibration_policy);
-            if requested_policy != TargetOnlyCalibrationPolicy::CompareBoth {
-                let capability = target_only_policy_capability(&model.model, requested_policy);
-                anyhow::ensure!(
-                    capability.supported,
-                    "{} does not support target-only policy {}: {}",
-                    model_slug(&model.model),
-                    requested_policy.stage_name(),
-                    capability.reason.as_deref().unwrap_or("unsupported policy")
-                );
+            if !self
+                .parameter_optimizer
+                .as_ref()
+                .is_some_and(ParameterOptimizerConfig::optimization_only)
+            {
+                let requested_policy = model
+                    .target_only_calibration_policy
+                    .unwrap_or(self.target_only_calibration_policy);
+                if requested_policy != TargetOnlyCalibrationPolicy::CompareBoth {
+                    let capability = target_only_policy_capability(&model.model, requested_policy);
+                    anyhow::ensure!(
+                        capability.supported,
+                        "{} does not support target-only policy {}: {}",
+                        model_slug(&model.model),
+                        requested_policy.stage_name(),
+                        capability.reason.as_deref().unwrap_or("unsupported policy")
+                    );
+                }
             }
         }
         if self.validation.dataset_role == ValidationDatasetRole::Holdout {
@@ -1357,7 +1442,9 @@ fn strict_resource_preflight(
     if !manifest
         .parameter_optimizer
         .as_ref()
-        .is_some_and(|optimizer| optimizer.enabled && optimizer.production_smoke_only)
+        .is_some_and(|optimizer| {
+            optimizer.enabled && (optimizer.production_smoke_only || optimizer.optimization_only())
+        })
     {
         spaces.push(("target_only", manifest.target_fasta.clone(), true));
     }
@@ -2052,15 +2139,23 @@ fn apply_ensemble_lock(
                 expert.model
             );
         }
-        anyhow::ensure!(
-            expert.target_only_policy_capability.as_ref()
-                == Some(&target_only_policy_capability(
-                    &expert.model,
-                    expert.target_only_calibration_policy,
-                )),
-            "Ensemble expert {:?} target-only capability provenance is missing or stale",
-            expert.model
-        );
+        if lock.post_selection_in_scope {
+            anyhow::ensure!(
+                expert.target_only_policy_capability.as_ref()
+                    == Some(&target_only_policy_capability(
+                        &expert.model,
+                        expert.target_only_calibration_policy,
+                    )),
+                "Ensemble expert {:?} target-only capability provenance is missing or stale",
+                expert.model
+            );
+        } else {
+            anyhow::ensure!(
+                expert.target_only_results.as_os_str().is_empty()
+                    && expert.target_only_policy_capability.is_none(),
+                "optimizer-only Ensemble lock contains target-only provenance"
+            );
+        }
         if let Some(target_policy) = target_only_policy {
             let capability = target_only_policy_capability(&expert.model, target_policy);
             anyhow::ensure!(
@@ -2182,7 +2277,7 @@ fn ensemble_lock_analysis_fingerprint(lock: &EnsembleLock) -> Result<String> {
                 "window": expert.window,
                 "optimized_fitted_artifacts_sha256": expert.optimized_fitted_artifacts_sha256,
                 "ms2rescore_fitted_artifacts_sha256": expert.ms2rescore_fitted_artifacts_sha256,
-                "target_only_calibration_policy": expert.target_only_calibration_policy,
+                "target_only_calibration_policy": lock.post_selection_in_scope.then_some(expert.target_only_calibration_policy),
                 "enabled": expert.enabled,
                 "interaction_baseline": expert.interaction_baseline,
                 "participation_decision": expert.participation_decision,
@@ -2203,6 +2298,7 @@ fn ensemble_lock_analysis_fingerprint(lock: &EnsembleLock) -> Result<String> {
         .collect::<Vec<_>>();
     let value = serde_json::json!({
         "schema": "sage-ensemble-analysis-v4-independent-shared-profile-contract",
+        "post_selection_in_scope": lock.post_selection_in_scope,
         "dataset_fingerprint": lock.dataset_fingerprint,
         "source_configuration_sha256": lock.source_configuration_sha256,
         "experts": experts,
@@ -2316,6 +2412,10 @@ fn build_ensemble_lock_with_failures(
     experts: &[CompletedExpert],
     runtime_failures: &BTreeMap<String, Vec<String>>,
 ) -> Result<EnsembleLock> {
+    let optimization_only = manifest
+        .parameter_optimizer
+        .as_ref()
+        .is_some_and(ParameterOptimizerConfig::optimization_only);
     let (ensemble_p_combiner, ensemble_pep_combiner) =
         resolved_ensemble_combiners(&manifest.search_config)?;
     struct LockCandidate<'a> {
@@ -2523,14 +2623,16 @@ fn build_ensemble_lock_with_failures(
                 failures.push("MS2Rescore annotation-cache provenance is missing".into());
             }
         }
-        let capability =
-            target_only_policy_capability(&expert.model, expert.target_only_calibration_policy);
-        if !capability.supported {
-            failures.push(format!(
-                "unsupported target-only policy {}: {}",
-                expert.target_only_calibration_policy.stage_name(),
-                capability.reason.as_deref().unwrap_or("unsupported policy")
-            ));
+        if !optimization_only {
+            let capability =
+                target_only_policy_capability(&expert.model, expert.target_only_calibration_policy);
+            if !capability.supported {
+                failures.push(format!(
+                    "unsupported target-only policy {}: {}",
+                    expert.target_only_calibration_policy.stage_name(),
+                    capability.reason.as_deref().unwrap_or("unsupported policy")
+                ));
+            }
         }
 
         // Statistical validation remains available as explicitly nonblocking
@@ -2603,28 +2705,31 @@ fn build_ensemble_lock_with_failures(
                 BTreeSet::new()
             }
         };
-        let target_peptides = match accepted_target_peptides(
-            &expert.target_only_results,
-            &ValidationMode::DecoyFree,
-            manifest.validation.fdr_threshold,
-            manifest.validation.null_window_validation_scope == NullWindowValidationScope::Level4,
-        ) {
-            Ok(peptides) => peptides,
-            Err(error) => {
-                warnings.push(format!(
-                    "nonblocking diagnostic: target-only peptide counts are unavailable: {error}"
-                ));
-                BTreeSet::new()
-            }
-        };
-        if !peptides.is_empty() {
-            let change =
-                (target_peptides.len() as f64 - peptides.len() as f64) / peptides.len() as f64;
-            if change < -manifest.validation.maximum_transfer_fraction_loss {
-                warnings.push(format!(
-                    "nonblocking diagnostic: target-only peptide transfer loss is {:.1}%",
-                    -100.0 * change
-                ));
+        if !optimization_only {
+            let target_peptides = match accepted_target_peptides(
+                &expert.target_only_results,
+                &ValidationMode::DecoyFree,
+                manifest.validation.fdr_threshold,
+                manifest.validation.null_window_validation_scope
+                    == NullWindowValidationScope::Level4,
+            ) {
+                Ok(peptides) => peptides,
+                Err(error) => {
+                    warnings.push(format!(
+                        "nonblocking diagnostic: target-only peptide counts are unavailable: {error}"
+                    ));
+                    BTreeSet::new()
+                }
+            };
+            if !peptides.is_empty() {
+                let change =
+                    (target_peptides.len() as f64 - peptides.len() as f64) / peptides.len() as f64;
+                if change < -manifest.validation.maximum_transfer_fraction_loss {
+                    warnings.push(format!(
+                        "nonblocking diagnostic: target-only peptide transfer loss is {:.1}%",
+                        -100.0 * change
+                    ));
+                }
             }
         }
 
@@ -2661,7 +2766,7 @@ fn build_ensemble_lock_with_failures(
                         target_only_calibration_policy: None,
                         release_candidate: true,
                     }),
-                Some(ValidationRun {
+                (!optimization_only).then(|| ValidationRun {
                     method: model_slug(&expert.model).into(),
                     stage: expert.target_only_calibration_policy.stage_name().into(),
                     results: expert.target_only_results.clone(),
@@ -2876,7 +2981,11 @@ fn build_ensemble_lock_with_failures(
             ms2rescore_fitted_artifacts_sha256: candidate.ms2_hash,
             calibration_stage: expert.calibration_stage.clone(),
             calibration_results: expert.calibration_results.clone(),
-            target_only_results: expert.target_only_results.clone(),
+            target_only_results: if optimization_only {
+                PathBuf::new()
+            } else {
+                expert.target_only_results.clone()
+            },
             target_only_calibration_policy: expert.target_only_calibration_policy,
             enabled,
             target_peptides: candidate.peptides.len(),
@@ -2900,10 +3009,9 @@ fn build_ensemble_lock_with_failures(
             participation_decision: participation_decision.into(),
             fallback_used: candidate.fallback_used,
             fallback_reason: candidate.fallback_reason,
-            target_only_policy_capability: Some(target_only_policy_capability(
-                &expert.model,
-                expert.target_only_calibration_policy,
-            )),
+            target_only_policy_capability: (!optimization_only).then(|| {
+                target_only_policy_capability(&expert.model, expert.target_only_calibration_policy)
+            }),
             fitted_external_profile_identity_sha256: expert
                 .fitted_external_profile_identity_sha256
                 .clone(),
@@ -2936,6 +3044,7 @@ fn build_ensemble_lock_with_failures(
         .transpose()?;
     stamp_ensemble_lock_analysis_fingerprint(EnsembleLock {
         schema_version: 8,
+        post_selection_in_scope: !optimization_only,
         source_manifest_hash: manifest_hash.into(),
         dataset_fingerprint: dataset.fingerprint.clone(),
         experts: locked,
@@ -4240,6 +4349,11 @@ fn optimizer_identity_from_preflight(
     );
     Ok(OptimizerIdentity {
         schema_version: 1,
+        execution_mode: manifest
+            .parameter_optimizer
+            .as_ref()
+            .map(|config| config.execution_mode)
+            .unwrap_or_default(),
         dataset_identity: dataset.fingerprint.clone(),
         candidate_pool_identity: candidate.actual_fingerprint.clone(),
         raw_annotation_cache_identity: raw.actual_fingerprint.clone(),
@@ -4300,6 +4414,84 @@ fn selected_optimizer_parameters(
         .request
         .parameters
         .clone())
+}
+
+fn final_optimizer_winner_record(result: &OptimizerRunResult) -> Result<&TrialRecord> {
+    let winner = result
+        .block_order
+        .iter()
+        .rev()
+        .filter_map(|block| result.block_winners.get(block))
+        .next()
+        .context("completed optimizer has no final block winner")?;
+    result
+        .trials
+        .iter()
+        .find(|record| &record.request.trial_id == winner)
+        .context("optimizer final block winner has no trial record")
+}
+
+fn completed_optimizer_expert(
+    manifest: &WorkflowManifest,
+    model: &ModelWorkflow,
+    result: &OptimizerRunResult,
+    window: Option<NullWindow>,
+) -> Result<CompletedExpert> {
+    let winner = final_optimizer_winner_record(result)?;
+    let root = manifest
+        .output_root
+        .join("parameter_optimizer")
+        .join(optimizer_expert(&model.model).slug())
+        .join("trials")
+        .join(&winner.request.trial_id);
+    let stage_path = root.join("workflow.stage.json");
+    let stage: StageRecord =
+        serde_json::from_slice(&std::fs::read(&stage_path).with_context(|| {
+            format!(
+                "optimizer winner stage is missing: {}",
+                stage_path.display()
+            )
+        })?)?;
+    anyhow::ensure!(
+        stage.status == "complete"
+            && stage.stage == "parameter_optimizer_trial"
+            && stage.target_only_calibration_policy.is_none(),
+        "optimizer-only expert winner has invalid or target-only stage provenance"
+    );
+    let artifacts = root.join("fitted_model_artifacts.json");
+    anyhow::ensure!(
+        stage.results.is_file() && artifacts.is_file(),
+        "optimizer-only expert winner is incomplete"
+    );
+    let candidate = stage
+        .candidate_pool
+        .as_ref()
+        .context("optimizer-only expert winner has no candidate-pool provenance")?;
+    let annotation = stage.ms2rescore_annotation_cache.as_ref();
+    Ok(CompletedExpert {
+        model: model.model.clone(),
+        window,
+        optimized_artifacts: artifacts.clone(),
+        optimized_results: stage.results.clone(),
+        ms2rescore_artifacts: stage.external_features_enabled.then_some(artifacts),
+        ms2rescore_results: stage
+            .external_features_enabled
+            .then_some(stage.results.clone()),
+        calibration_stage: stage.stage,
+        calibration_results: stage.results,
+        target_only_results: PathBuf::new(),
+        target_only_calibration_policy: manifest.target_only_calibration_policy,
+        calibration_search_fingerprint: candidate.search_fingerprint.clone(),
+        fitted_external_profile_identity_sha256: stage.fitted_external_profile_identity_sha256,
+        fitted_external_profile_calibration: stage.external_profile_calibration,
+        annotation_cache_fingerprint: annotation.map(|usage| usage.annotation_fingerprint.clone()),
+        annotation_cache_manifest_sha256: annotation
+            .map(|usage| sha256_file(&usage.manifest))
+            .transpose()?,
+        annotation_cache_payload_sha256: annotation
+            .map(|usage| sha256_file(&usage.payload))
+            .transpose()?,
+    })
 }
 
 fn prune_nonwinner_trial_payloads(root: &Path, result: &OptimizerRunResult) -> Result<()> {
@@ -4454,6 +4646,9 @@ pub fn execute_workflow(
             resource_preflight,
             planned_models,
             parameter_optimization: Vec::new(),
+            parameter_optimizer_execution: manifest.parameter_optimizer.as_ref().map(|config| {
+                optimizer_execution_report(config, &[], "plan_only_preflight_complete")
+            }),
         });
     }
     std::fs::create_dir_all(&manifest.output_root)?;
@@ -4665,16 +4860,26 @@ pub fn execute_workflow(
                     resolved_model.window_optimizer = None;
                 }
                 parameter_overrides = Some(parameters);
+                if manifest
+                    .parameter_optimizer
+                    .as_ref()
+                    .is_some_and(ParameterOptimizerConfig::optimization_only)
+                    && model.model != ModelFit::Ensemble
+                {
+                    completed_experts.push(completed_optimizer_expert(
+                        &manifest,
+                        &resolved_model,
+                        &result,
+                        resolved_expert_window(&resolved_model.model, &resolved_model.window),
+                    )?);
+                }
                 optimization_results.push(result);
             }
         }
         if manifest
             .parameter_optimizer
             .as_ref()
-            .is_some_and(|optimizer| {
-                optimizer.enabled
-                    && (optimizer.implementation_smoke_only || optimizer.production_smoke_only)
-            })
+            .is_some_and(ParameterOptimizerConfig::stops_after_optimization)
         {
             continue;
         }
@@ -5309,6 +5514,81 @@ pub fn execute_workflow(
         }
     }
 
+    if let Some(config) = manifest
+        .parameter_optimizer
+        .as_ref()
+        .filter(|config| config.optimization_only())
+    {
+        let expected = config
+            .selected_experts
+            .iter()
+            .filter(|expert| {
+                config
+                    .blocks
+                    .iter()
+                    .any(|block| block.enabled && block.expert == Some(**expert))
+            })
+            .count();
+        anyhow::ensure!(
+            optimization_results.len() == expected,
+            "optimization_only completed {} optimizer result(s), expected {expected}",
+            optimization_results.len()
+        );
+        let execution = optimizer_execution_report(
+            config,
+            &optimization_results,
+            "completed_entrapment_optimization",
+        );
+        anyhow::ensure!(
+            execution.selected_entrapment_winners.len() == expected,
+            "optimization_only did not materialize every selected +entrapment winner"
+        );
+        write_json_atomic(
+            &manifest
+                .output_root
+                .join("workflow.parameter_optimizer.execution.json"),
+            &execution,
+        )?;
+        let scope_reason =
+            "optimization_only completed; post-selection and target-only stages were not run by execution scope";
+        let state = WorkflowState {
+            schema_version: 2,
+            manifest_hash,
+            dataset,
+            entrapment,
+            entrapment_fasta_parity,
+            baseline,
+            stages: Vec::new(),
+            candidate_pools: Vec::new(),
+            ms2rescore_annotation_caches: Vec::new(),
+            validation: Vec::new(),
+            missing_runs: Vec::new(),
+            invalid_runs: Vec::new(),
+            stage_comparisons: Vec::new(),
+            ensemble_expert_gates: Vec::new(),
+            ensemble_expert_gates_participation_effect: nonblocking_ensemble_gate_effect(),
+            parity_comparisons: Vec::new(),
+            tdc_benchmarks: Vec::new(),
+            release_gate: ReleaseGate {
+                status: ReleaseGateStatus::NotEvaluable,
+                eligible_for_statistical_default_change: false,
+                reasons: vec![scope_reason.into()],
+                not_evaluable_reasons: vec![scope_reason.into()],
+                not_eligible_reasons: Vec::new(),
+                calibrated_tdc_improvements: 0,
+            },
+            transfer_stability: Vec::new(),
+            pending_validation_gates: vec![scope_reason.into()],
+            ensemble_interaction_calibration: None,
+            resource_preflight,
+            planned_models: planned_model_reports(&manifest),
+            parameter_optimization: optimization_results,
+            parameter_optimizer_execution: Some(execution),
+        };
+        write_json_atomic(&manifest.output_root.join("workflow.state.json"), &state)?;
+        return Ok(state);
+    }
+
     let selected_calibration_stages = completed_experts
         .iter()
         .map(|expert| {
@@ -5674,6 +5954,13 @@ pub fn execute_workflow(
             .join("workflow.ms2rescore_annotations.json"),
         &ms2rescore_annotation_caches,
     )?;
+    let parameter_optimizer_execution = manifest.parameter_optimizer.as_ref().map(|config| {
+        optimizer_execution_report(
+            config,
+            &optimization_results,
+            "post_selection_workflow_complete",
+        )
+    });
     let state = WorkflowState {
         schema_version: 2,
         manifest_hash,
@@ -5699,6 +5986,7 @@ pub fn execute_workflow(
         resource_preflight,
         planned_models: planned_model_reports(&manifest),
         parameter_optimization: optimization_results,
+        parameter_optimizer_execution,
     };
     write_json_atomic(&manifest.output_root.join("workflow.state.json"), &state)?;
     Ok(state)
@@ -5758,6 +6046,7 @@ mod tests {
             statistical_validity_contracts: BTreeMap::new(),
             resume: true,
             materialize_winner: true,
+            execution_mode: OptimizerExecutionMode::OptimizationAndPostSelection,
             implementation_smoke_only: false,
             production_smoke_only: false,
             require_existing_candidate_pool: true,
@@ -6219,7 +6508,7 @@ mod tests {
         manifest.spectra = vec![spectrum.display().to_string()];
         manifest.output_root = directory.join("strict-output-must-not-exist");
         manifest.candidate_pool_root = Some(candidate_root);
-        manifest.annotation_cache_root = Some(annotation_root);
+        manifest.annotation_cache_root = Some(annotation_root.clone());
         manifest.target_only_annotation_cache_root = Some(target_annotation_root.clone());
         manifest.entrapment.database_mode = EntrapmentDatabaseMode::FrozenLegacy;
         manifest.entrapment.foreign_fastas.clear();
@@ -6286,6 +6575,47 @@ mod tests {
             .unwrap_err()
             .to_string();
         assert!(error.contains("target_only"));
+        assert!(error.contains("generation_prohibited=true"));
+        assert!(!manifest.output_root.exists());
+
+        let poison_target_root = directory.join("poison-target-only-cache");
+        std::fs::create_dir_all(&poison_target_root).unwrap();
+        std::fs::write(
+            poison_target_root.join("manifest.json"),
+            b"corrupt target-only cache that must never be opened\n",
+        )
+        .unwrap();
+        manifest.target_only_annotation_cache_root = Some(poison_target_root.clone());
+        let mut optimizer = test_optimizer_config();
+        optimizer.schema_version = crate::parameter_optimizer::PARAMETER_OPTIMIZER_SCHEMA_VERSION;
+        optimizer.execution_mode = OptimizerExecutionMode::OptimizationOnly;
+        manifest.parameter_optimizer = Some(optimizer);
+        write_json_atomic(&manifest_path, &manifest).unwrap();
+        let state = execute_workflow(&manifest_path, &directory, 1, true).unwrap();
+        assert_eq!(state.resource_preflight.len(), 3);
+        assert!(state
+            .resource_preflight
+            .iter()
+            .all(|resource| resource.search_space == "+entrapment"));
+        assert!(state
+            .resource_preflight
+            .iter()
+            .all(|resource| !resource.requested_path.starts_with(&poison_target_root)));
+        assert_eq!(
+            state
+                .parameter_optimizer_execution
+                .as_ref()
+                .unwrap()
+                .execution_mode,
+            OptimizerExecutionMode::OptimizationOnly
+        );
+        assert!(!manifest.output_root.exists());
+
+        std::fs::remove_dir_all(&annotation_root).unwrap();
+        let error = execute_workflow(&manifest_path, &directory, 1, true)
+            .unwrap_err()
+            .to_string();
+        assert!(error.contains("+entrapment"));
         assert!(error.contains("generation_prohibited=true"));
         assert!(!manifest.output_root.exists());
         std::fs::remove_dir_all(directory).unwrap();
@@ -7020,6 +7350,7 @@ mod tests {
             .collect::<Vec<_>>();
         let lock = stamp_ensemble_lock_analysis_fingerprint(EnsembleLock {
             schema_version: 8,
+            post_selection_in_scope: true,
             source_manifest_hash: "manifest".into(),
             dataset_fingerprint: dataset.fingerprint.clone(),
             experts: experts.clone(),
