@@ -141,7 +141,9 @@ use crate::lfq::{Peak, PrecursorId};
 use crate::ml::lower_order::{
     fit_decoy_free_model, fit_gumbel_mle, fit_gumbel_moments, LowerOrderArtifact, LowerOrderModel,
 };
-use crate::ml::msfdr::{Msfdr1SmixModel, Msfdr2SmixModel, MsfdrSeededModel};
+use crate::ml::msfdr::{
+    Msfdr1SmixModel, Msfdr2SmixModel, MsfdrMixtureFitFailure, MsfdrSeededModel,
+};
 use crate::ml::nokoi;
 use crate::ml::stats;
 use crate::scoring::{DfFeature, TdcFeature};
@@ -151,7 +153,7 @@ use serde::{Deserialize, Serialize};
 use statrs::distribution::{ContinuousCDF, Gumbel};
 use std::borrow::Cow;
 use std::cmp::Ordering;
-use std::collections::HashMap;
+use std::collections::{BTreeMap, HashMap};
 use std::sync::Arc;
 use std::time::Instant;
 
@@ -3875,6 +3877,7 @@ struct Engines {
     msfdr_seeded: Option<MsfdrSeededModel>,
     msfdr_1smix: Option<Msfdr1SmixModel>,
     msfdr_2smix: Option<Msfdr2SmixModel>,
+    msfdr_mixture_failures: BTreeMap<String, MsfdrMixtureFitFailure>,
 
     nokoi_p_values: Option<Arc<Vec<f64>>>,
     nokoi_peps: Option<Arc<Vec<f64>>>,
@@ -4235,8 +4238,11 @@ fn fit_msfdr_seeded(
 }
 
 #[inline]
-fn fit_msfdr_1smix(rank1_scores: &[f64], settings: &FdrSettings) -> Option<Msfdr1SmixModel> {
-    Msfdr1SmixModel::fit_rank1(
+fn fit_msfdr_1smix(
+    rank1_scores: &[f64],
+    settings: &FdrSettings,
+) -> Result<Msfdr1SmixModel, MsfdrMixtureFitFailure> {
+    Msfdr1SmixModel::fit_rank1_checked(
         rank1_scores,
         settings.mix_em_max_iter,
         settings.mix_em_tol,
@@ -4251,8 +4257,8 @@ fn fit_msfdr_2smix(
     rank1_scores: &[f64],
     pooled_rank_scores: &[f64],
     settings: &FdrSettings,
-) -> Option<Msfdr2SmixModel> {
-    Msfdr2SmixModel::fit_top_two_pooled(
+) -> Result<Msfdr2SmixModel, MsfdrMixtureFitFailure> {
+    Msfdr2SmixModel::fit_top_two_pooled_checked(
         rank1_scores,
         pooled_rank_scores,
         settings.mix_em_max_iter,
@@ -4270,7 +4276,8 @@ fn fit_engines(
     settings: &FdrSettings,
     gates: RunGates,
     db: &IndexedDatabase,
-) -> Option<Engines> {
+) -> Result<Engines, BTreeMap<String, MsfdrMixtureFitFailure>> {
+    let mut msfdr_mixture_failures = BTreeMap::new();
     let min_null_size = settings.min_null_size;
     let null_source = RankNullSource::build(features, work, settings);
 
@@ -4372,7 +4379,7 @@ fn fit_engines(
         } else {
             let Some(moments_pool) = moments_pool.as_ref() else {
                 log::warn!("Moments unavailable: method-specific null pool could not be built.");
-                return None;
+                return Err(msfdr_mixture_failures);
             };
 
             let scores = moments_pool.scores_in_window(
@@ -4439,7 +4446,7 @@ fn fit_engines(
     if gates.run_lo {
         let Some(lower_order_pool) = lower_order_pool.as_ref() else {
             log::warn!("LowerOrder unavailable: method-specific null pool could not be built.");
-            return None;
+            return Err(msfdr_mixture_failures);
         };
 
         let lo_tev_map =
@@ -4632,7 +4639,7 @@ fn fit_engines(
         } else {
             let Some(mle_pool) = mle_pool.as_ref() else {
                 log::warn!("MLE unavailable: method-specific null pool could not be built.");
-                return None;
+                return Err(msfdr_mixture_failures);
             };
 
             let scores =
@@ -4700,7 +4707,7 @@ fn fit_engines(
                 log::warn!(
                     "MSFDR seeded unavailable: method-specific null pool could not be built."
                 );
-                return None;
+                return Err(msfdr_mixture_failures);
             };
 
             let seed_pool = msfdr_seeded_pool
@@ -4728,77 +4735,111 @@ fn fit_engines(
 
     let msfdr_1smix = if gates.run_msfdr_1smix {
         if let Some(model) = settings.msfdr_1smix_frozen_model.as_ref() {
-            log::info!("MSFDR1-SMIX using frozen fitted model; refit=false rank1_only=true");
-            Some(model.clone())
-        } else {
-            let m = fit_msfdr_1smix(&rank1_scores, settings);
-            if let Some(ref model) = m {
-                log_fit_ok("MSFDR 1smix", model);
-            } else {
-                log_fit_failed_closed("MSFDR 1smix");
+            match model.validate_for_scores(&rank1_scores) {
+                Ok(()) => {
+                    log::info!(
+                        "MSFDR1-SMIX using validated frozen fitted model; refit=false rank1_only=true"
+                    );
+                    Some(model.clone())
+                }
+                Err(error) => {
+                    log::error!(
+                        "MSFDR1-SMIX frozen artifact rejected by technical-validity gate: {error}"
+                    );
+                    msfdr_mixture_failures.insert("msfdr1_smix".into(), error);
+                    None
+                }
             }
-            m
+        } else {
+            match fit_msfdr_1smix(&rank1_scores, settings) {
+                Ok(model) => {
+                    log_fit_ok("MSFDR 1smix", &model);
+                    Some(model)
+                }
+                Err(error) => {
+                    log::error!(
+                        "MSFDR 1smix technical-validity failure; no probabilities or artifact will be produced: {error}"
+                    );
+                    msfdr_mixture_failures.insert("msfdr1_smix".into(), error);
+                    log_fit_failed_closed("MSFDR 1smix");
+                    None
+                }
+            }
         }
     } else {
         None
     };
 
+    // MSFDR2 is a joint S1/S2 mixture. Build the declared raw pooled S2
+    // population even for artifact replay so frozen models pass the same gate
+    // as newly fitted models before they can produce probabilities.
+    let effective_min_rank = settings.msfdr2_smix_min_null_rank.max(2);
+    let effective_max_rank = settings.msfdr2_smix_max_null_rank.max(effective_min_rank);
+    let unpurified_s2_scores: Vec<f64> = if gates.run_msfdr_2smix {
+        features
+            .iter()
+            .filter(|f| {
+                let rank = f.core.rank as u32;
+                rank >= effective_min_rank && rank <= effective_max_rank
+            })
+            .filter_map(tev)
+            .collect()
+    } else {
+        Vec::new()
+    };
+
     let msfdr_2smix = if gates.run_msfdr_2smix {
+        if settings.msfdr2_smix_min_null_rank < 2 {
+            log::warn!(
+                "MSFDR pooled-rank 2smix: requested min rank {} includes S1; using effective S2 min rank {}",
+                settings.msfdr2_smix_min_null_rank,
+                effective_min_rank
+            );
+        }
+        log::info!(
+            "DF MSFDR pooled-rank 2smix S2 source: unpurified_features ranks={}..{} n_s1={} n_s2={}",
+            effective_min_rank,
+            effective_max_rank,
+            rank1_scores.len(),
+            unpurified_s2_scores.len()
+        );
+
         if let Some(model) = settings.msfdr_2smix_frozen_model.as_ref() {
-            log::info!("MSFDR2-SMIX using frozen fitted model; refit=false");
-            Some(model.clone())
-        } else {
-            // MSFDR2 is a joint S1/S2 mixture model. Unlike Moments/MLE/LO,
-            // it should not receive the purified rank-null pool because the
-            // model explicitly includes a correct-in-S2 component (`b`).
-            //
-            // Use raw lower-rank scores directly from features. Also enforce
-            // rank >= 2 because S2 must not contain the rank-1 S1 scores.
-            let effective_min_rank = settings.msfdr2_smix_min_null_rank.max(2);
-            let effective_max_rank = settings.msfdr2_smix_max_null_rank.max(effective_min_rank);
-
-            if settings.msfdr2_smix_min_null_rank < 2 {
-                log::warn!(
-				"MSFDR pooled-rank 2smix: requested min rank {} includes S1; using effective S2 min rank {}",
-				settings.msfdr2_smix_min_null_rank,
-				effective_min_rank
-			);
-            }
-
-            let unpurified_s2_scores: Vec<f64> = features
-                .iter()
-                .filter(|f| {
-                    let r = f.core.rank as u32;
-                    r >= effective_min_rank && r <= effective_max_rank
-                })
-                .filter_map(|f| tev(f))
-                .filter(|x| x.is_finite())
-                .collect();
-
-            log::info!(
-			"DF MSFDR pooled-rank 2smix S2 source: unpurified_features ranks={}..{} n_s1={} n_s2={}",
-			effective_min_rank,
-			effective_max_rank,
-			rank1_scores.len(),
-			unpurified_s2_scores.len()
-		);
-
-            if window_ok(
-                "MSFDR pooled-rank 2smix",
-                effective_min_rank,
-                effective_max_rank,
-                unpurified_s2_scores.len(),
-            ) {
-                let m = fit_msfdr_2smix(&rank1_scores, &unpurified_s2_scores, settings);
-                if let Some(ref model) = m {
-                    log_fit_ok("MSFDR pooled-rank 2smix", model);
-                } else {
-                    log_fit_failed_closed("MSFDR pooled-rank 2smix");
+            match model.validate_for_scores(&rank1_scores, &unpurified_s2_scores) {
+                Ok(()) => {
+                    log::info!("MSFDR2-SMIX using validated frozen fitted model; refit=false");
+                    Some(model.clone())
                 }
-                m
-            } else {
-                None
+                Err(error) => {
+                    log::error!(
+                        "MSFDR2-SMIX frozen artifact rejected by technical-validity gate: {error}"
+                    );
+                    msfdr_mixture_failures.insert("msfdr2_smix".into(), error);
+                    None
+                }
             }
+        } else if window_ok(
+            "MSFDR pooled-rank 2smix",
+            effective_min_rank,
+            effective_max_rank,
+            unpurified_s2_scores.len(),
+        ) {
+            match fit_msfdr_2smix(&rank1_scores, &unpurified_s2_scores, settings) {
+                Ok(model) => {
+                    log_fit_ok("MSFDR pooled-rank 2smix", &model);
+                    Some(model)
+                }
+                Err(error) => {
+                    log::error!(
+                        "MSFDR pooled-rank 2smix technical-validity failure; no probabilities or artifact will be produced: {error}"
+                    );
+                    msfdr_mixture_failures.insert("msfdr2_smix".into(), error);
+                    log_fit_failed_closed("MSFDR pooled-rank 2smix");
+                    None
+                }
+            }
+        } else {
+            None
         }
     } else {
         None
@@ -4978,11 +5019,11 @@ fn fit_engines(
                  Clearing selected DF outputs instead of substituting p=1.0/PEP=1.0.",
                 settings.model_fit
             );
-            return None;
+            return Err(msfdr_mixture_failures);
         }
     }
 
-    Some(Engines {
+    Ok(Engines {
         mom_params,
         mle_params,
         lo_model,
@@ -4990,6 +5031,7 @@ fn fit_engines(
         msfdr_seeded,
         msfdr_1smix,
         msfdr_2smix,
+        msfdr_mixture_failures,
         nokoi_p_values,
         nokoi_peps,
         nokoi_artifact,
@@ -5069,7 +5111,7 @@ fn fit_base_experts(
     settings: &FdrSettings,
     gates: RunGates,
     db: &IndexedDatabase,
-) -> Option<Engines> {
+) -> Result<Engines, BTreeMap<String, MsfdrMixtureFitFailure>> {
     fit_engines(features, work, settings, gates, db)
 }
 
@@ -11278,6 +11320,10 @@ pub struct DfRunArtifacts {
     pub msfdr_2smix: Option<Msfdr2SmixModel>,
     #[serde(default)]
     pub msfdr_2smix_metadata: Option<FrozenModelMetadata>,
+    /// Explicit reasons why an MSFDR1/2 fit or frozen artifact was rejected.
+    /// Invalid fits have no corresponding model artifact or evidence stream.
+    #[serde(default, skip_serializing_if = "BTreeMap::is_empty")]
+    pub msfdr_mixture_failures: BTreeMap<String, MsfdrMixtureFitFailure>,
     pub nokoi: Option<nokoi::NokoiArtifact>,
     #[serde(default)]
     pub external_ms2rescore: Option<ExternalMs2RescoreProfiles>,
@@ -11355,15 +11401,22 @@ pub fn run_df_layers_with_artifacts(
     // Each expert now builds its own method-specific rank-null pool using its own
     // purification factor. There is intentionally no shared/global null pool here.
     let engines = match fit_base_experts(&new_features, &work, settings, gates, db) {
-        Some(e) => e,
-        None => {
+        Ok(engines) => engines,
+        Err(msfdr_mixture_failures) => {
             log::error!("Invalid null fit. FDR will fail closed.");
             new_features.par_iter_mut().for_each(|psm| {
                 clear_all_df_outputs(psm, true);
             });
-            return (new_features, DfRunArtifacts::default());
+            return (
+                new_features,
+                DfRunArtifacts {
+                    msfdr_mixture_failures,
+                    ..DfRunArtifacts::default()
+                },
+            );
         }
     };
+    let msfdr_mixture_failures = engines.msfdr_mixture_failures.clone();
 
     let lower_order_artifact = if let Some(artifact) = settings.lower_order_frozen_artifact.as_ref()
     {
@@ -11658,6 +11711,7 @@ pub fn run_df_layers_with_artifacts(
             msfdr_1smix_metadata,
             msfdr_2smix: msfdr_2smix_artifact,
             msfdr_2smix_metadata,
+            msfdr_mixture_failures,
             nokoi: nokoi_artifact,
             external_ms2rescore: settings.external_ms2rescore_frozen_profiles.clone(),
         },
@@ -14072,5 +14126,228 @@ mod tests {
         assert!(outcome.global_optimum_guaranteed);
         assert_eq!((best.min_rank, best.max_rank), (9, 18));
         assert_eq!(evaluator.touched.len(), universe_size);
+    }
+
+    #[test]
+    fn statistical_conformance_probability_q_and_fallback_contracts() {
+        for x in [f64::NAN, f64::NEG_INFINITY, -1.0, 0.0, 0.2, 1.0, 2.0] {
+            let p = finite_df_p_value(x);
+            let pep = finite_df_probability_for_logit(x);
+            assert!(p.is_finite() && (0.0..=1.0).contains(&p));
+            assert!(pep.is_finite() && (0.0..=1.0).contains(&pep));
+        }
+
+        let p = [0.001, 0.01, 0.01, 0.2, 0.8, 1.0];
+        let q = stats::bh_q_value(&p);
+        let mut ordered: Vec<(f64, f64)> = p.into_iter().zip(q).collect();
+        ordered.sort_by(|a, b| a.0.total_cmp(&b.0));
+        assert!(ordered.windows(2).all(|w| w[0].1 <= w[1].1 + 1e-12));
+        assert_eq!(
+            ordered[1].1, ordered[2].1,
+            "equal p-values need equal q-values"
+        );
+
+        let settings = FdrSettings::from(FdrOptions::default());
+        let report = q_values_from_p_values_with_method_report(
+            &[0.01, 0.2],
+            &[],
+            &settings,
+            QMethod::Storey,
+            "conformance",
+        );
+        assert_eq!(report.actual_method, "BH");
+        assert_eq!(
+            report.fallback_reason,
+            Some("storey_reference_count_below_min_storey_n")
+        );
+        assert!(report
+            .q_values
+            .iter()
+            .all(|q| q.is_finite() && (0.0..=1.0).contains(q)));
+
+        assert!(grenander_pep_from_p(&[], 1.0).is_empty());
+        let peps = grenander_pep_from_p(&[0.001, 0.01, 0.01, 0.2, 0.8], 0.8);
+        assert!(peps
+            .iter()
+            .all(|x| x.is_finite() && (0.0..=1.0).contains(x)));
+        assert!(peps.windows(2).all(|w| w[0] <= w[1] + 1e-12));
+        assert_eq!(peps[1], peps[2]);
+    }
+
+    #[test]
+    fn statistical_conformance_candidate_count_and_entrapment_ratio_formulas() {
+        let tail = 0.001;
+        let power = 1.0;
+        let scale = 0.5;
+        let values: Vec<f64> = [1.0, 10.0, 100.0, 1000.0]
+            .into_iter()
+            .map(|n| lo_e_value_from_tail_and_candidates(tail, n, power, scale).unwrap())
+            .collect();
+        assert_eq!(values, vec![0.0005, 0.005, 0.05, 0.5]);
+        assert!(values.windows(2).all(|w| w[0] <= w[1]));
+
+        assert_eq!(entrapment_fdp(0, 0, 3.0), None);
+        assert_eq!(entrapment_fdp(10, 1, 0.0), None);
+        let got = entrapment_fdp(90, 10, 3.0).unwrap();
+        let expected = 10.0 * (1.0 + 1.0 / 3.0) / 100.0;
+        assert!((got - expected).abs() <= 1e-15);
+    }
+
+    #[test]
+    fn statistical_conformance_ensemble_consensus_is_bounded_order_invariant_and_continuous() {
+        let mut settings = FdrSettings::from(FdrOptions::default());
+        settings.ensemble_p_combiner = EnsemblePCombiner::SecondBest;
+
+        let p = [0.4, 0.01, 0.2, f64::NAN];
+        let reversed = [f64::NAN, 0.2, 0.01, 0.4];
+        let a = combine_p_values_for_ensemble(&p, &settings);
+        let b = combine_p_values_for_ensemble(&reversed, &settings);
+        assert_eq!(a, 0.2);
+        assert_eq!(a, b);
+        assert_eq!(combine_second_best_p(&[0.03, 0.03]), 0.03);
+
+        let weights = [1.0; 4];
+        let pep_a = combine_peps(
+            &[0.9, 0.1, 0.4, 0.2],
+            &weights,
+            EnsemblePepCombiner::Median,
+            0.2,
+            0.5,
+            2,
+            1e-6,
+        );
+        let pep_b = combine_peps(
+            &[0.2, 0.4, 0.1, 0.9],
+            &weights,
+            EnsemblePepCombiner::Median,
+            0.2,
+            0.5,
+            2,
+            1e-6,
+        );
+        assert_eq!(pep_a, pep_b);
+        assert!((0.0..=1.0).contains(&pep_a));
+
+        let weak = combine_second_best_p(&[0.001, 0.8, 0.9]);
+        let strengthened = combine_second_best_p(&[0.001, 0.2, 0.9]);
+        assert!(strengthened <= weak);
+    }
+
+    #[test]
+    fn statistical_conformance_raw_second_best_is_not_a_universal_combined_p_value() {
+        // For three independent U(0,1) experts, P(P_(2) <= a) is the binomial
+        // probability of at least two values <= a. At a=0.9 it is 0.972, which
+        // exceeds 0.9. Thus raw P_(2) is an operational consensus statistic,
+        // not a super-uniform p-value over its full domain.
+        let alpha = 0.9_f64;
+        let cdf = 3.0 * alpha.powi(2) * (1.0 - alpha) + alpha.powi(3);
+        assert!((cdf - 0.972).abs() <= 1e-12);
+        assert!(cdf > alpha);
+    }
+
+    #[test]
+    fn statistical_conformance_correlated_expert_simulation() {
+        use statrs::distribution::Normal;
+
+        struct Rng(u64);
+        impl Rng {
+            fn uniform(&mut self) -> f64 {
+                let mut x = self.0;
+                x ^= x << 13;
+                x ^= x >> 7;
+                x ^= x << 17;
+                self.0 = x;
+                (((x >> 11) as f64) / ((1_u64 << 53) as f64)).clamp(1e-12, 1.0 - 1e-12)
+            }
+            fn normal(&mut self) -> f64 {
+                let radius = (-2.0 * self.uniform().ln()).sqrt();
+                let angle = std::f64::consts::TAU * self.uniform();
+                radius * angle.cos()
+            }
+        }
+        fn wilson95(successes: usize, n: usize) -> (f64, f64) {
+            let z = 1.959_963_984_540_054;
+            let n = n as f64;
+            let p = successes as f64 / n;
+            let denom = 1.0 + z * z / n;
+            let center = (p + z * z / (2.0 * n)) / denom;
+            let half = z * ((p * (1.0 - p) / n + z * z / (4.0 * n * n)).sqrt()) / denom;
+            (center - half, center + half)
+        }
+
+        const N: usize = 100_000;
+        let alphas = [0.01, 0.05, 0.10, 0.50, 0.90];
+        let standard = Normal::new(0.0, 1.0).unwrap();
+        let mut independent_counts = [0_usize; 5];
+        let mut correlated_counts = [0_usize; 5];
+        let mut rng = Rng(0x5354_4154_5f45_4e53);
+        let rho = 0.9_f64;
+
+        for _ in 0..N {
+            let independent = [rng.uniform(), rng.uniform(), rng.uniform()];
+            let independent_stat = combine_second_best_p(&independent);
+
+            let common = rng.normal();
+            let correlated = [0, 1, 2].map(|_| {
+                let z = rho.sqrt() * common + (1.0 - rho).sqrt() * rng.normal();
+                standard.cdf(z)
+            });
+            let correlated_stat = combine_second_best_p(&correlated);
+
+            for (i, &alpha) in alphas.iter().enumerate() {
+                independent_counts[i] += usize::from(independent_stat <= alpha);
+                correlated_counts[i] += usize::from(correlated_stat <= alpha);
+            }
+        }
+
+        for (i, &alpha) in alphas.iter().enumerate() {
+            let independent_rate = independent_counts[i] as f64 / N as f64;
+            let correlated_rate = correlated_counts[i] as f64 / N as f64;
+            let independent_ci = wilson95(independent_counts[i], N);
+            let correlated_ci = wilson95(correlated_counts[i], N);
+            let analytic = 3.0 * alpha.powi(2) * (1.0 - alpha) + alpha.powi(3);
+            assert!(
+                analytic >= independent_ci.0 - 5e-4 && analytic <= independent_ci.1 + 5e-4,
+                "independent alpha={alpha} estimate={independent_rate} CI={independent_ci:?} analytic={analytic}"
+            );
+            assert!((0.0..=1.0).contains(&correlated_rate));
+            eprintln!(
+                "second_best alpha={alpha:.2} independent={independent_rate:.6} CI={independent_ci:?} correlated_rho_0.9={correlated_rate:.6} CI={correlated_ci:?}"
+            );
+        }
+
+        assert!(independent_counts.windows(2).all(|w| w[0] <= w[1]));
+        assert!(correlated_counts.windows(2).all(|w| w[0] <= w[1]));
+    }
+
+    #[test]
+    fn statistical_conformance_invalid_msfdr_fit_provenance_has_no_artifact() {
+        let failure = MsfdrMixtureFitFailure::DegenerateScoreVariance {
+            population: "rank1".into(),
+            observed_range: 0.0,
+            observed_std: 0.0,
+            numerical_resolution: 64.0 * f64::EPSILON,
+        };
+        let artifacts = DfRunArtifacts {
+            msfdr_mixture_failures: BTreeMap::from([("msfdr1_smix".into(), failure.clone())]),
+            ..DfRunArtifacts::default()
+        };
+        assert!(artifacts.msfdr_1smix.is_none());
+        assert!(artifacts.msfdr_2smix.is_none());
+
+        let serialized = serde_json::to_string(&artifacts).expect("artifact provenance serializes");
+        assert!(serialized.contains("degenerate_score_variance"));
+        assert!(serialized.contains("\"msfdr_1smix\":null"));
+        assert!(serialized.contains("\"msfdr_2smix\":null"));
+        assert!(!serialized.contains("p_value"));
+        assert!(!serialized.contains("pep"));
+        assert!(!serialized.contains("q_value"));
+
+        let replay: DfRunArtifacts =
+            serde_json::from_str(&serialized).expect("artifact provenance replays");
+        assert_eq!(
+            replay.msfdr_mixture_failures.get("msfdr1_smix"),
+            Some(&failure)
+        );
     }
 }

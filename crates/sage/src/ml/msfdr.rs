@@ -5,7 +5,7 @@
 //! New mixture models for decoy-free false discovery rate estimation in mass spectrometry proteomics
 //! Yisu Peng, Shantanu Jain, Yong Fuga Li, Michal Greguš, Alexander R. Ivanov, Olga Vitek, Predrag Radivojac,
 //! Bioinformatics, Volume 36, Issue Supplement_2, December 2020, Pages i745–i753,
-//! DOI: 10.1093/bioinformatics/btaa8074
+//! DOI: 10.1093/bioinformatics/btaa807
 //! https://academic.oup.com/bioinformatics/article/36/Supplement_2/i745/6055912
 //!
 //! and implemented on GitHub here:
@@ -15,9 +15,289 @@ use crate::ml::skew_normal::SkewNormal;
 use serde::{Deserialize, Serialize};
 use statrs::consts::EULER_MASCHERONI;
 use statrs::distribution::{Continuous, ContinuousCDF, Gumbel};
+use std::fmt;
 
 /// Small floor to prevent log(0) and divide-by-zero cascades.
 const TINY: f64 = 1e-300;
+
+/// Binary64 guard used only to distinguish representable score/component
+/// variation from roundoff. This is not a biological or power threshold.
+const IDENTIFIABILITY_ULPS: f64 = 64.0;
+const MIN_EFFECTIVE_COMPONENT_SUPPORT: f64 = 3.0;
+
+/// Explicit technical failure emitted by the MSFDR1/2 post-fit validity gate.
+///
+/// These failures are distinct from a valid reduced model (which the declared
+/// MSFDR1/2 methods do not emit), optimizer non-convergence, and any workflow
+/// fallback. An invalid fit never becomes a probability-producing model.
+#[derive(Clone, Debug, Serialize, Deserialize, PartialEq)]
+#[serde(tag = "code", rename_all = "snake_case")]
+pub enum MsfdrMixtureFitFailure {
+    NonFiniteInput {
+        population: String,
+        index: usize,
+        value: f64,
+    },
+    InsufficientData {
+        population: String,
+        observed: usize,
+        minimum: usize,
+    },
+    DegenerateScoreVariance {
+        population: String,
+        observed_range: f64,
+        observed_std: f64,
+        numerical_resolution: f64,
+    },
+    NonFiniteParameter {
+        component: String,
+        parameter: String,
+        value: f64,
+    },
+    NonPositiveScale {
+        component: String,
+        scale: f64,
+        numerical_resolution: f64,
+    },
+    InvalidMixtureWeight {
+        component: String,
+        weight: f64,
+        numerical_resolution: f64,
+    },
+    IneffectiveComponentSupport {
+        component: String,
+        effective_support: f64,
+        minimum: f64,
+    },
+    CoincidentComponents {
+        left: String,
+        right: String,
+    },
+    NoFeasibleTrial {
+        model: String,
+        attempted: usize,
+        last_failure: String,
+    },
+}
+
+impl MsfdrMixtureFitFailure {
+    pub fn code(&self) -> &'static str {
+        match self {
+            Self::NonFiniteInput { .. } => "non_finite_input",
+            Self::InsufficientData { .. } => "insufficient_data",
+            Self::DegenerateScoreVariance { .. } => "degenerate_score_variance",
+            Self::NonFiniteParameter { .. } => "non_finite_parameter",
+            Self::NonPositiveScale { .. } => "non_positive_scale",
+            Self::InvalidMixtureWeight { .. } => "invalid_mixture_weight",
+            Self::IneffectiveComponentSupport { .. } => "ineffective_component_support",
+            Self::CoincidentComponents { .. } => "coincident_components",
+            Self::NoFeasibleTrial { .. } => "no_feasible_trial",
+        }
+    }
+}
+
+impl fmt::Display for MsfdrMixtureFitFailure {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        write!(f, "{}: ", self.code())?;
+        match self {
+            Self::NonFiniteInput {
+                population,
+                index,
+                value,
+            } => write!(f, "{population}[{index}]={value:?}"),
+            Self::InsufficientData {
+                population,
+                observed,
+                minimum,
+            } => write!(f, "{population} n={observed} < {minimum}"),
+            Self::DegenerateScoreVariance {
+                population,
+                observed_range,
+                observed_std,
+                numerical_resolution,
+            } => write!(
+                f,
+                "{population} range={observed_range:.6e} std={observed_std:.6e} resolution={numerical_resolution:.6e}"
+            ),
+            Self::NonFiniteParameter {
+                component,
+                parameter,
+                value,
+            } => write!(f, "{component}.{parameter}={value:?}"),
+            Self::NonPositiveScale {
+                component,
+                scale,
+                numerical_resolution,
+            } => write!(
+                f,
+                "{component}.scale={scale:.6e} <= resolution={numerical_resolution:.6e}"
+            ),
+            Self::InvalidMixtureWeight {
+                component,
+                weight,
+                numerical_resolution,
+            } => write!(
+                f,
+                "{component} weight={weight:.6e} <= resolution={numerical_resolution:.6e} or is outside the declared simplex"
+            ),
+            Self::IneffectiveComponentSupport {
+                component,
+                effective_support,
+                minimum,
+            } => write!(
+                f,
+                "{component} expected support={effective_support:.6e} < {minimum:.6e}"
+            ),
+            Self::CoincidentComponents { left, right } => {
+                write!(f, "{left} and {right} are numerically indistinguishable")
+            }
+            Self::NoFeasibleTrial {
+                model,
+                attempted,
+                last_failure,
+            } => write!(
+                f,
+                "{model} had no technically valid fit among {attempted} deterministic trials; last failure: {last_failure}"
+            ),
+        }
+    }
+}
+
+#[derive(Clone, Copy, Debug)]
+struct ScoreValidity {
+    n: usize,
+    resolution: f64,
+}
+
+impl ScoreValidity {
+    fn new(
+        population: &str,
+        scores: &[f64],
+        minimum: usize,
+    ) -> Result<Self, MsfdrMixtureFitFailure> {
+        if scores.len() < minimum {
+            return Err(MsfdrMixtureFitFailure::InsufficientData {
+                population: population.into(),
+                observed: scores.len(),
+                minimum,
+            });
+        }
+
+        let mut mean = 0.0;
+        let mut m2 = 0.0;
+        let mut min = f64::INFINITY;
+        let mut max = f64::NEG_INFINITY;
+        let mut max_abs = 0.0f64;
+        for (index, &value) in scores.iter().enumerate() {
+            if !value.is_finite() {
+                return Err(MsfdrMixtureFitFailure::NonFiniteInput {
+                    population: population.into(),
+                    index,
+                    value,
+                });
+            }
+            let count = index as f64 + 1.0;
+            let delta = value - mean;
+            mean += delta / count;
+            m2 += delta * (value - mean);
+            min = min.min(value);
+            max = max.max(value);
+            max_abs = max_abs.max(value.abs());
+        }
+
+        let range = max - min;
+        let std = (m2 / scores.len() as f64).max(0.0).sqrt();
+        let resolution = IDENTIFIABILITY_ULPS * f64::EPSILON * max_abs.max(range.abs()).max(1.0);
+        if !range.is_finite() || !std.is_finite() || range <= resolution || std <= resolution {
+            return Err(MsfdrMixtureFitFailure::DegenerateScoreVariance {
+                population: population.into(),
+                observed_range: range,
+                observed_std: std,
+                numerical_resolution: resolution,
+            });
+        }
+
+        Ok(Self {
+            n: scores.len(),
+            resolution,
+        })
+    }
+}
+
+fn validate_component(
+    name: &str,
+    component: &SkewNormal,
+    score_resolution: f64,
+) -> Result<(), MsfdrMixtureFitFailure> {
+    for (parameter, value) in [
+        ("location", component.location),
+        ("scale", component.scale),
+        ("shape", component.shape),
+    ] {
+        if !value.is_finite() {
+            return Err(MsfdrMixtureFitFailure::NonFiniteParameter {
+                component: name.into(),
+                parameter: parameter.into(),
+                value,
+            });
+        }
+    }
+    if component.scale <= score_resolution {
+        return Err(MsfdrMixtureFitFailure::NonPositiveScale {
+            component: name.into(),
+            scale: component.scale,
+            numerical_resolution: score_resolution,
+        });
+    }
+    Ok(())
+}
+
+fn validate_weight(name: &str, weight: f64) -> Result<(), MsfdrMixtureFitFailure> {
+    let resolution = IDENTIFIABILITY_ULPS * f64::EPSILON;
+    if !weight.is_finite() || weight <= resolution || weight >= 1.0 - resolution {
+        return Err(MsfdrMixtureFitFailure::InvalidMixtureWeight {
+            component: name.into(),
+            weight,
+            numerical_resolution: resolution,
+        });
+    }
+    Ok(())
+}
+
+fn validate_effective_support(name: &str, support: f64) -> Result<(), MsfdrMixtureFitFailure> {
+    if !support.is_finite() || support < MIN_EFFECTIVE_COMPONENT_SUPPORT {
+        return Err(MsfdrMixtureFitFailure::IneffectiveComponentSupport {
+            component: name.into(),
+            effective_support: support,
+            minimum: MIN_EFFECTIVE_COMPONENT_SUPPORT,
+        });
+    }
+    Ok(())
+}
+
+fn components_distinct(
+    left_name: &str,
+    left: &SkewNormal,
+    right_name: &str,
+    right: &SkewNormal,
+    score_resolution: f64,
+) -> Result<(), MsfdrMixtureFitFailure> {
+    let scale_resolution =
+        (IDENTIFIABILITY_ULPS * f64::EPSILON * left.scale.abs().max(right.scale.abs()).max(1.0))
+            .max(score_resolution);
+    let shape_resolution =
+        IDENTIFIABILITY_ULPS * f64::EPSILON * left.shape.abs().max(right.shape.abs()).max(1.0);
+    if (left.location - right.location).abs() <= score_resolution
+        && (left.scale - right.scale).abs() <= scale_resolution
+        && (left.shape - right.shape).abs() <= shape_resolution
+    {
+        return Err(MsfdrMixtureFitFailure::CoincidentComponents {
+            left: left_name.into(),
+            right: right_name.into(),
+        });
+    }
+    Ok(())
+}
 
 // --- Formatting helpers for parameter summaries ---
 #[inline]
@@ -342,6 +622,26 @@ impl Msfdr1SmixModel {
         sn.location + sn.scale * delta * (2.0 / std::f64::consts::PI).sqrt()
     }
 
+    /// Validate a fitted 1SMix model against the population it models.
+    /// Successful validation never mutates the fitted parameters.
+    pub fn validate_for_scores(&self, rank1_scores: &[f64]) -> Result<(), MsfdrMixtureFitFailure> {
+        let scores = ScoreValidity::new("rank1", rank1_scores, 20)?;
+        validate_component("correct", &self.correct, scores.resolution)?;
+        validate_component("incorrect1", &self.incorrect1, scores.resolution)?;
+        validate_weight("correct", self.a)?;
+        validate_weight("incorrect1", 1.0 - self.a)?;
+        validate_effective_support("correct", scores.n as f64 * self.a)?;
+        validate_effective_support("incorrect1", scores.n as f64 * (1.0 - self.a))?;
+        components_distinct(
+            "correct",
+            &self.correct,
+            "incorrect1",
+            &self.incorrect1,
+            scores.resolution,
+        )?;
+        Ok(())
+    }
+
     #[inline]
     fn component_strength(sn: &SkewNormal, q90: f64, q95: f64) -> f64 {
         let mean = Self::skew_normal_mean(sn);
@@ -561,23 +861,16 @@ impl Msfdr1SmixModel {
         Some((model, ll - penalty))
     }
 
-    pub fn fit_rank1(
+    pub fn fit_rank1_checked(
         rank1_scores: &[f64],
         iters: usize,
         em_tol: f64,
         pi_clamp: (f64, f64),
         bottom_frac_init: f64,
         top_frac_init: f64,
-    ) -> Option<Self> {
-        let mut xs: Vec<f64> = rank1_scores
-            .iter()
-            .copied()
-            .filter(|x| x.is_finite())
-            .collect();
-
-        if xs.len() < 20 {
-            return None;
-        }
+    ) -> Result<Self, MsfdrMixtureFitFailure> {
+        ScoreValidity::new("rank1", rank1_scores, 20)?;
+        let mut xs = rank1_scores.to_vec();
 
         xs.sort_by(|a, b| a.total_cmp(b));
         let n = xs.len();
@@ -611,11 +904,14 @@ impl Msfdr1SmixModel {
         let skew_signs = [1.0, -1.0, 0.0];
 
         let mut best: Option<(Self, f64, f64, f64)> = None;
+        let mut attempted = 0usize;
+        let mut last_failure = None;
 
         for &bottom_frac in &bottom_fracs {
             for &top_frac in &top_fracs {
                 for &bottom_skew_seed in &skew_signs {
                     for &top_skew_seed in &skew_signs {
+                        attempted += 1;
                         let Some((model, score)) = Self::fit_rank1_once(
                             &xs,
                             iters,
@@ -628,6 +924,11 @@ impl Msfdr1SmixModel {
                         ) else {
                             continue;
                         };
+
+                        if let Err(error) = model.validate_for_scores(&xs) {
+                            last_failure = Some(error.to_string());
+                            continue;
+                        }
 
                         let replace = best
                             .as_ref()
@@ -643,7 +944,12 @@ impl Msfdr1SmixModel {
         }
 
         let Some((model, score, bottom_frac, top_frac)) = best else {
-            return None;
+            return Err(MsfdrMixtureFitFailure::NoFeasibleTrial {
+                model: "MSFDR1-SMIX".into(),
+                attempted,
+                last_failure: last_failure
+                    .unwrap_or_else(|| "optimizer did not return a finite candidate model".into()),
+            });
         };
 
         log::info!(
@@ -655,7 +961,28 @@ impl Msfdr1SmixModel {
             Self::skew_normal_mean(&model.incorrect1),
         );
 
-        Some(model)
+        Ok(model)
+    }
+
+    /// Backward-compatible optional fit. Production callers that need
+    /// provenance must use [`Self::fit_rank1_checked`].
+    pub fn fit_rank1(
+        rank1_scores: &[f64],
+        iters: usize,
+        em_tol: f64,
+        pi_clamp: (f64, f64),
+        bottom_frac_init: f64,
+        top_frac_init: f64,
+    ) -> Option<Self> {
+        Self::fit_rank1_checked(
+            rank1_scores,
+            iters,
+            em_tol,
+            pi_clamp,
+            bottom_frac_init,
+            top_frac_init,
+        )
+        .ok()
     }
 
     /// Local posterior error probability: P(I1 | x).
@@ -758,7 +1085,66 @@ pub struct Msfdr2SmixModel {
 }
 
 impl Msfdr2SmixModel {
-    pub fn fit_top_two_pooled(
+    /// Validate a fitted pooled 2SMix model against both modeled populations.
+    /// Successful validation never mutates the fitted parameters.
+    pub fn validate_for_scores(
+        &self,
+        rank1_scores: &[f64],
+        pooled_rank_scores: &[f64],
+    ) -> Result<(), MsfdrMixtureFitFailure> {
+        let s1 = ScoreValidity::new("rank1", rank1_scores, 20)?;
+        let s2 = ScoreValidity::new("pooled_rank", pooled_rank_scores, 20)?;
+        let resolution = s1.resolution.max(s2.resolution);
+        validate_component("correct", &self.correct, resolution)?;
+        validate_component("incorrect1", &self.incorrect1, resolution)?;
+        validate_component("incorrect2", &self.incorrect2, resolution)?;
+
+        let s2_balance = (s1.n as f64 / s2.n as f64).clamp(1e-6, 1.0);
+        let a_s2 = self.a * s2_balance;
+        let i2_weight = 1.0 - a_s2 - self.b;
+        for (name, weight) in [
+            ("correct_s1", self.a),
+            ("incorrect1_s1", 1.0 - self.a),
+            ("incorrect1_s2", a_s2),
+            ("correct_s2", self.b),
+            ("incorrect2_s2", i2_weight),
+        ] {
+            validate_weight(name, weight)?;
+        }
+
+        validate_effective_support("correct", s1.n as f64 * self.a + s2.n as f64 * self.b)?;
+        validate_effective_support(
+            "incorrect1",
+            s1.n as f64 * (1.0 - self.a) + s2.n as f64 * a_s2,
+        )?;
+        validate_effective_support("incorrect2", s2.n as f64 * i2_weight)?;
+
+        components_distinct(
+            "correct",
+            &self.correct,
+            "incorrect1",
+            &self.incorrect1,
+            resolution,
+        )?;
+        components_distinct(
+            "correct",
+            &self.correct,
+            "incorrect2",
+            &self.incorrect2,
+            resolution,
+        )?;
+        components_distinct(
+            "incorrect1",
+            &self.incorrect1,
+            "incorrect2",
+            &self.incorrect2,
+            resolution,
+        )?;
+
+        Ok(())
+    }
+
+    pub fn fit_top_two_pooled_checked(
         rank1_scores: &[f64],
         pooled_rank_scores: &[f64],
         iters: usize,
@@ -766,22 +1152,11 @@ impl Msfdr2SmixModel {
         pi_clamp: (f64, f64),
         bottom_frac_init: f64,
         top_frac_init: f64,
-    ) -> Option<Self> {
-        let mut s1: Vec<f64> = rank1_scores
-            .iter()
-            .copied()
-            .filter(|x| x.is_finite())
-            .collect();
-
-        let mut s2: Vec<f64> = pooled_rank_scores
-            .iter()
-            .copied()
-            .filter(|x| x.is_finite())
-            .collect();
-
-        if s1.len() < 20 || s2.len() < 20 {
-            return None;
-        }
+    ) -> Result<Self, MsfdrMixtureFitFailure> {
+        ScoreValidity::new("rank1", rank1_scores, 20)?;
+        ScoreValidity::new("pooled_rank", pooled_rank_scores, 20)?;
+        let mut s1 = rank1_scores.to_vec();
+        let mut s2 = pooled_rank_scores.to_vec();
 
         s1.sort_by(|a, b| a.total_cmp(b));
         s2.sort_by(|a, b| a.total_cmp(b));
@@ -965,13 +1340,38 @@ impl Msfdr2SmixModel {
             }
         }
 
-        Some(Self {
+        let model = Self {
             correct,
             incorrect1,
             incorrect2,
             a: a_mix,
             b: b_mix,
-        })
+        };
+        model.validate_for_scores(&s1, &s2)?;
+        Ok(model)
+    }
+
+    /// Backward-compatible optional fit. Production callers that need
+    /// provenance must use [`Self::fit_top_two_pooled_checked`].
+    pub fn fit_top_two_pooled(
+        rank1_scores: &[f64],
+        pooled_rank_scores: &[f64],
+        iters: usize,
+        em_tol: f64,
+        pi_clamp: (f64, f64),
+        bottom_frac_init: f64,
+        top_frac_init: f64,
+    ) -> Option<Self> {
+        Self::fit_top_two_pooled_checked(
+            rank1_scores,
+            pooled_rank_scores,
+            iters,
+            em_tol,
+            pi_clamp,
+            bottom_frac_init,
+            top_frac_init,
+        )
+        .ok()
     }
 
     /// Local posterior error probability for an S1/rank1 score: P(I1 | S1=x).
@@ -1195,7 +1595,7 @@ mod tests {
     fn onesmix_bounds_pep_and_p_value_are_finite_in_unit_interval() {
         let xs = synthetic_rank1_scores();
 
-        let m = Msfdr1SmixModel::fit_rank1(
+        let m = Msfdr1SmixModel::fit_rank1_checked(
             &xs,
             /*iters*/ 100,
             /*em_tol*/ 1e-6,
@@ -1203,7 +1603,7 @@ mod tests {
             /*bottom_frac_init*/ 0.7,
             /*top_frac_init*/ 0.2,
         )
-        .expect("1Smix should fit on synthetic input");
+        .unwrap_or_else(|error| panic!("1Smix should fit on synthetic input: {error}"));
 
         for x in grid(-5.0, 10.0, 301) {
             let pep = m.pep(x);
@@ -1223,7 +1623,7 @@ mod tests {
         let xs = synthetic_rank1_scores();
         let pool = synthetic_pool_scores();
 
-        let m = Msfdr2SmixModel::fit_top_two_pooled(
+        let m = Msfdr2SmixModel::fit_top_two_pooled_checked(
             &xs,
             &pool,
             /*iters*/ 100,
@@ -1232,7 +1632,7 @@ mod tests {
             /*bottom_frac_init*/ 0.5,
             /*top_frac_init*/ 0.2,
         )
-        .expect("2Smix should fit on synthetic input");
+        .unwrap_or_else(|error| panic!("2Smix should fit on synthetic input: {error}"));
 
         for x in grid(-5.0, 10.0, 301) {
             let pep = m.pep(x);
@@ -1420,5 +1820,311 @@ mod tests {
             assert!(!e.is_nan(), "2Smix pep NaN at x={x}");
             assert!(!f.is_nan(), "2Smix p_value NaN at x={x}");
         }
+    }
+
+    #[test]
+    fn statistical_conformance_pooled_s2_exact_replication_is_fit_invariant() {
+        // Exact row replication carries no new information. The pooled-rank
+        // balancing extension should therefore preserve its fitted state.
+        let rank1 = synthetic_rank1_scores();
+        let pool = synthetic_pool_scores();
+        let replicated: Vec<f64> = pool
+            .iter()
+            .flat_map(|&x| std::iter::repeat_n(x, 4))
+            .collect();
+        let fit = |s2: &[f64]| {
+            Msfdr2SmixModel::fit_top_two_pooled(&rank1, s2, 200, 1e-8, (0.01, 0.99), 0.5, 0.2)
+                .expect("2SMix fit")
+        };
+        let one = fit(&pool);
+        let four = fit(&replicated);
+        assert!(
+            (one.a - four.a).abs() <= 0.03,
+            "pooled-S2 replication changed a: one={} four={}",
+            one.a,
+            four.a
+        );
+        assert!(
+            (one.b - four.b).abs() <= 0.03,
+            "pooled-S2 replication changed b: one={} four={}",
+            one.b,
+            four.b
+        );
+    }
+
+    #[test]
+    fn statistical_conformance_coincident_mixture_components_fail_closed() {
+        let rank1 = vec![0.0; 100];
+        let pool = vec![0.0; 100];
+        let onesmix = Msfdr1SmixModel::fit_rank1_checked(&rank1, 100, 1e-8, (0.01, 0.99), 0.5, 0.2);
+        let twosmix = Msfdr2SmixModel::fit_top_two_pooled_checked(
+            &rank1,
+            &pool,
+            100,
+            1e-8,
+            (0.01, 0.99),
+            0.5,
+            0.2,
+        );
+        assert!(
+            matches!(
+                onesmix,
+                Err(MsfdrMixtureFitFailure::DegenerateScoreVariance { .. })
+            ) && matches!(
+                twosmix,
+                Err(MsfdrMixtureFitFailure::DegenerateScoreVariance { .. })
+            ),
+            "coincident mixtures must be unavailable: 1SMix_returned_model={} 2SMix_returned_model={}",
+            onesmix.is_ok(),
+            twosmix.is_ok()
+        );
+    }
+
+    fn gate_rank1_scores() -> Vec<f64> {
+        grid(-2.0, 6.0, 100)
+    }
+
+    fn gate_s2_scores() -> Vec<f64> {
+        grid(-3.0, 2.0, 100)
+    }
+
+    fn valid_onesmix_artifact() -> Msfdr1SmixModel {
+        Msfdr1SmixModel {
+            correct: SkewNormal::new(4.0, 0.7, 0.5),
+            incorrect1: SkewNormal::new(0.0, 0.8, -0.2),
+            a: 0.4,
+        }
+    }
+
+    fn valid_twosmix_artifact() -> Msfdr2SmixModel {
+        Msfdr2SmixModel {
+            correct: SkewNormal::new(4.0, 0.7, 0.5),
+            incorrect1: SkewNormal::new(0.0, 0.8, -0.2),
+            incorrect2: SkewNormal::new(-2.0, 0.9, 0.1),
+            a: 0.4,
+            b: 0.1,
+        }
+    }
+
+    #[test]
+    fn statistical_conformance_nonzero_constants_and_nonfinite_inputs_fail_closed() {
+        for constant in [0.0, 37.0] {
+            let rank1 = vec![constant; 100];
+            let pool = vec![constant; 100];
+            assert!(matches!(
+                Msfdr1SmixModel::fit_rank1_checked(&rank1, 100, 1e-8, (0.01, 0.99), 0.5, 0.2),
+                Err(MsfdrMixtureFitFailure::DegenerateScoreVariance { .. })
+            ));
+            assert!(matches!(
+                Msfdr2SmixModel::fit_top_two_pooled_checked(
+                    &rank1,
+                    &pool,
+                    100,
+                    1e-8,
+                    (0.01, 0.99),
+                    0.5,
+                    0.2
+                ),
+                Err(MsfdrMixtureFitFailure::DegenerateScoreVariance { .. })
+            ));
+        }
+
+        for bad in [f64::NAN, f64::INFINITY, f64::NEG_INFINITY] {
+            let mut rank1 = gate_rank1_scores();
+            rank1[17] = bad;
+            assert!(matches!(
+                Msfdr1SmixModel::fit_rank1_checked(&rank1, 100, 1e-8, (0.01, 0.99), 0.5, 0.2),
+                Err(MsfdrMixtureFitFailure::NonFiniteInput { index: 17, .. })
+            ));
+
+            let mut pool = gate_s2_scores();
+            pool[23] = bad;
+            assert!(matches!(
+                Msfdr2SmixModel::fit_top_two_pooled_checked(
+                    &gate_rank1_scores(),
+                    &pool,
+                    100,
+                    1e-8,
+                    (0.01, 0.99),
+                    0.5,
+                    0.2
+                ),
+                Err(MsfdrMixtureFitFailure::NonFiniteInput { index: 23, .. })
+            ));
+        }
+    }
+
+    #[test]
+    fn statistical_conformance_invalid_scales_weights_and_support_fail_closed() {
+        let rank1 = gate_rank1_scores();
+        let pool = gate_s2_scores();
+
+        for scale in [0.0, f64::NAN, f64::INFINITY] {
+            let mut one = valid_onesmix_artifact();
+            one.correct.scale = scale;
+            assert!(matches!(
+                one.validate_for_scores(&rank1),
+                Err(MsfdrMixtureFitFailure::NonPositiveScale { .. })
+                    | Err(MsfdrMixtureFitFailure::NonFiniteParameter { .. })
+            ));
+
+            let mut two = valid_twosmix_artifact();
+            two.incorrect2.scale = scale;
+            assert!(matches!(
+                two.validate_for_scores(&rank1, &pool),
+                Err(MsfdrMixtureFitFailure::NonPositiveScale { .. })
+                    | Err(MsfdrMixtureFitFailure::NonFiniteParameter { .. })
+            ));
+        }
+
+        for a in [0.0, 1.0, f64::NAN] {
+            let mut one = valid_onesmix_artifact();
+            one.a = a;
+            assert!(matches!(
+                one.validate_for_scores(&rank1),
+                Err(MsfdrMixtureFitFailure::InvalidMixtureWeight { .. })
+            ));
+        }
+
+        let mut ineffective_one = valid_onesmix_artifact();
+        ineffective_one.a = 0.02;
+        assert!(matches!(
+            ineffective_one.validate_for_scores(&rank1),
+            Err(MsfdrMixtureFitFailure::IneffectiveComponentSupport { .. })
+        ));
+
+        let mut boundary_two = valid_twosmix_artifact();
+        boundary_two.b = 0.0;
+        assert!(matches!(
+            boundary_two.validate_for_scores(&rank1, &pool),
+            Err(MsfdrMixtureFitFailure::InvalidMixtureWeight { .. })
+        ));
+
+        let mut ineffective_two = valid_twosmix_artifact();
+        ineffective_two.a = 0.01;
+        ineffective_two.b = 0.97;
+        assert!(matches!(
+            ineffective_two.validate_for_scores(&rank1, &pool),
+            Err(MsfdrMixtureFitFailure::IneffectiveComponentSupport { .. })
+        ));
+    }
+
+    #[test]
+    fn statistical_conformance_coincident_and_numerically_indistinguishable_components_fail() {
+        let rank1 = gate_rank1_scores();
+        let pool = gate_s2_scores();
+
+        let mut exact_one = valid_onesmix_artifact();
+        exact_one.incorrect1 = exact_one.correct.clone();
+        assert!(matches!(
+            exact_one.validate_for_scores(&rank1),
+            Err(MsfdrMixtureFitFailure::CoincidentComponents { .. })
+        ));
+
+        let mut numeric_one = valid_onesmix_artifact();
+        numeric_one.incorrect1 = numeric_one.correct.clone();
+        numeric_one.incorrect1.location += 1e-14;
+        assert!(matches!(
+            numeric_one.validate_for_scores(&rank1),
+            Err(MsfdrMixtureFitFailure::CoincidentComponents { .. })
+        ));
+
+        let mut exact_two = valid_twosmix_artifact();
+        exact_two.incorrect2 = exact_two.incorrect1.clone();
+        assert!(matches!(
+            exact_two.validate_for_scores(&rank1, &pool),
+            Err(MsfdrMixtureFitFailure::CoincidentComponents { .. })
+        ));
+
+        let mut numeric_two = valid_twosmix_artifact();
+        numeric_two.incorrect2 = numeric_two.incorrect1.clone();
+        numeric_two.incorrect2.shape += 1e-15;
+        assert!(matches!(
+            numeric_two.validate_for_scores(&rank1, &pool),
+            Err(MsfdrMixtureFitFailure::CoincidentComponents { .. })
+        ));
+    }
+
+    #[test]
+    fn statistical_conformance_valid_well_separated_and_low_variance_mixtures_pass() {
+        let rank1 = gate_rank1_scores();
+        let pool = gate_s2_scores();
+        valid_onesmix_artifact()
+            .validate_for_scores(&rank1)
+            .expect("well-separated 1SMix artifact");
+        valid_twosmix_artifact()
+            .validate_for_scores(&rank1, &pool)
+            .expect("well-separated 2SMix artifact");
+
+        let low_rank1: Vec<f64> = (0..100).map(|i| 1.0 + (i as f64 - 50.0) * 2e-9).collect();
+        let low_pool: Vec<f64> = (0..100)
+            .map(|i| 1.0 - 6e-8 + (i as f64 - 50.0) * 2e-9)
+            .collect();
+        let low_one = Msfdr1SmixModel {
+            correct: SkewNormal::new(1.0 + 8e-8, 1e-8, 0.25),
+            incorrect1: SkewNormal::new(1.0, 1e-8, -0.25),
+            a: 0.5,
+        };
+        low_one
+            .validate_for_scores(&low_rank1)
+            .expect("representable low-variance 1SMix artifact");
+        let low_two = Msfdr2SmixModel {
+            correct: SkewNormal::new(1.0 + 12e-8, 1e-8, 0.3),
+            incorrect1: SkewNormal::new(1.0 + 6e-8, 1e-8, 0.0),
+            incorrect2: SkewNormal::new(1.0, 1e-8, -0.3),
+            a: 0.4,
+            b: 0.1,
+        };
+        low_two
+            .validate_for_scores(&low_rank1, &low_pool)
+            .expect("representable low-variance 2SMix artifact");
+    }
+
+    #[test]
+    fn statistical_conformance_repeated_fitting_and_label_roles_are_deterministic() {
+        let rank1 = synthetic_rank1_scores();
+        let pool = synthetic_pool_scores();
+        let fit_one = || {
+            Msfdr1SmixModel::fit_rank1_checked(&rank1, 100, 1e-8, (0.01, 0.99), 0.5, 0.2)
+                .expect("valid 1SMix")
+        };
+        let first_one = fit_one();
+        let second_one = fit_one();
+        assert_eq!(first_one.param_tuple(), second_one.param_tuple());
+
+        let mut swapped_one = first_one.clone();
+        std::mem::swap(&mut swapped_one.correct, &mut swapped_one.incorrect1);
+        swapped_one.a = 1.0 - swapped_one.a;
+        let mut sorted = rank1.clone();
+        sorted.sort_by(|a, b| a.total_cmp(b));
+        let recanonicalized = swapped_one.orient_by_upper_tail(&sorted);
+        assert_eq!(first_one.param_tuple(), recanonicalized.param_tuple());
+
+        let fit_two = || {
+            Msfdr2SmixModel::fit_top_two_pooled_checked(
+                &rank1,
+                &pool,
+                100,
+                1e-8,
+                (0.01, 0.99),
+                0.5,
+                0.2,
+            )
+            .expect("valid fixed-role 2SMix")
+        };
+        assert_eq!(fit_two().param_tuple(), fit_two().param_tuple());
+    }
+
+    #[test]
+    fn statistical_conformance_invalid_fit_has_explicit_serializable_provenance_and_no_model() {
+        let fit =
+            Msfdr1SmixModel::fit_rank1_checked(&vec![37.0; 100], 100, 1e-8, (0.01, 0.99), 0.5, 0.2);
+        let error = fit.expect_err("invalid fit must not expose a probability-producing model");
+        assert_eq!(error.code(), "degenerate_score_variance");
+        let serialized = serde_json::to_string(&error).expect("failure provenance serializes");
+        assert!(serialized.contains("degenerate_score_variance"));
+        assert!(!serialized.contains("p_value"));
+        assert!(!serialized.contains("pep"));
+        assert!(!serialized.contains("q_value"));
     }
 }
