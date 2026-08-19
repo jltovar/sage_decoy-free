@@ -16,6 +16,12 @@ use crate::external_feature_cache::{
     RAW_EXTERNAL_PREDICTION_CACHE_SCHEMA_VERSION,
 };
 use crate::input::Input;
+use crate::parameter_optimizer::{
+    apply_fdr_overrides, parameter_catalog_fingerprint, run_optimizer, OptimizerBlock,
+    OptimizerExpert, OptimizerIdentity, OptimizerOutcome, OptimizerRunResult,
+    OptimizerWindowSearch, ParameterOptimizerConfig, ParameterValue, TrialEvaluation,
+    TrialEvaluator, TrialMetrics, TrialRecord, TrialRequest, TrialStatus,
+};
 use crate::provenance::{freeze_baseline, sha256_file, write_json_atomic, BaselineManifest};
 use crate::runner::Runner;
 use crate::validation::{
@@ -466,6 +472,11 @@ pub struct WorkflowManifest {
     /// default locks the selected window but refits nuisance state.
     #[serde(default)]
     pub target_only_calibration_policy: TargetOnlyCalibrationPolicy,
+    /// Versioned, development-only analysis-parameter optimization. The
+    /// declaration is embedded in the portable workflow; the repository
+    /// catalog is used for authoring and tests, never as a runtime file.
+    #[serde(default)]
+    pub parameter_optimizer: Option<ParameterOptimizerConfig>,
 }
 
 #[derive(Clone, Debug, Serialize, Deserialize)]
@@ -563,6 +574,10 @@ pub struct StageRecord {
     pub model_artifact_schema: Option<u32>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub ensemble_interaction_calibration: Option<EnsembleInteractionCalibration>,
+    /// Resolved analysis-only optimizer values applied after workflow defaults.
+    /// Empty for non-optimizer stages and legacy checkpoints.
+    #[serde(default)]
+    pub parameter_overrides: BTreeMap<String, ParameterValue>,
 }
 
 #[derive(Clone, Debug, Serialize, Deserialize)]
@@ -599,6 +614,10 @@ pub struct WorkflowState {
     pub resource_preflight: Vec<ResourcePreflightReport>,
     #[serde(default)]
     pub planned_models: Vec<PlannedModelReport>,
+    /// Development-only parameter-optimization provenance. Target-only
+    /// stages never contribute to these records.
+    #[serde(default)]
+    pub parameter_optimization: Vec<OptimizerRunResult>,
 }
 
 #[derive(Clone, Debug, Serialize, Deserialize, PartialEq, Eq)]
@@ -785,6 +804,47 @@ impl WorkflowManifest {
             "at least one spectrum file is required"
         );
         anyhow::ensure!(!self.models.is_empty(), "at least one model is required");
+        if let Some(optimizer) = self
+            .parameter_optimizer
+            .as_ref()
+            .filter(|optimizer| optimizer.enabled)
+        {
+            optimizer.validate()?;
+            anyhow::ensure!(
+                self.require_existing_candidate_pool
+                    && self.require_existing_annotation_cache
+                    && !self.migrate_schema_v2_annotation_cache_only,
+                "parameter optimization requires read-only existing candidate pools and raw annotation caches"
+            );
+            anyhow::ensure!(
+                self.validation.dataset_role == ValidationDatasetRole::Development,
+                "parameter optimization is development-only and requires a development dataset"
+            );
+            anyhow::ensure!(
+                (self.validation.fdr_threshold - optimizer.fixed_evaluation_threshold).abs()
+                    <= f64::EPSILON,
+                "optimizer fixed_evaluation_threshold must equal the workflow validation threshold"
+            );
+            let selected = optimizer
+                .selected_experts
+                .iter()
+                .copied()
+                .collect::<BTreeSet<_>>();
+            let requested = self
+                .models
+                .iter()
+                .filter(|model| {
+                    model.enabled
+                        && (model.model == ModelFit::Ensemble
+                            || model.ensemble_participation == EnsembleParticipation::Auto)
+                })
+                .map(|model| optimizer_expert(&model.model))
+                .collect::<BTreeSet<_>>();
+            anyhow::ensure!(
+                selected == requested,
+                "parameter_optimizer selected_experts must exactly match the JSON-selected technically eligible roster (including Ensemble when enabled)"
+            );
+        }
         let mut canonical_models = BTreeSet::new();
         for model in &self.models {
             anyhow::ensure!(
@@ -1293,10 +1353,14 @@ fn strict_resource_preflight(
         .iter()
         .any(|model| model.enabled && !matches!(model.ms2rescore, Ms2RescorePolicy::Never));
     let entrapment_fasta = strict_preflight_fasta(manifest)?;
-    let spaces = [
-        ("+entrapment", entrapment_fasta, false),
-        ("target_only", manifest.target_fasta.clone(), true),
-    ];
+    let mut spaces = vec![("+entrapment", entrapment_fasta, false)];
+    if !manifest
+        .parameter_optimizer
+        .as_ref()
+        .is_some_and(|optimizer| optimizer.enabled && optimizer.production_smoke_only)
+    {
+        spaces.push(("target_only", manifest.target_fasta.clone(), true));
+    }
     let mut reports = Vec::new();
     for (search_space, fasta, target_only) in spaces {
         let mut input = Input::load(manifest.search_config.to_string_lossy().as_ref())?;
@@ -3120,6 +3184,7 @@ fn hash_stage(
     frozen_artifact: Option<&Path>,
     ensemble_lock: Option<&EnsembleLock>,
     target_only: Option<&TargetOnlyStageContext>,
+    parameter_overrides: Option<&BTreeMap<String, ParameterValue>>,
 ) -> Result<String> {
     let mut hasher = Sha256::new();
     hasher.update(b"sage-workflow-stage-v6-external-profile-and-required-pool\0");
@@ -3157,6 +3222,10 @@ fn hash_stage(
     }
     if let Some(target_only) = target_only {
         hasher.update(serde_json::to_vec(target_only)?);
+    }
+    if let Some(parameter_overrides) = parameter_overrides {
+        hasher.update(b"parameter-optimizer-overrides-v1\0");
+        hasher.update(serde_json::to_vec(parameter_overrides)?);
     }
     Ok(format!("{:x}", hasher.finalize()))
 }
@@ -3210,6 +3279,7 @@ fn run_search_stage(
     frozen_model_artifacts: Option<&Path>,
     ensemble_lock: Option<&EnsembleLock>,
     target_only: Option<&TargetOnlyStageContext>,
+    parameter_overrides: Option<&BTreeMap<String, ParameterValue>>,
     runtime: &mut WorkflowRuntime,
 ) -> Result<StageRecord> {
     if let Some(context) = target_only {
@@ -3247,6 +3317,7 @@ fn run_search_stage(
         frozen_model_artifacts,
         ensemble_lock,
         target_only,
+        parameter_overrides,
     )?;
     let results = output_directory.join("results.sage.tsv");
     let config_snapshot = output_directory.join("workflow.search.resolved.json");
@@ -3381,7 +3452,19 @@ fn run_search_stage(
     fdr.mode = Some(FdrMode::DecoyFree);
     fdr.model_fit = Some(model.model.clone());
     fdr.nokoi_application_dataset_fingerprint = Some(dataset.fingerprint.clone());
-    if let Some(lock) = ensemble_lock {
+    if let Some(parameter_overrides) = parameter_overrides {
+        apply_fdr_overrides(fdr, parameter_overrides)?;
+    }
+    let mut optimizer_ensemble_lock = ensemble_lock.cloned();
+    if model.model == ModelFit::Ensemble && parameter_overrides.is_some() {
+        if let Some(lock) = optimizer_ensemble_lock.as_mut() {
+            let settings = FdrSettings::from(fdr.clone());
+            lock.ensemble_p_combiner = settings.ensemble_p_combiner;
+            lock.ensemble_pep_combiner = settings.ensemble_pep_combiner;
+            lock.analysis_fingerprint = ensemble_lock_analysis_fingerprint(lock)?;
+        }
+    }
+    if let Some(lock) = optimizer_ensemble_lock.as_ref() {
         anyhow::ensure!(
             model.model == ModelFit::Ensemble,
             "Ensemble lock on non-Ensemble stage"
@@ -3399,7 +3482,7 @@ fn run_search_stage(
         )?;
     }
     apply_window(fdr, &model.model, &model.window);
-    if stage == "optimized"
+    if matches!(stage, "optimized" | "parameter_optimizer_trial")
         && (!model.candidate_windows.is_empty() || model.window_optimizer.is_some())
     {
         let (strategy, bounds, adaptive) = model
@@ -3559,6 +3642,7 @@ fn run_search_stage(
         fallback_reason: None,
         model_artifact_schema: None,
         ensemble_interaction_calibration: None,
+        parameter_overrides: parameter_overrides.cloned().unwrap_or_default(),
     };
     std::fs::create_dir_all(output_directory)?;
     write_json_atomic(&checkpoint, &record)?;
@@ -3590,8 +3674,10 @@ fn run_search_stage(
     // actual search parameters that produced or consumed the pool.
     write_json_atomic(&config_snapshot, &runner.parameters)?;
 
-    let candidate_pool = (matches!(stage, "optimized" | "ms2rescore")
-        || model.model == ModelFit::Ensemble
+    let candidate_pool = (matches!(
+        stage,
+        "optimized" | "ms2rescore" | "parameter_optimizer_trial"
+    ) || model.model == ModelFit::Ensemble
         || target_only.is_some())
     .then(|| {
         let requested_by_model = model
@@ -3706,6 +3792,616 @@ fn run_search_stage(
     Ok(record)
 }
 
+fn optimizer_expert(model: &ModelFit) -> OptimizerExpert {
+    match model {
+        ModelFit::Moments => OptimizerExpert::Moments,
+        ModelFit::Mle => OptimizerExpert::Mle,
+        ModelFit::LowerOrder => OptimizerExpert::LowerOrder,
+        ModelFit::Msfdr => OptimizerExpert::MsfdrSeeded,
+        ModelFit::Msfdr1Smix => OptimizerExpert::Msfdr1Smix,
+        ModelFit::Msfdr2Smix => OptimizerExpert::Msfdr2Smix,
+        ModelFit::Nokoi => OptimizerExpert::Nokoi,
+        ModelFit::Ensemble => OptimizerExpert::Ensemble,
+    }
+}
+
+fn optimizer_config_for_expert(
+    config: &ParameterOptimizerConfig,
+    expert: OptimizerExpert,
+) -> Option<ParameterOptimizerConfig> {
+    if !config.enabled {
+        return None;
+    }
+    let blocks = config
+        .blocks
+        .iter()
+        .filter(|block| block.enabled && block.expert == Some(expert))
+        .cloned()
+        .collect::<Vec<_>>();
+    if blocks.is_empty() {
+        return None;
+    }
+    let ids = blocks
+        .iter()
+        .map(|block| block.id.clone())
+        .collect::<BTreeSet<_>>();
+    let mut selected = config.clone();
+    selected.blocks = blocks;
+    if expert != OptimizerExpert::Ensemble {
+        selected.selected_experts = vec![expert];
+    }
+    selected.block_order = config
+        .block_order
+        .iter()
+        .filter(|id| ids.contains(*id))
+        .cloned()
+        .collect();
+    Some(selected)
+}
+
+fn apply_optimizer_window(model: &mut ModelWorkflow, search: &OptimizerWindowSearch) -> Result<()> {
+    model.window = None;
+    model.candidate_windows.clear();
+    model.window_optimizer = None;
+    match search.strategy.as_str() {
+        "landscape_adaptive" => {
+            model.window_optimizer = Some(WindowOptimizerWorkflow {
+                strategy: NullWindowSearchStrategy::LandscapeAdaptive,
+                min_rank_range: search.min_rank_range,
+                max_rank_range: search.max_rank_range,
+                adaptive: AdaptiveNullWindowSearchOptions::default(),
+            });
+        }
+        "explicit_grid" => {
+            for min_rank in search.min_rank_range[0]..=search.min_rank_range[1] {
+                for max_rank in search.max_rank_range[0]..=search.max_rank_range[1] {
+                    if max_rank >= min_rank {
+                        model
+                            .candidate_windows
+                            .push(NullWindow { min_rank, max_rank });
+                    }
+                }
+            }
+            anyhow::ensure!(
+                !model.candidate_windows.is_empty() && model.candidate_windows.len() <= 10_000,
+                "explicit model-local null-window grid must contain 1..=10000 valid windows"
+            );
+        }
+        strategy => anyhow::bail!("unsupported optimizer null-window strategy {strategy}"),
+    }
+    Ok(())
+}
+
+struct WorkflowTrialEvaluator<'a> {
+    manifest: &'a WorkflowManifest,
+    dataset: &'a DatasetIdentity,
+    base_model: &'a ModelWorkflow,
+    blocks: &'a [OptimizerBlock],
+    fasta: &'a Path,
+    root: &'a Path,
+    parallel: usize,
+    ensemble_lock: Option<&'a EnsembleLock>,
+    runtime: &'a mut WorkflowRuntime,
+}
+
+struct InfrastructureSmokeEvaluator<'a> {
+    root: &'a Path,
+    candidate_pool_identity: &'a str,
+    raw_annotation_cache_identity: &'a str,
+}
+
+impl TrialEvaluator for InfrastructureSmokeEvaluator<'_> {
+    fn evaluate(&mut self, request: &TrialRequest) -> Result<TrialEvaluation> {
+        anyhow::ensure!(
+            !request.target_only_outcomes_allowed,
+            "target-only outcomes are prohibited in optimizer smoke trials"
+        );
+        // Exercise the same JSON materialization contract without fitting or
+        // reading biological result rows. Strict resource reuse was already
+        // integrity-checked by workflow preflight.
+        let mut options = FdrOptions::default();
+        apply_fdr_overrides(&mut options, &request.parameters)?;
+        Ok(TrialEvaluation {
+            status: TrialStatus::Feasible,
+            technical_reason: None,
+            empirical_reason: None,
+            metrics: Some(TrialMetrics {
+                level4_proteins: 0,
+                level4_canonical_peptides: 0,
+                level4_peptidoforms: 0,
+                level4_psms: 0,
+                adjusted_entrapment_fdp: None,
+                entrapment_count: 0,
+                adjusted_entrapment_fdp_by_level: BTreeMap::new(),
+                entrapment_count_by_level: BTreeMap::new(),
+                model_complexity: request.parameters.len(),
+            }),
+            compact_diagnostics: BTreeMap::from([
+                ("implementation_smoke_only".into(), serde_json::json!(true)),
+                ("biological_metrics_used".into(), serde_json::json!(false)),
+                ("candidate_pool_reused".into(), serde_json::json!(true)),
+                (
+                    "candidate_pool_identity".into(),
+                    serde_json::json!(self.candidate_pool_identity),
+                ),
+                (
+                    "raw_annotation_cache_reused".into(),
+                    serde_json::json!(true),
+                ),
+                (
+                    "raw_annotation_cache_identity".into(),
+                    serde_json::json!(self.raw_annotation_cache_identity),
+                ),
+                ("spectrum_search_allowed".into(), serde_json::json!(false)),
+                (
+                    "raw_annotation_generation_allowed".into(),
+                    serde_json::json!(false),
+                ),
+                ("target_only_outcomes_used".into(), serde_json::json!(false)),
+            ]),
+        })
+    }
+
+    fn materialize_winner(&mut self, record: &TrialRecord) -> Result<Option<serde_json::Value>> {
+        let directory = self.root.join("winners").join(&record.request.block_id);
+        let path = directory.join("resolved_parameters.json");
+        write_json_atomic(&path, &record.request.parameters)?;
+        Ok(Some(serde_json::json!({
+            "artifact": format!("winners/{}/resolved_parameters.json", record.request.block_id),
+            "sha256": sha256_file(&path)?,
+            "scientific_fit": false,
+            "classification": "configuration_only_implementation_smoke"
+        })))
+    }
+}
+
+impl WorkflowTrialEvaluator<'_> {
+    fn trial_directory(&self, trial_id: &str) -> PathBuf {
+        self.root.join("trials").join(trial_id)
+    }
+
+    fn model_for(&self, request: &TrialRequest) -> Result<ModelWorkflow> {
+        let mut model = self.base_model.clone();
+        if let Some(search) = self
+            .blocks
+            .iter()
+            .find(|block| block.id == request.block_id)
+            .and_then(|block| block.window_search.as_ref())
+        {
+            apply_optimizer_window(&mut model, search)?;
+        }
+        Ok(model)
+    }
+}
+
+impl TrialEvaluator for WorkflowTrialEvaluator<'_> {
+    fn evaluate(&mut self, request: &TrialRequest) -> Result<TrialEvaluation> {
+        anyhow::ensure!(
+            !request.target_only_outcomes_allowed,
+            "target-only outcomes are prohibited in optimizer trials"
+        );
+        let model = self.model_for(request)?;
+        let output = self.trial_directory(&request.trial_id);
+        let stage = match run_search_stage(
+            self.manifest,
+            self.dataset,
+            &model,
+            "parameter_optimizer_trial",
+            self.fasta,
+            &output,
+            request.use_external_features,
+            false,
+            self.parallel,
+            false,
+            None,
+            self.ensemble_lock,
+            None,
+            Some(&request.parameters),
+            self.runtime,
+        ) {
+            Ok(stage) => stage,
+            Err(error) => {
+                return Ok(TrialEvaluation {
+                    status: TrialStatus::TechnicalFailure,
+                    technical_reason: Some(format!("{error:#}")),
+                    empirical_reason: None,
+                    metrics: None,
+                    compact_diagnostics: BTreeMap::from([
+                        ("fallback_used".into(), serde_json::json!(false)),
+                        ("model_substitution".into(), serde_json::json!(false)),
+                    ]),
+                });
+            }
+        };
+        if stage.fallback_used {
+            return Ok(TrialEvaluation {
+                status: TrialStatus::TechnicalFailure,
+                technical_reason: Some(
+                    stage
+                        .fallback_reason
+                        .clone()
+                        .unwrap_or_else(|| "production trial used an undocumented fallback".into()),
+                ),
+                empirical_reason: None,
+                metrics: None,
+                compact_diagnostics: BTreeMap::from([
+                    ("fallback_used".into(), serde_json::json!(true)),
+                    ("model_substitution".into(), serde_json::json!(false)),
+                    (
+                        "resolved_production_parameters".into(),
+                        serde_json::to_value(&request.parameters)?,
+                    ),
+                    ("target_only_outcomes_used".into(), serde_json::json!(false)),
+                ]),
+            });
+        }
+        let fitted_artifacts = output.join("fitted_model_artifacts.json");
+        if !fitted_artifacts.is_file() {
+            return Ok(TrialEvaluation {
+                status: TrialStatus::TechnicalFailure,
+                technical_reason: Some(
+                    "production trial completed without a fitted_model_artifacts.json payload"
+                        .into(),
+                ),
+                empirical_reason: None,
+                metrics: None,
+                compact_diagnostics: BTreeMap::from([
+                    ("fallback_used".into(), serde_json::json!(false)),
+                    ("model_substitution".into(), serde_json::json!(false)),
+                    (
+                        "resolved_production_parameters".into(),
+                        serde_json::to_value(&request.parameters)?,
+                    ),
+                    ("target_only_outcomes_used".into(), serde_json::json!(false)),
+                ]),
+            });
+        }
+        let summaries = summarize_run(
+            &ValidationRun {
+                method: model_slug(&model.model).into(),
+                stage: "parameter_optimizer_trial".into(),
+                results: stage.results.clone(),
+                mode: ValidationMode::DecoyFree,
+                expected_search_space: Some("+Ent".into()),
+                calibration_stage: None,
+                target_only_calibration_policy: None,
+                release_candidate: false,
+            },
+            &self.manifest.validation.effective_ratios,
+            self.manifest.validation.fdr_threshold,
+        )?;
+        let level4 = summaries
+            .iter()
+            .find(|row| row.layer == "level4")
+            .context("optimizer trial has no Level-4 summary")?;
+        let adjusted_entrapment_fdp_by_level = BTreeMap::from([
+            ("psm".into(), level4.psm.combined_entrapment_fdp),
+            ("peptide".into(), level4.peptide.combined_entrapment_fdp),
+            (
+                "peptidoform".into(),
+                level4.peptidoform.combined_entrapment_fdp,
+            ),
+            ("protein".into(), level4.protein.combined_entrapment_fdp),
+        ]);
+        let entrapment_count_by_level = BTreeMap::from([
+            ("psm".into(), level4.psm.entrapment),
+            ("peptide".into(), level4.peptide.entrapment),
+            ("peptidoform".into(), level4.peptidoform.entrapment),
+            ("protein".into(), level4.protein.entrapment),
+        ]);
+        let mut diagnostics = BTreeMap::from([
+            (
+                "candidate_pool_identity".into(),
+                serde_json::json!(stage
+                    .candidate_pool
+                    .as_ref()
+                    .map(|usage| usage.search_fingerprint.clone())),
+            ),
+            (
+                "raw_annotation_cache_identity".into(),
+                serde_json::json!(stage
+                    .ms2rescore_annotation_cache
+                    .as_ref()
+                    .map(|usage| usage.raw_prediction_cache_fingerprint.clone())),
+            ),
+            (
+                "fallback_used".into(),
+                serde_json::json!(stage.fallback_used),
+            ),
+            ("model_substitution".into(), serde_json::json!(false)),
+            (
+                "production_model".into(),
+                serde_json::json!(model_slug(&model.model)),
+            ),
+            (
+                "resolved_production_parameters".into(),
+                serde_json::to_value(&request.parameters)?,
+            ),
+            (
+                "production_config_snapshot_sha256".into(),
+                serde_json::json!(stage.config_snapshot_sha256),
+            ),
+            (
+                "trial_analysis_identity".into(),
+                serde_json::json!(stage.input_hash),
+            ),
+            (
+                "results_sha256".into(),
+                serde_json::json!(stage.results_sha256),
+            ),
+            (
+                "fitted_artifact_sha256".into(),
+                serde_json::json!(sha256_file(&fitted_artifacts)?),
+            ),
+            (
+                "candidate_pool_reused".into(),
+                serde_json::json!(stage
+                    .candidate_pool
+                    .as_ref()
+                    .is_some_and(|usage| usage.reused)),
+            ),
+            (
+                "raw_annotation_cache_reused".into(),
+                serde_json::json!(stage
+                    .ms2rescore_annotation_cache
+                    .as_ref()
+                    .is_some_and(|usage| usage.reused)),
+            ),
+            ("target_only_outcomes_used".into(), serde_json::json!(false)),
+        ]);
+        let evaluations_path = output.join("null_window_evaluations.json");
+        if evaluations_path.is_file() {
+            let evaluations: Vec<sage_core::decoy_free_fdr::NullWindowEvaluation> =
+                serde_json::from_slice(&std::fs::read(&evaluations_path)?)?;
+            if let Some(selected) = evaluations.iter().find(|evaluation| evaluation.selected) {
+                diagnostics.insert(
+                    "selected_null_window".into(),
+                    serde_json::json!([selected.min_rank, selected.max_rank]),
+                );
+            }
+        } else if let Some(window) = resolved_expert_window(&model.model, &model.window) {
+            // Explicitly configured windows do not produce a landscape file,
+            // but they remain part of the fitted scientific state and winner
+            // provenance. MSFDR1-SMIX resolves here to its fixed rank 1--1
+            // contract.
+            diagnostics.insert(
+                "selected_null_window".into(),
+                serde_json::json!([window.min_rank, window.max_rank]),
+            );
+        }
+        Ok(TrialEvaluation {
+            status: TrialStatus::Feasible,
+            technical_reason: None,
+            empirical_reason: None,
+            metrics: Some(TrialMetrics {
+                level4_proteins: level4.protein.target,
+                level4_canonical_peptides: level4.peptide.target,
+                level4_peptidoforms: level4.peptidoform.target,
+                level4_psms: level4.psm.target,
+                adjusted_entrapment_fdp: level4.protein.combined_entrapment_fdp,
+                entrapment_count: level4.protein.entrapment,
+                adjusted_entrapment_fdp_by_level,
+                entrapment_count_by_level,
+                model_complexity: request.parameters.len(),
+            }),
+            compact_diagnostics: diagnostics,
+        })
+    }
+
+    fn materialize_winner(&mut self, record: &TrialRecord) -> Result<Option<serde_json::Value>> {
+        let root = self.trial_directory(&record.request.trial_id);
+        let results = root.join("results.sage.tsv");
+        let artifacts = root.join("fitted_model_artifacts.json");
+        anyhow::ensure!(results.is_file(), "winner results are missing");
+        let selected_null_window = record
+            .evaluation
+            .compact_diagnostics
+            .get("selected_null_window")
+            .cloned()
+            .or_else(|| {
+                self.model_for(&record.request)
+                    .ok()
+                    .and_then(|model| resolved_expert_window(&model.model, &model.window))
+                    .map(|window| serde_json::json!([window.min_rank, window.max_rank]))
+            });
+        Ok(Some(serde_json::json!({
+            "trial_directory": format!("trials/{}", record.request.trial_id),
+            "results_sha256": sha256_file(&results)?,
+            "fitted_artifact_sha256": artifacts.is_file().then(|| sha256_file(&artifacts)).transpose()?,
+            "selected_null_window": selected_null_window,
+        })))
+    }
+}
+
+fn optimizer_identity_from_preflight(
+    manifest: &WorkflowManifest,
+    dataset: &DatasetIdentity,
+    reports: &[ResourcePreflightReport],
+) -> Result<OptimizerIdentity> {
+    anyhow::ensure!(
+        manifest.artifact_reuse_policy == ArtifactReusePolicy::DatasetLocalOnly,
+        "parameter optimization cannot use cross-dataset fitted artifacts"
+    );
+    let resource = |kind: &str| -> Result<&ResourcePreflightReport> {
+        reports
+            .iter()
+            .find(|report| report.resource_type == kind && report.search_space == "+entrapment")
+            .with_context(|| format!("strict preflight did not resolve +entrapment {kind}"))
+    };
+    let candidate = resource("candidate_pool")?;
+    let raw = resource("raw_external_prediction_cache")?;
+    anyhow::ensure!(
+        candidate.valid && candidate.reused && !candidate.generation_allowed,
+        "optimizer candidate pool is not strict immutable reuse"
+    );
+    anyhow::ensure!(
+        raw.valid && raw.reused && !raw.generation_allowed,
+        "optimizer raw annotation cache is not strict immutable reuse"
+    );
+    Ok(OptimizerIdentity {
+        schema_version: 1,
+        dataset_identity: dataset.fingerprint.clone(),
+        candidate_pool_identity: candidate.actual_fingerprint.clone(),
+        raw_annotation_cache_identity: raw.actual_fingerprint.clone(),
+        calibrated_annotation_identity: None,
+        model_artifact_schema: 1,
+        optimizer_schema: crate::parameter_optimizer::PARAMETER_OPTIMIZER_SCHEMA_VERSION,
+        optimizer_source_sha256:
+            crate::parameter_optimizer::PARAMETER_OPTIMIZER_IMPLEMENTATION_SOURCE_SHA256.into(),
+        source_configuration_sha256: dataset.search_config_sha256.clone(),
+        catalog_sha256: parameter_catalog_fingerprint()?,
+    })
+}
+
+fn selected_optimizer_window(result: &OptimizerRunResult) -> Option<NullWindow> {
+    result
+        .block_order
+        .iter()
+        .rev()
+        .filter_map(|block| result.block_winners.get(block))
+        .filter_map(|winner| {
+            result
+                .trials
+                .iter()
+                .find(|record| &record.request.trial_id == winner)
+        })
+        .next()
+        .and_then(|record| {
+            record
+                .evaluation
+                .compact_diagnostics
+                .get("selected_null_window")
+        })
+        .and_then(serde_json::Value::as_array)
+        .filter(|ranks| ranks.len() == 2)
+        .and_then(|ranks| {
+            Some(NullWindow {
+                min_rank: u32::try_from(ranks[0].as_u64()?).ok()?,
+                max_rank: u32::try_from(ranks[1].as_u64()?).ok()?,
+            })
+        })
+}
+
+fn selected_optimizer_parameters(
+    result: &OptimizerRunResult,
+) -> Result<BTreeMap<String, ParameterValue>> {
+    let winner = result
+        .block_order
+        .iter()
+        .rev()
+        .filter_map(|block| result.block_winners.get(block))
+        .next()
+        .context("completed optimizer has no block winner")?;
+    Ok(result
+        .trials
+        .iter()
+        .find(|record| &record.request.trial_id == winner)
+        .context("optimizer block winner has no trial record")?
+        .request
+        .parameters
+        .clone())
+}
+
+fn prune_nonwinner_trial_payloads(root: &Path, result: &OptimizerRunResult) -> Result<()> {
+    let winners = result
+        .block_winners
+        .values()
+        .map(String::as_str)
+        .collect::<BTreeSet<_>>();
+    let trials = root.join("trials");
+    if !trials.is_dir() {
+        return Ok(());
+    }
+    for entry in std::fs::read_dir(&trials)? {
+        let entry = entry?;
+        if entry.file_type()?.is_dir()
+            && !winners.contains(entry.file_name().to_string_lossy().as_ref())
+        {
+            std::fs::remove_dir_all(entry.path())?;
+        }
+    }
+    Ok(())
+}
+
+#[allow(clippy::too_many_arguments)]
+fn optimize_model_parameters(
+    manifest: &WorkflowManifest,
+    dataset: &DatasetIdentity,
+    resource_preflight: &[ResourcePreflightReport],
+    model: &ModelWorkflow,
+    fasta: &Path,
+    parallel: usize,
+    ensemble_lock: Option<&EnsembleLock>,
+    runtime: &mut WorkflowRuntime,
+) -> Result<
+    Option<(
+        OptimizerRunResult,
+        BTreeMap<String, ParameterValue>,
+        Option<NullWindow>,
+    )>,
+> {
+    let Some(config) = manifest
+        .parameter_optimizer
+        .as_ref()
+        .and_then(|config| optimizer_config_for_expert(config, optimizer_expert(&model.model)))
+    else {
+        return Ok(None);
+    };
+    config.validate()?;
+    let root = manifest
+        .output_root
+        .join("parameter_optimizer")
+        .join(optimizer_expert(&model.model).slug());
+    std::fs::create_dir_all(&root)?;
+    let identity = optimizer_identity_from_preflight(manifest, dataset, resource_preflight)?;
+    write_json_atomic(&root.join("identity.json"), &identity)?;
+    let result = if config.implementation_smoke_only {
+        let mut evaluator = InfrastructureSmokeEvaluator {
+            root: &root,
+            candidate_pool_identity: &identity.candidate_pool_identity,
+            raw_annotation_cache_identity: &identity.raw_annotation_cache_identity,
+        };
+        run_optimizer(
+            &config,
+            &identity,
+            &root.join("optimizer.checkpoint.json"),
+            &mut evaluator,
+        )?
+    } else {
+        let mut evaluator = WorkflowTrialEvaluator {
+            manifest,
+            dataset,
+            base_model: model,
+            blocks: &config.blocks,
+            fasta,
+            root: &root,
+            parallel,
+            ensemble_lock,
+            runtime,
+        };
+        run_optimizer(
+            &config,
+            &identity,
+            &root.join("optimizer.checkpoint.json"),
+            &mut evaluator,
+        )?
+    };
+    write_json_atomic(&root.join("optimizer.result.json"), &result)?;
+    prune_nonwinner_trial_payloads(&root, &result)?;
+    anyhow::ensure!(
+        matches!(
+            result.outcome,
+            OptimizerOutcome::ExhaustiveBoundedOptimum | OptimizerOutcome::CompletedHeuristicLocal
+        ),
+        "parameter optimizer for {} ended as {:?}; no baseline substitution is permitted",
+        model_slug(&model.model),
+        result.outcome
+    );
+    let parameters = selected_optimizer_parameters(&result)?;
+    let window = selected_optimizer_window(&result);
+    Ok(Some((result, parameters, window)))
+}
+
 pub fn execute_workflow(
     manifest_path: &Path,
     source_repo: &Path,
@@ -3757,6 +4453,7 @@ pub fn execute_workflow(
             ensemble_interaction_calibration: None,
             resource_preflight,
             planned_models,
+            parameter_optimization: Vec::new(),
         });
     }
     std::fs::create_dir_all(&manifest.output_root)?;
@@ -3888,6 +4585,7 @@ pub fn execute_workflow(
     let mut runtime_expert_failures = BTreeMap::<String, Vec<String>>::new();
     let mut ensemble_interaction_report = None;
     let mut runtime = WorkflowRuntime::default();
+    let mut optimization_results = Vec::new();
     let mut ordered_models = manifest
         .models
         .iter()
@@ -3948,6 +4646,39 @@ pub fn execute_workflow(
             );
             continue;
         }
+        let mut resolved_model = (*model).clone();
+        let mut parameter_overrides = None;
+        if !plan_only {
+            if let Some((result, parameters, window)) = optimize_model_parameters(
+                &manifest,
+                &dataset,
+                &resource_preflight,
+                &resolved_model,
+                &active_entrapment_fasta,
+                parallel,
+                ensemble_lock.as_ref(),
+                &mut runtime,
+            )? {
+                if let Some(window) = window {
+                    resolved_model.window = Some(window);
+                    resolved_model.candidate_windows.clear();
+                    resolved_model.window_optimizer = None;
+                }
+                parameter_overrides = Some(parameters);
+                optimization_results.push(result);
+            }
+        }
+        if manifest
+            .parameter_optimizer
+            .as_ref()
+            .is_some_and(|optimizer| {
+                optimizer.enabled
+                    && (optimizer.implementation_smoke_only || optimizer.production_smoke_only)
+            })
+        {
+            continue;
+        }
+        let model = &resolved_model;
         let optimized = match run_search_stage(
             &manifest,
             &dataset,
@@ -3962,6 +4693,7 @@ pub fn execute_workflow(
             imported_diagnostic_artifact,
             ensemble_lock.as_ref(),
             None,
+            parameter_overrides.as_ref(),
             &mut runtime,
         ) {
             Ok(record) => record,
@@ -4028,6 +4760,7 @@ pub fn execute_workflow(
                 imported_diagnostic_artifact,
                 ensemble_lock.as_ref(),
                 None,
+                parameter_overrides.as_ref(),
                 &mut runtime,
             ) {
                 Ok(record) => record,
@@ -4226,6 +4959,7 @@ pub fn execute_workflow(
                     None,
                     Some(baseline_lock),
                     None,
+                    parameter_overrides.as_ref(),
                     &mut runtime,
                 )?;
                 baseline_record.release_candidate = false;
@@ -4398,6 +5132,7 @@ pub fn execute_workflow(
                     frozen_model_artifacts,
                     ensemble_lock.as_ref(),
                     Some(&context),
+                    parameter_overrides.as_ref(),
                 )?;
                 let record = StageRecord {
                     schema_version: 4,
@@ -4446,6 +5181,7 @@ pub fn execute_workflow(
                     fallback_reason: None,
                     model_artifact_schema: optimized.model_artifact_schema,
                     ensemble_interaction_calibration: None,
+                    parameter_overrides: parameter_overrides.clone().unwrap_or_default(),
                 };
                 std::fs::create_dir_all(&target_output_directory)?;
                 write_json_atomic(
@@ -4471,6 +5207,7 @@ pub fn execute_workflow(
                     .flatten(),
                 ensemble_lock.as_ref(),
                 Some(&context),
+                parameter_overrides.as_ref(),
                 &mut runtime,
             ) {
                 Ok(record) => record,
@@ -4961,6 +5698,7 @@ pub fn execute_workflow(
         ensemble_interaction_calibration: ensemble_interaction_report,
         resource_preflight,
         planned_models: planned_model_reports(&manifest),
+        parameter_optimization: optimization_results,
     };
     write_json_atomic(&manifest.output_root.join("workflow.state.json"), &state)?;
     Ok(state)
@@ -5000,6 +5738,115 @@ mod tests {
             }),
             ..DfRunArtifacts::default()
         }
+    }
+
+    fn test_optimizer_config() -> ParameterOptimizerConfig {
+        ParameterOptimizerConfig {
+            schema_version: 1,
+            enabled: true,
+            classification: crate::parameter_optimizer::OptimizationClassification::DevelopmentOnly,
+            selected_experts: vec![OptimizerExpert::Moments],
+            compiled_defaults: BTreeMap::new(),
+            workflow_defaults: BTreeMap::new(),
+            fixed_baseline_values: BTreeMap::new(),
+            seed: 42,
+            maximum_trial_budget: 2,
+            maximum_optimization_passes: 1,
+            objective: crate::parameter_optimizer::default_objective(),
+            fixed_evaluation_threshold: 0.01,
+            empirical_entrapment_constraints: Vec::new(),
+            statistical_validity_contracts: BTreeMap::new(),
+            resume: true,
+            materialize_winner: true,
+            implementation_smoke_only: false,
+            production_smoke_only: false,
+            require_existing_candidate_pool: true,
+            require_existing_raw_annotation_cache: true,
+            target_only_outcomes_excluded: true,
+            block_order: vec!["moments".into()],
+            blocks: vec![OptimizerBlock {
+                id: "moments".into(),
+                enabled: true,
+                scope: crate::parameter_optimizer::ParameterScope::PerExpert,
+                expert: Some(OptimizerExpert::Moments),
+                strategy: crate::parameter_optimizer::OptimizerStrategy::ExhaustiveGrid,
+                structural_comparison: false,
+                fixed: BTreeMap::new(),
+                space: BTreeMap::from([(
+                    "moments_purification_factor".into(),
+                    vec![ParameterValue::Float(0.1), ParameterValue::Float(0.2)],
+                )]),
+                window_search: Some(OptimizerWindowSearch {
+                    strategy: "explicit_grid".into(),
+                    min_rank_range: [2, 3],
+                    max_rank_range: [3, 4],
+                }),
+                use_external_features: true,
+                max_trials: Some(2),
+                max_passes: None,
+            }],
+        }
+    }
+
+    #[test]
+    fn workflow_optimizer_requires_strict_reuse_and_exact_json_roster() {
+        let directory = test_directory("workflow-parameter-optimizer-contract");
+        let mut manifest = minimal_manifest(&directory, ValidationDatasetRole::Development);
+        manifest.parameter_optimizer = Some(test_optimizer_config());
+        assert!(manifest
+            .validate()
+            .unwrap_err()
+            .to_string()
+            .contains("read-only existing candidate pools"));
+        manifest.require_existing_candidate_pool = true;
+        manifest.require_existing_annotation_cache = true;
+        manifest.validate().unwrap();
+        manifest
+            .parameter_optimizer
+            .as_mut()
+            .unwrap()
+            .selected_experts
+            .push(OptimizerExpert::Mle);
+        assert!(manifest
+            .validate()
+            .unwrap_err()
+            .to_string()
+            .contains("exactly match"));
+        std::fs::remove_dir_all(directory).unwrap();
+    }
+
+    #[test]
+    fn model_local_optimizer_windows_are_bounded_and_deterministic() {
+        let mut model = ModelWorkflow {
+            model: ModelFit::Moments,
+            window: Some(NullWindow {
+                min_rank: 9,
+                max_rank: 18,
+            }),
+            candidate_windows: Vec::new(),
+            window_optimizer: None,
+            enabled: true,
+            ms2rescore: Ms2RescorePolicy::Never,
+            maximum_raw_fdp_increase: None,
+            minimum_level4_peptide_gain: None,
+            target_only_calibration_policy: None,
+            ensemble_participation: EnsembleParticipation::Auto,
+            ensemble_exclusion_reason: None,
+            ensemble_interaction_baseline: true,
+        };
+        let search = OptimizerWindowSearch {
+            strategy: "explicit_grid".into(),
+            min_rank_range: [2, 3],
+            max_rank_range: [3, 4],
+        };
+        apply_optimizer_window(&mut model, &search).unwrap();
+        let windows = model
+            .candidate_windows
+            .iter()
+            .map(|window| (window.min_rank, window.max_rank))
+            .collect::<Vec<_>>();
+        assert_eq!(windows, vec![(2, 3), (2, 4), (3, 3), (3, 4)]);
+        assert!(model.window.is_none());
     }
     use sage_core::ml::nokoi::{
         fit_nokoi_artifact_with_metadata, LogisticRegression, NokoiArtifact,
@@ -5208,6 +6055,7 @@ mod tests {
             locked_expert_artifacts: BTreeMap::new(),
             artifact_reuse_policy: ArtifactReusePolicy::DatasetLocalOnly,
             target_only_calibration_policy: TargetOnlyCalibrationPolicy::RefitWithLockedWindow,
+            parameter_optimizer: None,
         }
     }
 
@@ -5593,6 +6441,7 @@ mod tests {
             fallback_reason: None,
             model_artifact_schema: None,
             ensemble_interaction_calibration: None,
+            parameter_overrides: BTreeMap::new(),
         };
         let mut legacy_value = serde_json::to_value(&record).unwrap();
         legacy_value["schema_version"] = serde_json::json!(2);
@@ -6716,6 +7565,7 @@ mod tests {
             locked_expert_artifacts: BTreeMap::new(),
             artifact_reuse_policy: ArtifactReusePolicy::DatasetLocalOnly,
             target_only_calibration_policy: TargetOnlyCalibrationPolicy::RefitWithLockedWindow,
+            parameter_optimizer: None,
         };
         let dataset = DatasetIdentity {
             schema_version: 1,

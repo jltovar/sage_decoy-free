@@ -145,6 +145,16 @@ the individual experts and writes `ensemble.lock.json`; manually copying windows
 JSON is no longer required. Native and MS2Rescore artifacts are kept separate so an artifact fit
 after rescoring cannot be used silently in the native comparison.
 
+The broader `parameter_optimizer` workflow section builds on this machinery. It resolves and
+optimizes each expert independently, then runs separate final Ensemble combination/aggregation
+blocks. Trials require exact existing candidate pools and layered raw caches; search and raw
+annotation generation have no fallback. Only +entrapment development evidence can rank trials.
+Target-only results are reporting-only after the winner is frozen. The full interface and portable
+resume/fingerprint contract are documented in [PARAMETER_OPTIMIZER.md](PARAMETER_OPTIMIZER.md).
+Machine-readable binding coverage prevents a catalogued parameter from becoming a silent no-op.
+The bounded production-smoke mode evaluates real +entrapment trials, materializes winners, and
+then stops before ordinary post-winner or target-only stages.
+
 ## Layered MS2Rescore prediction and calibration caches
 
 An MS2Rescore stage consumes the same immutable native candidate pool as its optimized stage, so
