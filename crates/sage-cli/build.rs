@@ -20,7 +20,14 @@ fn main() {
         hasher.finalize()
     );
 
-    let optimizer_sources = ["src/parameter_optimizer.rs", "src/workflow.rs"];
+    let optimizer_sources = [
+        "src/parameter_optimizer.rs",
+        "src/workflow.rs",
+        "src/entrapment.rs",
+        "src/validation.rs",
+        "../sage/src/input.rs",
+        "../sage/src/decoy_free_fdr.rs",
+    ];
     let mut optimizer_hasher = Sha256::new();
     optimizer_hasher.update(b"sage-parameter-optimizer-source-v1\0");
     for source in optimizer_sources {

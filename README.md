@@ -148,6 +148,26 @@ historical blocking behavior. `development_eligible` may be requested only for d
 runs: a technically valid, within-ceiling zero/sparse-entrapment trial may enter the unchanged
 development objective, but remains `not_evaluable_underpowered` for empirical validation and
 `not_evaluated` for statistical-default eligibility.
+Schema v4 adds dataset-local `entrapment_validation`. The backward-compatible
+`full_population_development` mode exposes the complete entrapment population to development
+selection and makes no independent calibration claim. The prospective `selection_audit` mode
+partitions foreign proteins by content-stable shared-searchable-peptide components before fitting.
+Production fitting and q-calibration see every candidate score but no entrapment partition role.
+Only the workflow's development FDP/objective sees selection labels and measured selection ratios;
+audit labels remain hidden until every expert and final Ensemble winner is frozen, then each winner
+is evaluated once with separately measured audit ratios and uncertainty. The partition changes the
+analysis/optimizer identity, never the spectrum-search candidate pool or raw prediction-cache
+identity, and never controls Ensemble participation. Every new dataset constructs its own
+partition and reruns local parameter/window optimization; previously selected ISB settings are not
+portable defaults.
+
+Create and freeze the prospective artifact before any optimizer trial with
+`sage materialize-entrapment-partition workflow.json`. This dedicated path reads only the manifest,
+digestion/search-space configuration, dataset identities, target and active +entrapment FASTAs, and
+the existing entrapment-construction report. It does not resolve candidate or annotation caches,
+search spectra, fit a model, evaluate a trial, or access target-only resources.
+Its `--inputs-only` form reports the prospective identities without assigning components or
+writing the artifact.
 
 ### Layered MS2Rescore prediction cache
 

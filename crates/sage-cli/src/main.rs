@@ -5,7 +5,7 @@ use sage_cli::entrapment::execute_entrapment_audit;
 use sage_cli::input::Input;
 use sage_cli::provenance::{freeze_baseline, write_json_atomic};
 use sage_cli::runner::Runner;
-use sage_cli::workflow::execute_workflow;
+use sage_cli::workflow::{execute_workflow, materialize_workflow_entrapment_partition};
 
 fn main() -> anyhow::Result<()> {
     env_logger::Builder::default()
@@ -49,6 +49,25 @@ fn main() -> anyhow::Result<()> {
                         .long("plan-only")
                         .action(clap::ArgAction::SetTrue)
                         .help("Validate and materialize the workflow plan without running searches"),
+                ),
+        )
+        .subcommand(
+            Command::new("materialize-entrapment-partition")
+                .about(
+                    "Materialize or validate a workflow's deterministic entrapment partition without running searches or optimizer trials",
+                )
+                .arg(
+                    Arg::new("manifest")
+                        .required(true)
+                        .value_parser(clap::builder::NonEmptyStringValueParser::new())
+                        .value_hint(ValueHint::FilePath)
+                        .help("Path to a Sage Decoy-Free workflow manifest"),
+                )
+                .arg(
+                    Arg::new("inputs-only")
+                        .long("inputs-only")
+                        .action(clap::ArgAction::SetTrue)
+                        .help("Print prospective partition input identities without assigning components or writing an artifact"),
                 ),
         )
         .subcommand(
@@ -193,6 +212,26 @@ fn main() -> anyhow::Result<()> {
             report.database.measured().peptide_ratio,
             report.database.measured().peptidoform_ratio
         );
+        return Ok(());
+    }
+    if let Some(("materialize-entrapment-partition", partition_matches)) = matches.subcommand() {
+        let manifest = partition_matches
+            .get_one::<String>("manifest")
+            .expect("required workflow manifest");
+        if partition_matches
+            .get_one::<bool>("inputs-only")
+            .copied()
+            .unwrap_or(false)
+        {
+            let inputs = sage_cli::workflow::inspect_workflow_entrapment_partition_inputs(
+                std::path::Path::new(manifest),
+            )?;
+            println!("{}", serde_json::to_string_pretty(&inputs)?);
+        } else {
+            let artifact =
+                materialize_workflow_entrapment_partition(std::path::Path::new(manifest))?;
+            println!("{}", serde_json::to_string_pretty(&artifact)?);
+        }
         return Ok(());
     }
 

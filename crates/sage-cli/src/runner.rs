@@ -1149,6 +1149,7 @@ impl Runner {
                 let ent = sage_core::decoy_free_fdr::calculate_entrapment_counts_df(
                     &features,
                     &self.database,
+                    &fdr_settings,
                     fdr_settings.peptide_fdr,
                     fdr_settings.protein_fdr,
                 );

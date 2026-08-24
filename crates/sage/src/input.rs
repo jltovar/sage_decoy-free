@@ -159,6 +159,11 @@ pub struct NullWindowOptimizerOptions {
     pub maximum_entrapment_fdp: f64,
     #[serde(default = "default_minimum_entrapment_count")]
     pub minimum_entrapment_count_for_stable_estimate: usize,
+    /// Sorted preregistered selection-entrapment protein accessions. When
+    /// present, audit entrapments remain in the fitted candidate population
+    /// but are excluded from null-window objective counts and FDP numerators.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub selection_entrapment_proteins: Option<Vec<String>>,
     /// Emit the full normal-analysis INFO diagnostics for every trial. The
     /// default is false because compact trial metrics and warnings are enough
     /// during an optimizer grid; the selected analysis is still materialized
@@ -923,6 +928,14 @@ pub struct FdrOptions {
     pub mode: Option<FdrMode>,
     pub entrapment_report: Option<EntrapmentReportMode>,
 
+    /// Workflow-internal selection labels for a prospectively frozen
+    /// selection/audit partition. This cannot be supplied through JSON. When
+    /// present, all physical `Ent_` roles are masked from production fitting
+    /// and calibration; the workflow alone uses this list for development FDP
+    /// metrics and the complementary list for the post-freeze audit.
+    #[serde(skip)]
+    pub selection_entrapment_proteins: Option<Vec<String>>,
+
     // Model selection
     pub model_fit: Option<ModelFit>,
 
@@ -1280,6 +1293,7 @@ pub struct FdrSettings {
     // =========================================================================
     pub mode: FdrMode,
     pub entrapment_report: EntrapmentReportMode,
+    pub selection_entrapment_proteins: Option<Vec<String>>,
 
     // Model selection
     pub model_fit: ModelFit,
@@ -1630,6 +1644,12 @@ impl From<FdrOptions> for FdrSettings {
         let entrapment_report = options
             .entrapment_report
             .unwrap_or(EntrapmentReportMode::Auto);
+        let selection_entrapment_proteins =
+            options.selection_entrapment_proteins.map(|mut values| {
+                values.sort();
+                values.dedup();
+                values
+            });
 
         let hierarchical_inference = options.hierarchical_inference.unwrap_or_default();
 
@@ -2098,6 +2118,7 @@ impl From<FdrOptions> for FdrSettings {
             // =========================================================================
             mode,
             entrapment_report,
+            selection_entrapment_proteins,
 
             // Model selection
             model_fit,

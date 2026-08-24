@@ -456,7 +456,11 @@ fn protein_class(proteins: &str) -> Option<ProteinClass> {
     }
     let mut target = false;
     let mut entrapment = false;
-    for protein in proteins.split(';').map(str::trim).filter(|x| !x.is_empty()) {
+    for protein in proteins
+        .split([';', '/'])
+        .map(str::trim)
+        .filter(|x| !x.is_empty())
+    {
         if protein.contains("Ent_") {
             entrapment = true;
         } else {
@@ -538,6 +542,28 @@ pub fn summarize_run(
     ratios: &EffectiveRatios,
     fdr_threshold: f64,
 ) -> Result<Vec<RunValidationSummary>> {
+    summarize_run_with_entrapment_partition(run, ratios, fdr_threshold, None)
+}
+
+/// Summarize one immutable result table while exposing only one preregistered
+/// entrapment-label population. Genuine targets are counted identically in
+/// selection and audit summaries; entrapment proteins outside `allowed` are
+/// ignored rather than relabeled as targets.
+pub fn summarize_run_for_entrapment_partition(
+    run: &ValidationRun,
+    ratios: &EffectiveRatios,
+    fdr_threshold: f64,
+    allowed: &BTreeSet<String>,
+) -> Result<Vec<RunValidationSummary>> {
+    summarize_run_with_entrapment_partition(run, ratios, fdr_threshold, Some(allowed))
+}
+
+fn summarize_run_with_entrapment_partition(
+    run: &ValidationRun,
+    ratios: &EffectiveRatios,
+    fdr_threshold: f64,
+    allowed_entrapments: Option<&BTreeSet<String>>,
+) -> Result<Vec<RunValidationSummary>> {
     if !run.results.is_file() {
         return Ok(Vec::new());
     }
@@ -594,7 +620,8 @@ pub fn summarize_run(
 
     let mut raw = Sets::default();
     let mut reportable = Sets::default();
-    let mut has_entrapment = false;
+    let mut has_entrapment = allowed_entrapments.is_some();
+    let mut observed_entrapment_search_space = false;
     for (row_index, row) in reader.records().enumerate() {
         let row = row?;
         if parse_i64(row.get(rank)) != Some(1) || parse_i64(row.get(label)) != Some(1) {
@@ -606,7 +633,28 @@ pub fn summarize_run(
         }
         let entrapment = match protein_class(protein_text) {
             Some(ProteinClass::Target) => false,
-            Some(ProteinClass::Entrapment) => true,
+            Some(ProteinClass::Entrapment) => {
+                observed_entrapment_search_space = true;
+                if let Some(allowed) = allowed_entrapments {
+                    let proteins = protein_text
+                        .split([';', '/'])
+                        .map(str::trim)
+                        .filter(|protein| !protein.is_empty())
+                        .collect::<Vec<_>>();
+                    let included = proteins
+                        .iter()
+                        .filter(|protein| allowed.contains(**protein))
+                        .count();
+                    anyhow::ensure!(
+                        included == 0 || included == proteins.len(),
+                        "result protein group crosses the selection/audit entrapment boundary: {protein_text}"
+                    );
+                    if included == 0 {
+                        continue;
+                    }
+                }
+                true
+            }
             Some(ProteinClass::Ambiguous) | None => continue,
         };
         let protein = protein_key(protein_text);
@@ -679,7 +727,11 @@ pub fn summarize_run(
         }
     }
 
-    let observed_search_space = if has_entrapment { "+Ent" } else { "No Ent" };
+    let observed_search_space = if observed_entrapment_search_space || has_entrapment {
+        "+Ent"
+    } else {
+        "No Ent"
+    };
     if let Some(expected) = run.expected_search_space.as_deref() {
         anyhow::ensure!(
             expected == observed_search_space,
@@ -729,7 +781,7 @@ pub fn summarize_run(
             peptide,
             peptidoform,
             protein,
-            counting_definition: "rank=1,label=1,non-contaminant,unambiguous target/entrapment mapping; PSM is a distinct result-table PSM identity; peptide removes bracketed modifications and canonicalizes I/L; peptidoform retains bracketed modification annotations while canonicalizing unmodified I/L; protein requires one inferred protein key"
+            counting_definition: "rank=1,label=1,non-contaminant,unambiguous target/entrapment mapping; optional preregistered entrapment partition ignores the other partition without relabeling it as target; PSM is a distinct result-table PSM identity; peptide removes bracketed modifications and canonicalizes I/L; peptidoform retains bracketed modification annotations while canonicalizing unmodified I/L; protein requires one inferred protein key"
                 .into(),
         }
     };
@@ -1569,6 +1621,100 @@ mod tests {
         assert_eq!(level4.peptidoform.target, 2);
         assert_eq!(level4.peptidoform.entrapment, 1);
         assert!(level4.counting_definition.contains("peptidoform retains"));
+        std::fs::remove_file(path).unwrap();
+    }
+
+    #[test]
+    fn selection_and_audit_summaries_are_disjoint_without_target_relabeling() {
+        let path = std::env::temp_dir().join(format!(
+            "sage-entrapment-partition-summary-{}-{}.tsv",
+            std::process::id(),
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .unwrap()
+                .as_nanos()
+        ));
+        let header = "psm_id\trank\tlabel\tproteins\tpeptide\tdecoy_free_q_value\tdecoy_free_peptide_q\tdecoy_free_protein_q\tdecoy_free_protein_supported_peptide\tdecoy_free_peptide_supported_psm\n";
+        std::fs::write(
+            &path,
+            format!(
+                "{header}t1\t1\t1\tTarget_A\tTARGETPEP\t0.001\t0.001\t0.001\ttrue\ttrue\n\
+                 s1\t1\t1\tEnt_selection\tSELECTPEP\t0.001\t0.001\t0.001\ttrue\ttrue\n\
+                 a1\t1\t1\tEnt_audit\tAUDITPEP\t0.001\t0.001\t0.001\ttrue\ttrue\n"
+            ),
+        )
+        .unwrap();
+        let run = ValidationRun {
+            method: "moments".into(),
+            stage: "frozen".into(),
+            results: path.clone(),
+            mode: ValidationMode::DecoyFree,
+            expected_search_space: Some("+Ent".into()),
+            calibration_stage: None,
+            target_only_calibration_policy: None,
+            release_candidate: false,
+        };
+        let ratios = EffectiveRatios {
+            psm: 0.25,
+            peptide: 0.5,
+            protein: 1.0,
+        };
+        let selection = summarize_run_for_entrapment_partition(
+            &run,
+            &ratios,
+            0.01,
+            &BTreeSet::from(["Ent_selection".into()]),
+        )
+        .unwrap();
+        let audit = summarize_run_for_entrapment_partition(
+            &run,
+            &ratios,
+            0.01,
+            &BTreeSet::from(["Ent_audit".into()]),
+        )
+        .unwrap();
+        let selection = selection.iter().find(|row| row.layer == "level4").unwrap();
+        let audit = audit.iter().find(|row| row.layer == "level4").unwrap();
+        assert_eq!((selection.psm.target, selection.psm.entrapment), (1, 1));
+        assert_eq!((audit.psm.target, audit.psm.entrapment), (1, 1));
+        assert_eq!(selection.protein.target, 1);
+        assert_eq!(audit.protein.target, 1);
+        assert_eq!(selection.protein.combined_entrapment_fdp, Some(1.0));
+        assert_eq!(audit.protein.combined_entrapment_fdp, Some(1.0));
+
+        std::fs::write(
+            &path,
+            format!(
+                "{header}x1\t1\t1\tEnt_selection;Ent_audit\tCROSSPEP\t0.001\t0.001\t0.001\ttrue\ttrue\n"
+            ),
+        )
+        .unwrap();
+        let error = summarize_run_for_entrapment_partition(
+            &run,
+            &ratios,
+            0.01,
+            &BTreeSet::from(["Ent_selection".into()]),
+        )
+        .unwrap_err()
+        .to_string();
+        assert!(error.contains("crosses the selection/audit"));
+
+        std::fs::write(
+            &path,
+            format!(
+                "{header}x2\t1\t1\tEnt_selection/Ent_audit\tCROSSGROUP\t0.001\t0.001\t0.001\ttrue\ttrue\n"
+            ),
+        )
+        .unwrap();
+        let error = summarize_run_for_entrapment_partition(
+            &run,
+            &ratios,
+            0.01,
+            &BTreeSet::from(["Ent_selection".into()]),
+        )
+        .unwrap_err()
+        .to_string();
+        assert!(error.contains("crosses the selection/audit"));
         std::fs::remove_file(path).unwrap();
     }
 

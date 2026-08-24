@@ -1,4 +1,8 @@
 use crate::input::Input;
+use crate::parameter_optimizer::{
+    EntrapmentValidationConfig, EntrapmentValidationMode,
+    PARAMETER_OPTIMIZER_IMPLEMENTATION_SOURCE_SHA256,
+};
 use crate::provenance::{sha256_file, write_json_atomic};
 use anyhow::{Context, Result};
 use sage_core::database::Parameters;
@@ -16,7 +20,7 @@ struct FastaRecord {
     sequence: String,
 }
 
-#[derive(Clone, Debug, Serialize, Deserialize)]
+#[derive(Clone, Debug, Serialize, Deserialize, PartialEq)]
 pub struct EntrapmentRatios {
     pub target_proteins: usize,
     pub entrapment_proteins: usize,
@@ -27,6 +31,83 @@ pub struct EntrapmentRatios {
     pub target_peptidoforms: usize,
     pub entrapment_peptidoforms: usize,
     pub peptidoform_ratio: f64,
+}
+
+#[derive(Clone, Copy, Debug, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(rename_all = "snake_case")]
+pub enum EntrapmentPartitionAssignment {
+    Selection,
+    Audit,
+}
+
+#[derive(Clone, Debug, Serialize, Deserialize, PartialEq, Eq)]
+pub struct EntrapmentComponentAssignment {
+    pub component_identity: String,
+    pub partition: EntrapmentPartitionAssignment,
+    pub proteins: Vec<String>,
+    pub canonical_peptide_count: usize,
+    pub peptidoform_count: usize,
+}
+
+#[derive(Clone, Debug, Serialize, Deserialize, PartialEq)]
+pub struct EntrapmentPartitionArtifact {
+    pub schema_version: u32,
+    pub partition_identity: String,
+    pub dataset_identity: String,
+    pub target_fasta_sha256: String,
+    pub active_entrapment_fasta_sha256: String,
+    pub digestion_search_space_identity: String,
+    pub entrapment_construction_identity: String,
+    pub seed: u64,
+    pub salt: String,
+    pub requested_selection_fraction: f64,
+    pub requested_audit_fraction: f64,
+    pub realized_selection_fraction: f64,
+    pub realized_audit_fraction: f64,
+    pub component_assignments: Vec<EntrapmentComponentAssignment>,
+    pub selection_proteins: Vec<String>,
+    pub audit_proteins: Vec<String>,
+    pub selection_canonical_peptides: Vec<String>,
+    pub audit_canonical_peptides: Vec<String>,
+    pub selection_peptidoforms: Vec<String>,
+    pub audit_peptidoforms: Vec<String>,
+    pub selection_ratios: EntrapmentRatios,
+    pub audit_ratios: EntrapmentRatios,
+    pub source_implementation_identity: String,
+    pub payload_sha256: String,
+}
+
+/// The only partition data available to model fitting and optimizer trial
+/// evaluation. Audit identities and ratios deliberately have no field here.
+#[derive(Clone, Debug, Serialize, Deserialize, PartialEq)]
+pub struct EntrapmentSelectionView {
+    pub partition_identity: String,
+    pub selection_proteins: Vec<String>,
+    pub selection_ratios: EntrapmentRatios,
+}
+
+impl EntrapmentPartitionArtifact {
+    pub fn selection_protein_set(&self) -> BTreeSet<String> {
+        self.selection_proteins.iter().cloned().collect()
+    }
+
+    pub fn audit_protein_set(&self) -> BTreeSet<String> {
+        self.audit_proteins.iter().cloned().collect()
+    }
+
+    pub fn selection_view(&self) -> EntrapmentSelectionView {
+        EntrapmentSelectionView {
+            partition_identity: self.partition_identity.clone(),
+            selection_proteins: self.selection_proteins.clone(),
+            selection_ratios: self.selection_ratios.clone(),
+        }
+    }
+}
+
+impl EntrapmentSelectionView {
+    pub fn selection_protein_set(&self) -> BTreeSet<String> {
+        self.selection_proteins.iter().cloned().collect()
+    }
 }
 
 #[derive(Clone, Debug, Default, Serialize, Deserialize, PartialEq, Eq)]
@@ -436,6 +517,511 @@ fn split_combined_records(records: &[FastaRecord]) -> (Vec<FastaRecord>, Vec<Fas
         .iter()
         .cloned()
         .partition(|record| !is_entrapment_record(record))
+}
+
+#[derive(Clone, Debug)]
+struct ProteinSearchEvidence {
+    record: FastaRecord,
+    peptides: BTreeSet<String>,
+    peptidoforms: BTreeSet<String>,
+}
+
+fn canonical_digested_keys(peptide: &sage_core::peptide::Peptide) -> (String, String) {
+    let sequence = String::from_utf8_lossy(&peptide.sequence)
+        .chars()
+        .map(|residue| {
+            let residue = residue.to_ascii_uppercase();
+            if residue == 'I' {
+                'L'
+            } else {
+                residue
+            }
+        })
+        .collect::<String>();
+    let modifications = peptide
+        .modifications
+        .iter()
+        .map(|mass| mass.to_bits().to_string())
+        .collect::<Vec<_>>()
+        .join(",");
+    let peptidoform = format!(
+        "{}|n={:?}|c={:?}|m={}",
+        sequence,
+        peptide.nterm.map(f32::to_bits),
+        peptide.cterm.map(f32::to_bits),
+        modifications
+    );
+    (sequence, peptidoform)
+}
+
+fn protein_search_evidence(
+    parameters: &Parameters,
+    records: &[FastaRecord],
+) -> Result<Vec<ProteinSearchEvidence>> {
+    let mut by_accession = records
+        .iter()
+        .cloned()
+        .map(|record| {
+            (
+                record.accession.clone(),
+                ProteinSearchEvidence {
+                    record,
+                    peptides: BTreeSet::new(),
+                    peptidoforms: BTreeSet::new(),
+                },
+            )
+        })
+        .collect::<BTreeMap<_, _>>();
+    anyhow::ensure!(
+        by_accession.len() == records.len(),
+        "entrapment FASTA contains duplicate accessions"
+    );
+    for peptide in parameters
+        .digest(&fasta_from_records(records))
+        .into_iter()
+        .filter(|peptide| !peptide.decoy)
+    {
+        let (canonical, peptidoform) = canonical_digested_keys(&peptide);
+        for protein in &peptide.proteins {
+            let accession = protein.to_string();
+            let evidence = by_accession.get_mut(&accession).with_context(|| {
+                format!("digested peptide refers to unknown FASTA protein {accession}")
+            })?;
+            evidence.peptides.insert(canonical.clone());
+            evidence.peptidoforms.insert(peptidoform.clone());
+        }
+    }
+    Ok(by_accession.into_values().collect())
+}
+
+fn stable_component_identity(proteins: &[&ProteinSearchEvidence]) -> String {
+    let mut members = proteins
+        .iter()
+        .map(|protein| {
+            let sequence_sha256 =
+                format!("{:x}", Sha256::digest(protein.record.sequence.as_bytes()));
+            format!(
+                "{}\0{}",
+                canonical_source_accession(&protein.record.accession),
+                sequence_sha256
+            )
+        })
+        .collect::<Vec<_>>();
+    members.sort();
+    let mut hasher = Sha256::new();
+    hasher.update(b"sage-entrapment-component-v1\0");
+    for member in members {
+        hasher.update(member.as_bytes());
+        hasher.update([0]);
+    }
+    format!("{:x}", hasher.finalize())
+}
+
+pub fn digestion_search_space_identity(parameters: &Parameters) -> Result<String> {
+    let mut static_mods = parameters
+        .static_mods
+        .iter()
+        .map(|(specificity, mass)| Ok((serde_json::to_string(specificity)?, mass.to_bits())))
+        .collect::<Result<Vec<_>>>()?;
+    static_mods.sort();
+    let mut variable_mods = parameters
+        .variable_mods
+        .iter()
+        .map(|(specificity, masses)| {
+            let mut masses = masses.iter().map(|mass| mass.to_bits()).collect::<Vec<_>>();
+            masses.sort_unstable();
+            Ok((serde_json::to_string(specificity)?, masses))
+        })
+        .collect::<Result<Vec<_>>>()?;
+    variable_mods.sort();
+    let portable = serde_json::json!({
+        "schema": "sage-entrapment-digestion-search-space-v1",
+        "enzyme": parameters.enzyme,
+        "peptide_min_mass_bits": parameters.peptide_min_mass.to_bits(),
+        "peptide_max_mass_bits": parameters.peptide_max_mass.to_bits(),
+        "static_mods": static_mods,
+        "variable_mods": variable_mods,
+        "max_variable_mods": parameters.max_variable_mods,
+    });
+    let mut hasher = Sha256::new();
+    hasher.update(b"sage-entrapment-digestion-search-space-v1\0");
+    hasher.update(serde_json::to_vec(&portable)?);
+    Ok(format!("{:x}", hasher.finalize()))
+}
+
+fn artifact_payload_sha256(artifact: &EntrapmentPartitionArtifact) -> Result<String> {
+    let mut payload = artifact.clone();
+    payload.payload_sha256.clear();
+    let mut hasher = Sha256::new();
+    hasher.update(b"sage-entrapment-partition-payload-v1\0");
+    hasher.update(serde_json::to_vec(&payload)?);
+    Ok(format!("{:x}", hasher.finalize()))
+}
+
+fn artifact_partition_identity(artifact: &EntrapmentPartitionArtifact) -> Result<String> {
+    let mut hasher = Sha256::new();
+    hasher.update(b"sage-entrapment-partition-identity-v1\0");
+    hasher.update(artifact.dataset_identity.as_bytes());
+    hasher.update(artifact.target_fasta_sha256.as_bytes());
+    hasher.update(artifact.active_entrapment_fasta_sha256.as_bytes());
+    hasher.update(artifact.digestion_search_space_identity.as_bytes());
+    hasher.update(artifact.entrapment_construction_identity.as_bytes());
+    hasher.update(artifact.seed.to_le_bytes());
+    hasher.update(artifact.salt.as_bytes());
+    hasher.update(
+        artifact
+            .requested_selection_fraction
+            .to_bits()
+            .to_le_bytes(),
+    );
+    hasher.update(artifact.requested_audit_fraction.to_bits().to_le_bytes());
+    hasher.update(serde_json::to_vec(&artifact.component_assignments)?);
+    Ok(format!("{:x}", hasher.finalize()))
+}
+
+pub fn entrapment_construction_identity(report: &EntrapmentDatabaseReport) -> Result<String> {
+    let value = match report {
+        EntrapmentDatabaseReport::NativeGenerated { generation } => serde_json::json!({
+            "mode": "native_generated",
+            "generator_version": generation.generator_version,
+            "selection_algorithm": generation.selection_algorithm,
+            "target_sha256": generation.target_sha256,
+            "selected_foreign_sha256": generation.selected_foreign_sha256,
+            "output_sha256": generation.output_sha256,
+            "seed": generation.seed,
+            "protein_fold": generation.protein_fold,
+            "shared_peptide_exclusion_mode": generation.shared_peptide_exclusion_mode,
+            "foreign_source_mode": generation.foreign_source_mode,
+            "automatically_recommended_foreign_sha256": generation.automatically_recommended_foreign_sha256,
+            "override_applied": generation.override_applied,
+            "selected_accessions": generation.selected_accessions,
+            "excluded_shared_target_peptide": generation.excluded_shared_target_peptide,
+            "source_accession_mapping": generation.source_accession_mapping,
+            "deterministic_selection_sha256": generation.deterministic_selection_sha256,
+        }),
+        EntrapmentDatabaseReport::FrozenLegacy { frozen } => serde_json::json!({
+            "mode": "frozen_legacy",
+            "frozen_entrapment_sha256": frozen.frozen_entrapment_sha256,
+            "target_sha256": frozen.target_sha256,
+        }),
+    };
+    let mut hasher = Sha256::new();
+    hasher.update(b"sage-entrapment-construction-identity-v1\0");
+    hasher.update(serde_json::to_vec(&value)?);
+    Ok(format!("{:x}", hasher.finalize()))
+}
+
+pub fn build_entrapment_partition(
+    parameters: &Parameters,
+    dataset_identity: &str,
+    target_fasta: &Path,
+    active_entrapment_fasta: &Path,
+    entrapment_construction_identity: &str,
+    config: &EntrapmentValidationConfig,
+) -> Result<EntrapmentPartitionArtifact> {
+    anyhow::ensure!(
+        config.mode == EntrapmentValidationMode::SelectionAudit,
+        "partition construction requires selection_audit mode"
+    );
+    anyhow::ensure!(
+        config.partition_schema_version == 1,
+        "unsupported entrapment partition schema"
+    );
+    anyhow::ensure!(
+        config.selection_fraction > 0.0
+            && config.audit_fraction > 0.0
+            && (config.selection_fraction + config.audit_fraction - 1.0).abs() <= 1e-12,
+        "selection/audit fractions must be positive and sum to one"
+    );
+
+    let target_records = parse_fasta(target_fasta)?;
+    let combined_records = parse_fasta(active_entrapment_fasta)?;
+    let (_, entrapment_records) = split_combined_records(&combined_records);
+    anyhow::ensure!(
+        entrapment_records.len() >= 2,
+        "selection/audit partition requires at least two entrapment proteins"
+    );
+    let target_evidence = protein_search_evidence(parameters, &target_records)?;
+    let entrapment_evidence = protein_search_evidence(parameters, &entrapment_records)?;
+    let target_peptides = target_evidence
+        .iter()
+        .flat_map(|protein| protein.peptides.iter().cloned())
+        .collect::<BTreeSet<_>>();
+    let target_peptidoforms = target_evidence
+        .iter()
+        .flat_map(|protein| protein.peptidoforms.iter().cloned())
+        .collect::<BTreeSet<_>>();
+    for protein in &entrapment_evidence {
+        anyhow::ensure!(
+            protein.peptides.is_disjoint(&target_peptides),
+            "entrapment protein {} shares a searchable canonical peptide with the target FASTA",
+            protein.record.accession
+        );
+    }
+
+    let mut parent = (0..entrapment_evidence.len()).collect::<Vec<_>>();
+    fn find(parent: &mut [usize], mut index: usize) -> usize {
+        while parent[index] != index {
+            parent[index] = parent[parent[index]];
+            index = parent[index];
+        }
+        index
+    }
+    fn union(parent: &mut [usize], left: usize, right: usize) {
+        let left = find(parent, left);
+        let right = find(parent, right);
+        if left != right {
+            let (keep, merge) = if left < right {
+                (left, right)
+            } else {
+                (right, left)
+            };
+            parent[merge] = keep;
+        }
+    }
+    let mut peptide_owner = BTreeMap::<String, usize>::new();
+    for (index, protein) in entrapment_evidence.iter().enumerate() {
+        for peptide in &protein.peptides {
+            if let Some(previous) = peptide_owner.insert(peptide.clone(), index) {
+                union(&mut parent, previous, index);
+            }
+        }
+    }
+    let mut component_indices = BTreeMap::<usize, Vec<usize>>::new();
+    for index in 0..entrapment_evidence.len() {
+        let root = find(&mut parent, index);
+        component_indices.entry(root).or_default().push(index);
+    }
+    anyhow::ensure!(
+        component_indices.len() >= 2,
+        "entrapment searchable-peptide graph has only one component; nonempty selection and audit partitions are impossible"
+    );
+
+    #[derive(Clone)]
+    struct Component {
+        identity: String,
+        assignment_hash: String,
+        proteins: Vec<String>,
+        peptides: BTreeSet<String>,
+        peptidoforms: BTreeSet<String>,
+    }
+    let mut components = component_indices
+        .into_values()
+        .map(|indices| {
+            let members = indices
+                .iter()
+                .map(|index| &entrapment_evidence[*index])
+                .collect::<Vec<_>>();
+            let identity = stable_component_identity(&members);
+            let mut assignment_hasher = Sha256::new();
+            assignment_hasher.update(b"sage-entrapment-partition-assignment-v1\0");
+            assignment_hasher.update(config.seed.to_le_bytes());
+            assignment_hasher.update(config.salt.as_bytes());
+            assignment_hasher.update(identity.as_bytes());
+            let assignment_hash = format!("{:x}", assignment_hasher.finalize());
+            let mut proteins = members
+                .iter()
+                .map(|protein| protein.record.accession.clone())
+                .collect::<Vec<_>>();
+            proteins.sort();
+            let peptides = members
+                .iter()
+                .flat_map(|protein| protein.peptides.iter().cloned())
+                .collect();
+            let peptidoforms = members
+                .iter()
+                .flat_map(|protein| protein.peptidoforms.iter().cloned())
+                .collect();
+            Component {
+                identity,
+                assignment_hash,
+                proteins,
+                peptides,
+                peptidoforms,
+            }
+        })
+        .collect::<Vec<_>>();
+    let mut component_identities = BTreeSet::new();
+    let mut assignment_hashes = BTreeSet::new();
+    for component in &components {
+        anyhow::ensure!(
+            component_identities.insert(component.identity.clone()),
+            "entrapment partition contains indistinguishable component payloads"
+        );
+        anyhow::ensure!(
+            assignment_hashes.insert(component.assignment_hash.clone()),
+            "entrapment partition assignment hash collision"
+        );
+    }
+    components.sort_by(|left, right| {
+        left.assignment_hash
+            .cmp(&right.assignment_hash)
+            .then_with(|| left.identity.cmp(&right.identity))
+    });
+
+    let requested_audit_proteins = config.audit_fraction * entrapment_evidence.len() as f64;
+    let mut cumulative = 0usize;
+    let mut best_audit_components = 1usize;
+    let mut best_distance = f64::INFINITY;
+    for count in 1..components.len() {
+        cumulative += components[count - 1].proteins.len();
+        let distance = (cumulative as f64 - requested_audit_proteins).abs();
+        if distance < best_distance {
+            best_distance = distance;
+            best_audit_components = count;
+        }
+    }
+
+    let mut assignments = Vec::with_capacity(components.len());
+    let mut selection_proteins = BTreeSet::new();
+    let mut audit_proteins = BTreeSet::new();
+    let mut selection_peptides = BTreeSet::new();
+    let mut audit_peptides = BTreeSet::new();
+    let mut selection_peptidoforms = BTreeSet::new();
+    let mut audit_peptidoforms = BTreeSet::new();
+    for (index, component) in components.into_iter().enumerate() {
+        let partition = if index < best_audit_components {
+            audit_proteins.extend(component.proteins.iter().cloned());
+            audit_peptides.extend(component.peptides.iter().cloned());
+            audit_peptidoforms.extend(component.peptidoforms.iter().cloned());
+            EntrapmentPartitionAssignment::Audit
+        } else {
+            selection_proteins.extend(component.proteins.iter().cloned());
+            selection_peptides.extend(component.peptides.iter().cloned());
+            selection_peptidoforms.extend(component.peptidoforms.iter().cloned());
+            EntrapmentPartitionAssignment::Selection
+        };
+        assignments.push(EntrapmentComponentAssignment {
+            component_identity: component.identity,
+            partition,
+            proteins: component.proteins,
+            canonical_peptide_count: component.peptides.len(),
+            peptidoform_count: component.peptidoforms.len(),
+        });
+    }
+    assignments.sort_by(|left, right| left.component_identity.cmp(&right.component_identity));
+    anyhow::ensure!(
+        !selection_proteins.is_empty() && !audit_proteins.is_empty(),
+        "selection/audit partition produced an empty population"
+    );
+    anyhow::ensure!(
+        selection_proteins.is_disjoint(&audit_proteins)
+            && selection_peptides.is_disjoint(&audit_peptides)
+            && selection_peptidoforms.is_disjoint(&audit_peptidoforms),
+        "selection/audit partition overlaps at protein, peptide, or peptidoform level"
+    );
+
+    let ratios_for = |proteins: &BTreeSet<String>,
+                      peptides: &BTreeSet<String>,
+                      peptidoforms: &BTreeSet<String>| EntrapmentRatios {
+        target_proteins: target_records.len(),
+        entrapment_proteins: proteins.len(),
+        protein_ratio: ratio(proteins.len(), target_records.len()),
+        target_peptides: target_peptides.len(),
+        entrapment_peptides: peptides.len(),
+        peptide_ratio: ratio(peptides.len(), target_peptides.len()),
+        target_peptidoforms: target_peptidoforms.len(),
+        entrapment_peptidoforms: peptidoforms.len(),
+        peptidoform_ratio: ratio(peptidoforms.len(), target_peptidoforms.len()),
+    };
+    let total_entrapment = entrapment_evidence.len() as f64;
+    let selection_ratios = ratios_for(
+        &selection_proteins,
+        &selection_peptides,
+        &selection_peptidoforms,
+    );
+    let audit_ratios = ratios_for(&audit_proteins, &audit_peptides, &audit_peptidoforms);
+    for (population, ratios) in [("selection", &selection_ratios), ("audit", &audit_ratios)] {
+        anyhow::ensure!(
+            ratios.target_proteins > 0
+                && ratios.target_peptides > 0
+                && ratios.target_peptidoforms > 0
+                && ratios.entrapment_proteins > 0
+                && ratios.entrapment_peptides > 0
+                && ratios.entrapment_peptidoforms > 0
+                && ratios.protein_ratio.is_finite()
+                && ratios.protein_ratio > 0.0
+                && ratios.peptide_ratio.is_finite()
+                && ratios.peptide_ratio > 0.0
+                && ratios.peptidoform_ratio.is_finite()
+                && ratios.peptidoform_ratio > 0.0,
+            "{population} entrapment partition has an empty or invalid observable protein/peptide/peptidoform ratio"
+        );
+    }
+    let mut artifact = EntrapmentPartitionArtifact {
+        schema_version: 1,
+        partition_identity: String::new(),
+        dataset_identity: dataset_identity.into(),
+        target_fasta_sha256: sha256_file(target_fasta)?,
+        active_entrapment_fasta_sha256: sha256_file(active_entrapment_fasta)?,
+        digestion_search_space_identity: digestion_search_space_identity(parameters)?,
+        entrapment_construction_identity: entrapment_construction_identity.into(),
+        seed: config.seed,
+        salt: config.salt.clone(),
+        requested_selection_fraction: config.selection_fraction,
+        requested_audit_fraction: config.audit_fraction,
+        realized_selection_fraction: selection_proteins.len() as f64 / total_entrapment,
+        realized_audit_fraction: audit_proteins.len() as f64 / total_entrapment,
+        component_assignments: assignments,
+        selection_proteins: selection_proteins.into_iter().collect(),
+        audit_proteins: audit_proteins.into_iter().collect(),
+        selection_canonical_peptides: selection_peptides.iter().cloned().collect(),
+        audit_canonical_peptides: audit_peptides.iter().cloned().collect(),
+        selection_peptidoforms: selection_peptidoforms.iter().cloned().collect(),
+        audit_peptidoforms: audit_peptidoforms.iter().cloned().collect(),
+        selection_ratios,
+        audit_ratios,
+        source_implementation_identity: PARAMETER_OPTIMIZER_IMPLEMENTATION_SOURCE_SHA256.into(),
+        payload_sha256: String::new(),
+    };
+    artifact.partition_identity = artifact_partition_identity(&artifact)?;
+    artifact.payload_sha256 = artifact_payload_sha256(&artifact)?;
+    Ok(artifact)
+}
+
+pub fn resolve_entrapment_partition(
+    parameters: &Parameters,
+    dataset_identity: &str,
+    target_fasta: &Path,
+    active_entrapment_fasta: &Path,
+    entrapment_construction_identity: &str,
+    config: &EntrapmentValidationConfig,
+    artifact_path: &Path,
+) -> Result<EntrapmentPartitionArtifact> {
+    let expected = build_entrapment_partition(
+        parameters,
+        dataset_identity,
+        target_fasta,
+        active_entrapment_fasta,
+        entrapment_construction_identity,
+        config,
+    )?;
+    if artifact_path.is_file() {
+        let existing: EntrapmentPartitionArtifact =
+            serde_json::from_slice(&std::fs::read(artifact_path).with_context(|| {
+                format!(
+                    "failed to read entrapment partition {}",
+                    artifact_path.display()
+                )
+            })?)
+            .context("invalid entrapment partition artifact")?;
+        anyhow::ensure!(
+            existing.payload_sha256 == artifact_payload_sha256(&existing)?,
+            "entrapment partition payload integrity failure"
+        );
+        anyhow::ensure!(
+            existing == expected,
+            "entrapment partition disagrees with dataset, FASTAs, digestion, construction, seed, fractions, assignments, ratios, or implementation identity"
+        );
+        return Ok(existing);
+    }
+    anyhow::ensure!(
+        !config.require_existing_partition,
+        "required existing entrapment partition artifact is missing: {}",
+        artifact_path.display()
+    );
+    write_json_atomic(artifact_path, &expected)?;
+    Ok(expected)
 }
 
 fn fdrbench_canonical_sequence(sequence: &str) -> String {
@@ -1222,6 +1808,272 @@ mod tests {
             prefilter: false,
             prefilter_low_memory: true,
         }
+    }
+
+    fn partition_config() -> EntrapmentValidationConfig {
+        EntrapmentValidationConfig {
+            mode: EntrapmentValidationMode::SelectionAudit,
+            partition_schema_version: 1,
+            seed: 73,
+            salt: "synthetic-dataset-local-holdout-v1".into(),
+            selection_fraction: 0.5,
+            audit_fraction: 0.5,
+            require_existing_partition: false,
+        }
+    }
+
+    fn partition_fastas(directory: &Path, reverse: bool) -> (PathBuf, PathBuf) {
+        let target = directory.join(if reverse {
+            "target-reversed.fasta"
+        } else {
+            "target.fasta"
+        });
+        let combined = directory.join(if reverse {
+            "combined-reversed.fasta"
+        } else {
+            "combined.fasta"
+        });
+        std::fs::write(&target, b">Target_A\nTTTKQQQQK\n>Target_B\nLLLLKMMMMK\n").unwrap();
+        let entrapments = if reverse {
+            ">Ent_D\nNNNNKPPPPK\n>Ent_C\nDDDKEEEEK\n>Ent_B\nGGGKCCCCK\n>Ent_A\nAAAKCCCCK\n"
+        } else {
+            ">Ent_A\nAAAKCCCCK\n>Ent_B\nGGGKCCCCK\n>Ent_C\nDDDKEEEEK\n>Ent_D\nNNNNKPPPPK\n"
+        };
+        std::fs::write(
+            &combined,
+            format!(">Target_A\nTTTKQQQQK\n>Target_B\nLLLLKMMMMK\n{entrapments}"),
+        )
+        .unwrap();
+        (target, combined)
+    }
+
+    #[test]
+    fn selection_audit_partition_is_order_independent_and_component_safe() {
+        let directory = test_directory("partition-order");
+        let (target, combined) = partition_fastas(&directory, false);
+        let (target_reversed, combined_reversed) = partition_fastas(&directory, true);
+        let mut first_parameters = parameters();
+        first_parameters.fasta = "/unrelated/machine/a/target.fasta".into();
+        let first = build_entrapment_partition(
+            &first_parameters,
+            "dataset",
+            &target,
+            &combined,
+            "construction",
+            &partition_config(),
+        )
+        .unwrap();
+        let mut reordered_parameters = parameters();
+        reordered_parameters.fasta = "D:\\unrelated\\machine\\b\\target.fasta".into();
+        let reordered = build_entrapment_partition(
+            &reordered_parameters,
+            "dataset",
+            &target_reversed,
+            &combined_reversed,
+            "construction",
+            &partition_config(),
+        )
+        .unwrap();
+        assert_eq!(first.component_assignments, reordered.component_assignments);
+        assert_eq!(
+            first.digestion_search_space_identity,
+            reordered.digestion_search_space_identity
+        );
+        assert_eq!(first.selection_proteins, reordered.selection_proteins);
+        assert_eq!(first.audit_proteins, reordered.audit_proteins);
+        assert_eq!(first.selection_ratios, reordered.selection_ratios);
+        assert_eq!(first.audit_ratios, reordered.audit_ratios);
+        let concurrent = (0..4)
+            .map(|_| {
+                let target = target.clone();
+                let combined = combined.clone();
+                std::thread::spawn(move || {
+                    build_entrapment_partition(
+                        &parameters(),
+                        "dataset",
+                        &target,
+                        &combined,
+                        "construction",
+                        &partition_config(),
+                    )
+                    .unwrap()
+                    .component_assignments
+                })
+            })
+            .collect::<Vec<_>>();
+        for assignment in concurrent {
+            assert_eq!(first.component_assignments, assignment.join().unwrap());
+        }
+        assert!(!first.selection_proteins.is_empty());
+        assert!(!first.audit_proteins.is_empty());
+        assert!(first
+            .selection_protein_set()
+            .is_disjoint(&first.audit_protein_set()));
+        assert!(first
+            .selection_canonical_peptides
+            .iter()
+            .all(|peptide| !first.audit_canonical_peptides.contains(peptide)));
+        assert!(first
+            .selection_peptidoforms
+            .iter()
+            .all(|form| !first.audit_peptidoforms.contains(form)));
+
+        let assignment = |protein: &str| {
+            first
+                .component_assignments
+                .iter()
+                .find(|component| component.proteins.iter().any(|item| item == protein))
+                .map(|component| component.partition)
+                .unwrap()
+        };
+        assert_eq!(assignment("Ent_A"), assignment("Ent_B"));
+        let selection_view = serde_json::to_string(&first.selection_view()).unwrap();
+        for audit_protein in &first.audit_proteins {
+            assert!(!selection_view.contains(audit_protein));
+        }
+        assert!(!selection_view.contains("audit_ratios"));
+        assert_eq!(
+            first.selection_ratios.entrapment_proteins + first.audit_ratios.entrapment_proteins,
+            4
+        );
+        assert_eq!(first.selection_ratios.target_proteins, 2);
+        assert_eq!(first.audit_ratios.target_proteins, 2);
+        std::fs::remove_dir_all(directory).unwrap();
+    }
+
+    #[test]
+    fn target_shared_peptides_and_malformed_partition_fail_closed() {
+        let directory = test_directory("partition-fail-closed");
+        let target = directory.join("target.fasta");
+        let combined = directory.join("combined.fasta");
+        std::fs::write(&target, b">Target\nAAAKCCCCK\n").unwrap();
+        std::fs::write(
+            &combined,
+            b">Target\nAAAKCCCCK\n>Ent_shared\nGGGKCCCCK\n>Ent_other\nDDDKEEEEK\n",
+        )
+        .unwrap();
+        assert!(build_entrapment_partition(
+            &parameters(),
+            "dataset",
+            &target,
+            &combined,
+            "construction",
+            &partition_config(),
+        )
+        .unwrap_err()
+        .to_string()
+        .contains("shares a searchable canonical peptide"));
+
+        std::fs::write(&target, b">Target\nTARGETPEPK\n").unwrap();
+        std::fs::write(
+            &combined,
+            b">Target\nTARGETPEPK\n>Ent_one\nAAAKSHAREDK\n>Ent_two\nGGGKSHAREDK\n",
+        )
+        .unwrap();
+        assert!(build_entrapment_partition(
+            &parameters(),
+            "dataset",
+            &target,
+            &combined,
+            "construction",
+            &partition_config(),
+        )
+        .unwrap_err()
+        .to_string()
+        .contains("only one component"));
+
+        // Distinct FASTA accessions that canonicalize to the same source and
+        // have the same non-searchable sequence would otherwise produce two
+        // indistinguishable singleton component payloads. Fail closed instead
+        // of allowing record order to resolve the tie.
+        std::fs::write(&target, b">Target\nTARGETPEPK\n").unwrap();
+        std::fs::write(
+            &combined,
+            b">Target\nTARGETPEPK\n>Ent_000001_same\nAA\n>Ent_000002_same\nAA\n>Ent_other\nDDDKEEEEK\n",
+        )
+        .unwrap();
+        assert!(build_entrapment_partition(
+            &parameters(),
+            "dataset",
+            &target,
+            &combined,
+            "construction",
+            &partition_config(),
+        )
+        .unwrap_err()
+        .to_string()
+        .contains("indistinguishable component payloads"));
+
+        let (target, combined) = partition_fastas(&directory, false);
+        let artifact_path = directory.join("partition.json");
+        let artifact = resolve_entrapment_partition(
+            &parameters(),
+            "dataset",
+            &target,
+            &combined,
+            "construction",
+            &partition_config(),
+            &artifact_path,
+        )
+        .unwrap();
+        let mut corrupt = artifact;
+        corrupt.selection_proteins.push("Ent_missing".into());
+        write_json_atomic(&artifact_path, &corrupt).unwrap();
+        assert!(resolve_entrapment_partition(
+            &parameters(),
+            "dataset",
+            &target,
+            &combined,
+            "construction",
+            &partition_config(),
+            &artifact_path,
+        )
+        .unwrap_err()
+        .to_string()
+        .contains("payload integrity failure"));
+
+        let mut inconsistent = resolve_entrapment_partition(
+            &parameters(),
+            "dataset",
+            &target,
+            &combined,
+            "construction",
+            &partition_config(),
+            &directory.join("fresh-partition.json"),
+        )
+        .unwrap();
+        inconsistent.component_assignments.pop();
+        inconsistent.selection_ratios.protein_ratio = 0.123;
+        inconsistent.payload_sha256 = artifact_payload_sha256(&inconsistent).unwrap();
+        write_json_atomic(&artifact_path, &inconsistent).unwrap();
+        assert!(resolve_entrapment_partition(
+            &parameters(),
+            "dataset",
+            &target,
+            &combined,
+            "construction",
+            &partition_config(),
+            &artifact_path,
+        )
+        .unwrap_err()
+        .to_string()
+        .contains("disagrees with dataset"));
+
+        let mut require_existing = partition_config();
+        require_existing.require_existing_partition = true;
+        assert!(resolve_entrapment_partition(
+            &parameters(),
+            "dataset",
+            &target,
+            &combined,
+            "construction",
+            &require_existing,
+            &directory.join("missing.json"),
+        )
+        .unwrap_err()
+        .to_string()
+        .contains("required existing"));
+        std::fs::remove_dir_all(directory).unwrap();
     }
 
     #[test]

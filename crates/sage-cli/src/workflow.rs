@@ -4,10 +4,12 @@ use crate::candidate_pool::{
     CandidatePoolUsage, CANDIDATE_ID_SCHEMA,
 };
 use crate::entrapment::{
-    compare_generated_to_legacy, entrapment_generation_input_sha256, generate_foreign_entrapment,
-    inspect_frozen_entrapment, EntrapmentDatabaseMode, EntrapmentDatabaseReport,
-    EntrapmentFastaParityReport, EntrapmentGenerationReport, ForeignSourceMode,
-    LegacyEntrapmentReference, SharedPeptideExclusionMode,
+    build_entrapment_partition, compare_generated_to_legacy, digestion_search_space_identity,
+    entrapment_construction_identity, entrapment_generation_input_sha256,
+    generate_foreign_entrapment, inspect_frozen_entrapment, resolve_entrapment_partition,
+    EntrapmentDatabaseMode, EntrapmentDatabaseReport, EntrapmentFastaParityReport,
+    EntrapmentGenerationReport, EntrapmentPartitionArtifact, EntrapmentSelectionView,
+    ForeignSourceMode, LegacyEntrapmentReference, SharedPeptideExclusionMode,
 };
 use crate::external_feature_cache::{
     preflight_existing_cache_root, raw_generator_settings_sha256_with_existing_probe_root,
@@ -17,7 +19,8 @@ use crate::external_feature_cache::{
 };
 use crate::input::Input;
 use crate::parameter_optimizer::{
-    apply_fdr_overrides, parameter_catalog_fingerprint, run_optimizer, EmpiricalCalibrationPower,
+    apply_fdr_overrides, parameter_catalog_fingerprint, run_optimizer, AuditLevelMetrics,
+    EmpiricalCalibrationPower, EntrapmentValidationMode, FrozenWinnerAuditEvaluation,
     OptimizerBlock, OptimizerExecutionMode, OptimizerExpert, OptimizerIdentity, OptimizerOutcome,
     OptimizerRunResult, OptimizerWindowSearch, ParameterOptimizerConfig, ParameterValue,
     StatisticalDefaultEligibility, StatisticalValidationStatus, TrialEvaluation, TrialEvaluator,
@@ -28,11 +31,11 @@ use crate::runner::Runner;
 use crate::validation::{
     accepted_target_peptides, ensemble_interaction_calibration, expert_quality_gates,
     is_target_only_stage, missing_parity_evidence, parity_comparisons, stage_comparisons,
-    summarize_run, target_only_policy_capability, tdc_benchmark_comparisons, transfer_stability,
-    EffectiveRatios, EnsembleInteractionCalibration, ExpertQualityGate, InvalidValidationRun,
-    ParityComparison, ParityPair, RunValidationSummary, StageComparison,
-    TargetOnlyCalibrationPolicy, TargetOnlyPolicyCapability, TdcBenchmarkComparison,
-    ValidationMode, ValidationRun,
+    summarize_run, summarize_run_for_entrapment_partition, target_only_policy_capability,
+    tdc_benchmark_comparisons, transfer_stability, EffectiveRatios, EnsembleInteractionCalibration,
+    ExpertQualityGate, InvalidValidationRun, ParityComparison, ParityPair, RunValidationSummary,
+    StageComparison, TargetOnlyCalibrationPolicy, TargetOnlyPolicyCapability,
+    TdcBenchmarkComparison, ValidationMode, ValidationRun,
 };
 use anyhow::{Context, Result};
 use sage_core::decoy_free_fdr::{DfRunArtifacts, FittedArtifactProvenance};
@@ -159,6 +162,10 @@ pub struct EntrapmentWorkflow {
     pub seed: u64,
     #[serde(default = "default_protein_fold")]
     pub protein_fold: usize,
+    /// Immutable dataset-local selection/audit label partition. Required only
+    /// when parameter_optimizer.entrapment_validation.mode is selection_audit.
+    #[serde(default)]
+    pub partition_artifact: Option<PathBuf>,
 }
 
 #[derive(Clone, Debug, Serialize, Deserialize)]
@@ -588,6 +595,8 @@ pub struct StageRecord {
     /// Empty for non-optimizer stages and legacy checkpoints.
     #[serde(default)]
     pub parameter_overrides: BTreeMap<String, ParameterValue>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub entrapment_partition_identity: Option<String>,
 }
 
 #[derive(Clone, Debug, Serialize, Deserialize)]
@@ -598,6 +607,8 @@ pub struct WorkflowState {
     pub entrapment: Option<EntrapmentDatabaseReport>,
     #[serde(default)]
     pub entrapment_fasta_parity: Option<EntrapmentFastaParityReport>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub entrapment_partition: Option<EntrapmentPartitionArtifact>,
     pub baseline: Option<BaselineManifest>,
     pub stages: Vec<StageRecord>,
     #[serde(default)]
@@ -642,6 +653,8 @@ pub struct OptimizerWinnerSummary {
     pub statistical_validation_status: StatisticalValidationStatus,
     pub statistical_default_eligibility: StatisticalDefaultEligibility,
     pub winner_artifacts: BTreeMap<String, serde_json::Value>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub frozen_audit: Option<FrozenWinnerAuditEvaluation>,
 }
 
 #[derive(Clone, Debug, Serialize, Deserialize)]
@@ -657,6 +670,10 @@ pub struct OptimizerExecutionReport {
     pub matched_tdc_evaluation: String,
     pub independent_validation: String,
     pub statistical_default_eligibility: String,
+    pub entrapment_validation_mode: EntrapmentValidationMode,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub entrapment_partition_identity: Option<String>,
+    pub frozen_audit_evaluation: String,
 }
 
 fn optimizer_execution_report(
@@ -692,6 +709,7 @@ fn optimizer_execution_report(
                         .evaluation
                         .statistical_default_eligibility,
                     winner_artifacts: result.winner_artifacts.clone(),
+                    frozen_audit: result.frozen_audit.clone(),
                 },
             ))
         })
@@ -735,6 +753,23 @@ fn optimizer_execution_report(
         matched_tdc_evaluation: "not_run".into(),
         independent_validation: "not_run".into(),
         statistical_default_eligibility: "not_evaluated".into(),
+        entrapment_validation_mode: config.entrapment_validation.mode,
+        entrapment_partition_identity: results
+            .iter()
+            .find_map(|result| result.frozen_audit.as_ref())
+            .map(|audit| audit.partition_identity.clone()),
+        frozen_audit_evaluation: if config.entrapment_validation.mode
+            == EntrapmentValidationMode::SelectionAudit
+        {
+            if !results.is_empty() && results.iter().all(|result| result.frozen_audit.is_some()) {
+                "completed_once_after_all_winners_frozen"
+            } else {
+                "not_run_before_winner_freeze"
+            }
+        } else {
+            "not_configured_full_population_development"
+        }
+        .into(),
     }
 }
 
@@ -943,6 +978,26 @@ impl WorkflowManifest {
                     <= f64::EPSILON,
                 "optimizer fixed_evaluation_threshold must equal the workflow validation threshold"
             );
+            match optimizer.entrapment_validation.mode {
+                EntrapmentValidationMode::FullPopulationDevelopment => anyhow::ensure!(
+                    self.entrapment.partition_artifact.is_none(),
+                    "full_population_development must not declare an entrapment partition artifact"
+                ),
+                EntrapmentValidationMode::SelectionAudit => {
+                    let path = self
+                        .entrapment
+                        .partition_artifact
+                        .as_ref()
+                        .context("selection_audit requires entrapment.partition_artifact")?;
+                    if optimizer.entrapment_validation.require_existing_partition {
+                        anyhow::ensure!(
+                            path.is_file(),
+                            "required existing entrapment partition does not exist: {}",
+                            path.display()
+                        );
+                    }
+                }
+            }
             let selected = optimizer
                 .selected_experts
                 .iter()
@@ -1328,6 +1383,145 @@ fn strict_preflight_fasta(manifest: &WorkflowManifest) -> Result<PathBuf> {
     }
 }
 
+#[derive(Clone, Debug, Serialize, Deserialize, PartialEq)]
+pub struct EntrapmentPartitionInputReport {
+    pub schema_version: u32,
+    pub dataset_identity: String,
+    pub target_fasta_sha256: String,
+    pub active_entrapment_fasta_sha256: String,
+    pub digestion_search_space_identity: String,
+    pub entrapment_construction_identity: String,
+    pub partition_schema_version: u32,
+    pub seed: u64,
+    pub salt: String,
+    pub requested_selection_fraction: f64,
+    pub requested_audit_fraction: f64,
+}
+
+fn workflow_entrapment_partition_inputs(
+    manifest: &WorkflowManifest,
+) -> Result<(
+    sage_core::database::Parameters,
+    DatasetIdentity,
+    PathBuf,
+    String,
+)> {
+    let active_entrapment_fasta = strict_preflight_fasta(manifest)?;
+    let input = Input::load(manifest.search_config.to_string_lossy().as_ref())?;
+    let parameters = input.database.make_parameters();
+    let database_report = match manifest.entrapment.database_mode {
+        EntrapmentDatabaseMode::NativeGenerated => {
+            let report_path = manifest.output_root.join("entrapment.generation.json");
+            let generation: EntrapmentGenerationReport =
+                serde_json::from_slice(&std::fs::read(&report_path).with_context(|| {
+                    format!(
+                        "partition materialization requires existing {}",
+                        report_path.display()
+                    )
+                })?)?;
+            let expected_input_sha256 = entrapment_generation_input_sha256(
+                &parameters,
+                &manifest.target_fasta,
+                &manifest.entrapment.foreign_fastas,
+                manifest.entrapment.seed,
+                manifest.entrapment.protein_fold,
+                &manifest.entrapment.foreign_source_mode,
+                &manifest.entrapment.shared_peptide_exclusion_mode,
+                manifest.entrapment.selected_foreign_fasta.as_deref(),
+            )?;
+            anyhow::ensure!(
+                generation.schema_version == 2
+                    && generation.generation_input_sha256 == expected_input_sha256
+                    && generation.output_sha256 == sha256_file(&active_entrapment_fasta)?,
+                "partition materialization found an entrapment generation input, schema, or FASTA hash mismatch"
+            );
+            EntrapmentDatabaseReport::NativeGenerated { generation }
+        }
+        EntrapmentDatabaseMode::FrozenLegacy => EntrapmentDatabaseReport::FrozenLegacy {
+            frozen: inspect_frozen_entrapment(
+                &parameters,
+                &manifest.target_fasta,
+                &active_entrapment_fasta,
+            )?,
+        },
+    };
+    Ok((
+        parameters,
+        compute_dataset_identity(manifest)?,
+        active_entrapment_fasta,
+        entrapment_construction_identity(&database_report)?,
+    ))
+}
+
+/// Inspect only prospectively frozen partition inputs. No component graph is
+/// constructed and no partition artifact or workflow output is written.
+pub fn inspect_workflow_entrapment_partition_inputs(
+    manifest_path: &Path,
+) -> Result<EntrapmentPartitionInputReport> {
+    let manifest = WorkflowManifest::load(manifest_path)?;
+    let config = manifest
+        .parameter_optimizer
+        .as_ref()
+        .filter(|config| config.enabled)
+        .context("partition input inspection requires an enabled parameter_optimizer")?;
+    anyhow::ensure!(
+        config.entrapment_validation.mode == EntrapmentValidationMode::SelectionAudit,
+        "partition input inspection requires entrapment_validation.mode=selection_audit"
+    );
+    let (parameters, dataset, active_entrapment_fasta, construction_identity) =
+        workflow_entrapment_partition_inputs(&manifest)?;
+    Ok(EntrapmentPartitionInputReport {
+        schema_version: 1,
+        dataset_identity: dataset.fingerprint,
+        target_fasta_sha256: sha256_file(&manifest.target_fasta)?,
+        active_entrapment_fasta_sha256: sha256_file(&active_entrapment_fasta)?,
+        digestion_search_space_identity: digestion_search_space_identity(&parameters)?,
+        entrapment_construction_identity: construction_identity,
+        partition_schema_version: config.entrapment_validation.partition_schema_version,
+        seed: config.entrapment_validation.seed,
+        salt: config.entrapment_validation.salt.clone(),
+        requested_selection_fraction: config.entrapment_validation.selection_fraction,
+        requested_audit_fraction: config.entrapment_validation.audit_fraction,
+    })
+}
+
+/// Materialize or validate the prospectively declared selection/audit
+/// partition without entering workflow execution. This path reads only the
+/// workflow manifest, its search/digestion configuration, dataset identity,
+/// target and active +entrapment FASTAs, and the existing entrapment
+/// construction report. It does not resolve candidate pools, annotation
+/// caches, target-only resources, model fits, or optimizer trials.
+pub fn materialize_workflow_entrapment_partition(
+    manifest_path: &Path,
+) -> Result<EntrapmentPartitionArtifact> {
+    let manifest = WorkflowManifest::load(manifest_path)?;
+    let config = manifest
+        .parameter_optimizer
+        .as_ref()
+        .filter(|config| config.enabled)
+        .context("partition materialization requires an enabled parameter_optimizer")?;
+    anyhow::ensure!(
+        config.entrapment_validation.mode == EntrapmentValidationMode::SelectionAudit,
+        "partition materialization requires entrapment_validation.mode=selection_audit"
+    );
+    let artifact_path = manifest
+        .entrapment
+        .partition_artifact
+        .as_ref()
+        .context("selection_audit requires entrapment.partition_artifact")?;
+    let (parameters, dataset, active_entrapment_fasta, construction_identity) =
+        workflow_entrapment_partition_inputs(&manifest)?;
+    resolve_entrapment_partition(
+        &parameters,
+        &dataset.fingerprint,
+        &manifest.target_fasta,
+        &active_entrapment_fasta,
+        &construction_identity,
+        &config.entrapment_validation,
+        artifact_path,
+    )
+}
+
 fn requested_rank_depth(manifest: &WorkflowManifest, runner: &Runner) -> usize {
     let model_rank = manifest
         .models
@@ -1477,7 +1671,7 @@ fn strict_resource_preflight(
         .iter()
         .any(|model| model.enabled && !matches!(model.ms2rescore, Ms2RescorePolicy::Never));
     let entrapment_fasta = strict_preflight_fasta(manifest)?;
-    let mut spaces = vec![("+entrapment", entrapment_fasta, false)];
+    let mut spaces = vec![("+entrapment", entrapment_fasta.clone(), false)];
     if !manifest
         .parameter_optimizer
         .as_ref()
@@ -1488,6 +1682,115 @@ fn strict_resource_preflight(
         spaces.push(("target_only", manifest.target_fasta.clone(), true));
     }
     let mut reports = Vec::new();
+    if let Some(config) = manifest.parameter_optimizer.as_ref().filter(|config| {
+        config.enabled
+            && config.entrapment_validation.mode == EntrapmentValidationMode::SelectionAudit
+    }) {
+        let input = Input::load(manifest.search_config.to_string_lossy().as_ref())?;
+        let parameters = input.database.make_parameters();
+        let database_report = match manifest.entrapment.database_mode {
+            EntrapmentDatabaseMode::NativeGenerated => {
+                let report_path = manifest.output_root.join("entrapment.generation.json");
+                let generation: EntrapmentGenerationReport =
+                    serde_json::from_slice(&std::fs::read(&report_path).with_context(|| {
+                        format!(
+                            "selection/audit preflight requires existing {}",
+                            report_path.display()
+                        )
+                    })?)?;
+                let expected_input_sha256 = entrapment_generation_input_sha256(
+                    &parameters,
+                    &manifest.target_fasta,
+                    &manifest.entrapment.foreign_fastas,
+                    manifest.entrapment.seed,
+                    manifest.entrapment.protein_fold,
+                    &manifest.entrapment.foreign_source_mode,
+                    &manifest.entrapment.shared_peptide_exclusion_mode,
+                    manifest.entrapment.selected_foreign_fasta.as_deref(),
+                )?;
+                anyhow::ensure!(
+                    generation.schema_version == 2
+                        && generation.generation_input_sha256 == expected_input_sha256
+                        && generation.output_sha256 == sha256_file(&entrapment_fasta)?,
+                    "selection/audit preflight found an entrapment generation input, schema, or FASTA hash mismatch"
+                );
+                EntrapmentDatabaseReport::NativeGenerated { generation }
+            }
+            EntrapmentDatabaseMode::FrozenLegacy => EntrapmentDatabaseReport::FrozenLegacy {
+                frozen: inspect_frozen_entrapment(
+                    &parameters,
+                    &manifest.target_fasta,
+                    &entrapment_fasta,
+                )?,
+            },
+        };
+        let partition_path = manifest
+            .entrapment
+            .partition_artifact
+            .as_ref()
+            .context("selection_audit requires entrapment.partition_artifact")?;
+        let construction_identity = entrapment_construction_identity(&database_report)?;
+        let expected = build_entrapment_partition(
+            &parameters,
+            &compute_dataset_identity(manifest)?.fingerprint,
+            &manifest.target_fasta,
+            &entrapment_fasta,
+            &construction_identity,
+            &config.entrapment_validation,
+        )?;
+        let (partition, reused, status, manifest_sha256) = if partition_path.is_file() {
+            let mut require_existing = config.entrapment_validation.clone();
+            require_existing.require_existing_partition = true;
+            let partition = resolve_entrapment_partition(
+                &parameters,
+                &expected.dataset_identity,
+                &manifest.target_fasta,
+                &entrapment_fasta,
+                &construction_identity,
+                &require_existing,
+                partition_path,
+            )?;
+            (
+                partition,
+                true,
+                "validated_exact",
+                sha256_file(partition_path)?,
+            )
+        } else {
+            anyhow::ensure!(
+                !config.entrapment_validation.require_existing_partition,
+                "required existing entrapment partition artifact is missing: {}",
+                partition_path.display()
+            );
+            (expected, false, "validated_derivable", String::new())
+        };
+        reports.push(ResourcePreflightReport {
+            resource_type: "entrapment_partition".into(),
+            search_space: "+entrapment_selection_audit".into(),
+            stage: None,
+            status: status.into(),
+            requested_path: partition_path.clone(),
+            expected_fingerprint: partition.partition_identity.clone(),
+            actual_fingerprint: reused
+                .then(|| partition.partition_identity.clone())
+                .unwrap_or_default(),
+            schema_version: partition.schema_version,
+            candidate_or_annotation_count: partition.selection_proteins.len()
+                + partition.audit_proteins.len(),
+            retained_rank_depth: None,
+            manifest_sha256,
+            payload_sha256: partition.payload_sha256,
+            valid: true,
+            reused,
+            generation_allowed: !config.entrapment_validation.require_existing_partition,
+            catalog_fingerprints: Vec::new(),
+            original_source_uris: Vec::new(),
+            current_source_uris: Vec::new(),
+            portable_identity_valid: Some(true),
+            relocation_detected: Some(false),
+            failure_reason: None,
+        });
+    }
     for (search_space, fasta, target_only) in spaces {
         let mut input = Input::load(manifest.search_config.to_string_lossy().as_ref())?;
         input.database.fasta = Some(fasta.display().to_string());
@@ -3333,6 +3636,7 @@ fn hash_stage(
     ensemble_lock: Option<&EnsembleLock>,
     target_only: Option<&TargetOnlyStageContext>,
     parameter_overrides: Option<&BTreeMap<String, ParameterValue>>,
+    entrapment_selection: Option<&EntrapmentSelectionView>,
 ) -> Result<String> {
     let mut hasher = Sha256::new();
     hasher.update(b"sage-workflow-stage-v6-external-profile-and-required-pool\0");
@@ -3374,6 +3678,11 @@ fn hash_stage(
     if let Some(parameter_overrides) = parameter_overrides {
         hasher.update(b"parameter-optimizer-overrides-v1\0");
         hasher.update(serde_json::to_vec(parameter_overrides)?);
+    }
+    if let Some(partition) = entrapment_selection {
+        hasher.update(b"entrapment-selection-audit-v1\0");
+        hasher.update(partition.partition_identity.as_bytes());
+        hasher.update(serde_json::to_vec(partition)?);
     }
     Ok(format!("{:x}", hasher.finalize()))
 }
@@ -3428,6 +3737,7 @@ fn run_search_stage(
     ensemble_lock: Option<&EnsembleLock>,
     target_only: Option<&TargetOnlyStageContext>,
     parameter_overrides: Option<&BTreeMap<String, ParameterValue>>,
+    entrapment_selection: Option<&EntrapmentSelectionView>,
     runtime: &mut WorkflowRuntime,
 ) -> Result<StageRecord> {
     if let Some(context) = target_only {
@@ -3466,6 +3776,7 @@ fn run_search_stage(
         ensemble_lock,
         target_only,
         parameter_overrides,
+        entrapment_selection,
     )?;
     let results = output_directory.join("results.sage.tsv");
     let config_snapshot = output_directory.join("workflow.search.resolved.json");
@@ -3599,6 +3910,11 @@ fn run_search_stage(
     let fdr = input.fdr.get_or_insert_with(FdrOptions::default);
     fdr.mode = Some(FdrMode::DecoyFree);
     fdr.model_fit = Some(model.model.clone());
+    fdr.selection_entrapment_proteins = entrapment_selection.map(|partition| {
+        let mut proteins = partition.selection_proteins.clone();
+        proteins.sort();
+        proteins
+    });
     fdr.nokoi_application_dataset_fingerprint = Some(dataset.fingerprint.clone());
     if let Some(parameter_overrides) = parameter_overrides {
         apply_fdr_overrides(fdr, parameter_overrides)?;
@@ -3667,6 +3983,11 @@ fn run_search_stage(
             protein_entrapment_ratio: manifest.validation.effective_ratios.protein,
             maximum_entrapment_fdp: manifest.validation.fdr_threshold,
             minimum_entrapment_count_for_stable_estimate: 3,
+            selection_entrapment_proteins: entrapment_selection.map(|partition| {
+                let mut proteins = partition.selection_proteins.clone();
+                proteins.sort();
+                proteins
+            }),
             verbose_diagnostics: false,
         });
     }
@@ -3791,6 +4112,8 @@ fn run_search_stage(
         model_artifact_schema: None,
         ensemble_interaction_calibration: None,
         parameter_overrides: parameter_overrides.cloned().unwrap_or_default(),
+        entrapment_partition_identity: entrapment_selection
+            .map(|partition| partition.partition_identity.clone()),
     };
     std::fs::create_dir_all(output_directory)?;
     write_json_atomic(&checkpoint, &record)?;
@@ -4030,6 +4353,7 @@ struct WorkflowTrialEvaluator<'a> {
     parallel: usize,
     ensemble_lock: Option<&'a EnsembleLock>,
     runtime: &'a mut WorkflowRuntime,
+    entrapment_selection: Option<&'a EntrapmentSelectionView>,
 }
 
 struct InfrastructureSmokeEvaluator<'a> {
@@ -4153,6 +4477,7 @@ impl TrialEvaluator for WorkflowTrialEvaluator<'_> {
             self.ensemble_lock,
             None,
             Some(&request.parameters),
+            self.entrapment_selection,
             self.runtime,
         ) {
             Ok(stage) => stage,
@@ -4236,20 +4561,30 @@ impl TrialEvaluator for WorkflowTrialEvaluator<'_> {
                 ]),
             });
         }
-        let summaries = summarize_run(
-            &ValidationRun {
-                method: model_slug(&model.model).into(),
-                stage: "parameter_optimizer_trial".into(),
-                results: stage.results.clone(),
-                mode: ValidationMode::DecoyFree,
-                expected_search_space: Some("+Ent".into()),
-                calibration_stage: None,
-                target_only_calibration_policy: None,
-                release_candidate: false,
-            },
-            &self.manifest.validation.effective_ratios,
-            self.manifest.validation.fdr_threshold,
-        )?;
+        let validation_run = ValidationRun {
+            method: model_slug(&model.model).into(),
+            stage: "parameter_optimizer_trial".into(),
+            results: stage.results.clone(),
+            mode: ValidationMode::DecoyFree,
+            expected_search_space: Some("+Ent".into()),
+            calibration_stage: None,
+            target_only_calibration_policy: None,
+            release_candidate: false,
+        };
+        let summaries = if let Some(partition) = self.entrapment_selection {
+            summarize_run_for_entrapment_partition(
+                &validation_run,
+                &self.manifest.validation.effective_ratios,
+                self.manifest.validation.fdr_threshold,
+                &partition.selection_protein_set(),
+            )?
+        } else {
+            summarize_run(
+                &validation_run,
+                &self.manifest.validation.effective_ratios,
+                self.manifest.validation.fdr_threshold,
+            )?
+        };
         let level4 = summaries
             .iter()
             .find(|row| row.layer == "level4")
@@ -4329,6 +4664,17 @@ impl TrialEvaluator for WorkflowTrialEvaluator<'_> {
             ),
             ("target_only_outcomes_used".into(), serde_json::json!(false)),
         ]);
+        if let Some(partition) = self.entrapment_selection {
+            diagnostics.insert(
+                "entrapment_partition_identity".into(),
+                serde_json::json!(partition.partition_identity),
+            );
+            diagnostics.insert(
+                "entrapment_metrics_population".into(),
+                serde_json::json!("selection_only"),
+            );
+            diagnostics.insert("audit_metrics_present".into(), serde_json::json!(false));
+        }
         let evaluations_path = output.join("null_window_evaluations.json");
         if evaluations_path.is_file() {
             let evaluations: Vec<sage_core::decoy_free_fdr::NullWindowEvaluation> =
@@ -4405,6 +4751,7 @@ fn optimizer_identity_from_preflight(
     manifest: &WorkflowManifest,
     dataset: &DatasetIdentity,
     reports: &[ResourcePreflightReport],
+    entrapment_selection: Option<&EntrapmentSelectionView>,
 ) -> Result<OptimizerIdentity> {
     anyhow::ensure!(
         manifest.artifact_reuse_policy == ArtifactReusePolicy::DatasetLocalOnly,
@@ -4443,6 +4790,8 @@ fn optimizer_identity_from_preflight(
             crate::parameter_optimizer::PARAMETER_OPTIMIZER_IMPLEMENTATION_SOURCE_SHA256.into(),
         source_configuration_sha256: dataset.search_config_sha256.clone(),
         catalog_sha256: parameter_catalog_fingerprint()?,
+        entrapment_partition_identity: entrapment_selection
+            .map(|partition| partition.partition_identity.clone()),
     })
 }
 
@@ -4594,6 +4943,215 @@ fn prune_nonwinner_trial_payloads(root: &Path, result: &OptimizerRunResult) -> R
     Ok(())
 }
 
+fn adjusted_fdp_interval_95(
+    targets: usize,
+    entrapments: usize,
+    measured_ratio: f64,
+) -> Option<[f64; 2]> {
+    let n = targets.checked_add(entrapments)?;
+    if n == 0 || !measured_ratio.is_finite() || measured_ratio <= 0.0 {
+        return None;
+    }
+    // Wilson score interval for the observed entrapment proportion, mapped
+    // through the same measured-ratio correction as the FDP point estimate.
+    let n = n as f64;
+    let p = entrapments as f64 / n;
+    let z = 1.959_963_984_540_054_f64;
+    let z2 = z * z;
+    let denominator = 1.0 + z2 / n;
+    let center = (p + z2 / (2.0 * n)) / denominator;
+    let radius = z * ((p * (1.0 - p) / n + z2 / (4.0 * n * n)).sqrt()) / denominator;
+    let correction = 1.0 + 1.0 / measured_ratio;
+    Some([
+        ((center - radius).max(0.0) * correction).clamp(0.0, 1.0),
+        ((center + radius).min(1.0) * correction).clamp(0.0, 1.0),
+    ])
+}
+
+fn audit_level_metrics(
+    count: &crate::validation::IdentificationCount,
+    measured_ratio: f64,
+    minimum_observations_for_power: usize,
+    maximum_adjusted_fdp: Option<f64>,
+) -> AuditLevelMetrics {
+    let empirical_calibration_power = if count.entrapment < minimum_observations_for_power {
+        EmpiricalCalibrationPower::Underpowered
+    } else {
+        EmpiricalCalibrationPower::AdequatelyPowered
+    };
+    AuditLevelMetrics {
+        targets: count.target,
+        audit_entrapments: count.entrapment,
+        measured_audit_ratio: measured_ratio,
+        adjusted_fdp: count.combined_entrapment_fdp,
+        adjusted_fdp_interval_95: adjusted_fdp_interval_95(
+            count.target,
+            count.entrapment,
+            measured_ratio,
+        ),
+        minimum_observations_for_power,
+        empirical_calibration_power,
+        maximum_adjusted_fdp,
+        empirical_point_estimate_within_limit: maximum_adjusted_fdp.map(|maximum| {
+            count
+                .combined_entrapment_fdp
+                .is_some_and(|fdp| fdp.is_finite() && fdp <= maximum)
+        }),
+    }
+}
+
+fn frozen_audit_payload_sha256(audit: &FrozenWinnerAuditEvaluation) -> Result<String> {
+    let mut portable = audit.clone();
+    portable.payload_sha256.clear();
+    let mut hasher = Sha256::new();
+    hasher.update(b"sage-frozen-winner-entrapment-audit-v1\0");
+    hasher.update(serde_json::to_vec(&portable)?);
+    Ok(format!("{:x}", hasher.finalize()))
+}
+
+fn evaluate_frozen_optimizer_winner_once(
+    manifest: &WorkflowManifest,
+    partition: &EntrapmentPartitionArtifact,
+    result: &OptimizerRunResult,
+) -> Result<FrozenWinnerAuditEvaluation> {
+    let expert = result
+        .requested_parameter_space
+        .iter()
+        .find_map(|block| block.expert)
+        .context("optimizer result has no expert for frozen audit")?;
+    let winner = final_optimizer_winner_record(result)?;
+    let root = manifest
+        .output_root
+        .join("parameter_optimizer")
+        .join(expert.slug());
+    let results = root
+        .join("trials")
+        .join(&winner.request.trial_id)
+        .join("results.sage.tsv");
+    anyhow::ensure!(results.is_file(), "frozen winner result table is missing");
+    let winner_results_sha256 = sha256_file(&results)?;
+    let audit_path = root.join("winner.entrapment_audit.json");
+    if audit_path.is_file() {
+        let audit: FrozenWinnerAuditEvaluation =
+            serde_json::from_slice(&std::fs::read(&audit_path)?)?;
+        anyhow::ensure!(
+            audit.payload_sha256 == frozen_audit_payload_sha256(&audit)?,
+            "frozen winner audit payload integrity failure"
+        );
+        anyhow::ensure!(
+            audit.partition_identity == partition.partition_identity
+                && audit.expert == expert
+                && audit.winner_trial_id == winner.request.trial_id
+                && audit.winner_results_sha256 == winner_results_sha256,
+            "frozen winner audit disagrees with partition or selected winner"
+        );
+        return Ok(audit);
+    }
+
+    let run = ValidationRun {
+        method: expert.slug().into(),
+        stage: "frozen_winner_entrapment_audit".into(),
+        results,
+        mode: ValidationMode::DecoyFree,
+        expected_search_space: Some("+Ent".into()),
+        calibration_stage: Some("parameter_optimizer_trial".into()),
+        target_only_calibration_policy: None,
+        release_candidate: false,
+    };
+    let ratios = EffectiveRatios {
+        psm: partition.audit_ratios.peptidoform_ratio,
+        peptide: partition.audit_ratios.peptide_ratio,
+        protein: partition.audit_ratios.protein_ratio,
+    };
+    let summaries = summarize_run_for_entrapment_partition(
+        &run,
+        &ratios,
+        manifest.validation.fdr_threshold,
+        &partition.audit_protein_set(),
+    )?;
+    let level4 = summaries
+        .iter()
+        .find(|summary| summary.layer == "level4")
+        .or_else(|| {
+            summaries
+                .iter()
+                .find(|summary| summary.layer == "reportable_q")
+        })
+        .context("frozen audit has no reportable summary")?;
+    let default_power_minimum = manifest
+        .validation
+        .minimum_entrapment_peptides_for_stable_estimate;
+    let constraint = |level: &str| {
+        manifest.parameter_optimizer.as_ref().and_then(|config| {
+            config
+                .empirical_entrapment_constraints
+                .iter()
+                .find(|constraint| constraint.level == level)
+        })
+    };
+    let level_metrics =
+        |level: &str, count: &crate::validation::IdentificationCount, ratio: f64| {
+            let constraint = constraint(level);
+            audit_level_metrics(
+                count,
+                ratio,
+                constraint
+                    .map(|value| value.minimum_entrapment_observations_for_power)
+                    .unwrap_or(default_power_minimum),
+                constraint.map(|value| value.maximum_adjusted_fdp),
+            )
+        };
+    let psm = level_metrics("psm", &level4.psm, ratios.psm);
+    let canonical_peptide = level_metrics("peptide", &level4.peptide, ratios.peptide);
+    let peptidoform = level_metrics("peptidoform", &level4.peptidoform, ratios.psm);
+    let protein = level_metrics("protein", &level4.protein, ratios.protein);
+    let levels = [&psm, &canonical_peptide, &peptidoform, &protein];
+    let power = if levels
+        .iter()
+        .any(|level| level.empirical_calibration_power == EmpiricalCalibrationPower::Underpowered)
+    {
+        EmpiricalCalibrationPower::Underpowered
+    } else {
+        EmpiricalCalibrationPower::AdequatelyPowered
+    };
+    let above_ceiling = levels
+        .iter()
+        .any(|level| level.empirical_point_estimate_within_limit == Some(false));
+    let missing_point_estimate = levels
+        .iter()
+        .any(|level| level.targets == 0 || level.adjusted_fdp.is_none_or(|fdp| !fdp.is_finite()));
+    let statistical_validation_status = if above_ceiling {
+        StatisticalValidationStatus::EmpiricallyInfeasible
+    } else if missing_point_estimate {
+        StatisticalValidationStatus::NotEvaluated
+    } else if power == EmpiricalCalibrationPower::Underpowered {
+        StatisticalValidationStatus::NotEvaluableUnderpowered
+    } else {
+        StatisticalValidationStatus::EmpiricallyEvaluable
+    };
+    let mut audit = FrozenWinnerAuditEvaluation {
+        schema_version: 1,
+        partition_identity: partition.partition_identity.clone(),
+        expert,
+        winner_trial_id: winner.request.trial_id.clone(),
+        winner_results_sha256,
+        evaluated_after_winner_freeze: true,
+        psm,
+        canonical_peptide,
+        peptidoform,
+        protein,
+        empirical_calibration_power: power,
+        statistical_validation_status,
+        statistical_default_eligibility: StatisticalDefaultEligibility::NotEvaluated,
+        voter_participation_effect: "none_audit_is_nonadmissive".into(),
+        target_only_outcomes_used: false,
+        payload_sha256: String::new(),
+    };
+    audit.payload_sha256 = frozen_audit_payload_sha256(&audit)?;
+    write_json_atomic(&audit_path, &audit)?;
+    Ok(audit)
+}
+
 #[allow(clippy::too_many_arguments)]
 fn optimize_model_parameters(
     manifest: &WorkflowManifest,
@@ -4603,6 +5161,7 @@ fn optimize_model_parameters(
     fasta: &Path,
     parallel: usize,
     ensemble_lock: Option<&EnsembleLock>,
+    entrapment_selection: Option<&EntrapmentSelectionView>,
     runtime: &mut WorkflowRuntime,
 ) -> Result<
     Option<(
@@ -4624,7 +5183,12 @@ fn optimize_model_parameters(
         .join("parameter_optimizer")
         .join(optimizer_expert(&model.model).slug());
     std::fs::create_dir_all(&root)?;
-    let identity = optimizer_identity_from_preflight(manifest, dataset, resource_preflight)?;
+    let identity = optimizer_identity_from_preflight(
+        manifest,
+        dataset,
+        resource_preflight,
+        entrapment_selection,
+    )?;
     write_json_atomic(&root.join("identity.json"), &identity)?;
     let result = if config.implementation_smoke_only {
         let mut evaluator = InfrastructureSmokeEvaluator {
@@ -4649,6 +5213,7 @@ fn optimize_model_parameters(
             parallel,
             ensemble_lock,
             runtime,
+            entrapment_selection,
         };
         run_optimizer(
             &config,
@@ -4700,6 +5265,7 @@ pub fn execute_workflow(
             dataset,
             entrapment: None,
             entrapment_fasta_parity: None,
+            entrapment_partition: None,
             baseline: None,
             stages: Vec::new(),
             candidate_pools: Vec::new(),
@@ -4843,8 +5409,55 @@ pub fn execute_workflow(
         }
         _ => None,
     };
+    let entrapment_partition = match manifest.parameter_optimizer.as_ref().filter(|config| {
+        config.enabled
+            && config.entrapment_validation.mode == EntrapmentValidationMode::SelectionAudit
+    }) {
+        Some(config) => {
+            let report = entrapment
+                .as_ref()
+                .context("selection/audit mode requires a resolved active entrapment FASTA")?;
+            let path = manifest
+                .entrapment
+                .partition_artifact
+                .as_ref()
+                .context("validated selection/audit partition path is missing")?;
+            let partition = resolve_entrapment_partition(
+                &parameters,
+                &dataset.fingerprint,
+                &manifest.target_fasta,
+                &active_entrapment_fasta,
+                &entrapment_construction_identity(report)?,
+                &config.entrapment_validation,
+                path,
+            )?;
+            write_json_atomic(
+                &manifest
+                    .output_root
+                    .join("entrapment.partition.reference.json"),
+                &serde_json::json!({
+                    "schema_version": partition.schema_version,
+                    "partition_identity": partition.partition_identity,
+                    "payload_sha256": partition.payload_sha256,
+                    "selection_ratios": partition.selection_ratios,
+                    "audit_ratios": partition.audit_ratios,
+                }),
+            )?;
+            Some(partition)
+        }
+        None => None,
+    };
+    // The optimizer-facing view deliberately contains no audit accession or
+    // audit ratio. The complete artifact stays at workflow scope until every
+    // winner has been frozen.
+    let entrapment_selection = entrapment_partition
+        .as_ref()
+        .map(EntrapmentPartitionArtifact::selection_view);
     if let Some(report) = entrapment.as_ref() {
-        let measured = report.measured();
+        let measured = entrapment_partition
+            .as_ref()
+            .map(|partition| &partition.selection_ratios)
+            .unwrap_or_else(|| report.measured());
         manifest.validation.effective_ratios = EffectiveRatios {
             psm: measured.peptidoform_ratio,
             peptide: measured.peptide_ratio,
@@ -4934,6 +5547,7 @@ pub fn execute_workflow(
                 &active_entrapment_fasta,
                 parallel,
                 ensemble_lock.as_ref(),
+                entrapment_selection.as_ref(),
                 &mut runtime,
             )? {
                 if let Some(window) = window {
@@ -4981,6 +5595,7 @@ pub fn execute_workflow(
             ensemble_lock.as_ref(),
             None,
             parameter_overrides.as_ref(),
+            entrapment_selection.as_ref(),
             &mut runtime,
         ) {
             Ok(record) => record,
@@ -5048,6 +5663,7 @@ pub fn execute_workflow(
                 ensemble_lock.as_ref(),
                 None,
                 parameter_overrides.as_ref(),
+                entrapment_selection.as_ref(),
                 &mut runtime,
             ) {
                 Ok(record) => record,
@@ -5247,6 +5863,7 @@ pub fn execute_workflow(
                     Some(baseline_lock),
                     None,
                     parameter_overrides.as_ref(),
+                    entrapment_selection.as_ref(),
                     &mut runtime,
                 )?;
                 baseline_record.release_candidate = false;
@@ -5420,6 +6037,7 @@ pub fn execute_workflow(
                     ensemble_lock.as_ref(),
                     Some(&context),
                     parameter_overrides.as_ref(),
+                    None,
                 )?;
                 let record = StageRecord {
                     schema_version: 4,
@@ -5469,6 +6087,7 @@ pub fn execute_workflow(
                     model_artifact_schema: optimized.model_artifact_schema,
                     ensemble_interaction_calibration: None,
                     parameter_overrides: parameter_overrides.clone().unwrap_or_default(),
+                    entrapment_partition_identity: None,
                 };
                 std::fs::create_dir_all(&target_output_directory)?;
                 write_json_atomic(
@@ -5495,6 +6114,7 @@ pub fn execute_workflow(
                 ensemble_lock.as_ref(),
                 Some(&context),
                 parameter_overrides.as_ref(),
+                None,
                 &mut runtime,
             ) {
                 Ok(record) => record,
@@ -5601,6 +6221,55 @@ pub fn execute_workflow(
         .as_ref()
         .filter(|config| config.optimization_only())
     {
+        if let Some(partition) = entrapment_partition.as_ref() {
+            // This loop is intentionally after every expert and the final
+            // Ensemble optimizer has frozen its winner. Audit labels and
+            // metrics therefore cannot influence any subsequent proposal,
+            // checkpoint, transition, or voter decision.
+            for result in &mut optimization_results {
+                anyhow::ensure!(
+                    result.frozen_audit.is_none()
+                        && result.trials.iter().any(|trial| {
+                            trial.evaluation.compact_diagnostics
+                                ["entrapment_partition_identity"]
+                                .as_str()
+                                == Some(partition.partition_identity.as_str())
+                        })
+                        && result.trials.iter().all(|trial| {
+                            trial
+                                .evaluation
+                                .compact_diagnostics
+                                .get("entrapment_partition_identity")
+                                .is_none_or(|value| {
+                                    value.as_str()
+                                        == Some(partition.partition_identity.as_str())
+                                })
+                                && trial
+                                    .evaluation
+                                    .compact_diagnostics
+                                    .get("audit_metrics_present")
+                                    .is_none_or(|value| value == &serde_json::json!(false))
+                        }),
+                    "optimizer trial/checkpoint provenance is missing the shared selection-only partition contract"
+                );
+                result.frozen_audit = Some(evaluate_frozen_optimizer_winner_once(
+                    &manifest, partition, result,
+                )?);
+                let expert = result
+                    .requested_parameter_space
+                    .iter()
+                    .find_map(|block| block.expert)
+                    .context("optimizer result has no expert after frozen audit")?;
+                write_json_atomic(
+                    &manifest
+                        .output_root
+                        .join("parameter_optimizer")
+                        .join(expert.slug())
+                        .join("optimizer.result.json"),
+                    result,
+                )?;
+            }
+        }
         let expected = config
             .selected_experts
             .iter()
@@ -5639,6 +6308,7 @@ pub fn execute_workflow(
             dataset,
             entrapment,
             entrapment_fasta_parity,
+            entrapment_partition,
             baseline,
             stages: Vec::new(),
             candidate_pools: Vec::new(),
@@ -6049,6 +6719,7 @@ pub fn execute_workflow(
         dataset,
         entrapment,
         entrapment_fasta_parity,
+        entrapment_partition,
         baseline,
         stages,
         candidate_pools,
@@ -6125,6 +6796,7 @@ mod tests {
             objective: crate::parameter_optimizer::default_objective(),
             fixed_evaluation_threshold: 0.01,
             empirical_entrapment_constraints: Vec::new(),
+            entrapment_validation: Default::default(),
             underpowered_trial_policy:
                 crate::parameter_optimizer::UnderpoweredTrialPolicy::NotEvaluable,
             statistical_validity_contracts: BTreeMap::new(),
@@ -6161,6 +6833,151 @@ mod tests {
         }
     }
 
+    #[derive(Default)]
+    struct FrozenAuditFixtureEvaluator;
+
+    impl TrialEvaluator for FrozenAuditFixtureEvaluator {
+        fn evaluate(&mut self, _request: &TrialRequest) -> Result<TrialEvaluation> {
+            Ok(TrialEvaluation {
+                status: TrialStatus::Feasible,
+                technical_reason: None,
+                empirical_reason: None,
+                metrics: Some(TrialMetrics {
+                    level4_proteins: 1,
+                    level4_canonical_peptides: 1,
+                    level4_peptidoforms: 1,
+                    level4_psms: 1,
+                    adjusted_entrapment_fdp: Some(0.0),
+                    entrapment_count: 0,
+                    adjusted_entrapment_fdp_by_level: BTreeMap::new(),
+                    entrapment_count_by_level: BTreeMap::new(),
+                    model_complexity: 1,
+                }),
+                development_selection_eligible: true,
+                empirical_point_estimate_within_limit: Some(true),
+                empirical_calibration_power: EmpiricalCalibrationPower::Underpowered,
+                statistical_validation_status:
+                    StatisticalValidationStatus::NotEvaluableUnderpowered,
+                statistical_default_eligibility: StatisticalDefaultEligibility::NotEvaluated,
+                compact_diagnostics: BTreeMap::from([(
+                    "audit_metrics_present".into(),
+                    serde_json::json!(false),
+                )]),
+            })
+        }
+
+        fn materialize_winner(
+            &mut self,
+            record: &TrialRecord,
+        ) -> Result<Option<serde_json::Value>> {
+            Ok(Some(
+                serde_json::json!({"trial_id": record.request.trial_id}),
+            ))
+        }
+    }
+
+    #[test]
+    fn frozen_entrapment_audit_is_post_winner_immutable_and_nonadmissive() {
+        let directory = test_directory("frozen-entrapment-audit");
+        let mut manifest = minimal_manifest(&directory, ValidationDatasetRole::Development);
+        manifest.output_root = directory.join("output");
+        std::fs::create_dir_all(&manifest.output_root).unwrap();
+        std::fs::write(&manifest.target_fasta, b">Target_A\nTARGETPEPK\n").unwrap();
+        let active_fasta = directory.join("active-entrapment.fasta");
+        std::fs::write(
+            &active_fasta,
+            b">Target_A\nTARGETPEPK\n>Ent_one\nSELECTIONK\n>Ent_two\nAUDITPEPK\n",
+        )
+        .unwrap();
+        let mut config = test_optimizer_config();
+        config.schema_version = crate::parameter_optimizer::PARAMETER_OPTIMIZER_SCHEMA_VERSION;
+        config.execution_mode = OptimizerExecutionMode::OptimizationOnly;
+        config.maximum_trial_budget = 2;
+        config.entrapment_validation = crate::parameter_optimizer::EntrapmentValidationConfig {
+            mode: EntrapmentValidationMode::SelectionAudit,
+            partition_schema_version: 1,
+            seed: 17,
+            salt: "synthetic-end-to-end".into(),
+            selection_fraction: 0.5,
+            audit_fraction: 0.5,
+            require_existing_partition: false,
+        };
+        let source_config = Path::new(env!("CARGO_MANIFEST_DIR"))
+            .join("../..")
+            .join("tests/config.json");
+        let input = Input::load(source_config.to_string_lossy().as_ref()).unwrap();
+        let partition = build_entrapment_partition(
+            &input.database.make_parameters(),
+            "dataset",
+            &manifest.target_fasta,
+            &active_fasta,
+            "construction",
+            &config.entrapment_validation,
+        )
+        .unwrap();
+        manifest.parameter_optimizer = Some(config.clone());
+        let identity = OptimizerIdentity {
+            schema_version: 1,
+            execution_mode: config.execution_mode,
+            dataset_identity: "dataset".into(),
+            candidate_pool_identity: "candidate".into(),
+            raw_annotation_cache_identity: "raw".into(),
+            calibrated_annotation_identity: None,
+            model_artifact_schema: 2,
+            optimizer_schema: crate::parameter_optimizer::PARAMETER_OPTIMIZER_SCHEMA_VERSION,
+            optimizer_source_sha256:
+                crate::parameter_optimizer::PARAMETER_OPTIMIZER_IMPLEMENTATION_SOURCE_SHA256.into(),
+            source_configuration_sha256: "config".into(),
+            catalog_sha256: "catalog".into(),
+            entrapment_partition_identity: Some(partition.partition_identity.clone()),
+        };
+        let optimizer_root = manifest
+            .output_root
+            .join("parameter_optimizer")
+            .join("moments");
+        std::fs::create_dir_all(&optimizer_root).unwrap();
+        let result = run_optimizer(
+            &config,
+            &identity,
+            &optimizer_root.join("optimizer.checkpoint.json"),
+            &mut FrozenAuditFixtureEvaluator,
+        )
+        .unwrap();
+        assert!(result.frozen_audit.is_none());
+        let winner = final_optimizer_winner_record(&result).unwrap();
+        let trial_root = optimizer_root.join("trials").join(&winner.request.trial_id);
+        std::fs::create_dir_all(&trial_root).unwrap();
+        std::fs::write(
+            trial_root.join("results.sage.tsv"),
+            "psm_id\trank\tlabel\tproteins\tpeptide\tdecoy_free_q_value\tdecoy_free_peptide_q\tdecoy_free_protein_q\tdecoy_free_protein_supported_peptide\tdecoy_free_peptide_supported_psm\n\
+             t1\t1\t1\tTarget_A\tTARGETPEP\t0.001\t0.001\t0.001\ttrue\ttrue\n",
+        )
+        .unwrap();
+        let first = evaluate_frozen_optimizer_winner_once(&manifest, &partition, &result).unwrap();
+        let audit_path = optimizer_root.join("winner.entrapment_audit.json");
+        let first_bytes = std::fs::read(&audit_path).unwrap();
+        let second = evaluate_frozen_optimizer_winner_once(&manifest, &partition, &result).unwrap();
+        assert_eq!(first, second);
+        assert_eq!(first_bytes, std::fs::read(&audit_path).unwrap());
+        assert!(first.evaluated_after_winner_freeze);
+        assert_eq!(
+            first.voter_participation_effect,
+            "none_audit_is_nonadmissive"
+        );
+        assert!(!first.target_only_outcomes_used);
+        assert_eq!(first.protein.audit_entrapments, 0);
+        assert_eq!(first.protein.adjusted_fdp, Some(0.0));
+        assert!(first
+            .protein
+            .adjusted_fdp_interval_95
+            .is_some_and(|interval| interval[1] > 0.0));
+        assert_eq!(
+            first.statistical_validation_status,
+            StatisticalValidationStatus::NotEvaluableUnderpowered
+        );
+        std::fs::remove_dir_all(directory).unwrap();
+    }
+
     #[test]
     fn workflow_optimizer_requires_strict_reuse_and_exact_json_roster() {
         let directory = test_directory("workflow-parameter-optimizer-contract");
@@ -6185,6 +7002,146 @@ mod tests {
             .unwrap_err()
             .to_string()
             .contains("exactly match"));
+        std::fs::remove_dir_all(directory).unwrap();
+    }
+
+    #[test]
+    fn workflow_entrapment_partition_contract_is_explicit_and_fail_closed() {
+        let directory = test_directory("workflow-entrapment-partition-contract");
+        let mut manifest = minimal_manifest(&directory, ValidationDatasetRole::Development);
+        manifest.require_existing_candidate_pool = true;
+        manifest.require_existing_annotation_cache = true;
+        let mut optimizer = test_optimizer_config();
+        optimizer.schema_version = crate::parameter_optimizer::PARAMETER_OPTIMIZER_SCHEMA_VERSION;
+        optimizer.execution_mode = OptimizerExecutionMode::OptimizationOnly;
+        optimizer.entrapment_validation = crate::parameter_optimizer::EntrapmentValidationConfig {
+            mode: EntrapmentValidationMode::SelectionAudit,
+            partition_schema_version: 1,
+            seed: 9,
+            salt: "prospective-test".into(),
+            selection_fraction: 0.5,
+            audit_fraction: 0.5,
+            require_existing_partition: false,
+        };
+        manifest.parameter_optimizer = Some(optimizer);
+        manifest.entrapment.partition_artifact = Some(directory.join("partition.json"));
+        manifest.validate().unwrap();
+        assert_eq!(
+            optimizer_execution_report(
+                manifest.parameter_optimizer.as_ref().unwrap(),
+                &[],
+                "plan_only"
+            )
+            .frozen_audit_evaluation,
+            "not_run_before_winner_freeze"
+        );
+
+        manifest
+            .parameter_optimizer
+            .as_mut()
+            .unwrap()
+            .entrapment_validation
+            .require_existing_partition = true;
+        assert!(manifest
+            .validate()
+            .unwrap_err()
+            .to_string()
+            .contains("required existing entrapment partition"));
+
+        manifest
+            .parameter_optimizer
+            .as_mut()
+            .unwrap()
+            .entrapment_validation = Default::default();
+        assert!(manifest
+            .validate()
+            .unwrap_err()
+            .to_string()
+            .contains("must not declare"));
+        std::fs::remove_dir_all(directory).unwrap();
+    }
+
+    #[test]
+    fn partition_materialization_is_prospective_and_does_not_enter_workflow_execution() {
+        let directory = test_directory("partition-materialization-only");
+        let mut manifest = minimal_manifest(&directory, ValidationDatasetRole::Development);
+        manifest.search_config = Path::new(env!("CARGO_MANIFEST_DIR"))
+            .join("../..")
+            .join("tests/config.json");
+        let active = directory.join("active-entrapment.fasta");
+        std::fs::write(
+            &active,
+            b">target\nPEPTIDER\n>Ent_selection\nSELECTIONK\n>Ent_audit\nAUDITPEPK\n",
+        )
+        .unwrap();
+        let spectrum = directory.join("identity-only.mzML");
+        std::fs::write(&spectrum, b"identity only\n").unwrap();
+        manifest.spectra = vec![spectrum.to_string_lossy().into_owned()];
+        manifest.entrapment.database_mode = EntrapmentDatabaseMode::FrozenLegacy;
+        manifest.entrapment.foreign_fastas.clear();
+        manifest.entrapment.frozen_legacy_fasta = Some(active);
+        manifest.entrapment.output_fasta = directory.join("unused.fasta");
+        manifest.entrapment.partition_artifact = Some(directory.join("partition.json"));
+        manifest.require_existing_candidate_pool = true;
+        manifest.require_existing_annotation_cache = true;
+        let mut optimizer = test_optimizer_config();
+        optimizer.schema_version = crate::parameter_optimizer::PARAMETER_OPTIMIZER_SCHEMA_VERSION;
+        optimizer.execution_mode = OptimizerExecutionMode::OptimizationOnly;
+        optimizer.entrapment_validation = crate::parameter_optimizer::EntrapmentValidationConfig {
+            mode: EntrapmentValidationMode::SelectionAudit,
+            partition_schema_version: 1,
+            seed: 91,
+            salt: "prospective-materialization-test".into(),
+            selection_fraction: 0.5,
+            audit_fraction: 0.5,
+            require_existing_partition: false,
+        };
+        manifest.parameter_optimizer = Some(optimizer);
+        let manifest_path = directory.join("workflow.json");
+        write_json_atomic(&manifest_path, &manifest).unwrap();
+
+        let inputs = inspect_workflow_entrapment_partition_inputs(&manifest_path).unwrap();
+        assert_eq!(inputs.seed, 91);
+        assert_eq!(inputs.requested_selection_fraction, 0.5);
+        assert!(!inputs.digestion_search_space_identity.is_empty());
+        assert!(!manifest
+            .entrapment
+            .partition_artifact
+            .as_ref()
+            .unwrap()
+            .exists());
+        assert!(!manifest.output_root.exists());
+
+        let first = materialize_workflow_entrapment_partition(&manifest_path).unwrap();
+        assert!(manifest
+            .entrapment
+            .partition_artifact
+            .as_ref()
+            .unwrap()
+            .is_file());
+        assert!(!manifest.output_root.exists());
+        assert!(!directory.join("candidate_pools").exists());
+        assert!(!directory.join("ms2rescore_annotations").exists());
+
+        manifest
+            .parameter_optimizer
+            .as_mut()
+            .unwrap()
+            .entrapment_validation
+            .require_existing_partition = true;
+        write_json_atomic(&manifest_path, &manifest).unwrap();
+        let replay = materialize_workflow_entrapment_partition(&manifest_path).unwrap();
+        assert_eq!(first, replay);
+
+        let partition_path = manifest.entrapment.partition_artifact.as_ref().unwrap();
+        let mut corrupt: EntrapmentPartitionArtifact =
+            serde_json::from_slice(&std::fs::read(partition_path).unwrap()).unwrap();
+        corrupt.payload_sha256 = "corrupt".into();
+        write_json_atomic(partition_path, &corrupt).unwrap();
+        assert!(materialize_workflow_entrapment_partition(&manifest_path)
+            .unwrap_err()
+            .to_string()
+            .contains("payload integrity failure"));
         std::fs::remove_dir_all(directory).unwrap();
     }
 
@@ -6383,6 +7340,7 @@ mod tests {
                 legacy_parity_reference: None,
                 seed: 1,
                 protein_fold: 1,
+                partition_artifact: None,
             },
             models: vec![ModelWorkflow {
                 model: ModelFit::Moments,
@@ -6856,6 +7814,7 @@ mod tests {
             model_artifact_schema: None,
             ensemble_interaction_calibration: None,
             parameter_overrides: BTreeMap::new(),
+            entrapment_partition_identity: None,
         };
         let mut legacy_value = serde_json::to_value(&record).unwrap();
         legacy_value["schema_version"] = serde_json::json!(2);
@@ -7935,6 +8894,7 @@ mod tests {
                 legacy_parity_reference: None,
                 seed: 0,
                 protein_fold: 1,
+                partition_artifact: None,
             },
             models: vec![
                 model(

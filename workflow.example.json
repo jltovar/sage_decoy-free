@@ -24,7 +24,8 @@
   ],
   "foreign_source_mode": "automatic",
   "shared_peptide_exclusion_mode": "sage_search_space",
-  "output_fasta": "/path/to/native_workflow/development/target_foreign_entrapment.fasta",
+    "output_fasta": "/path/to/native_workflow/development/target_foreign_entrapment.fasta",
+    "partition_artifact": null,
     "seed": 42,
     "protein_fold": 1
   },
@@ -152,7 +153,7 @@
   "locked_expert_artifacts": {},
   "artifact_reuse_policy": "dataset_local_only",
   "parameter_optimizer": {
-    "schema_version": 3,
+    "schema_version": 4,
     "enabled": false,
     "classification": "development_only",
     "selected_experts": [
@@ -187,6 +188,15 @@
       }
     ],
     "underpowered_trial_policy": "not_evaluable",
+    "entrapment_validation": {
+      "mode": "full_population_development",
+      "partition_schema_version": 1,
+      "seed": 42,
+      "salt": "",
+      "selection_fraction": 0.5,
+      "audit_fraction": 0.5,
+      "require_existing_partition": false
+    },
     "statistical_validity_contracts": {},
     "resume": true,
     "materialize_winner": true,
