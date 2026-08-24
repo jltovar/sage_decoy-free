@@ -625,12 +625,14 @@ pub enum LoTevTransform {
     ///   TEV = ln(1000 / E)
     ///
     /// This preserves the historical 1000/E reference without the 0.02 compression.
+    #[serde(alias = "log_1000_over_e")]
     Log1000OverE,
 
     /// Historical compressed Tide/Comet-style scale:
     ///   TEV = 0.02 * ln(1000 / E)
     ///
     /// Retained only for backward-compatible comparisons.
+    #[serde(alias = "scaled_log_1000_over_e")]
     ScaledLog1000OverE,
 }
 
@@ -1089,8 +1091,8 @@ pub struct FdrOptions {
     // Then lo_tev_transform selects the TEV score scale:
     //
     //   neg_log_e              => TEV = -ln(E_LO)
-    //   log_1000_over_e        => TEV = ln(1000 / E_LO)
-    //   scaled_log_1000_over_e => TEV = 0.02 * ln(1000 / E_LO)
+    //   log1000_over_e        => TEV = ln(1000 / E_LO)
+    //   scaled_log1000_over_e => TEV = 0.02 * ln(1000 / E_LO)
     //
     pub lo_evalue_candidate_count_power: Option<f64>,
     pub lo_evalue_scale: Option<f64>,

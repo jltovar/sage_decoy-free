@@ -99,6 +99,25 @@ explicit named statistical-validity contract. In particular, JSON exposure does 
 the null-independence or cross-fitting validity of `matched_peaks`, `best_longest_y_pct`,
 `nsaf_observable_length`, or any other covariate.
 
+Post-optimization review must distinguish active scientific settings from dormant,
+reparameterization-equivalent, numerical, and provenance-only settings. Lower Order
+`lo_evalue_scale` and `lo_tev_transform` are not eligible yield objectives: with the production
+`neg_log_e` family they induce only a positive affine change that the fitted location/scale
+absorbs. Their canonical values are `1.0` and `neg_log_e`; legacy spellings
+`log_1000_over_e` and `scaled_log_1000_over_e` load only as compatibility aliases and serialize
+canonically as `log1000_over_e` and `scaled_log1000_over_e`. Seeded MSFDR
+`msfdr_multistart` is retained for configuration compatibility but is not consumed by the current
+production estimator and is therefore ineligible until a production binding and numerical
+convergence contract are implemented. A declared active optimization block containing any of
+these fields fails closed rather than recording a no-op winner.
+
+Final-Ensemble dependencies are also fail-closed. P-value combiner choices and Cauchy penalty are
+active yield variables only for `final_evidence_space: p_value`; PEP combiner choices and their
+shape parameters are active only for `final_evidence_space: pep`. Expert weights are active only
+for a PEP final stream using `weighted_mean` or `weighted_median`. Otherwise those values remain
+positive canonical defaults and may still describe auxiliary stored evidence, but the optimizer
+does not present them as identification-yield winners.
+
 ## Leakage, identity, and resume
 
 Only the +entrapment development population contributes feasibility, objective values, ranking,

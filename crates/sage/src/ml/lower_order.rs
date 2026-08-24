@@ -1799,6 +1799,21 @@ mod tests {
     }
 
     #[test]
+    fn tev_k_mle_is_location_equivariant_for_lower_order_alias_transform() {
+        let scores = (0..160)
+            .map(|i| 2.0 + (i as f64) * 0.03125 + ((i % 7) as f64) * 0.017)
+            .collect::<Vec<_>>();
+        let shift = 1000.0_f64.ln();
+        let shifted = scores.iter().map(|score| score + shift).collect::<Vec<_>>();
+
+        let (mu, beta) = fit_tev_k_mle(&scores, 6).expect("canonical TEV fit");
+        let (shifted_mu, shifted_beta) = fit_tev_k_mle(&shifted, 6).expect("shifted TEV fit");
+
+        assert!((shifted_mu - (mu + shift)).abs() <= 1e-12);
+        assert!((shifted_beta - beta).abs() <= 1e-12);
+    }
+
+    #[test]
     fn pylord_parity_tev_cdf_asymptotic_matches_known_values() {
         // These expected values exercise the asymptotic k-th lower-order Gumbel CDF:
         //   F_k(z) = exp(-exp(-z)) * Σ_{m=0..k-1} exp(-m z) / m!

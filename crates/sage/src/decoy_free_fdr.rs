@@ -700,8 +700,8 @@ fn set_df_evidence_pair(psm: &mut DfFeature, active: ActiveEvidenceSpace, p_valu
 //   The final LO TEV score is selected explicitly by `lo_tev_transform`:
 //
 //       neg_log_e              => TEV = -ln(E)
-//       log_1000_over_e        => TEV = ln(1000 / E)
-//       scaled_log_1000_over_e => TEV = 0.02 * ln(1000 / E)
+//       log1000_over_e        => TEV = ln(1000 / E)
+//       scaled_log1000_over_e => TEV = 0.02 * ln(1000 / E)
 //
 //   `neg_log_e` is the default canonical uncompressed LO scale.
 #[inline(always)]
@@ -14194,6 +14194,24 @@ mod tests {
     }
 
     #[test]
+    fn lower_order_tev_representations_are_positive_affine_reparameterizations() {
+        let shift = LO_TEV_REFERENCE_EVALUE.ln();
+        for e_value in [1e-12, 1e-6, 0.1, 1.0, 10.0, 1e6] {
+            let canonical = lo_tev_from_e_value(e_value, LoTevTransform::NegLogE).unwrap();
+            let shifted = lo_tev_from_e_value(e_value, LoTevTransform::Log1000OverE).unwrap();
+            let scaled = lo_tev_from_e_value(e_value, LoTevTransform::ScaledLog1000OverE).unwrap();
+            assert!((shifted - (canonical + shift)).abs() <= 1e-14);
+            assert!((scaled - LO_HISTORICAL_TEV_SCALE * shifted).abs() <= 1e-14);
+        }
+
+        let base_e = 0.037;
+        let scale = 0.5;
+        let scaled_e = lo_tev_from_e_value(base_e * scale, LoTevTransform::NegLogE).unwrap();
+        let canonical = lo_tev_from_e_value(base_e, LoTevTransform::NegLogE).unwrap();
+        assert!((scaled_e - (canonical - scale.ln())).abs() <= 1e-14);
+    }
+
+    #[test]
     fn statistical_conformance_ensemble_consensus_is_bounded_order_invariant_and_continuous() {
         let mut settings = FdrSettings::from(FdrOptions::default());
         settings.ensemble_p_combiner = EnsemblePCombiner::SecondBest;
@@ -14231,6 +14249,41 @@ mod tests {
         let weak = combine_second_best_p(&[0.001, 0.8, 0.9]);
         let strengthened = combine_second_best_p(&[0.001, 0.2, 0.9]);
         assert!(strengthened <= weak);
+    }
+
+    #[test]
+    fn second_best_and_median_ignore_dormant_weight_and_shape_settings() {
+        let p_values = [0.001, 0.2, 0.9];
+        let mut first = FdrSettings::from(FdrOptions::default());
+        first.ensemble_p_combiner = EnsemblePCombiner::SecondBest;
+        first.ensemble_cauchy_penalty = 1.0;
+        let mut second = first.clone();
+        second.ensemble_cauchy_penalty = 100.0;
+        assert_eq!(
+            combine_p_values_for_ensemble(&p_values, &first),
+            combine_p_values_for_ensemble(&p_values, &second)
+        );
+
+        let peps = [0.05, 0.2, 0.4, 0.8];
+        let a = combine_peps(
+            &peps,
+            &[0.5, 0.5, 0.5, 0.5],
+            EnsemblePepCombiner::Median,
+            0.0,
+            0.1,
+            1,
+            1e-12,
+        );
+        let b = combine_peps(
+            &peps,
+            &[1.0, 2.0, 3.0, 4.0],
+            EnsemblePepCombiner::Median,
+            0.49,
+            0.9,
+            4,
+            0.1,
+        );
+        assert_eq!(a, b);
     }
 
     #[test]

@@ -567,7 +567,7 @@ diagnostics do not select Ensemble voters.
     "msfdr_max_null_rank": 20,
     "msfdr_seeded_purification_factor": 0.25,
     "msfdr_seeded_top_frac_init": 0.2,
-    "msfdr_multistart": 2,
+    "msfdr_multistart": 3,
     "msfdr_pi_clamp_min": 0.01,
     "msfdr_pi_clamp_max": 0.99,
 
@@ -795,8 +795,8 @@ The LowerOrder model uses non-rank-1 lower-order evidence to infer a rank-1 targ
 | `lo_min_count_per_rank` | integer | `10` | Minimum support per LO rank. |
 | `lo_stratify` | `global`, `charge` | `charge` | LO stratification mode. |
 | `lo_evalue_candidate_count_power` | float | `0.75` | Candidate-count power for LO E-value construction, clamped to `[0, 1]`. |
-| `lo_evalue_scale` | float | `1.0` | Multiplicative E-value scale, clamped to `[1e-6, 1e6]`. |
-| `lo_tev_transform` | `neg_log_e`, `log_1000_over_e`, `scaled_log_1000_over_e` | `neg_log_e` | TEV transform. |
+| `lo_evalue_scale` | float | `1.0` | Compatibility field for a fitted-location reparameterization. Keep at canonical `1.0`; it is not eligible for yield optimization. |
+| `lo_tev_transform` | `neg_log_e`, `log1000_over_e`, `scaled_log1000_over_e` | `neg_log_e` | Positive-affine TEV representation. Canonicalize to `neg_log_e`; legacy spellings with an underscore before `1000` remain accepted as loading aliases. |
 | `lo_tnm_extrapolation_strength` | float | `1.0` | Rank-1 TNM extrapolation strength, clamped to `[0.25, 5.0]`. |
 
 LO E-values are constructed as:
@@ -811,8 +811,8 @@ Then the configured TEV transform is applied:
 
 ```text
 neg_log_e              => TEV = -ln(E_LO)
-log_1000_over_e        => TEV = ln(1000 / E_LO)
-scaled_log_1000_over_e => TEV = 0.02 * ln(1000 / E_LO)
+log1000_over_e        => TEV = ln(1000 / E_LO)
+scaled_log1000_over_e => TEV = 0.02 * ln(1000 / E_LO)
 ```
 
 ### MSFDR seeded model
@@ -823,7 +823,7 @@ scaled_log_1000_over_e => TEV = 0.02 * ln(1000 / E_LO)
 | `msfdr_max_null_rank` | integer | `50` | Method-specific upper null rank. |
 | `msfdr_seeded_purification_factor` | float | `0.25` | Null-pool purification factor. |
 | `msfdr_seeded_top_frac_init` | float | `0.20` | Initial top fraction, clamped by the generic fraction helper. |
-| `msfdr_multistart` | integer | `3` | Number of multistart fits, clamped to `[1, 25]`. |
+| `msfdr_multistart` | integer | `3` | Compatibility field. The current seeded MSFDR fitter uses one deterministic initialization, so this field is not eligible for yield optimization. |
 | `msfdr_pi_clamp_min` | float | `0.01` | Minimum mixture weight clamp. |
 | `msfdr_pi_clamp_max` | float | `0.565` | Maximum mixture weight clamp. |
 
@@ -899,6 +899,13 @@ diagnostics and do not select voters.
 | `ensemble_pep_top_k` | integer | `2` | Top-k count for `top_k_mean`. |
 | `ensemble_pep_logit_eps` | float | `1e-6` | Epsilon for logit combiner. |
 | `ensemble_weight_*` | float | `1.0` | Static nonnegative expert weights for weighted combiners. |
+
+The parameter optimizer applies these controls conditionally. P-value combiner and Cauchy-penalty
+trials require a p-value final stream. PEP combiner and shape trials require a PEP final stream,
+and expert-weight trials additionally require `weighted_mean` or `weighted_median`. Dormant
+settings remain at positive canonical defaults, so they cannot masquerade as optimized values or
+silently remove a selected voter. A median PEP produced beside a p-value final stream remains an
+auxiliary stored consensus statistic and does not drive the final p-value decisions.
 
 ### Physical rescue / auxiliary evidence
 
