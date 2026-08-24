@@ -11,7 +11,7 @@ use sha2::{Digest, Sha256};
 use std::collections::{BTreeMap, BTreeSet};
 use std::path::Path;
 
-pub const PARAMETER_OPTIMIZER_SCHEMA_VERSION: u32 = 3;
+pub const PARAMETER_OPTIMIZER_SCHEMA_VERSION: u32 = 4;
 pub const PARAMETER_CATALOG_SCHEMA_VERSION: u32 = 2;
 pub const PARAMETER_OPTIMIZER_IMPLEMENTATION_SOURCE_SHA256: &str =
     env!("SAGE_PARAMETER_OPTIMIZER_SOURCE_SHA256");
@@ -2656,6 +2656,62 @@ pub enum OptimizerExecutionMode {
     OptimizationAndPostSelection,
 }
 
+/// Determines whether entrapment labels are used as one development
+/// population or prospectively separated into optimizer-selection and
+/// post-freeze audit populations. This is independent of the cross-dataset
+/// validation role.
+#[derive(Clone, Copy, Debug, Default, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(rename_all = "snake_case")]
+pub enum EntrapmentValidationMode {
+    #[default]
+    FullPopulationDevelopment,
+    SelectionAudit,
+}
+
+#[derive(Clone, Debug, Serialize, Deserialize, PartialEq)]
+pub struct EntrapmentValidationConfig {
+    #[serde(default)]
+    pub mode: EntrapmentValidationMode,
+    #[serde(default = "default_entrapment_partition_schema_version")]
+    pub partition_schema_version: u32,
+    #[serde(default)]
+    pub seed: u64,
+    #[serde(default)]
+    pub salt: String,
+    #[serde(default = "default_selection_fraction")]
+    pub selection_fraction: f64,
+    #[serde(default = "default_audit_fraction")]
+    pub audit_fraction: f64,
+    #[serde(default)]
+    pub require_existing_partition: bool,
+}
+
+impl Default for EntrapmentValidationConfig {
+    fn default() -> Self {
+        Self {
+            mode: EntrapmentValidationMode::FullPopulationDevelopment,
+            partition_schema_version: default_entrapment_partition_schema_version(),
+            seed: 0,
+            salt: String::new(),
+            selection_fraction: default_selection_fraction(),
+            audit_fraction: default_audit_fraction(),
+            require_existing_partition: false,
+        }
+    }
+}
+
+fn default_entrapment_partition_schema_version() -> u32 {
+    1
+}
+
+fn default_selection_fraction() -> f64 {
+    0.5
+}
+
+fn default_audit_fraction() -> f64 {
+    0.5
+}
+
 #[derive(Clone, Copy, Debug, Serialize, Deserialize, PartialEq, Eq)]
 #[serde(rename_all = "snake_case")]
 pub enum ObjectiveDirection {
@@ -2787,6 +2843,10 @@ pub struct ParameterOptimizerConfig {
     /// behavior.
     #[serde(default)]
     pub underpowered_trial_policy: UnderpoweredTrialPolicy,
+    /// Dataset-local label-isolation contract. Missing preserves the
+    /// historical full-population development behavior.
+    #[serde(default)]
+    pub entrapment_validation: EntrapmentValidationConfig,
     #[serde(default)]
     pub statistical_validity_contracts: BTreeMap<String, String>,
     pub resume: bool,
@@ -2846,6 +2906,37 @@ impl ParameterOptimizerConfig {
             anyhow::ensure!(
                 self.classification == OptimizationClassification::DevelopmentOnly,
                 "underpowered development eligibility is prohibited for holdout, release, statistical-default, and production-default claims"
+            );
+        }
+        if self.entrapment_validation.mode == EntrapmentValidationMode::SelectionAudit {
+            anyhow::ensure!(
+                self.schema_version >= 4,
+                "entrapment selection/audit partitioning requires parameter_optimizer schema_version 4"
+            );
+            anyhow::ensure!(
+                self.entrapment_validation.partition_schema_version == 1,
+                "unsupported entrapment partition schema {}",
+                self.entrapment_validation.partition_schema_version
+            );
+            anyhow::ensure!(
+                !self.entrapment_validation.salt.trim().is_empty(),
+                "selection/audit entrapment partition requires a nonempty deterministic salt"
+            );
+            anyhow::ensure!(
+                self.entrapment_validation.selection_fraction.is_finite()
+                    && self.entrapment_validation.audit_fraction.is_finite()
+                    && self.entrapment_validation.selection_fraction > 0.0
+                    && self.entrapment_validation.audit_fraction > 0.0
+                    && (self.entrapment_validation.selection_fraction
+                        + self.entrapment_validation.audit_fraction
+                        - 1.0)
+                        .abs()
+                        <= 1e-12,
+                "selection/audit entrapment fractions must be finite, positive, and sum to one"
+            );
+            anyhow::ensure!(
+                self.optimization_only(),
+                "selection/audit entrapment validation requires execution_mode=optimization_only so audit occurs only after every winner is frozen"
             );
         }
         anyhow::ensure!(
@@ -3635,6 +3726,8 @@ pub struct OptimizerIdentity {
     pub optimizer_source_sha256: String,
     pub source_configuration_sha256: String,
     pub catalog_sha256: String,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub entrapment_partition_identity: Option<String>,
 }
 
 pub fn optimizer_fingerprint(
@@ -3725,6 +3818,44 @@ pub struct OptimizerRunResult {
     pub development_only: bool,
     pub independent_evaluation_status: String,
     pub statistical_default_status: String,
+    /// Computed from the already-frozen winner after optimization has
+    /// terminated. This field is never present in optimizer checkpoints and
+    /// never participates in winner selection.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub frozen_audit: Option<FrozenWinnerAuditEvaluation>,
+}
+
+#[derive(Clone, Debug, Serialize, Deserialize, PartialEq)]
+pub struct AuditLevelMetrics {
+    pub targets: usize,
+    pub audit_entrapments: usize,
+    pub measured_audit_ratio: f64,
+    pub adjusted_fdp: Option<f64>,
+    pub adjusted_fdp_interval_95: Option<[f64; 2]>,
+    pub minimum_observations_for_power: usize,
+    pub empirical_calibration_power: EmpiricalCalibrationPower,
+    pub maximum_adjusted_fdp: Option<f64>,
+    pub empirical_point_estimate_within_limit: Option<bool>,
+}
+
+#[derive(Clone, Debug, Serialize, Deserialize, PartialEq)]
+pub struct FrozenWinnerAuditEvaluation {
+    pub schema_version: u32,
+    pub partition_identity: String,
+    pub expert: OptimizerExpert,
+    pub winner_trial_id: String,
+    pub winner_results_sha256: String,
+    pub evaluated_after_winner_freeze: bool,
+    pub psm: AuditLevelMetrics,
+    pub canonical_peptide: AuditLevelMetrics,
+    pub peptidoform: AuditLevelMetrics,
+    pub protein: AuditLevelMetrics,
+    pub empirical_calibration_power: EmpiricalCalibrationPower,
+    pub statistical_validation_status: StatisticalValidationStatus,
+    pub statistical_default_eligibility: StatisticalDefaultEligibility,
+    pub voter_participation_effect: String,
+    pub target_only_outcomes_used: bool,
+    pub payload_sha256: String,
 }
 
 pub fn run_optimizer<E: TrialEvaluator>(
@@ -4526,6 +4657,7 @@ fn finish_result<E: TrialEvaluator>(
             "development_candidate_not_a_default"
         }
         .into(),
+        frozen_audit: None,
     })
 }
 
@@ -4556,6 +4688,7 @@ mod tests {
             fixed_evaluation_threshold: 0.01,
             empirical_entrapment_constraints: vec![],
             underpowered_trial_policy: UnderpoweredTrialPolicy::NotEvaluable,
+            entrapment_validation: EntrapmentValidationConfig::default(),
             statistical_validity_contracts: BTreeMap::new(),
             resume: true,
             materialize_winner: true,
@@ -4605,6 +4738,7 @@ mod tests {
             optimizer_source_sha256: PARAMETER_OPTIMIZER_IMPLEMENTATION_SOURCE_SHA256.into(),
             source_configuration_sha256: "config".into(),
             catalog_sha256: "catalog".into(),
+            entrapment_partition_identity: None,
         }
     }
 
@@ -4652,6 +4786,28 @@ mod tests {
         }
     }
 
+    struct AuditBlindEvaluator {
+        hidden_audit_labels: Vec<bool>,
+        inner: Evaluator,
+    }
+
+    impl TrialEvaluator for AuditBlindEvaluator {
+        fn evaluate(&mut self, request: &TrialRequest) -> Result<TrialEvaluation> {
+            // The optimizer evaluator interface intentionally exposes no
+            // audit-label argument. Keep the synthetic labels alive solely to
+            // prove that changing them cannot affect selection metrics.
+            let _hidden_label_count = self.hidden_audit_labels.len();
+            self.inner.evaluate(request)
+        }
+
+        fn materialize_winner(
+            &mut self,
+            record: &TrialRecord,
+        ) -> Result<Option<serde_json::Value>> {
+            self.inner.materialize_winner(record)
+        }
+    }
+
     #[test]
     fn execution_mode_is_backward_compatible_and_changes_identity() {
         let mut value = serde_json::to_value(config()).unwrap();
@@ -4689,6 +4845,145 @@ mod tests {
         .to_string();
         assert!(error.contains("fingerprint mismatch"));
         std::fs::remove_dir_all(directory).unwrap();
+    }
+
+    #[test]
+    fn entrapment_partition_mode_is_explicit_backward_compatible_and_checkpoint_bound() {
+        let mut legacy_value = serde_json::to_value(config()).unwrap();
+        legacy_value
+            .as_object_mut()
+            .unwrap()
+            .remove("entrapment_validation");
+        let legacy: ParameterOptimizerConfig = serde_json::from_value(legacy_value).unwrap();
+        assert_eq!(
+            legacy.entrapment_validation.mode,
+            EntrapmentValidationMode::FullPopulationDevelopment
+        );
+
+        let mut selection = config();
+        selection.schema_version = PARAMETER_OPTIMIZER_SCHEMA_VERSION;
+        selection.execution_mode = OptimizerExecutionMode::OptimizationOnly;
+        selection.entrapment_validation = EntrapmentValidationConfig {
+            mode: EntrapmentValidationMode::SelectionAudit,
+            partition_schema_version: 1,
+            seed: 19,
+            salt: "dataset-local-selection-audit-v1".into(),
+            selection_fraction: 0.7,
+            audit_fraction: 0.3,
+            require_existing_partition: true,
+        };
+        selection.validate().unwrap();
+
+        let mut bad = selection.clone();
+        bad.schema_version = 3;
+        assert!(bad
+            .validate()
+            .unwrap_err()
+            .to_string()
+            .contains("schema_version 4"));
+        let mut bad = selection.clone();
+        bad.entrapment_validation.salt.clear();
+        assert!(bad.validate().unwrap_err().to_string().contains("nonempty"));
+        let mut bad = selection.clone();
+        bad.entrapment_validation.audit_fraction = 0.4;
+        assert!(bad
+            .validate()
+            .unwrap_err()
+            .to_string()
+            .contains("sum to one"));
+
+        let mut first_identity = identity();
+        first_identity.execution_mode = OptimizerExecutionMode::OptimizationOnly;
+        first_identity.entrapment_partition_identity = Some("partition-a".into());
+        let mut second_identity = first_identity.clone();
+        second_identity.entrapment_partition_identity = Some("partition-b".into());
+        assert_eq!(
+            first_identity.candidate_pool_identity,
+            second_identity.candidate_pool_identity
+        );
+        assert_eq!(
+            first_identity.raw_annotation_cache_identity,
+            second_identity.raw_annotation_cache_identity
+        );
+        assert_ne!(
+            optimizer_fingerprint(&first_identity, &selection).unwrap(),
+            optimizer_fingerprint(&second_identity, &selection).unwrap()
+        );
+
+        let directory = temp("partition-checkpoint-identity");
+        std::fs::create_dir_all(&directory).unwrap();
+        let checkpoint = directory.join("checkpoint.json");
+        let result = run_optimizer(
+            &selection,
+            &first_identity,
+            &checkpoint,
+            &mut Evaluator::default(),
+        )
+        .unwrap();
+        assert!(result.frozen_audit.is_none());
+        let checkpoint_text = std::fs::read_to_string(&checkpoint).unwrap();
+        assert!(!checkpoint_text.contains("frozen_audit"));
+        assert!(!checkpoint_text.contains("audit_entrapment"));
+        let error = run_optimizer(
+            &selection,
+            &second_identity,
+            &checkpoint,
+            &mut Evaluator::default(),
+        )
+        .unwrap_err()
+        .to_string();
+        assert!(error.contains("fingerprint mismatch"));
+        std::fs::remove_dir_all(directory).unwrap();
+    }
+
+    #[test]
+    fn hidden_audit_labels_cannot_change_trial_ranking_or_winner() {
+        let mut cfg = config();
+        cfg.schema_version = PARAMETER_OPTIMIZER_SCHEMA_VERSION;
+        cfg.execution_mode = OptimizerExecutionMode::OptimizationOnly;
+        cfg.entrapment_validation = EntrapmentValidationConfig {
+            mode: EntrapmentValidationMode::SelectionAudit,
+            partition_schema_version: 1,
+            seed: 19,
+            salt: "audit-blindness".into(),
+            selection_fraction: 0.5,
+            audit_fraction: 0.5,
+            require_existing_partition: false,
+        };
+        let mut partition_identity = identity();
+        partition_identity.execution_mode = OptimizerExecutionMode::OptimizationOnly;
+        partition_identity.entrapment_partition_identity = Some("frozen-partition".into());
+        let first_dir = temp("audit-blind-a");
+        let second_dir = temp("audit-blind-b");
+        std::fs::create_dir_all(&first_dir).unwrap();
+        std::fs::create_dir_all(&second_dir).unwrap();
+        let first = run_optimizer(
+            &cfg,
+            &partition_identity,
+            &first_dir.join("checkpoint.json"),
+            &mut AuditBlindEvaluator {
+                hidden_audit_labels: vec![false, false, true],
+                inner: Evaluator::default(),
+            },
+        )
+        .unwrap();
+        let second = run_optimizer(
+            &cfg,
+            &partition_identity,
+            &second_dir.join("checkpoint.json"),
+            &mut AuditBlindEvaluator {
+                hidden_audit_labels: vec![true, true, false, true],
+                inner: Evaluator::default(),
+            },
+        )
+        .unwrap();
+        assert_eq!(first.winner_trial_id, second.winner_trial_id);
+        assert_eq!(
+            first.scientific_result_sha256,
+            second.scientific_result_sha256
+        );
+        std::fs::remove_dir_all(first_dir).unwrap();
+        std::fs::remove_dir_all(second_dir).unwrap();
     }
 
     #[test]

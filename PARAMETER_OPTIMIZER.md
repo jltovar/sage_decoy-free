@@ -124,6 +124,69 @@ Only the +entrapment development population contributes feasibility, objective v
 early stopping, window selection, or parameter selection. Each trial request records
 `target_only_outcomes_allowed: false`.
 
+### Dataset-local entrapment selection/audit holdout
+
+Schema v4 adds this explicit configuration:
+
+```json
+"entrapment_validation": {
+  "mode": "selection_audit",
+  "partition_schema_version": 1,
+  "seed": 42,
+  "salt": "prospectively-frozen-dataset-salt",
+  "selection_fraction": 0.5,
+  "audit_fraction": 0.5,
+  "require_existing_partition": true
+}
+```
+
+The workflow's `entrapment.partition_artifact` names the immutable artifact. Missing configuration
+defaults to `full_population_development`, preserving historical development behavior and making
+no independent calibration claim. Selection/audit mode requires schema v4, a nonempty salt,
+positive fractions summing to one, and nonempty realized populations. A first prospective run may
+create the artifact; a formal replay should set `require_existing_partition: true` so any missing,
+corrupt, mismatched, or incompatible artifact fails closed during strict preflight.
+The mode currently requires `execution_mode: optimization_only`; downstream target-only reporting
+is a separate invocation using already frozen winners, never part of the selection/audit optimizer.
+
+Prospectively create the artifact before any trial with
+`sage materialize-entrapment-partition workflow.json`. The command reads only the workflow,
+digestion/search-space configuration, dataset identities, target and active +entrapment FASTAs, and
+the existing entrapment-construction report. It does not resolve candidate or annotation caches,
+search spectra, fit models, evaluate trials, or access target-only resources. Freeze the resulting
+hash, change `require_existing_partition` to `true`, and then run strict workflow preflight.
+Use `--inputs-only` first to record the exact portable dataset, FASTA, digestion, and
+entrapment-construction identities without assigning components or writing an artifact.
+
+Partitioning occurs at the foreign-protein connected-component level. Sage applies its configured
+digestion and modification search space, canonicalizes I/L, links all entrapment proteins sharing
+any searchable peptide, and assigns the whole content-identified component by a cryptographic hash
+of the schema, seed, salt, and component identity. Scores, accepted discoveries, FDP outcomes, file
+paths, FASTA/candidate ordering, thread scheduling, and prior trials never enter assignment.
+Selection and audit protein, canonical-peptide, peptidoform, and protein-group populations must be
+disjoint. Protein, peptide, and peptidoform ratios are measured separately from the realized
+observable components; no requested-fraction multiplication is used.
+
+All candidates remain physically present while models fit, but production fitting and q-calibration
+see no selection or audit entrapment role. The selection identity list is consumed only by
+model-local window metrics and outer trial summaries: genuine targets count normally, selection
+entrapments supply the development FDP numerator, and audit entrapments are ignored rather than
+treated as targets. Trial records contain the partition identity and `selection_only`
+population marker but no audit label or metric. After every expert and the final Ensemble winner is
+frozen, each retained winner result table receives exactly one immutable audit read. Its separate
+record reports target/audit counts, realized audit ratios, adjusted FDP and Wilson-derived 95%
+intervals by level, power, and validation classification. Exact resume verifies and reuses that
+record. Audit results cannot change the winner, checkpoint, convergence, fallback, or voter roster;
+zero audit entrapments never imply statistical validation.
+
+The partition identity participates in analysis, optimizer, trial, and checkpoint fingerprints.
+The strict spectrum-search fingerprint, immutable candidate-pool identity, and layered raw
+MS2PIP/DeepLC prediction identity remain unchanged. All experts and Ensemble use the same artifact.
+Target-only remains downstream of the frozen dataset-local winners and cannot retune any partition,
+parameter, window, or Ensemble setting. Each new dataset must create its own partition and perform
+its own complete expert-local and final-Ensemble optimization; prior ISB winners may be candidate
+values but are not transferred answers or statistical defaults.
+
 Schema v2 adds an explicit `execution_mode`. `optimization_and_post_selection` is the default,
 including for schema-v1 manifests that omit the field, and preserves the historical behavior of
 continuing into ordinary post-selection and target-only reporting after winners are frozen.

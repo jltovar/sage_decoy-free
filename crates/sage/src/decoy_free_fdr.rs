@@ -1012,6 +1012,16 @@ fn is_entrapment_str(proteins: &str) -> bool {
     proteins.contains("|Ent_") || proteins.contains("Ent_")
 }
 
+/// Entrapment role visible to production fitting/calibration. In a
+/// selection/audit run all entrapment identities are masked from production
+/// fitting and calibration: selection labels are consumed only by the
+/// workflow's declared development FDP/objective, while audit labels are
+/// consumed only by the post-freeze audit.
+#[inline]
+fn is_visible_entrapment_str(proteins: &str, settings: &FdrSettings) -> bool {
+    settings.selection_entrapment_proteins.is_none() && is_entrapment_str(proteins)
+}
+
 #[inline]
 fn df_unique_protein_key_for_feature(f: &DfFeature, db: &IndexedDatabase) -> Option<String> {
     let peptide = &db[f.core.peptide_idx];
@@ -1049,6 +1059,7 @@ pub struct EntrapmentCounts {
 pub fn calculate_entrapment_counts_df(
     features: &[DfFeature],
     db: &IndexedDatabase,
+    settings: &FdrSettings,
     peptide_fdr: f32,
     protein_fdr: f32,
 ) -> EntrapmentCounts {
@@ -1064,7 +1075,7 @@ pub fn calculate_entrapment_counts_df(
     {
         let peptide = &db[feat.core.peptide_idx];
         let raw_protein_key = peptide.proteins(&db.decoy_tag, db.generate_decoys);
-        let is_entrapment_peptide = is_entrapment_str(&raw_protein_key);
+        let is_entrapment_peptide = is_visible_entrapment_str(&raw_protein_key, settings);
 
         if is_entrapment_peptide && feat.decoy_free_q_value.unwrap_or(1.0) <= peptide_fdr {
             counts.psms += 1;
@@ -1076,7 +1087,7 @@ pub fn calculate_entrapment_counts_df(
 
         if feat.decoy_free_protein_q.unwrap_or(1.0) <= protein_fdr {
             if let Some(protein_key) = df_inferred_protein_key_for_feature(feat, db) {
-                if is_entrapment_str(protein_key.as_ref()) {
+                if is_visible_entrapment_str(protein_key.as_ref(), settings) {
                     protein_set.insert(protein_key.into_owned());
                 }
             }
@@ -1093,6 +1104,7 @@ fn accepted_target_entrapment_counts(
     db: &IndexedDatabase,
     threshold: f64,
     validation_scope: NullWindowValidationScope,
+    selection_entrapment_proteins: Option<&[String]>,
 ) -> ((usize, usize), (usize, usize), (usize, usize)) {
     let mut target_psms = 0usize;
     let mut entrapment_psms = 0usize;
@@ -1112,9 +1124,19 @@ fn accepted_target_entrapment_counts(
         }
         let mut has_target = false;
         let mut has_entrapment = false;
+        let mut entrapment_protein_count = 0usize;
+        let mut selected_entrapment_protein_count = 0usize;
         for protein in proteins.split(';').map(str::trim).filter(|x| !x.is_empty()) {
             if is_entrapment_str(protein) {
                 has_entrapment = true;
+                entrapment_protein_count += 1;
+                if selection_entrapment_proteins.is_some_and(|selected| {
+                    selected
+                        .binary_search_by(|candidate| candidate.as_str().cmp(protein))
+                        .is_ok()
+                }) {
+                    selected_entrapment_protein_count += 1;
+                }
             } else {
                 has_target = true;
             }
@@ -1125,6 +1147,16 @@ fn accepted_target_entrapment_counts(
             continue;
         }
         let entrapment = has_entrapment;
+        if entrapment && selection_entrapment_proteins.is_some() {
+            // Audit-only groups are withheld from the window objective. A
+            // mixed group indicates an invalid partition boundary and is
+            // conservatively unavailable to either population.
+            if selected_entrapment_protein_count == 0
+                || selected_entrapment_protein_count != entrapment_protein_count
+            {
+                continue;
+            }
+        }
         let peptide_key = String::from_utf8_lossy(&peptide.sequence)
             .chars()
             .map(|residue| {
@@ -1282,6 +1314,7 @@ fn evaluate_null_window(
         db,
         optimizer.fdr_threshold,
         optimizer.validation_scope,
+        optimizer.selection_entrapment_proteins.as_deref(),
     );
     let psm_fdp = entrapment_fdp(psm.0, psm.1, optimizer.psm_entrapment_ratio);
     let peptide_fdp = entrapment_fdp(peptide.0, peptide.1, optimizer.peptide_entrapment_ratio);
@@ -2210,6 +2243,7 @@ pub fn optimize_null_window_resumable(
         db,
         optimizer.fdr_threshold,
         optimizer.validation_scope,
+        optimizer.selection_entrapment_proteins.as_deref(),
     );
     let selected_row = &evaluations[selected];
     if rematerialized.0 != (selected_row.target_psms, selected_row.entrapment_psms)
@@ -3609,7 +3643,7 @@ fn log_lower_order_rank1_score_diagnostics(
         let f = &features[idx];
 
         let prot = db[f.core.peptide_idx].proteins(&db.decoy_tag, db.generate_decoys);
-        let is_ent = is_entrapment_str(&prot);
+        let is_ent = is_visible_entrapment_str(&prot, settings);
         let is_cont = is_contam_str(&prot);
         let is_ref = f.core.label == 1 && !is_ent && !is_cont;
 
@@ -3706,7 +3740,12 @@ fn log_lower_order_rank1_score_diagnostics(
 }
 
 // Rank-1 composition summary.
-fn log_rank1_composition(features: &[DfFeature], work: &WorkSet, db: &IndexedDatabase) {
+fn log_rank1_composition(
+    features: &[DfFeature],
+    work: &WorkSet,
+    db: &IndexedDatabase,
+    settings: &FdrSettings,
+) {
     let mut n_rank1 = 0usize;
     let mut n_label1 = 0usize;
     let mut n_ent = 0usize;
@@ -3719,7 +3758,7 @@ fn log_rank1_composition(features: &[DfFeature], work: &WorkSet, db: &IndexedDat
         n_rank1 += 1;
 
         let prot = db[f.core.peptide_idx].proteins(&db.decoy_tag, db.generate_decoys);
-        let ent = is_entrapment_str(&prot);
+        let ent = is_visible_entrapment_str(&prot, settings);
         let cont = is_contam_str(&prot);
 
         if f.core.label == 1 {
@@ -5380,7 +5419,7 @@ fn score_base_rank1(
             continue;
         }
         let prot = db[f.core.peptide_idx].proteins(&db.decoy_tag, db.generate_decoys);
-        is_ref.push(!is_contam_str(&prot) && !is_entrapment_str(&prot));
+        is_ref.push(!is_contam_str(&prot) && !is_visible_entrapment_str(&prot, settings));
     }
 
     let mut p_mom_ref: Vec<f64> = Vec::new();
@@ -5853,7 +5892,7 @@ fn finalize_base_q_values(
         .filter_map(|&i| features[i].decoy_free_p_value.map(finite_df_p_value))
         .collect();
 
-    log_rank1_composition(features, work, db);
+    log_rank1_composition(features, work, db, settings);
     if !use_ensemble {
         summarize_pvec("rank1_p (chosen stream, pre-q)", &rank1_p);
     } else {
@@ -5906,7 +5945,7 @@ fn finalize_base_q_values(
                 return None;
             }
             let prot = db[f.core.peptide_idx].proteins(&db.decoy_tag, db.generate_decoys);
-            if is_contam_str(&prot) || is_entrapment_str(&prot) {
+            if is_contam_str(&prot) || is_visible_entrapment_str(&prot, settings) {
                 return None;
             }
             let p = f.decoy_free_p_value?;
@@ -6045,7 +6084,7 @@ fn finalize_base_q_values(
                     return false;
                 }
                 let prot = db[f.core.peptide_idx].proteins(&db.decoy_tag, db.generate_decoys);
-                if is_contam_str(&prot) || is_entrapment_str(&prot) {
+                if is_contam_str(&prot) || is_visible_entrapment_str(&prot, settings) {
                     return false;
                 }
                 true
@@ -6081,7 +6120,7 @@ fn finalize_base_q_values(
             false
         } else {
             let prot = db[f.core.peptide_idx].proteins(&db.decoy_tag, db.generate_decoys);
-            !is_contam_str(&prot) && !is_entrapment_str(&prot)
+            !is_contam_str(&prot) && !is_visible_entrapment_str(&prot, settings)
         };
 
         if let Some(v) = f.p_mom {
@@ -6146,7 +6185,7 @@ fn finalize_base_q_values(
                     db[feature.core.peptide_idx].proteins(&db.decoy_tag, db.generate_decoys);
                 let is_ref = feature.core.label == 1
                     && !is_contam_str(&protein)
-                    && !is_entrapment_str(&protein);
+                    && !is_visible_entrapment_str(&protein, settings);
                 let stable_id = nokoi::stable_candidate_identity(
                     &feature.core,
                     &db[feature.core.peptide_idx].to_string(),
@@ -6396,7 +6435,7 @@ fn exclude_non_rescue_safe_anchors(
 
         let protein_ok = if exclude_unsafe_proteins {
             let prot = db[f.core.peptide_idx].proteins(&db.decoy_tag, db.generate_decoys);
-            !is_entrapment_str(&prot) && !is_contam_str(&prot)
+            !is_visible_entrapment_str(&prot, settings) && !is_contam_str(&prot)
         } else {
             true
         };
@@ -6481,7 +6520,7 @@ fn summarize_anchor_coverage(
             .filter(|&&idx| {
                 let f = &features[idx];
                 let prot = db[f.core.peptide_idx].proteins(&db.decoy_tag, db.generate_decoys);
-                is_entrapment_str(&prot) || is_contam_str(&prot)
+                is_visible_entrapment_str(&prot, settings) || is_contam_str(&prot)
             })
             .count()
     } else {
@@ -6502,7 +6541,7 @@ fn summarize_anchor_coverage(
 
             let safe_protein = if exclude_unsafe_proteins {
                 let prot = db[f.core.peptide_idx].proteins(&db.decoy_tag, db.generate_decoys);
-                !is_entrapment_str(&prot) && !is_contam_str(&prot)
+                !is_visible_entrapment_str(&prot, settings) && !is_contam_str(&prot)
             } else {
                 true
             };
@@ -7418,9 +7457,9 @@ struct RescueCompositionCounts {
 }
 
 impl RescueCompositionCounts {
-    fn observe(&mut self, f: &DfFeature, db: &IndexedDatabase) {
+    fn observe(&mut self, f: &DfFeature, db: &IndexedDatabase, settings: &FdrSettings) {
         let proteins = db[f.core.peptide_idx].proteins(&db.decoy_tag, db.generate_decoys);
-        let is_ent = is_entrapment_str(&proteins);
+        let is_ent = is_visible_entrapment_str(&proteins, settings);
         let is_cont = is_contam_str(&proteins);
         let is_ref = f.core.label == 1 && !is_ent && !is_cont;
 
@@ -7465,7 +7504,11 @@ fn fmt_rescue_composition(c: RescueCompositionCounts) -> String {
     )
 }
 
-fn log_physical_rescue_enrichment_diagnostics(features: &[DfFeature], db: &IndexedDatabase) {
+fn log_physical_rescue_enrichment_diagnostics(
+    features: &[DfFeature],
+    db: &IndexedDatabase,
+    settings: &FdrSettings,
+) {
     let mut all_rank1 = RescueCompositionCounts::default();
     let mut accepted_psm_q_1pct = RescueCompositionCounts::default();
     let mut rescued_by_rt = RescueCompositionCounts::default();
@@ -7473,22 +7516,22 @@ fn log_physical_rescue_enrichment_diagnostics(features: &[DfFeature], db: &Index
     let mut rescued_by_recurrence = RescueCompositionCounts::default();
 
     for f in features.iter().filter(|f| f.core.rank == 1) {
-        all_rank1.observe(f, db);
+        all_rank1.observe(f, db, settings);
 
         if f.decoy_free_q_value.unwrap_or(1.0) <= 0.01 {
-            accepted_psm_q_1pct.observe(f, db);
+            accepted_psm_q_1pct.observe(f, db, settings);
         }
 
         if f.rescued_by_rt.unwrap_or(false) {
-            rescued_by_rt.observe(f, db);
+            rescued_by_rt.observe(f, db, settings);
         }
 
         if f.rescued_by_ims.unwrap_or(false) {
-            rescued_by_ims.observe(f, db);
+            rescued_by_ims.observe(f, db, settings);
         }
 
         if f.rescued_by_recurrence.unwrap_or(false) {
-            rescued_by_recurrence.observe(f, db);
+            rescued_by_recurrence.observe(f, db, settings);
         }
     }
 
@@ -7547,7 +7590,11 @@ fn log_physical_rescue_enrichment_diagnostics(features: &[DfFeature], db: &Index
     }
 }
 
-fn log_df_pvalue_bin_diagnostics(features: &[DfFeature], db: &IndexedDatabase) {
+fn log_df_pvalue_bin_diagnostics(
+    features: &[DfFeature],
+    db: &IndexedDatabase,
+    settings: &FdrSettings,
+) {
     const THRESHOLDS: [f64; 6] = [1e-6, 1e-5, 1e-4, 1e-3, 1e-2, 5e-2];
 
     for thr in THRESHOLDS {
@@ -7559,7 +7606,7 @@ fn log_df_pvalue_bin_diagnostics(features: &[DfFeature], db: &IndexedDatabase) {
             };
 
             if p.is_finite() && (p as f64) <= thr {
-                counts.observe(f, db);
+                counts.observe(f, db, settings);
             }
         }
 
@@ -7651,6 +7698,7 @@ fn count_metric_subset(
     metric: DfMetricFn,
     higher_is_better: bool,
     threshold: f64,
+    settings: &FdrSettings,
 ) -> RescueCompositionCounts {
     let mut counts = RescueCompositionCounts::default();
 
@@ -7670,14 +7718,18 @@ fn count_metric_subset(
         };
 
         if pass {
-            counts.observe(f, db);
+            counts.observe(f, db, settings);
         }
     }
 
     counts
 }
 
-fn log_spectral_feature_separation_diagnostics(features: &[DfFeature], db: &IndexedDatabase) {
+fn log_spectral_feature_separation_diagnostics(
+    features: &[DfFeature],
+    db: &IndexedDatabase,
+    settings: &FdrSettings,
+) {
     let metrics: [DfMetricSpec; 9] = [
         DfMetricSpec {
             name: "hyperscore",
@@ -7760,7 +7812,14 @@ fn log_spectral_feature_separation_diagnostics(features: &[DfFeature], db: &Inde
                 continue;
             };
 
-            let counts = count_metric_subset(features, db, spec.value, spec.higher_is_better, thr);
+            let counts = count_metric_subset(
+                features,
+                db,
+                spec.value,
+                spec.higher_is_better,
+                thr,
+                settings,
+            );
 
             log::info!(
                 "DF spectral feature separation: metric={} subset={} threshold={:.6e} direction={} {}",
@@ -7774,11 +7833,15 @@ fn log_spectral_feature_separation_diagnostics(features: &[DfFeature], db: &Inde
     }
 }
 
-fn log_delta_next_focused_diagnostics(features: &[DfFeature], db: &IndexedDatabase) {
+fn log_delta_next_focused_diagnostics(
+    features: &[DfFeature],
+    db: &IndexedDatabase,
+    settings: &FdrSettings,
+) {
     const THRESHOLDS: [f64; 7] = [0.0, 0.01, 0.05, 0.10, 0.25, 0.50, 1.00];
 
     for thr in THRESHOLDS {
-        let counts = count_metric_subset(features, db, metric_delta_next, true, thr);
+        let counts = count_metric_subset(features, db, metric_delta_next, true, thr, settings);
 
         log::info!(
             "DF delta_next separation: delta_next>={:.2} {}",
@@ -7816,12 +7879,16 @@ fn fmt_run_count_bins(label: &str, bins: &[usize; 6]) -> String {
     )
 }
 
-fn log_peptide_recurrence_separation_diagnostics(features: &[DfFeature], db: &IndexedDatabase) {
+fn log_peptide_recurrence_separation_diagnostics(
+    features: &[DfFeature],
+    db: &IndexedDatabase,
+    settings: &FdrSettings,
+) {
     let mut peptide_runs: FnvHashMap<u32, PeptideRunEvidence> = FnvHashMap::default();
 
     for f in features.iter().filter(|f| f.core.rank == 1) {
         let proteins = db[f.core.peptide_idx].proteins(&db.decoy_tag, db.generate_decoys);
-        let is_ent = is_entrapment_str(&proteins);
+        let is_ent = is_visible_entrapment_str(&proteins, settings);
         let is_cont = is_contam_str(&proteins);
         let is_ref = f.core.label == 1 && !is_ent && !is_cont;
 
@@ -7875,7 +7942,7 @@ fn log_peptide_recurrence_separation_diagnostics(features: &[DfFeature], db: &In
                 .unwrap_or(1);
 
             if n >= min_runs {
-                counts.observe(f, db);
+                counts.observe(f, db, settings);
             }
         }
 
@@ -7887,7 +7954,11 @@ fn log_peptide_recurrence_separation_diagnostics(features: &[DfFeature], db: &In
     }
 }
 
-fn log_mass_error_separation_diagnostics(features: &[DfFeature], db: &IndexedDatabase) {
+fn log_mass_error_separation_diagnostics(
+    features: &[DfFeature],
+    db: &IndexedDatabase,
+    settings: &FdrSettings,
+) {
     const PPM_THRESHOLDS: [f64; 6] = [1.0, 2.0, 5.0, 10.0, 20.0, 50.0];
 
     for thr in PPM_THRESHOLDS {
@@ -7897,12 +7968,12 @@ fn log_mass_error_separation_diagnostics(features: &[DfFeature], db: &IndexedDat
         for f in features.iter().filter(|f| f.core.rank == 1) {
             let precursor_ppm_like = f.core.delta_mass as f64;
             if precursor_ppm_like.is_finite() && precursor_ppm_like.abs() <= thr {
-                precursor_counts.observe(f, db);
+                precursor_counts.observe(f, db, settings);
             }
 
             let fragment_ppm_like = f.core.average_ppm as f64;
             if fragment_ppm_like.is_finite() && fragment_ppm_like.abs() <= thr {
-                fragment_counts.observe(f, db);
+                fragment_counts.observe(f, db, settings);
             }
         }
 
@@ -7919,7 +7990,11 @@ fn log_mass_error_separation_diagnostics(features: &[DfFeature], db: &IndexedDat
     }
 }
 
-fn log_support_layer_separation_diagnostics(features: &[DfFeature], db: &IndexedDatabase) {
+fn log_support_layer_separation_diagnostics(
+    features: &[DfFeature],
+    db: &IndexedDatabase,
+    settings: &FdrSettings,
+) {
     let mut peptide_supported = RescueCompositionCounts::default();
     let mut protein_supported = RescueCompositionCounts::default();
     let mut peptide_q_1pct = RescueCompositionCounts::default();
@@ -7927,19 +8002,19 @@ fn log_support_layer_separation_diagnostics(features: &[DfFeature], db: &Indexed
 
     for f in features.iter().filter(|f| f.core.rank == 1) {
         if f.decoy_free_peptide_supported_psm.unwrap_or(false) {
-            peptide_supported.observe(f, db);
+            peptide_supported.observe(f, db, settings);
         }
 
         if f.decoy_free_protein_supported_peptide.unwrap_or(false) {
-            protein_supported.observe(f, db);
+            protein_supported.observe(f, db, settings);
         }
 
         if f.decoy_free_peptide_q.unwrap_or(1.0) <= 0.01 {
-            peptide_q_1pct.observe(f, db);
+            peptide_q_1pct.observe(f, db, settings);
         }
 
         if f.decoy_free_protein_q.unwrap_or(1.0) <= 0.01 {
-            protein_q_1pct.observe(f, db);
+            protein_q_1pct.observe(f, db, settings);
         }
     }
 
@@ -7961,7 +8036,11 @@ fn log_support_layer_separation_diagnostics(features: &[DfFeature], db: &Indexed
     );
 }
 
-fn log_physical_sigma_diagnostics(features: &[DfFeature], db: &IndexedDatabase) {
+fn log_physical_sigma_diagnostics(
+    features: &[DfFeature],
+    db: &IndexedDatabase,
+    settings: &FdrSettings,
+) {
     #[derive(Default)]
     struct Row {
         rt: SigmaBinCounts,
@@ -7978,7 +8057,7 @@ fn log_physical_sigma_diagnostics(features: &[DfFeature], db: &IndexedDatabase) 
 
     for f in features.iter().filter(|f| f.core.rank == 1) {
         let proteins = db[f.core.peptide_idx].proteins(&db.decoy_tag, db.generate_decoys);
-        let is_ent = is_entrapment_str(&proteins);
+        let is_ent = is_visible_entrapment_str(&proteins, settings);
         let is_cont = is_contam_str(&proteins);
         let is_ref = f.core.label == 1 && !is_ent && !is_cont;
 
@@ -8794,7 +8873,7 @@ fn apply_ims_bounded_update_to_active_stream(
 
         let protein_ok = if exclude_unsafe_proteins {
             let prot = db[f.core.peptide_idx].proteins(&db.decoy_tag, db.generate_decoys);
-            !is_entrapment_str(&prot) && !is_contam_str(&prot)
+            !is_visible_entrapment_str(&prot, settings) && !is_contam_str(&prot)
         } else {
             true
         };
@@ -8973,7 +9052,7 @@ fn prepare_ims_dart_context(
 
         let protein_ok = if exclude_unsafe_proteins {
             let prot = db[f.core.peptide_idx].proteins(&db.decoy_tag, db.generate_decoys);
-            !is_entrapment_str(&prot) && !is_contam_str(&prot)
+            !is_visible_entrapment_str(&prot, settings) && !is_contam_str(&prot)
         } else {
             true
         };
@@ -11689,14 +11768,14 @@ pub fn run_df_layers_with_artifacts(
     };
     log::info!("DF final active stream: {}", stream_kind);
 
-    log_physical_sigma_diagnostics(&new_features, db);
-    log_physical_rescue_enrichment_diagnostics(&new_features, db);
+    log_physical_sigma_diagnostics(&new_features, db, settings);
+    log_physical_rescue_enrichment_diagnostics(&new_features, db, settings);
 
-    log_df_pvalue_bin_diagnostics(&new_features, db);
-    log_spectral_feature_separation_diagnostics(&new_features, db);
-    log_delta_next_focused_diagnostics(&new_features, db);
-    log_peptide_recurrence_separation_diagnostics(&new_features, db);
-    log_mass_error_separation_diagnostics(&new_features, db);
+    log_df_pvalue_bin_diagnostics(&new_features, db, settings);
+    log_spectral_feature_separation_diagnostics(&new_features, db, settings);
+    log_delta_next_focused_diagnostics(&new_features, db, settings);
+    log_peptide_recurrence_separation_diagnostics(&new_features, db, settings);
+    log_mass_error_separation_diagnostics(&new_features, db, settings);
 
     (
         new_features,
@@ -12202,7 +12281,7 @@ pub fn calculate_q_values(
 
     let _ = apply_hierarchical_reporting_df(&mut features, db, settings);
 
-    log_support_layer_separation_diagnostics(&features, db);
+    log_support_layer_separation_diagnostics(&features, db, settings);
 
     features
 }
@@ -12265,7 +12344,7 @@ pub fn calculate_peptide_q_df(
 
         let peptide = db[feat.core.peptide_idx].to_string();
         let proteins = db[feat.core.peptide_idx].proteins(&db.decoy_tag, db.generate_decoys);
-        let is_ent = is_entrapment_str(&proteins);
+        let is_ent = is_visible_entrapment_str(&proteins, settings);
         let is_contam = is_contam_str(&proteins);
         let is_ref = !is_ent && !is_contam;
 
@@ -13032,7 +13111,7 @@ pub fn calculate_protein_q_df(
         // P-value-native protein path.
         let mut protein_p_ref: Vec<f64> = Vec::new();
         for (key, &p) in protein_keys.iter().zip(protein_combined_vals.iter()) {
-            if !is_contam_str(key) && !is_entrapment_str(key) && p.is_finite() {
+            if !is_contam_str(key) && !is_visible_entrapment_str(key, settings) && p.is_finite() {
                 protein_p_ref.push(p.clamp(0.0, 1.0).max(1e-300));
             }
         }
@@ -13085,7 +13164,7 @@ pub fn calculate_protein_q_df(
         .iter()
         .filter(|(protein_key, &q)| {
             !is_contam_str(protein_key)
-                && !is_entrapment_str(protein_key)
+                && !is_visible_entrapment_str(protein_key, settings)
                 && q <= settings.protein_fdr as f64
         })
         .count()
@@ -13188,7 +13267,7 @@ pub fn apply_hierarchical_reporting_df(
 
     let accepted_entrapment_proteins = accepted_proteins
         .iter()
-        .filter(|protein_key| is_entrapment_str(protein_key))
+        .filter(|protein_key| is_visible_entrapment_str(protein_key, settings))
         .count();
 
     // Step 2:
@@ -13362,6 +13441,20 @@ mod tests {
     use crate::database::PeptideIx;
     use crate::input::FdrOptions;
     use crate::peptide::Peptide;
+
+    #[test]
+    fn selection_audit_masks_all_entrapment_roles_from_production_calibration() {
+        let legacy = FdrSettings::from(FdrOptions::default());
+        assert!(is_visible_entrapment_str("Ent_selection", &legacy));
+        assert!(is_visible_entrapment_str("Ent_audit", &legacy));
+
+        let mut options = FdrOptions::default();
+        options.selection_entrapment_proteins = Some(vec!["Ent_selection".into()]);
+        let held_out = FdrSettings::from(options);
+        assert!(!is_visible_entrapment_str("Ent_selection", &held_out));
+        assert!(!is_visible_entrapment_str("Ent_audit", &held_out));
+        assert!(!is_visible_entrapment_str("target", &held_out));
+    }
 
     fn external_profile_fixture() -> Vec<DfFeature> {
         let mut features = Vec::new();
@@ -13686,6 +13779,64 @@ mod tests {
     }
 
     #[test]
+    fn null_window_objective_exposes_only_selection_entrapments() {
+        let proteins = ["Target_A", "Ent_selection", "Ent_audit"];
+        let peptides = proteins
+            .iter()
+            .enumerate()
+            .map(|(index, protein)| Peptide {
+                sequence: format!("PEPTIDE{index}").into_bytes().into(),
+                modifications: vec![0.0; 8],
+                proteins: vec![Arc::from(*protein)],
+                ..Default::default()
+            })
+            .collect();
+        let db = IndexedDatabase {
+            peptides,
+            decoy_tag: "rev_".into(),
+            generate_decoys: false,
+            ..IndexedDatabase::default()
+        };
+        let features = (0..3)
+            .map(|index| {
+                let mut feature = crate::scoring::FeatureCore {
+                    peptide_idx: PeptideIx(index),
+                    rank: 1,
+                    label: 1,
+                    ..Default::default()
+                }
+                .to_df();
+                feature.decoy_free_q_value = Some(0.001);
+                feature.decoy_free_peptide_q = Some(0.001);
+                feature.decoy_free_protein_q = Some(0.001);
+                feature
+            })
+            .collect::<Vec<_>>();
+        let selection = vec!["Ent_selection".to_string()];
+        let (psm, peptide, protein) = accepted_target_entrapment_counts(
+            &features,
+            &db,
+            0.01,
+            NullWindowValidationScope::RawQ,
+            Some(&selection),
+        );
+        assert_eq!(psm, (1, 1));
+        assert_eq!(peptide, (1, 1));
+        assert_eq!(protein, (1, 1));
+
+        let full = accepted_target_entrapment_counts(
+            &features,
+            &db,
+            0.01,
+            NullWindowValidationScope::RawQ,
+            None,
+        );
+        assert_eq!(full.0, (1, 2));
+        assert_eq!(full.1, (1, 2));
+        assert_eq!(full.2, (1, 2));
+    }
+
+    #[test]
     fn decoy_free_protein_grouping_uses_one_group_hypothesis() {
         use crate::input::{FdrMode, FdrOptions};
 
@@ -13768,7 +13919,7 @@ mod tests {
         // Entrapment groups are evaluated and receive q-values, but are not
         // reported as target protein discoveries.
         assert_eq!(calculate_protein_q_df(&mut features, &db, &settings), 0);
-        let counts = calculate_entrapment_counts_df(&features, &db, 0.01, 0.01);
+        let counts = calculate_entrapment_counts_df(&features, &db, &settings, 0.01, 0.01);
 
         assert_eq!(counts.psms, 2);
         assert_eq!(counts.peptides, 2);
@@ -13912,6 +14063,7 @@ mod tests {
             protein_entrapment_ratio: 1.0,
             maximum_entrapment_fdp: 0.01,
             minimum_entrapment_count_for_stable_estimate: 3,
+            selection_entrapment_proteins: None,
             verbose_diagnostics: false,
         };
         let prior = exhaustive_null_windows(bounds)
@@ -14006,6 +14158,7 @@ mod tests {
             protein_entrapment_ratio: 1.0,
             maximum_entrapment_fdp: 0.01,
             minimum_entrapment_count_for_stable_estimate: 3,
+            selection_entrapment_proteins: None,
             verbose_diagnostics: false,
         }
     }

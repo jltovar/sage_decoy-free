@@ -171,6 +171,35 @@ point-estimate ceiling: within-ceiling trials remain rankable, but their validat
 alter expert participation, objective order, target-only isolation, technical fail-closed rules,
 or the adjusted-FDP ceiling.
 
+Schema v4 adds a separate dataset-local entrapment-label holdout. With
+`entrapment_validation.mode: selection_audit`, Sage digests the active target and entrapment FASTAs,
+links foreign proteins that share any searchable canonical peptide, and cryptographically assigns
+whole connected components to selection or audit populations from the frozen seed, salt, and
+fractions. Target-shared foreign peptides remain excluded, and the workflow fails closed on an
+empty partition, cross-partition peptide/peptidoform/protein group, or identity/ratio mismatch.
+Record, candidate, path, thread, and resume ordering cannot alter component assignment.
+
+Both populations remain in the immutable +entrapment candidate pool because production fitting
+must see the real score population. Fitting and q-calibration receive the scores but no selection
+or audit entrapment role. During optimization, audit identities are ignored—not relabeled as
+targets—by both the model-local null-window objective and the outer parameter objective, while
+selection identities are used only for those declared development FDP/objective calculations.
+Audit labels and metrics are absent from trial checkpoints. Once all individual and
+final Ensemble winners are frozen, the workflow reads each retained result table once and writes a
+separate immutable audit result with measured audit protein/peptide/peptidoform ratios, adjusted
+FDP, a 95% interval, and explicit powered/underpowered status. A sparse or zero audit count remains
+not evaluable for statistical validation. Audit findings do not retune winners, run target-only,
+or alter the JSON-selected Ensemble roster.
+Selection/audit mode is paired with `execution_mode: optimization_only`. Target-only reporting is
+a later invocation over frozen settings and cannot be interleaved with audit or optimization.
+Materialize the prospective partition first with
+`sage materialize-entrapment-partition workflow.json`, record its hash, then set
+`require_existing_partition: true` for strict preflight and execution. The materialization command
+does not resolve candidate or annotation caches and cannot run searches, fitting, optimizer trials,
+or target-only stages.
+Run the same command with `--inputs-only` first to freeze the portable input identities without
+constructing a component assignment or writing the artifact.
+
 ## Layered MS2Rescore prediction and calibration caches
 
 An MS2Rescore stage consumes the same immutable native candidate pool as its optimized stage, so
