@@ -1072,12 +1072,12 @@ pub fn parameter_contracts() -> Vec<ParameterContract> {
             "lower_order",
             PER_EXPERT,
             Float,
-            ScientificOptimizationCandidate,
+            UnsafeOrUnsupported,
             Some(1e-6),
             Some(1e6),
             &[],
-            true,
-            true,
+            false,
+            false,
             false
         ),
         contract!(
@@ -1085,12 +1085,18 @@ pub fn parameter_contracts() -> Vec<ParameterContract> {
             "lower_order",
             PER_EXPERT,
             Enumeration,
-            StructuralMethodFamilyChoice,
+            UnsafeOrUnsupported,
             None,
             None,
-            &["neg_log_e", "log_1000_over_e", "scaled_log_1000_over_e"],
-            true,
-            true,
+            &[
+                "neg_log_e",
+                "log1000_over_e",
+                "scaled_log1000_over_e",
+                "log_1000_over_e",
+                "scaled_log_1000_over_e"
+            ],
+            false,
+            false,
             false
         ),
         contract!(
@@ -1163,12 +1169,12 @@ pub fn parameter_contracts() -> Vec<ParameterContract> {
             "msfdr_seeded",
             PER_EXPERT,
             Integer,
-            ScientificOptimizationCandidate,
+            UnsafeOrUnsupported,
             Some(1.0),
             Some(25.0),
             &[],
-            true,
-            true,
+            false,
+            false,
             false
         ),
         contract!(
@@ -2381,14 +2387,22 @@ fn dependency_predicate(name: &str, class: ParameterClass, validity_required: bo
         | "protein_q_covariate_weight_strength" => {
             "applicable q-value method=covariate_weighted_bh and a validated covariate contract is present"
         }
-        "ensemble_cauchy_penalty" => "ensemble_p_combiner=cauchy",
-        "ensemble_pep_trim_frac" => {
-            "ensemble_pep_combiner is trimmed_mean or winsorized_mean"
+        "ensemble_p_combiner" => "final_evidence_space=p_value",
+        "ensemble_cauchy_penalty" => {
+            "final_evidence_space=p_value and ensemble_p_combiner=cauchy"
         }
-        "ensemble_pep_quantile" => "ensemble_pep_combiner=quantile",
-        "ensemble_pep_top_k" => "ensemble_pep_combiner=top_k_mean and k<=selected voter count",
+        "ensemble_pep_combiner" => "final_evidence_space=pep",
+        "ensemble_pep_trim_frac" => {
+            "final_evidence_space=pep and ensemble_pep_combiner is trimmed_mean or winsorized_mean"
+        }
+        "ensemble_pep_quantile" => {
+            "final_evidence_space=pep and ensemble_pep_combiner=quantile"
+        }
+        "ensemble_pep_top_k" => {
+            "final_evidence_space=pep, ensemble_pep_combiner=top_k_mean, and k<=selected voter count"
+        }
         name if name.starts_with("ensemble_weight_") => {
-            "named expert is JSON-selected; effective weight must be finite and >0"
+            "final_evidence_space=pep, ensemble_pep_combiner is weighted_mean or weighted_median, named expert is JSON-selected, and effective weight is finite and >0"
         }
         name if name.starts_with("physical_rescue.") => {
             "deferred pending instrument/run metadata and a separately reviewed physical-evidence block"
@@ -3321,31 +3335,60 @@ fn validate_active_dependencies(
             "dependency violated: MLE winsor quantiles require mle_robust_fit=true"
         );
     }
+    if active.contains("ensemble_p_combiner") {
+        anyhow::ensure!(
+            string_value("final_evidence_space") == Some("p_value"),
+            "dependency violated: ensemble_p_combiner affects the selected decision stream only when final_evidence_space=p_value"
+        );
+    }
+    if active.contains("ensemble_pep_combiner") {
+        anyhow::ensure!(
+            string_value("final_evidence_space") == Some("pep"),
+            "dependency violated: ensemble_pep_combiner affects the selected decision stream only when final_evidence_space=pep"
+        );
+    }
     if active.contains("ensemble_cauchy_penalty") {
         anyhow::ensure!(
-            string_value("ensemble_p_combiner") == Some("cauchy"),
-            "dependency violated: ensemble_cauchy_penalty requires ensemble_p_combiner=cauchy"
+            string_value("final_evidence_space") == Some("p_value")
+                && string_value("ensemble_p_combiner") == Some("cauchy"),
+            "dependency violated: ensemble_cauchy_penalty requires final_evidence_space=p_value and ensemble_p_combiner=cauchy"
         );
     }
     if active.contains("ensemble_pep_trim_frac") {
         anyhow::ensure!(
-            matches!(
-                string_value("ensemble_pep_combiner"),
-                Some("trimmed_mean" | "winsorized_mean")
-            ),
-            "dependency violated: ensemble_pep_trim_frac requires a trimmed or winsorized PEP combiner"
+            string_value("final_evidence_space") == Some("pep")
+                && matches!(
+                    string_value("ensemble_pep_combiner"),
+                    Some("trimmed_mean" | "winsorized_mean")
+                ),
+            "dependency violated: ensemble_pep_trim_frac requires final_evidence_space=pep and a trimmed or winsorized PEP combiner"
         );
     }
     if active.contains("ensemble_pep_quantile") {
         anyhow::ensure!(
-            string_value("ensemble_pep_combiner") == Some("quantile"),
-            "dependency violated: ensemble_pep_quantile requires ensemble_pep_combiner=quantile"
+            string_value("final_evidence_space") == Some("pep")
+                && string_value("ensemble_pep_combiner") == Some("quantile"),
+            "dependency violated: ensemble_pep_quantile requires final_evidence_space=pep and ensemble_pep_combiner=quantile"
         );
     }
     if active.contains("ensemble_pep_top_k") {
         anyhow::ensure!(
-            string_value("ensemble_pep_combiner") == Some("top_k_mean"),
-            "dependency violated: ensemble_pep_top_k requires ensemble_pep_combiner=top_k_mean"
+            string_value("final_evidence_space") == Some("pep")
+                && string_value("ensemble_pep_combiner") == Some("top_k_mean"),
+            "dependency violated: ensemble_pep_top_k requires final_evidence_space=pep and ensemble_pep_combiner=top_k_mean"
+        );
+    }
+    if active
+        .iter()
+        .any(|name| name.starts_with("ensemble_weight_"))
+    {
+        anyhow::ensure!(
+            string_value("final_evidence_space") == Some("pep")
+                && matches!(
+                    string_value("ensemble_pep_combiner"),
+                    Some("weighted_mean" | "weighted_median")
+                ),
+            "dependency violated: expert weights affect the selected decision stream only when final_evidence_space=pep and ensemble_pep_combiner is weighted_mean or weighted_median"
         );
     }
     if any_active(&["p_combine_calibration_min_k", "p_combine_calibration_max_k"]) {
@@ -4663,7 +4706,16 @@ mod tests {
             expert: Some(OptimizerExpert::Ensemble),
             strategy: OptimizerStrategy::ExhaustiveGrid,
             structural_comparison: false,
-            fixed: BTreeMap::new(),
+            fixed: BTreeMap::from([
+                (
+                    "final_evidence_space".into(),
+                    ParameterValue::String("pep".into()),
+                ),
+                (
+                    "ensemble_pep_combiner".into(),
+                    ParameterValue::String("weighted_mean".into()),
+                ),
+            ]),
             space: BTreeMap::from([(
                 "ensemble_weight_moments".into(),
                 (1..=17)
@@ -4707,6 +4759,143 @@ mod tests {
     }
 
     #[test]
+    fn ensemble_dependencies_prune_parameters_dormant_for_the_decision_stream() {
+        let p_value_settings = BTreeMap::from([
+            (
+                "final_evidence_space".into(),
+                ParameterValue::String("p_value".into()),
+            ),
+            (
+                "ensemble_p_combiner".into(),
+                ParameterValue::String("second_best".into()),
+            ),
+            (
+                "ensemble_pep_combiner".into(),
+                ParameterValue::String("median".into()),
+            ),
+            (
+                "ensemble_cauchy_penalty".into(),
+                ParameterValue::Float(1.0224),
+            ),
+            ("ensemble_pep_trim_frac".into(), ParameterValue::Float(0.1)),
+            ("ensemble_weight_moments".into(), ParameterValue::Float(0.5)),
+        ]);
+
+        assert!(validate_active_dependencies(
+            &p_value_settings,
+            &BTreeSet::from(["ensemble_p_combiner".into()])
+        )
+        .is_ok());
+        for dormant in [
+            "ensemble_pep_combiner",
+            "ensemble_cauchy_penalty",
+            "ensemble_pep_trim_frac",
+            "ensemble_weight_moments",
+        ] {
+            let error =
+                validate_active_dependencies(&p_value_settings, &BTreeSet::from([dormant.into()]))
+                    .unwrap_err()
+                    .to_string();
+            assert!(error.contains("dependency violated"), "{dormant}: {error}");
+        }
+
+        let mut pep_settings = p_value_settings;
+        pep_settings.insert(
+            "final_evidence_space".into(),
+            ParameterValue::String("pep".into()),
+        );
+        pep_settings.insert(
+            "ensemble_pep_combiner".into(),
+            ParameterValue::String("weighted_median".into()),
+        );
+        assert!(validate_active_dependencies(
+            &pep_settings,
+            &BTreeSet::from([
+                "ensemble_pep_combiner".into(),
+                "ensemble_weight_moments".into(),
+            ])
+        )
+        .is_ok());
+        assert!(validate_active_dependencies(
+            &pep_settings,
+            &BTreeSet::from(["ensemble_p_combiner".into()])
+        )
+        .is_err());
+    }
+
+    #[test]
+    fn dormant_ensemble_weight_is_pruned_before_production_evaluation() {
+        let path = temp("dormant-ensemble-weight");
+        std::fs::create_dir_all(&path).unwrap();
+        let mut cfg = config();
+        cfg.maximum_trial_budget = 1;
+        cfg.selected_experts = vec![OptimizerExpert::Moments, OptimizerExpert::Ensemble];
+        cfg.block_order = vec!["ensemble".into()];
+        cfg.fixed_baseline_values.extend([
+            (
+                "final_evidence_space".into(),
+                ParameterValue::String("p_value".into()),
+            ),
+            (
+                "ensemble_p_combiner".into(),
+                ParameterValue::String("second_best".into()),
+            ),
+            (
+                "ensemble_pep_combiner".into(),
+                ParameterValue::String("median".into()),
+            ),
+        ]);
+        cfg.blocks = vec![OptimizerBlock {
+            id: "ensemble".into(),
+            enabled: true,
+            scope: ParameterScope::EnsembleFinal,
+            expert: Some(OptimizerExpert::Ensemble),
+            strategy: OptimizerStrategy::ExhaustiveGrid,
+            structural_comparison: false,
+            fixed: BTreeMap::new(),
+            space: BTreeMap::from([(
+                "ensemble_weight_moments".into(),
+                vec![ParameterValue::Float(0.5)],
+            )]),
+            window_search: None,
+            use_external_features: false,
+            max_trials: Some(1),
+            max_passes: None,
+        }];
+        cfg.validate().unwrap();
+
+        let mut evaluator = Evaluator::default();
+        let result = run_optimizer(
+            &cfg,
+            &identity(),
+            &path.join("checkpoint.json"),
+            &mut evaluator,
+        )
+        .unwrap();
+        assert!(evaluator.calls.is_empty());
+        assert_eq!(result.trials.len(), 1);
+        assert_eq!(
+            result.trials[0].evaluation.status,
+            TrialStatus::TechnicalFailure
+        );
+        assert!(result.trials[0]
+            .evaluation
+            .technical_reason
+            .as_deref()
+            .is_some_and(
+                |reason| reason.contains("parameter_dependency_invalid_before_production")
+            ));
+        assert_eq!(
+            result.trials[0]
+                .evaluation
+                .compact_diagnostics
+                .get("production_evaluation_started"),
+            Some(&serde_json::json!(false))
+        );
+        std::fs::remove_dir_all(path).unwrap();
+    }
+
+    #[test]
     fn optimization_only_represents_all_experts_without_admission_gates() {
         let mut cfg = config();
         cfg.schema_version = PARAMETER_OPTIMIZER_SCHEMA_VERSION;
@@ -4744,8 +4933,8 @@ mod tests {
             (
                 OptimizerExpert::MsfdrSeeded,
                 ParameterScope::PerExpert,
-                "msfdr_multistart",
-                ParameterValue::Integer(2),
+                "msfdr_seeded_top_frac_init",
+                ParameterValue::Float(0.2),
             ),
             (
                 OptimizerExpert::Msfdr1Smix,
@@ -5209,7 +5398,7 @@ mod tests {
     }
 
     #[test]
-    fn user_relevant_values_reach_resolved_production_settings() {
+    fn configuration_values_reach_resolved_fdr_settings() {
         let values = BTreeMap::from([
             ("moments_robust_fit".into(), ParameterValue::Bool(true)),
             ("moments_winsor_upper_q".into(), ParameterValue::Float(0.90)),
@@ -5313,6 +5502,72 @@ mod tests {
         assert_eq!(format!("{:?}", settings.psm_q_method), "Storey");
         assert_eq!(format!("{:?}", settings.peptide_q_method), "Storey");
         assert_eq!(format!("{:?}", settings.protein_q_method), "Storey");
+    }
+
+    #[test]
+    fn lower_order_tev_aliases_load_but_serialize_canonically() {
+        use sage_core::input::LoTevTransform;
+
+        let shifted: LoTevTransform = serde_json::from_str("\"log_1000_over_e\"").unwrap();
+        let scaled: LoTevTransform = serde_json::from_str("\"scaled_log_1000_over_e\"").unwrap();
+        assert_eq!(shifted, LoTevTransform::Log1000OverE);
+        assert_eq!(scaled, LoTevTransform::ScaledLog1000OverE);
+        assert_eq!(
+            serde_json::to_string(&shifted).unwrap(),
+            "\"log1000_over_e\""
+        );
+        assert_eq!(
+            serde_json::to_string(&scaled).unwrap(),
+            "\"scaled_log1000_over_e\""
+        );
+    }
+
+    #[test]
+    fn reparameterizations_and_unused_multistart_are_not_yield_variables() {
+        for (expert, structural, name, value) in [
+            (
+                OptimizerExpert::LowerOrder,
+                false,
+                "lo_evalue_scale",
+                ParameterValue::Float(0.5),
+            ),
+            (
+                OptimizerExpert::LowerOrder,
+                true,
+                "lo_tev_transform",
+                ParameterValue::String("log1000_over_e".into()),
+            ),
+            (
+                OptimizerExpert::MsfdrSeeded,
+                false,
+                "msfdr_multistart",
+                ParameterValue::Integer(2),
+            ),
+        ] {
+            let mut cfg = config();
+            cfg.selected_experts = vec![expert];
+            cfg.block_order = vec!["audit".into()];
+            cfg.blocks = vec![OptimizerBlock {
+                id: "audit".into(),
+                enabled: true,
+                scope: ParameterScope::PerExpert,
+                expert: Some(expert),
+                strategy: OptimizerStrategy::ExhaustiveGrid,
+                structural_comparison: structural,
+                fixed: BTreeMap::new(),
+                space: BTreeMap::from([(name.into(), vec![value])]),
+                window_search: None,
+                use_external_features: false,
+                max_trials: Some(1),
+                max_passes: None,
+            }];
+            let error = cfg.validate().unwrap_err().to_string();
+            assert!(
+                error.contains("deliberately deferred")
+                    || error.contains("not eligible for internal optimization"),
+                "{name}: {error}"
+            );
+        }
     }
 
     #[test]
