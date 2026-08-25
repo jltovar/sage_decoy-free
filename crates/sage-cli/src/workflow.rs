@@ -22,9 +22,10 @@ use crate::parameter_optimizer::{
     apply_fdr_overrides, parameter_catalog_fingerprint, run_optimizer, AuditLevelMetrics,
     EmpiricalCalibrationPower, EntrapmentValidationMode, FrozenWinnerAuditEvaluation,
     OptimizerBlock, OptimizerExecutionMode, OptimizerExpert, OptimizerIdentity, OptimizerOutcome,
-    OptimizerRunResult, OptimizerWindowSearch, ParameterOptimizerConfig, ParameterValue,
-    StatisticalDefaultEligibility, StatisticalValidationStatus, TrialEvaluation, TrialEvaluator,
-    TrialMetrics, TrialRecord, TrialRequest, TrialStatus,
+    OptimizerRunResult, OptimizerStageKind, OptimizerWindowSearch, ParameterOptimizerConfig,
+    ParameterOptimizerStageProjection, ParameterValue, StatisticalDefaultEligibility,
+    StatisticalValidationStatus, TrialEvaluation, TrialEvaluator, TrialMetrics, TrialRecord,
+    TrialRequest, TrialStatus,
 };
 use crate::provenance::{freeze_baseline, sha256_file, write_json_atomic, BaselineManifest};
 use crate::runner::Runner;
@@ -3261,6 +3262,42 @@ fn validate_expected_expert_configuration_hashes(
     Ok(())
 }
 
+fn validate_stage_expected_expert_configuration(
+    config: Option<&ParameterOptimizerConfig>,
+    model: &ModelFit,
+    resolved_configuration: &ResolvedExpertConfiguration,
+    ensemble_expert_configuration_sha256: &BTreeMap<ExpertIdentity, String>,
+) -> Result<()> {
+    let Some(config) = config.filter(|config| {
+        config.require_expected_expert_configurations
+            || !config.expected_expert_configuration_sha256.is_empty()
+    }) else {
+        return Ok(());
+    };
+    if *model == ModelFit::Ensemble {
+        return validate_expected_expert_configuration_hashes(
+            config,
+            ensemble_expert_configuration_sha256,
+        );
+    }
+    let identity = expert_identity(model);
+    let expected = config
+        .expected_expert_configuration_sha256
+        .get(&identity)
+        .with_context(|| {
+            format!(
+                "stage-local optimizer provenance is missing expected configuration hash for {}",
+                identity.as_str()
+            )
+        })?;
+    anyhow::ensure!(
+        config.expected_expert_configuration_sha256.len() == 1
+            && expected == &resolved_configuration.resolved_configuration_sha256,
+        "stage-local resolved expert configuration differs from its prospectively expected hash"
+    );
+    Ok(())
+}
+
 fn interaction_baseline_lock(lock: &EnsembleLock) -> Result<EnsembleLock> {
     let mut baseline = lock.clone();
     baseline.roster_contract = "interaction_diagnostic_baseline".into();
@@ -4440,6 +4477,7 @@ fn run_search_stage(
     ensemble_lock: Option<&EnsembleLock>,
     target_only: Option<&TargetOnlyStageContext>,
     parameter_overrides: Option<&BTreeMap<String, ParameterValue>>,
+    stage_optimizer_config: Option<&ParameterOptimizerConfig>,
     entrapment_selection: Option<&EntrapmentSelectionView>,
     runtime: &mut WorkflowRuntime,
 ) -> Result<StageRecord> {
@@ -4729,6 +4767,12 @@ fn run_search_stage(
                 .collect::<BTreeMap<_, _>>()
         })
         .unwrap_or_default();
+    validate_stage_expected_expert_configuration(
+        stage_optimizer_config,
+        &model.model,
+        &resolved_production_configuration,
+        &ensemble_expert_configuration_sha256,
+    )?;
     let inherited_artifact_provenance = if let Some(path) = frozen_model_artifacts {
         let artifacts: DfRunArtifacts = serde_json::from_slice(&std::fs::read(path)?)
             .with_context(|| format!("invalid fitted artifacts {}", path.display()))?;
@@ -5021,35 +5065,32 @@ fn optimizer_expert(model: &ModelFit) -> OptimizerExpert {
 fn optimizer_config_for_expert(
     config: &ParameterOptimizerConfig,
     expert: OptimizerExpert,
-) -> Option<ParameterOptimizerConfig> {
+) -> Result<Option<ParameterOptimizerStageProjection>> {
     if !config.enabled {
-        return None;
+        return Ok(None);
     }
-    let blocks = config
+    if !config
         .blocks
         .iter()
-        .filter(|block| block.enabled && block.expert == Some(expert))
-        .cloned()
-        .collect::<Vec<_>>();
-    if blocks.is_empty() {
-        return None;
+        .any(|block| block.enabled && block.expert == Some(expert))
+    {
+        return Ok(None);
     }
-    let ids = blocks
+    let root_experts = config
+        .selected_experts
         .iter()
-        .map(|block| block.id.clone())
+        .filter(|selected| **selected != OptimizerExpert::Ensemble)
+        .map(|selected| ExpertIdentity::from(*selected))
         .collect::<BTreeSet<_>>();
-    let mut selected = config.clone();
-    selected.blocks = blocks;
-    if expert != OptimizerExpert::Ensemble {
-        selected.selected_experts = vec![expert];
-    }
-    selected.block_order = config
-        .block_order
-        .iter()
-        .filter(|id| ids.contains(*id))
-        .cloned()
-        .collect();
-    Some(selected)
+    let (requested, stage_kind) = if expert == OptimizerExpert::Ensemble {
+        (root_experts, OptimizerStageKind::FinalEnsemble)
+    } else {
+        (
+            BTreeSet::from([ExpertIdentity::from(expert)]),
+            OptimizerStageKind::SingleExpert,
+        )
+    };
+    config.project_for_stage(&requested, stage_kind).map(Some)
 }
 
 fn apply_optimizer_window(model: &mut ModelWorkflow, search: &OptimizerWindowSearch) -> Result<()> {
@@ -5090,6 +5131,7 @@ struct WorkflowTrialEvaluator<'a> {
     dataset: &'a DatasetIdentity,
     base_model: &'a ModelWorkflow,
     blocks: &'a [OptimizerBlock],
+    stage_optimizer_config: &'a ParameterOptimizerConfig,
     fasta: &'a Path,
     root: &'a Path,
     parallel: usize,
@@ -5219,6 +5261,7 @@ impl TrialEvaluator for WorkflowTrialEvaluator<'_> {
             self.ensemble_lock,
             None,
             Some(&request.parameters),
+            Some(self.stage_optimizer_config),
             self.entrapment_selection,
             self.runtime,
         ) {
@@ -5534,6 +5577,8 @@ fn optimizer_identity_from_preflight(
         catalog_sha256: parameter_catalog_fingerprint()?,
         entrapment_partition_identity: entrapment_selection
             .map(|partition| partition.partition_identity.clone()),
+        root_optimizer_provenance_sha256: None,
+        stage_optimizer_provenance_sha256: None,
     })
 }
 
@@ -6366,26 +6411,36 @@ fn optimize_model_parameters(
         Option<NullWindow>,
     )>,
 > {
-    let Some(config) = manifest
-        .parameter_optimizer
-        .as_ref()
-        .and_then(|config| optimizer_config_for_expert(config, optimizer_expert(&model.model)))
+    let Some(root_config) = manifest.parameter_optimizer.as_ref() else {
+        return Ok(None);
+    };
+    let Some(projection) =
+        optimizer_config_for_expert(root_config, optimizer_expert(&model.model))?
     else {
         return Ok(None);
     };
+    let config = projection.config.clone();
     config.validate()?;
     let root = manifest
         .output_root
         .join("parameter_optimizer")
         .join(optimizer_expert(&model.model).slug());
     std::fs::create_dir_all(&root)?;
-    let identity = optimizer_identity_from_preflight(
+    let mut identity = optimizer_identity_from_preflight(
         manifest,
         dataset,
         resource_preflight,
         entrapment_selection,
     )?;
+    identity.root_optimizer_provenance_sha256 =
+        Some(projection.root_optimizer_provenance_sha256.clone());
+    identity.stage_optimizer_provenance_sha256 =
+        Some(projection.stage_optimizer_provenance_sha256.clone());
     write_json_atomic(&root.join("identity.json"), &identity)?;
+    write_json_atomic(
+        &root.join("optimizer.provenance.projection.json"),
+        &projection,
+    )?;
     let result = if config.implementation_smoke_only {
         let mut evaluator = InfrastructureSmokeEvaluator {
             root: &root,
@@ -6404,6 +6459,7 @@ fn optimize_model_parameters(
             dataset,
             base_model: model,
             blocks: &config.blocks,
+            stage_optimizer_config: &config,
             fasta,
             root: &root,
             parallel,
@@ -6824,6 +6880,7 @@ pub fn execute_workflow(
             ensemble_lock.as_ref(),
             None,
             parameter_overrides.as_ref(),
+            None,
             entrapment_selection.as_ref(),
             &mut runtime,
         ) {
@@ -6892,6 +6949,7 @@ pub fn execute_workflow(
                 ensemble_lock.as_ref(),
                 None,
                 parameter_overrides.as_ref(),
+                None,
                 entrapment_selection.as_ref(),
                 &mut runtime,
             ) {
@@ -7092,6 +7150,7 @@ pub fn execute_workflow(
                     Some(baseline_lock),
                     None,
                     parameter_overrides.as_ref(),
+                    None,
                     entrapment_selection.as_ref(),
                     &mut runtime,
                 )?;
@@ -7346,6 +7405,7 @@ pub fn execute_workflow(
                 ensemble_lock.as_ref(),
                 Some(&context),
                 parameter_overrides.as_ref(),
+                None,
                 None,
                 &mut runtime,
             ) {
@@ -8246,6 +8306,54 @@ mod tests {
         }
     }
 
+    #[derive(Default)]
+    struct NonbaselineEnsembleProjectionEvaluator {
+        calls: usize,
+    }
+
+    impl TrialEvaluator for NonbaselineEnsembleProjectionEvaluator {
+        fn evaluate(&mut self, request: &TrialRequest) -> Result<TrialEvaluation> {
+            self.calls += 1;
+            let penalty = request
+                .parameters
+                .get("ensemble_cauchy_penalty")
+                .and_then(ParameterValue::as_f64)
+                .unwrap_or(1.0);
+            Ok(TrialEvaluation {
+                status: TrialStatus::Feasible,
+                technical_reason: None,
+                empirical_reason: None,
+                metrics: Some(TrialMetrics {
+                    level4_proteins: if penalty > 1.0 { 2 } else { 1 },
+                    level4_canonical_peptides: 1,
+                    level4_peptidoforms: 1,
+                    level4_psms: 1,
+                    adjusted_entrapment_fdp: Some(0.0),
+                    entrapment_count: 0,
+                    adjusted_entrapment_fdp_by_level: BTreeMap::new(),
+                    entrapment_count_by_level: BTreeMap::new(),
+                    model_complexity: 1,
+                }),
+                development_selection_eligible: true,
+                empirical_point_estimate_within_limit: Some(true),
+                empirical_calibration_power: EmpiricalCalibrationPower::Underpowered,
+                statistical_validation_status:
+                    StatisticalValidationStatus::NotEvaluableUnderpowered,
+                statistical_default_eligibility: StatisticalDefaultEligibility::NotEvaluated,
+                compact_diagnostics: BTreeMap::new(),
+            })
+        }
+
+        fn materialize_winner(
+            &mut self,
+            record: &TrialRecord,
+        ) -> Result<Option<serde_json::Value>> {
+            Ok(Some(
+                serde_json::json!({"trial_id": record.request.trial_id}),
+            ))
+        }
+    }
+
     #[test]
     fn frozen_entrapment_audit_is_post_winner_immutable_and_nonadmissive() {
         let directory = test_directory("frozen-entrapment-audit");
@@ -8300,6 +8408,8 @@ mod tests {
             source_configuration_sha256: "config".into(),
             catalog_sha256: "catalog".into(),
             entrapment_partition_identity: Some(partition.partition_identity.clone()),
+            root_optimizer_provenance_sha256: None,
+            stage_optimizer_provenance_sha256: None,
         };
         let optimizer_root = manifest
             .output_root
@@ -11320,7 +11430,7 @@ mod tests {
     }
 
     #[test]
-    fn seven_expert_identity_is_canonical_across_preflight_runtime_and_target_policy() {
+    fn seven_expert_projection_runs_through_optimizer_resume_and_target_policy_identity() {
         let optimizer_experts = [
             OptimizerExpert::Moments,
             OptimizerExpert::Mle,
@@ -11358,6 +11468,96 @@ mod tests {
         }
 
         let mut config = test_optimizer_config();
+        let definitions = [
+            (
+                "block_moments",
+                OptimizerExpert::Moments,
+                crate::parameter_optimizer::ParameterScope::PerExpert,
+                "moments_purification_factor",
+                vec![ParameterValue::Float(0.2)],
+            ),
+            (
+                "block_mle",
+                OptimizerExpert::Mle,
+                crate::parameter_optimizer::ParameterScope::PerExpert,
+                "mle_purification_factor",
+                vec![ParameterValue::Float(0.1)],
+            ),
+            (
+                "block_lower_order",
+                OptimizerExpert::LowerOrder,
+                crate::parameter_optimizer::ParameterScope::PerExpert,
+                "lower_order_purification_factor",
+                vec![ParameterValue::Float(0.15)],
+            ),
+            (
+                "block_msfdr",
+                OptimizerExpert::MsfdrSeeded,
+                crate::parameter_optimizer::ParameterScope::PerExpert,
+                "msfdr_seeded_purification_factor",
+                vec![ParameterValue::Float(0.2)],
+            ),
+            (
+                "block_msfdr1_smix",
+                OptimizerExpert::Msfdr1Smix,
+                crate::parameter_optimizer::ParameterScope::PerExpert,
+                "msfdr1_bottom_frac_init",
+                vec![ParameterValue::Float(0.3)],
+            ),
+            (
+                "block_msfdr2_smix",
+                OptimizerExpert::Msfdr2Smix,
+                crate::parameter_optimizer::ParameterScope::PerExpert,
+                "msfdr2_bottom_frac_init",
+                vec![ParameterValue::Float(0.5)],
+            ),
+            (
+                "block_nokoi",
+                OptimizerExpert::Nokoi,
+                crate::parameter_optimizer::ParameterScope::PerExpert,
+                "nokoi_k_folds",
+                vec![ParameterValue::Integer(5)],
+            ),
+            (
+                "block_ensemble",
+                OptimizerExpert::Ensemble,
+                crate::parameter_optimizer::ParameterScope::EnsembleFinal,
+                "ensemble_cauchy_penalty",
+                vec![ParameterValue::Float(1.0), ParameterValue::Float(1.0224)],
+            ),
+        ];
+        config.blocks = definitions
+            .into_iter()
+            .map(|(id, expert, scope, parameter, values)| OptimizerBlock {
+                id: id.into(),
+                enabled: true,
+                scope,
+                expert: Some(expert),
+                strategy: crate::parameter_optimizer::OptimizerStrategy::ExhaustiveGrid,
+                structural_comparison: true,
+                fixed: if expert == OptimizerExpert::Ensemble {
+                    BTreeMap::from([
+                        (
+                            "final_evidence_space".into(),
+                            ParameterValue::String("p_value".into()),
+                        ),
+                        (
+                            "ensemble_p_combiner".into(),
+                            ParameterValue::String("cauchy".into()),
+                        ),
+                    ])
+                } else {
+                    BTreeMap::new()
+                },
+                space: BTreeMap::from([(parameter.into(), values)]),
+                window_search: None,
+                use_external_features: false,
+                max_trials: Some(2),
+                max_passes: Some(1),
+            })
+            .collect();
+        config.block_order = config.blocks.iter().map(|block| block.id.clone()).collect();
+        config.maximum_trial_budget = 16;
         config.selected_experts = optimizer_experts
             .into_iter()
             .chain(std::iter::once(OptimizerExpert::Ensemble))
@@ -11365,6 +11565,122 @@ mod tests {
         config.require_expected_expert_configurations = true;
         config.expected_expert_configuration_sha256 = expected.clone();
         config.validate().unwrap();
+        let root_bytes = serde_json::to_vec(&config).unwrap();
+        for optimizer in optimizer_experts {
+            let projection = optimizer_config_for_expert(&config, optimizer)
+                .unwrap()
+                .unwrap();
+            projection.config.validate().unwrap();
+            let identity = ExpertIdentity::from(optimizer);
+            assert_eq!(projection.requested_experts, vec![identity]);
+            assert_eq!(projection.config.selected_experts, vec![optimizer]);
+            assert_eq!(
+                projection.config.expected_expert_configuration_sha256,
+                BTreeMap::from([(identity, expected[&identity].clone())])
+            );
+        }
+        let ensemble_projection = optimizer_config_for_expert(&config, OptimizerExpert::Ensemble)
+            .unwrap()
+            .unwrap();
+        ensemble_projection.config.validate().unwrap();
+        assert_eq!(
+            ensemble_projection
+                .config
+                .expected_expert_configuration_sha256,
+            expected
+        );
+        assert_eq!(
+            ensemble_projection.config.selected_experts,
+            config.selected_experts
+        );
+        assert_eq!(serde_json::to_vec(&config).unwrap(), root_bytes);
+
+        let moments_projection = optimizer_config_for_expert(&config, OptimizerExpert::Moments)
+            .unwrap()
+            .unwrap();
+        let moments_configuration = test_resolved_configuration(
+            &ModelFit::Moments,
+            Some(&NullWindow {
+                min_rank: 9,
+                max_rank: 13,
+            }),
+        );
+        assert!(validate_stage_expected_expert_configuration(
+            Some(&moments_projection.config),
+            &ModelFit::Moments,
+            &moments_configuration,
+            &BTreeMap::new(),
+        )
+        .unwrap_err()
+        .to_string()
+        .contains("prospectively expected"));
+        let mut matching_moments_projection = moments_projection.config.clone();
+        matching_moments_projection.expected_expert_configuration_sha256 = BTreeMap::from([(
+            ExpertIdentity::Moments,
+            moments_configuration.resolved_configuration_sha256.clone(),
+        )]);
+        validate_stage_expected_expert_configuration(
+            Some(&matching_moments_projection),
+            &ModelFit::Moments,
+            &moments_configuration,
+            &BTreeMap::new(),
+        )
+        .unwrap();
+
+        let checkpoint_root = test_directory("seven-expert-projection-checkpoint");
+        let checkpoint = checkpoint_root.join("optimizer.checkpoint.json");
+        let identity = OptimizerIdentity {
+            schema_version: 1,
+            execution_mode: ensemble_projection.config.execution_mode,
+            dataset_identity: "dataset".into(),
+            candidate_pool_identity: "candidate".into(),
+            raw_annotation_cache_identity: "raw".into(),
+            calibrated_annotation_identity: None,
+            model_artifact_schema: 2,
+            optimizer_schema: crate::parameter_optimizer::PARAMETER_OPTIMIZER_SCHEMA_VERSION,
+            optimizer_source_sha256:
+                crate::parameter_optimizer::PARAMETER_OPTIMIZER_IMPLEMENTATION_SOURCE_SHA256.into(),
+            source_configuration_sha256: "config".into(),
+            catalog_sha256: "catalog".into(),
+            entrapment_partition_identity: None,
+            root_optimizer_provenance_sha256: Some(
+                ensemble_projection.root_optimizer_provenance_sha256.clone(),
+            ),
+            stage_optimizer_provenance_sha256: Some(
+                ensemble_projection
+                    .stage_optimizer_provenance_sha256
+                    .clone(),
+            ),
+        };
+        let mut evaluator = NonbaselineEnsembleProjectionEvaluator::default();
+        let first = run_optimizer(
+            &ensemble_projection.config,
+            &identity,
+            &checkpoint,
+            &mut evaluator,
+        )
+        .unwrap();
+        assert_eq!(evaluator.calls, 2);
+        let winner = first
+            .trials
+            .iter()
+            .find(|trial| Some(&trial.request.trial_id) == first.winner_trial_id.as_ref())
+            .unwrap();
+        assert_eq!(
+            winner.request.parameters["ensemble_cauchy_penalty"],
+            ParameterValue::Float(1.0224)
+        );
+        let mut replay_evaluator = NonbaselineEnsembleProjectionEvaluator::default();
+        let replay = run_optimizer(
+            &ensemble_projection.config,
+            &identity,
+            &checkpoint,
+            &mut replay_evaluator,
+        )
+        .unwrap();
+        assert_eq!(replay_evaluator.calls, 0);
+        assert_eq!(replay.winner_trial_id, first.winner_trial_id);
+        std::fs::remove_dir_all(checkpoint_root).unwrap();
         validate_expected_expert_configuration_hashes(&config, &expected).unwrap();
         let mut missing = expected.clone();
         missing.remove(&ExpertIdentity::Nokoi);

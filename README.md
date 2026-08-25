@@ -1249,6 +1249,13 @@ explicit 9-18 window, independent of expert order; expert-specific profiles cann
 Statistical diagnostics do not remove a technically valid requested voter. Native and
 MS2Rescore-fitted artifacts remain separate.
 
+Optimizer manifests retain immutable all-expert root provenance. Production orchestration derives
+typed stage-local views: one expert and one expected configuration hash for an individual stage,
+then the complete all-expert map for final Ensemble evaluation. Shared scientific and cache
+settings are not filtered, root configuration bytes are never mutated, and resolved hashes are
+checked before fitting. Root/stage lineage hashes enter optimizer checkpoints without changing
+search, candidate-pool, or raw-annotation identities.
+
 Each distinct canonical model contributes one continuous PSM-level vote. Canonical ordering is
 used only for deterministic serialization; models are not ordered by discovery counts. Duplicate
 canonical models and duplicate artifact instances fail closed. `precursor_fdr`, `peptide_fdr`, and

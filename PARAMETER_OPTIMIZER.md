@@ -269,6 +269,30 @@ candidate; a mismatch exits nonzero. Frozen-Ensemble manifests can additionally 
 prospectively declared `expected_expert_configuration_sha256` map, which participates in the
 optimizer fingerprint and fails preflight on any missing, reassigned, or drifted expert.
 
+Workflow orchestration treats that manifest as immutable root provenance. A typed stage projection
+creates a new configuration for each production optimizer stage: individual stages contain exactly
+one selected expert, that expert's expected hash, and that expert's blocks; the final Ensemble stage
+contains the complete selected roster, expected-hash map, and Ensemble-final blocks. Shared
+dataset, search, cache, objective, threshold, seed, and execution settings are copied unchanged.
+Both root and stage-projection hashes are recorded in optimizer identity/checkpoint provenance.
+Before fitting, an individual stage's resolved production configuration must equal its projected
+expected hash; before Ensemble evaluation, the complete resolved expert map must equal the root
+map. Extra stage-local hashes remain invalid, and projection never mutates the root manifest.
+
+The root-to-stage ownership audit is:
+
+| Field family | Projection behavior |
+| --- | --- |
+| selected experts, expected configuration hashes | exact stage subset; retained complete for final Ensemble |
+| optimizer blocks, block order, per-expert fixed/trial overrides | exact stage subset |
+| dataset, FASTA/search, candidate/cache, objective, constraints, thresholds, seed | shared unchanged |
+| resolved configurations and fitted artifact hashes | regenerated from the validated stage output |
+| locked artifacts, target-policy capability, technical failures, requested/actual rosters | root/final-lock data; retained complete for final Ensemble and reconstructed only from validated outputs |
+
+This internal projection adds no durable lock field, so Ensemble lock schema remains v10. The
+implementation-source, analysis, optimizer, and checkpoint identities change; strict search,
+candidate-pool, and raw-annotation identities do not.
+
 Schema-v9 optimizer locks are not accepted for target-only refit or `compare_both`, because they
 cannot prove that their root configuration was the selected trial. Regenerate them through a
 frozen candidate replay; do not infer or patch winner identity.
