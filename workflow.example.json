@@ -160,6 +160,8 @@
       "moments", "mle", "lower_order", "msfdr_seeded",
       "msfdr_1smix", "msfdr_2smix", "nokoi", "ensemble"
     ],
+    "expected_expert_configuration_sha256": {},
+    "require_expected_expert_configurations": false,
     "compiled_defaults": {},
     "workflow_defaults": {
       "psm_q_method": "storey",

@@ -213,7 +213,7 @@ schema, fingerprint, and payload integrity, then reuses completed trial identiti
 Nonwinner result/artifact payloads are removed after completion; full diagnostics and fitted state
 remain only for each block winner.
 
-When independently optimized experts are assembled, the schema-v9 Ensemble lock stores the
+When independently optimized experts are assembled, the schema-v10 Ensemble lock stores the
 complete canonical effective `FdrOptions` and fully resolved `FdrSettings` for each expert, not
 only optimizer deltas or selected windows. It also binds the fitted artifact and the
 dataset/search/candidate/annotation identities under which that configuration was consumed. The
@@ -221,6 +221,32 @@ final Ensemble configuration has its own hash and cannot overwrite expert-local 
 Target-only `refit_with_locked_window` reconstructs each expert from this locked configuration;
 `reuse_dataset_artifact` additionally verifies the artifact/configuration identity. Old partial
 locks are deliberately incompatible with refit and `compare_both`.
+
+Scientific configuration identity is computed from the fully resolved `FdrSettings`, while the
+canonical option carrier and its separate declared-form hash remain stored for reconstruction and
+audit. This gives omitted, JSON `null`, and explicit effective defaults one scientific identity;
+canonical enum aliases likewise resolve before hashing. The following optional/default families
+are covered by this rule: evidence-space and p-combiner calibration, q methods/covariates,
+reporting thresholds and grouping, null support and Storey controls, every expert fitting family,
+final Ensemble combiners/shapes/weights, stage enablement, physical rescue, reproducibility, and
+hierarchical reporting. Runtime artifact carriers, partition labels, roster convenience booleans,
+paths, and process-local identifiers are excluded and bound by their dedicated provenance fields.
+A different resolved active value still changes the scientific hash.
+
+Final-Ensemble optimization completes transactionally. After candidate selection, Sage builds the
+schema-v10 root lock from the exact winning trial configuration and the exact ordered expert
+configuration/artifact mapping used by that trial. It validates a temporary lock, atomically
+renames it, reopens and validates the durable bytes, and only then writes successful workflow
+completion. Lock metadata binds the selected trial, result, fitted artifact, optimizer result,
+cache identities, fallback state, and development/statistical classification. A missing or stale
+lock can be recovered from an integrity-valid completed checkpoint without evaluating another
+candidate; a mismatch exits nonzero. Frozen-Ensemble manifests can additionally require the
+prospectively declared `expected_expert_configuration_sha256` map, which participates in the
+optimizer fingerprint and fails preflight on any missing, reassigned, or drifted expert.
+
+Schema-v9 optimizer locks are not accepted for target-only refit or `compare_both`, because they
+cannot prove that their root configuration was the selected trial. Regenerate them through a
+frozen candidate replay; do not infer or patch winner identity.
 
 Legacy outcomes distinguish `exhaustive_bounded_optimum`, `completed_heuristic_local`,
 `trial_budget_exhausted`, `no_technically_valid_solution`, `no_empirically_feasible_solution`,

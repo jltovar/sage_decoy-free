@@ -2825,6 +2825,14 @@ pub struct ParameterOptimizerConfig {
     pub classification: OptimizationClassification,
     #[serde(default)]
     pub selected_experts: Vec<OptimizerExpert>,
+    /// Prospective model-to-canonical-configuration identities for a frozen
+    /// expert roster. Final-Ensemble-only optimization sets
+    /// `require_expected_expert_configurations` so preflight cannot silently
+    /// substitute a different expert configuration or artifact.
+    #[serde(default)]
+    pub expected_expert_configuration_sha256: BTreeMap<String, String>,
+    #[serde(default)]
+    pub require_expected_expert_configurations: bool,
     #[serde(default)]
     pub compiled_defaults: BTreeMap<String, ParameterValue>,
     #[serde(default)]
@@ -3041,6 +3049,43 @@ impl ParameterOptimizerConfig {
             selected.len() == self.selected_experts.len(),
             "selected_experts contains duplicates"
         );
+        let selected_models = self
+            .selected_experts
+            .iter()
+            .filter(|expert| **expert != OptimizerExpert::Ensemble)
+            .map(|expert| expert.slug().to_owned())
+            .collect::<BTreeSet<_>>();
+        anyhow::ensure!(
+            self.expected_expert_configuration_sha256
+                .keys()
+                .all(|model| selected_models.contains(model)),
+            "expected_expert_configuration_sha256 contains an unselected or non-expert model"
+        );
+        anyhow::ensure!(
+            self.expected_expert_configuration_sha256
+                .values()
+                .all(|hash| {
+                    hash.len() == 64 && hash.bytes().all(|byte| byte.is_ascii_hexdigit())
+                }),
+            "expected expert configuration hashes must be 64 hexadecimal characters"
+        );
+        if self.require_expected_expert_configurations
+            || !self.expected_expert_configuration_sha256.is_empty()
+        {
+            anyhow::ensure!(
+                self.selected_experts.contains(&OptimizerExpert::Ensemble),
+                "expected expert configurations are meaningful only for an Ensemble optimization"
+            );
+            let expected = self
+                .expected_expert_configuration_sha256
+                .keys()
+                .cloned()
+                .collect::<BTreeSet<_>>();
+            anyhow::ensure!(
+                expected == selected_models,
+                "expected expert configuration map is incomplete or disagrees with the selected frozen expert roster"
+            );
+        }
         anyhow::ensure!(
             !self.objective.is_empty(),
             "optimizer objective order is required"
@@ -4672,6 +4717,8 @@ mod tests {
             enabled: true,
             classification: OptimizationClassification::DevelopmentOnly,
             selected_experts: vec![OptimizerExpert::Moments, OptimizerExpert::Mle],
+            expected_expert_configuration_sha256: BTreeMap::new(),
+            require_expected_expert_configurations: false,
             compiled_defaults: BTreeMap::from([
                 (
                     "moments_purification_factor".into(),
@@ -6440,6 +6487,15 @@ mod tests {
         let mut changed_source = identity();
         changed_source.optimizer_source_sha256 = "different-optimizer-source".into();
         assert_ne!(first, optimizer_fingerprint(&changed_source, &cfg).unwrap());
+        let mut frozen_experts = cfg.clone();
+        frozen_experts
+            .expected_expert_configuration_sha256
+            .insert("moments".into(), "a".repeat(64));
+        assert_ne!(
+            first,
+            optimizer_fingerprint(&identity(), &frozen_experts).unwrap(),
+            "prospectively declared frozen expert hashes must bind checkpoints"
+        );
         let serialized = serde_json::to_string(&identity()).unwrap();
         assert!(!serialized.contains(std::env::temp_dir().to_string_lossy().as_ref()));
     }

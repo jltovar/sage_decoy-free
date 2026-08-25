@@ -139,6 +139,13 @@ objective semantics, portable fingerprint, and failure classifications.
 Every executable candidate has serialized production-binding coverage. A bounded
 production-smoke mode verifies real +entrapment fitting and objective selection without entering
 target-only reporting.
+Final-Ensemble winners use transactional schema-v10 locks: the exact selected final configuration
+and exact expert configuration/artifact mapping are validated before atomic replacement, reopened,
+and validated again before the workflow can succeed. Effective scientific identities hash fully
+resolved settings, making omitted, `null`, and explicit defaults equivalent without dropping any
+active setting. Schema-v9 optimizer locks fail closed for target-only use and must be regenerated
+by frozen replay; completed checkpoints can recover lock materialization without reevaluating
+trials.
 Schema-v2 optimizer manifests can additionally set `execution_mode: optimization_only` for a full
 development run that materializes all individual and final Ensemble +entrapment winners and then
 returns successfully without resolving or executing any target-only resource or stage. Omitting
