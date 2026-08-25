@@ -2914,6 +2914,36 @@ pub struct ParameterOptimizerConfig {
     pub blocks: Vec<OptimizerBlock>,
 }
 
+#[derive(Clone, Copy, Debug, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(rename_all = "snake_case")]
+pub enum OptimizerStageKind {
+    SingleExpert,
+    FinalEnsemble,
+}
+
+/// Immutable lineage record for a root optimizer configuration projected into
+/// one production workflow stage. The root configuration is never mutated;
+/// expert-scoped fields in `config` contain exactly the requested stage set.
+#[derive(Clone, Debug, Serialize, Deserialize)]
+pub struct ParameterOptimizerStageProjection {
+    pub schema_version: u32,
+    pub stage_kind: OptimizerStageKind,
+    pub requested_experts: Vec<ExpertIdentity>,
+    pub root_optimizer_provenance_sha256: String,
+    pub stage_optimizer_provenance_sha256: String,
+    pub config: ParameterOptimizerConfig,
+}
+
+fn optimizer_config_provenance_sha256(
+    domain: &[u8],
+    config: &ParameterOptimizerConfig,
+) -> Result<String> {
+    let mut hasher = Sha256::new();
+    hasher.update(domain);
+    hasher.update(serde_json::to_vec(config)?);
+    Ok(format!("{:x}", hasher.finalize()))
+}
+
 impl ParameterOptimizerConfig {
     pub fn optimization_only(&self) -> bool {
         self.enabled && self.execution_mode == OptimizerExecutionMode::OptimizationOnly
@@ -2924,6 +2954,115 @@ impl ParameterOptimizerConfig {
             && (self.optimization_only()
                 || self.implementation_smoke_only
                 || self.production_smoke_only)
+    }
+
+    pub fn project_for_stage(
+        &self,
+        requested_experts: &BTreeSet<ExpertIdentity>,
+        stage_kind: OptimizerStageKind,
+    ) -> Result<ParameterOptimizerStageProjection> {
+        self.validate()?;
+        anyhow::ensure!(
+            !requested_experts.is_empty()
+                && requested_experts
+                    .iter()
+                    .all(|expert| expert.is_individual()),
+            "optimizer stage projection requires one or more individual expert identities"
+        );
+        let root_selected = self
+            .selected_experts
+            .iter()
+            .filter(|expert| **expert != OptimizerExpert::Ensemble)
+            .map(|expert| ExpertIdentity::from(*expert))
+            .collect::<BTreeSet<_>>();
+        anyhow::ensure!(
+            requested_experts.is_subset(&root_selected),
+            "optimizer stage projection requested an expert outside the immutable root roster"
+        );
+        if self.require_expected_expert_configurations
+            || !self.expected_expert_configuration_sha256.is_empty()
+        {
+            anyhow::ensure!(
+                requested_experts.iter().all(|expert| self
+                    .expected_expert_configuration_sha256
+                    .contains_key(expert)),
+                "optimizer stage projection is missing a prospectively expected expert configuration hash"
+            );
+        }
+
+        let mut projected = self.clone();
+        match stage_kind {
+            OptimizerStageKind::SingleExpert => {
+                anyhow::ensure!(
+                    requested_experts.len() == 1,
+                    "single-expert optimizer projection requires exactly one expert"
+                );
+                let expert = OptimizerExpert::from(*requested_experts.iter().next().unwrap());
+                projected.selected_experts = vec![expert];
+                projected.blocks = self
+                    .blocks
+                    .iter()
+                    .filter(|block| block.enabled && block.expert == Some(expert))
+                    .cloned()
+                    .collect();
+            }
+            OptimizerStageKind::FinalEnsemble => {
+                anyhow::ensure!(
+                    self.selected_experts.contains(&OptimizerExpert::Ensemble),
+                    "final-Ensemble optimizer projection requires Ensemble in the root roster"
+                );
+                anyhow::ensure!(
+                    requested_experts == &root_selected,
+                    "final-Ensemble optimizer projection must retain the complete root expert roster"
+                );
+                projected.selected_experts = self.selected_experts.clone();
+                projected.blocks = self
+                    .blocks
+                    .iter()
+                    .filter(|block| {
+                        block.enabled && block.expert == Some(OptimizerExpert::Ensemble)
+                    })
+                    .cloned()
+                    .collect();
+            }
+        }
+        anyhow::ensure!(
+            !projected.blocks.is_empty(),
+            "optimizer stage projection has no enabled block for the requested stage"
+        );
+        let projected_block_ids = projected
+            .blocks
+            .iter()
+            .map(|block| block.id.as_str())
+            .collect::<BTreeSet<_>>();
+        projected.block_order = self
+            .block_order
+            .iter()
+            .filter(|id| projected_block_ids.contains(id.as_str()))
+            .cloned()
+            .collect();
+        projected.expected_expert_configuration_sha256 = self
+            .expected_expert_configuration_sha256
+            .iter()
+            .filter(|(expert, _)| requested_experts.contains(expert))
+            .map(|(expert, hash)| (*expert, hash.clone()))
+            .collect();
+        projected.validate()?;
+
+        let root_optimizer_provenance_sha256 =
+            optimizer_config_provenance_sha256(b"sage-root-optimizer-provenance-v1\0", self)?;
+        let stage_optimizer_provenance_sha256 = optimizer_config_provenance_sha256(
+            b"sage-stage-optimizer-provenance-v1\0",
+            &projected,
+        )?;
+        Ok(ParameterOptimizerStageProjection {
+            schema_version: 1,
+            stage_kind,
+            requested_experts: requested_experts.iter().copied().collect(),
+            root_optimizer_provenance_sha256,
+            stage_optimizer_provenance_sha256,
+            config: projected,
+        })
     }
 
     pub fn validate(&self) -> Result<()> {
@@ -3105,10 +3244,6 @@ impl ParameterOptimizerConfig {
         if self.require_expected_expert_configurations
             || !self.expected_expert_configuration_sha256.is_empty()
         {
-            anyhow::ensure!(
-                self.selected_experts.contains(&OptimizerExpert::Ensemble),
-                "expected expert configurations are meaningful only for an Ensemble optimization"
-            );
             let expected = self
                 .expected_expert_configuration_sha256
                 .keys()
@@ -3117,6 +3252,11 @@ impl ParameterOptimizerConfig {
             anyhow::ensure!(
                 expected == selected_models,
                 "expected expert configuration map is incomplete or disagrees with the selected frozen expert roster"
+            );
+            anyhow::ensure!(
+                self.selected_experts.contains(&OptimizerExpert::Ensemble)
+                    || (self.selected_experts.len() == 1 && selected_models.len() == 1),
+                "expected expert configurations require either the final Ensemble roster or one strict stage-local expert projection"
             );
         }
         anyhow::ensure!(
@@ -3806,6 +3946,10 @@ pub struct OptimizerIdentity {
     pub catalog_sha256: String,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub entrapment_partition_identity: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub root_optimizer_provenance_sha256: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub stage_optimizer_provenance_sha256: Option<String>,
 }
 
 pub fn optimizer_fingerprint(
@@ -4819,7 +4963,203 @@ mod tests {
             source_configuration_sha256: "config".into(),
             catalog_sha256: "catalog".into(),
             entrapment_partition_identity: None,
+            root_optimizer_provenance_sha256: None,
+            stage_optimizer_provenance_sha256: None,
         }
+    }
+
+    fn seven_expert_root_config() -> ParameterOptimizerConfig {
+        let mut cfg = config();
+        cfg.schema_version = PARAMETER_OPTIMIZER_SCHEMA_VERSION;
+        cfg.selected_experts = vec![
+            OptimizerExpert::Moments,
+            OptimizerExpert::Mle,
+            OptimizerExpert::LowerOrder,
+            OptimizerExpert::MsfdrSeeded,
+            OptimizerExpert::Msfdr1Smix,
+            OptimizerExpert::Msfdr2Smix,
+            OptimizerExpert::Nokoi,
+            OptimizerExpert::Ensemble,
+        ];
+        cfg.expected_expert_configuration_sha256 = ExpertIdentity::INDIVIDUALS
+            .into_iter()
+            .enumerate()
+            .map(|(ordinal, expert)| (expert, format!("{:064x}", ordinal + 1)))
+            .collect();
+        cfg.require_expected_expert_configurations = true;
+        let definitions = [
+            (
+                "moments",
+                OptimizerExpert::Moments,
+                ParameterScope::PerExpert,
+                "moments_purification_factor",
+                ParameterValue::Float(0.2),
+            ),
+            (
+                "mle",
+                OptimizerExpert::Mle,
+                ParameterScope::PerExpert,
+                "mle_purification_factor",
+                ParameterValue::Float(0.1),
+            ),
+            (
+                "lower_order",
+                OptimizerExpert::LowerOrder,
+                ParameterScope::PerExpert,
+                "lower_order_purification_factor",
+                ParameterValue::Float(0.15),
+            ),
+            (
+                "msfdr",
+                OptimizerExpert::MsfdrSeeded,
+                ParameterScope::PerExpert,
+                "msfdr_seeded_purification_factor",
+                ParameterValue::Float(0.2),
+            ),
+            (
+                "msfdr1_smix",
+                OptimizerExpert::Msfdr1Smix,
+                ParameterScope::PerExpert,
+                "msfdr1_bottom_frac_init",
+                ParameterValue::Float(0.3),
+            ),
+            (
+                "msfdr2_smix",
+                OptimizerExpert::Msfdr2Smix,
+                ParameterScope::PerExpert,
+                "msfdr2_bottom_frac_init",
+                ParameterValue::Float(0.5),
+            ),
+            (
+                "nokoi",
+                OptimizerExpert::Nokoi,
+                ParameterScope::PerExpert,
+                "nokoi_k_folds",
+                ParameterValue::Integer(5),
+            ),
+            (
+                "ensemble",
+                OptimizerExpert::Ensemble,
+                ParameterScope::EnsembleFinal,
+                "final_evidence_space",
+                ParameterValue::String("p_value".into()),
+            ),
+        ];
+        cfg.blocks = definitions
+            .into_iter()
+            .map(|(id, expert, scope, parameter, value)| OptimizerBlock {
+                id: id.into(),
+                enabled: true,
+                scope,
+                expert: Some(expert),
+                strategy: OptimizerStrategy::ExhaustiveGrid,
+                structural_comparison: true,
+                fixed: BTreeMap::new(),
+                space: BTreeMap::from([(parameter.into(), vec![value])]),
+                window_search: None,
+                use_external_features: false,
+                max_trials: Some(1),
+                max_passes: Some(1),
+            })
+            .collect();
+        cfg.block_order = cfg.blocks.iter().map(|block| block.id.clone()).collect();
+        cfg.maximum_trial_budget = 16;
+        cfg
+    }
+
+    #[test]
+    fn immutable_root_provenance_projects_exact_expert_subsets() {
+        let root = seven_expert_root_config();
+        root.validate().unwrap();
+        let root_bytes = serde_json::to_vec(&root).unwrap();
+        let shared_fingerprint_inputs = (
+            root.seed,
+            root.objective.clone(),
+            root.require_existing_candidate_pool,
+            root.require_existing_raw_annotation_cache,
+            root.execution_mode,
+        );
+        let mut root_hash = None;
+        let mut forward_stage_hashes = BTreeMap::new();
+        for expert in ExpertIdentity::INDIVIDUALS {
+            let projection = root
+                .project_for_stage(&BTreeSet::from([expert]), OptimizerStageKind::SingleExpert)
+                .unwrap();
+            projection.config.validate().unwrap();
+            assert_eq!(projection.requested_experts, vec![expert]);
+            assert_eq!(projection.config.selected_experts, vec![expert.into()]);
+            assert_eq!(
+                projection
+                    .config
+                    .expected_expert_configuration_sha256
+                    .keys()
+                    .copied()
+                    .collect::<Vec<_>>(),
+                vec![expert]
+            );
+            assert!(projection
+                .config
+                .blocks
+                .iter()
+                .all(|block| block.expert == Some(expert.into())));
+            assert_eq!(
+                (
+                    projection.config.seed,
+                    projection.config.objective.clone(),
+                    projection.config.require_existing_candidate_pool,
+                    projection.config.require_existing_raw_annotation_cache,
+                    projection.config.execution_mode,
+                ),
+                shared_fingerprint_inputs
+            );
+            if let Some(expected) = &root_hash {
+                assert_eq!(expected, &projection.root_optimizer_provenance_sha256);
+            } else {
+                root_hash = Some(projection.root_optimizer_provenance_sha256.clone());
+            }
+            forward_stage_hashes.insert(expert, projection.stage_optimizer_provenance_sha256);
+        }
+        for expert in ExpertIdentity::INDIVIDUALS.into_iter().rev() {
+            let projection = root
+                .project_for_stage(&BTreeSet::from([expert]), OptimizerStageKind::SingleExpert)
+                .unwrap();
+            assert_eq!(
+                forward_stage_hashes[&expert],
+                projection.stage_optimizer_provenance_sha256
+            );
+        }
+        let requested = ExpertIdentity::INDIVIDUALS.into_iter().collect();
+        let ensemble = root
+            .project_for_stage(&requested, OptimizerStageKind::FinalEnsemble)
+            .unwrap();
+        ensemble.config.validate().unwrap();
+        assert_eq!(ensemble.config.selected_experts, root.selected_experts);
+        assert_eq!(
+            ensemble.config.expected_expert_configuration_sha256,
+            root.expected_expert_configuration_sha256
+        );
+        assert!(ensemble
+            .config
+            .blocks
+            .iter()
+            .all(|block| block.expert == Some(OptimizerExpert::Ensemble)));
+        assert_eq!(serde_json::to_vec(&root).unwrap(), root_bytes);
+
+        let mut unprojected = root.clone();
+        unprojected.selected_experts = vec![OptimizerExpert::Moments];
+        assert!(unprojected.validate().is_err());
+        let mut missing = root.clone();
+        missing
+            .expected_expert_configuration_sha256
+            .remove(&ExpertIdentity::Nokoi);
+        assert!(missing
+            .project_for_stage(
+                &BTreeSet::from([ExpertIdentity::Nokoi]),
+                OptimizerStageKind::SingleExpert,
+            )
+            .is_err());
+        assert_ne!(ExpertIdentity::Msfdr, ExpertIdentity::Msfdr1Smix);
+        assert_ne!(ExpertIdentity::Msfdr, ExpertIdentity::Msfdr2Smix);
     }
 
     #[derive(Default)]
