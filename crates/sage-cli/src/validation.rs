@@ -1,6 +1,6 @@
 use anyhow::{Context, Result};
 use csv::StringRecord;
-use sage_core::input::ModelFit;
+use sage_core::input::{ExpertIdentity, ModelFit};
 use serde::{Deserialize, Serialize};
 use std::collections::{BTreeMap, BTreeSet};
 use std::path::PathBuf;
@@ -45,7 +45,7 @@ pub const LOWER_ORDER_TARGET_ONLY_REUSE_UNSUPPORTED_REASON: &str =
 /// lower-level callers enforce the same scientific contract.
 #[derive(Clone, Debug, Serialize, Deserialize, PartialEq, Eq)]
 pub struct TargetOnlyPolicyCapability {
-    pub model: String,
+    pub model: ExpertIdentity,
     pub policy: TargetOnlyCalibrationPolicy,
     pub supported: bool,
     #[serde(default, skip_serializing_if = "Option::is_none")]
@@ -59,17 +59,7 @@ pub fn target_only_policy_capability(
     let unsupported_lower_order_reuse = *model == ModelFit::LowerOrder
         && policy == TargetOnlyCalibrationPolicy::ReuseDatasetArtifact;
     TargetOnlyPolicyCapability {
-        model: match model {
-            ModelFit::Moments => "moments",
-            ModelFit::Mle => "mle",
-            ModelFit::LowerOrder => "lower_order",
-            ModelFit::Msfdr => "msfdr",
-            ModelFit::Msfdr1Smix => "msfdr1_smix",
-            ModelFit::Msfdr2Smix => "msfdr2_smix",
-            ModelFit::Nokoi => "nokoi",
-            ModelFit::Ensemble => "ensemble",
-        }
-        .into(),
+        model: ExpertIdentity::from(model),
         policy,
         supported: !unsupported_lower_order_reuse,
         reason: unsupported_lower_order_reuse
@@ -200,9 +190,9 @@ pub struct EnsembleInteractionCalibration {
     pub baseline_lock_analysis_fingerprint: Option<String>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub final_lock_analysis_fingerprint: Option<String>,
-    pub baseline_experts: Vec<String>,
-    pub final_experts: Vec<String>,
-    pub newly_participating_experts: Vec<String>,
+    pub baseline_experts: Vec<ExpertIdentity>,
+    pub final_experts: Vec<ExpertIdentity>,
+    pub newly_participating_experts: Vec<ExpertIdentity>,
     pub raw_q: Option<EnsembleInteractionLayer>,
     pub level4: Option<EnsembleInteractionLayer>,
     pub raw_q_warning: Option<EnsembleInteractionWarning>,
@@ -293,8 +283,8 @@ pub fn ensemble_interaction_calibration(
     ratios: &EffectiveRatios,
     fdr_threshold: f64,
     raw_q_warning_threshold: f64,
-    mut baseline_experts: Vec<String>,
-    mut final_experts: Vec<String>,
+    mut baseline_experts: Vec<ExpertIdentity>,
+    mut final_experts: Vec<ExpertIdentity>,
 ) -> Result<EnsembleInteractionCalibration> {
     anyhow::ensure!(
         fdr_threshold.is_finite() && fdr_threshold >= 0.0,
@@ -1745,8 +1735,12 @@ mod tests {
             },
             0.01,
             0.01,
-            vec!["mle".into(), "moments".into()],
-            vec!["lower_order".into(), "moments".into(), "mle".into()],
+            vec![ExpertIdentity::Mle, ExpertIdentity::Moments],
+            vec![
+                ExpertIdentity::LowerOrder,
+                ExpertIdentity::Moments,
+                ExpertIdentity::Mle,
+            ],
         )
         .unwrap();
         let repeated = ensemble_interaction_calibration(
@@ -1759,13 +1753,23 @@ mod tests {
             },
             0.01,
             0.01,
-            vec!["moments".into(), "mle".into()],
-            vec!["mle".into(), "moments".into(), "lower_order".into()],
+            vec![ExpertIdentity::Moments, ExpertIdentity::Mle],
+            vec![
+                ExpertIdentity::Mle,
+                ExpertIdentity::Moments,
+                ExpertIdentity::LowerOrder,
+            ],
         )
         .unwrap();
 
-        assert_eq!(report.baseline_experts, vec!["mle", "moments"]);
-        assert_eq!(report.newly_participating_experts, vec!["lower_order"]);
+        assert_eq!(
+            report.baseline_experts,
+            vec![ExpertIdentity::Mle, ExpertIdentity::Moments]
+        );
+        assert_eq!(
+            report.newly_participating_experts,
+            vec![ExpertIdentity::LowerOrder]
+        );
         assert!(report.final_level4_calibration_pass);
         assert_eq!(report.schema_version, 2);
         assert_eq!(report.participation_effect, "none_nonblocking_diagnostic");
@@ -1804,8 +1808,8 @@ mod tests {
             &EffectiveRatios::default(),
             0.01,
             0.01,
-            vec!["moments".into()],
-            vec!["moments".into(), "lower_order".into()],
+            vec![ExpertIdentity::Moments],
+            vec![ExpertIdentity::Moments, ExpertIdentity::LowerOrder],
         )
         .unwrap();
         assert!(!report.evaluable);

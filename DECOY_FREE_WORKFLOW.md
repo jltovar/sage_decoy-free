@@ -475,6 +475,12 @@ Schema-v9 and older optimizer locks fail closed for target-only refit or `compar
 must materialize a new lock from the frozen single-value development configuration rather than
 inferring omitted values from contemporary defaults.
 
+All expert-keyed workflow state uses the canonical public identities `moments`, `mle`,
+`lower_order`, `msfdr`, `msfdr1_smix`, `msfdr2_smix`, and `nokoi`. Legacy MSFDR aliases are
+accepted only while parsing and normalize before map validation and fingerprinting. Locks,
+checkpoints, rosters, target-policy records, and provenance always serialize canonical names;
+duplicate aliases for one logical expert fail closed instead of permitting last-key-wins behavior.
+
 For optimizer-produced locks, the root lock is a transactional winner artifact rather than a
 baseline planning record. Sage copies the exact selected trial's final configuration and exact
 expert configuration/artifact mapping into a temporary schema-v10 lock, validates it, atomically

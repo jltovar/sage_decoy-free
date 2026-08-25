@@ -11445,7 +11445,7 @@ pub struct FittedArtifactProvenance {
     #[serde(default)]
     pub candidate_id_schema: String,
     pub fit_stage: String,
-    pub model: String,
+    pub model: crate::input::ExpertIdentity,
     /// Complete effective scientific configuration used to fit this artifact.
     /// Empty only for legacy artifacts, which cannot enter schema-v10 Ensemble
     /// target-only refit/reuse locks.
@@ -11456,7 +11456,11 @@ pub struct FittedArtifactProvenance {
     /// Ordered model-to-configuration mapping for a fitted Ensemble artifact.
     /// Empty for individual experts and legacy artifacts.
     #[serde(default, skip_serializing_if = "BTreeMap::is_empty")]
-    pub resolved_expert_configurations_sha256: BTreeMap<String, String>,
+    #[serde(
+        deserialize_with = "crate::input::deserialize_expert_map",
+        serialize_with = "crate::input::serialize_expert_map"
+    )]
+    pub resolved_expert_configurations_sha256: BTreeMap<crate::input::ExpertIdentity, String>,
     #[serde(default)]
     pub external_profile_calibration: Option<crate::input::ExternalProfileCalibration>,
 }

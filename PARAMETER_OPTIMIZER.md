@@ -16,11 +16,36 @@ scope, setter path, production `FdrOptions`/`FdrSettings` field, dependency pred
 executable, conditional, or deliberately deferred status. Enabled spaces fail closed when a
 binding is deferred; catalog exposure can never silently become a no-op.
 
+## Canonical expert identity
+
+Every manifest, optimizer record, checkpoint, fitted artifact, Ensemble lock, roster, target-only
+policy, and provenance map uses one typed expert identity. The canonical serialized identifiers are
+`moments`, `mle`, `lower_order`, `msfdr`, `msfdr1_smix`, `msfdr2_smix`, and `nokoi` (plus
+`ensemble` for the final combination stage). The legacy input aliases `msfdr_seeded`,
+`msfdr_1smix`, and `msfdr_2smix` remain readable, but all durable output uses the canonical public
+name. Alias spelling is normalized before scientific fingerprinting. A canonical name and alias—or
+two aliases for the same logical expert—in one map is a duplicate and fails closed.
+This normalization does not change the schema-v10 JSON structure or scientific fields, so the lock
+schema remains v10. Existing schema-v10 payloads using either recognized spelling normalize
+unambiguously; schema-v9 optimizer locks remain ineligible for target-only use.
+
+| Prior representation | Location/meaning | Canonical identity | Boundary |
+|---|---|---|---|
+| `msfdr_seeded` | optimizer enum, parameter ownership | `msfdr` | legacy input/internal field prefix |
+| `msfdr_1smix` | optimizer enum, parameter ownership | `msfdr1_smix` | legacy input/internal field prefix |
+| `msfdr_2smix` | optimizer enum, parameter ownership | `msfdr2_smix` | legacy input/internal field prefix |
+| `msfdr`, `msfdr1_smix`, `msfdr2_smix` | workflow models and public reports | unchanged | public schema |
+| `moments`, `mle`, `lower_order`, `nokoi` | every layer | unchanged | public schema |
+
+Scientific field names such as `msfdr_seeded_purification_factor` and fitted-state members retain
+their established names; they are parameter or artifact fields, not expert identities. Optimizer
+block IDs also remain independent labels and are converted to the typed identity at their boundary.
+
 ## Ownership, scope, and precedence
 
 Every block declares one scope: `default`, `per_expert`, `ensemble_final`, `physical`,
 `reproducibility`, `hierarchical_or_reporting`, or `numerical_only`. Model-local blocks also name
-exactly one of `moments`, `mle`, `lower_order`, `msfdr_seeded`, `msfdr_1smix`, `msfdr_2smix`, or
+exactly one of `moments`, `mle`, `lower_order`, `msfdr`, `msfdr1_smix`, `msfdr2_smix`, or
 `nokoi`; final Ensemble blocks name `ensemble`. A parameter owned by a different expert is rejected.
 Physical, reproducibility, and hierarchy blocks name the stream they modify and remain separate
 because their applicability depends on run, group, sample-role, instrument, and IMS metadata.
