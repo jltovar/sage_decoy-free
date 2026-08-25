@@ -151,6 +151,13 @@ resolved settings, making omitted, `null`, and explicit defaults equivalent with
 active setting. Schema-v9 optimizer locks fail closed for target-only use and must be regenerated
 by frozen replay; completed checkpoints can recover lock materialization without reevaluating
 trials.
+Frozen expert hashes are prepared inputs-only with
+`sage resolve-frozen-expert-configurations WORKFLOW.json --output RESOLUTION.json`. The command
+uses the production stage projection and effective `FdrSettings` resolver for every single-valued
+expert block, emits one immutable canonical artifact, and performs no spectra, cache, fitting,
+target-only, or optimizer-trial work. Strict preflight independently resolves and compares the
+complete roster before any production trial. Do not manufacture current hashes by editing older
+stage records or replacing only their implementation identity.
 Schema-v2 optimizer manifests can additionally set `execution_mode: optimization_only` for a full
 development run that materializes all individual and final Ensemble +entrapment winners and then
 returns successfully without resolving or executing any target-only resource or stage. Omitting

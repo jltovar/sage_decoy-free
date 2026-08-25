@@ -269,6 +269,34 @@ candidate; a mismatch exits nonzero. Frozen-Ensemble manifests can additionally 
 prospectively declared `expected_expert_configuration_sha256` map, which participates in the
 optimizer fingerprint and fails preflight on any missing, reassigned, or drifted expert.
 
+Prospective frozen hashes must be produced by Sage itself; editing an older stage record or
+substituting a new implementation identity is invalid because schema-v2 identity covers the
+complete current effective `FdrSettings`, including resolved default and dormant groups. The
+formal sequence is:
+
+1. Declare every expert-local setting and fixed window in single-valued `exhaustive_grid` blocks,
+   with no expected map.
+2. Run `sage resolve-frozen-expert-configurations WORKFLOW.json --output RESOLUTION.json`.
+3. Freeze the schema-v1 resolution artifact and its payload hash.
+4. Copy its canonical expected map into the executable manifest, or reference the artifact with
+   `frozen_expert_configuration_artifact`.
+5. Run strict workflow preflight and only then production optimization.
+
+The inputs-only resolver calls the same projection, precedence, override, window, effective
+`FdrSettings`, model-version, and schema-v2 hashing functions as production execution. It rejects
+multi-valued expert blocks rather than choosing a baseline, reads only the manifest and search
+configuration, and performs no spectrum, pool, annotation, fitting, target-only, or optimizer
+trial work. Its portable artifact contains all expert configurations, declared-option audit
+hashes, projection lineage, implementation/catalog identities, the canonical expected map, and a
+payload SHA-256; paths, timestamps, host/user data, process IDs, and biological outcomes are
+excluded.
+
+When expected hashes or a resolution artifact are supplied, workflow preflight resolves the
+entire roster again before dataset/resource preflight. Every missing, extra, or mismatched expert
+is reported together, and no trial can start. A referenced artifact must match the current
+implementation, catalog, root provenance, windows, and complete production resolution exactly.
+The existing stage-local validation remains an independent defense-in-depth check.
+
 Workflow orchestration treats that manifest as immutable root provenance. A typed stage projection
 creates a new configuration for each production optimizer stage: individual stages contain exactly
 one selected expert, that expert's expected hash, and that expert's blocks; the final Ensemble stage
