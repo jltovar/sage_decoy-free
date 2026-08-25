@@ -920,6 +920,15 @@ impl Default for HierarchicalInferenceConfig {
     }
 }
 
+/// One independently resolved production input for a member of a locked
+/// Ensemble. The box makes the recursive `FdrOptions` relationship explicit
+/// while keeping this workflow-internal carrier cheap to move.
+#[derive(Clone, Debug, Default)]
+pub struct EnsembleExpertOptions {
+    pub model: ModelFit,
+    pub options: Box<FdrOptions>,
+}
+
 #[derive(Clone, Serialize, Deserialize, Debug, Default)]
 pub struct FdrOptions {
     // =========================================================================
@@ -938,6 +947,14 @@ pub struct FdrOptions {
 
     // Model selection
     pub model_fit: Option<ModelFit>,
+
+    /// Workflow-internal, fully resolved expert configurations used when an
+    /// Ensemble is reconstructed from a frozen lock. These entries are never
+    /// accepted from search JSON: the workflow verifies their portable hashes
+    /// and installs them after loading the ordinary configuration. Keeping this
+    /// runtime-only also prevents a user manifest from impersonating a lock.
+    #[serde(skip)]
+    pub ensemble_expert_options: Vec<EnsembleExpertOptions>,
 
     // Final active evidence-space controls.
     pub final_evidence_space: Option<FinalEvidenceSpace>,
@@ -1298,6 +1315,13 @@ pub struct FdrSettings {
     // Model selection
     pub model_fit: ModelFit,
 
+    /// Independently resolved expert configurations for a locked Ensemble.
+    /// The outer settings continue to own only final Ensemble combination and
+    /// aggregation. Each boxed option set resolves independently at the point
+    /// where its expert is fitted/scored.
+    #[serde(skip_serializing)]
+    pub ensemble_expert_options: Vec<EnsembleExpertOptions>,
+
     // Final active evidence-space controls.
     pub final_evidence_space: FinalEvidenceSpace,
 
@@ -1531,6 +1555,7 @@ pub struct FdrSettings {
 
 impl From<FdrOptions> for FdrSettings {
     fn from(options: FdrOptions) -> Self {
+        let ensemble_expert_options = options.ensemble_expert_options.clone();
         // ---------------------------------------------------------------------
         // Local helpers
         // ---------------------------------------------------------------------
@@ -2122,6 +2147,7 @@ impl From<FdrOptions> for FdrSettings {
 
             // Model selection
             model_fit,
+            ensemble_expert_options,
 
             // Final active evidence-space controls
             final_evidence_space,

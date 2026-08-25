@@ -213,6 +213,15 @@ schema, fingerprint, and payload integrity, then reuses completed trial identiti
 Nonwinner result/artifact payloads are removed after completion; full diagnostics and fitted state
 remain only for each block winner.
 
+When independently optimized experts are assembled, the schema-v9 Ensemble lock stores the
+complete canonical effective `FdrOptions` and fully resolved `FdrSettings` for each expert, not
+only optimizer deltas or selected windows. It also binds the fitted artifact and the
+dataset/search/candidate/annotation identities under which that configuration was consumed. The
+final Ensemble configuration has its own hash and cannot overwrite expert-local settings.
+Target-only `refit_with_locked_window` reconstructs each expert from this locked configuration;
+`reuse_dataset_artifact` additionally verifies the artifact/configuration identity. Old partial
+locks are deliberately incompatible with refit and `compare_both`.
+
 Legacy outcomes distinguish `exhaustive_bounded_optimum`, `completed_heuristic_local`,
 `trial_budget_exhausted`, `no_technically_valid_solution`, `no_empirically_feasible_solution`,
 `interrupted_resumable`, and `not_evaluable`. Schema-v3 development-eligible runs additionally

@@ -3905,7 +3905,7 @@ impl RankNullPool {
     }
 }
 
-#[derive(Clone)]
+#[derive(Clone, Default)]
 struct Engines {
     mom_params: Option<(f64, f64)>,
     mle_params: Option<(f64, f64)>,
@@ -3921,6 +3921,15 @@ struct Engines {
     nokoi_p_values: Option<Arc<Vec<f64>>>,
     nokoi_peps: Option<Arc<Vec<f64>>>,
     nokoi_artifact: Option<nokoi::NokoiArtifact>,
+}
+
+fn ensemble_expert_settings(settings: &FdrSettings, model: ModelFit) -> FdrSettings {
+    settings
+        .ensemble_expert_options
+        .iter()
+        .find(|entry| entry.model == model)
+        .map(|entry| FdrSettings::from((*entry.options).clone()))
+        .unwrap_or_else(|| settings.clone())
 }
 
 fn validate_lower_order_artifact(
@@ -5151,7 +5160,56 @@ fn fit_base_experts(
     gates: RunGates,
     db: &IndexedDatabase,
 ) -> Result<Engines, BTreeMap<String, MsfdrMixtureFitFailure>> {
-    fit_engines(features, work, settings, gates, db)
+    if !matches!(settings.model_fit, ModelFit::Ensemble)
+        || settings.ensemble_expert_options.is_empty()
+    {
+        return fit_engines(features, work, settings, gates, db);
+    }
+
+    let requested = [
+        (ModelFit::Moments, gates.run_mom),
+        (ModelFit::Mle, gates.run_mle),
+        (ModelFit::LowerOrder, gates.run_lo),
+        (ModelFit::Msfdr, gates.run_msfdr_seeded),
+        (ModelFit::Msfdr1Smix, gates.run_msfdr_1smix),
+        (ModelFit::Msfdr2Smix, gates.run_msfdr_2smix),
+        (ModelFit::Nokoi, gates.run_nokoi),
+    ];
+    let mut combined = Engines::default();
+    for (model, _) in requested.into_iter().filter(|(_, enabled)| *enabled) {
+        let expert_settings = ensemble_expert_settings(settings, model.clone());
+        let one = RunGates {
+            run_mom: model == ModelFit::Moments,
+            run_mle: model == ModelFit::Mle,
+            run_lo: model == ModelFit::LowerOrder,
+            run_msfdr_seeded: model == ModelFit::Msfdr,
+            run_msfdr_1smix: model == ModelFit::Msfdr1Smix,
+            run_msfdr_2smix: model == ModelFit::Msfdr2Smix,
+            run_nokoi: model == ModelFit::Nokoi,
+        };
+        let fitted = fit_engines(features, work, &expert_settings, one, db)?;
+        match model {
+            ModelFit::Moments => combined.mom_params = fitted.mom_params,
+            ModelFit::Mle => combined.mle_params = fitted.mle_params,
+            ModelFit::LowerOrder => {
+                combined.lo_model = fitted.lo_model;
+                combined.lo_tev_by_index = fitted.lo_tev_by_index;
+            }
+            ModelFit::Msfdr => combined.msfdr_seeded = fitted.msfdr_seeded,
+            ModelFit::Msfdr1Smix => combined.msfdr_1smix = fitted.msfdr_1smix,
+            ModelFit::Msfdr2Smix => combined.msfdr_2smix = fitted.msfdr_2smix,
+            ModelFit::Nokoi => {
+                combined.nokoi_p_values = fitted.nokoi_p_values;
+                combined.nokoi_peps = fitted.nokoi_peps;
+                combined.nokoi_artifact = fitted.nokoi_artifact;
+            }
+            ModelFit::Ensemble => unreachable!(),
+        }
+        combined
+            .msfdr_mixture_failures
+            .extend(fitted.msfdr_mixture_failures);
+    }
+    Ok(combined)
 }
 
 fn score_base_rank1(
@@ -5163,6 +5221,9 @@ fn score_base_rank1(
     db: &IndexedDatabase,
 ) -> BaseDiscoveryResult {
     let use_ensemble = matches!(settings.model_fit, ModelFit::Ensemble);
+    let moments_settings = ensemble_expert_settings(settings, ModelFit::Moments);
+    let mle_settings = ensemble_expert_settings(settings, ModelFit::Mle);
+    let lower_order_settings = ensemble_expert_settings(settings, ModelFit::LowerOrder);
 
     let engines = engines_opt
         .as_ref()
@@ -5211,7 +5272,7 @@ fn score_base_rank1(
 
             let p_lo = if let (Some(ref m), Some(ref tev_by_index)) = (&lo_model, &lo_tev_by_index)
             {
-                let bid = lo_bucket_id(settings, psm.core.charge);
+                let bid = lo_bucket_id(&lower_order_settings, psm.core.charge);
 
                 match tev_by_index.get(idx).copied().flatten() {
                     Some(x_eval) => {
@@ -5390,7 +5451,13 @@ fn score_base_rank1(
         }
 
         if let Some(ref tev_by_index) = lo_tev_by_index {
-            log_lower_order_rank1_score_diagnostics(features, &workset, db, tev_by_index, settings);
+            log_lower_order_rank1_score_diagnostics(
+                features,
+                &workset,
+                db,
+                tev_by_index,
+                &lower_order_settings,
+            );
         } else {
             log::warn!("LO rank1 TEV/component diagnostics skipped: no LO TEV map was available.");
         }
@@ -5451,13 +5518,13 @@ fn score_base_rank1(
         }
     }
 
-    let pi0_mom = estimate_pi0_from_reference_grid(&p_mom_ref, settings)
+    let pi0_mom = estimate_pi0_from_reference_grid(&p_mom_ref, &moments_settings)
         .unwrap_or(1.0)
         .clamp(0.0, 1.0);
-    let pi0_mle = estimate_pi0_from_reference_grid(&p_mle_ref, settings)
+    let pi0_mle = estimate_pi0_from_reference_grid(&p_mle_ref, &mle_settings)
         .unwrap_or(1.0)
         .clamp(0.0, 1.0);
-    let pi0_lo = estimate_pi0_from_reference_grid(&p_lo_ref, settings)
+    let pi0_lo = estimate_pi0_from_reference_grid(&p_lo_ref, &lower_order_settings)
         .unwrap_or(1.0)
         .clamp(0.0, 1.0);
 
@@ -11379,6 +11446,17 @@ pub struct FittedArtifactProvenance {
     pub candidate_id_schema: String,
     pub fit_stage: String,
     pub model: String,
+    /// Complete effective scientific configuration used to fit this artifact.
+    /// Empty only for legacy artifacts, which cannot enter schema-v9 Ensemble
+    /// target-only refit/reuse locks.
+    #[serde(default)]
+    pub resolved_configuration_sha256: String,
+    #[serde(default)]
+    pub implementation_source_sha256: String,
+    /// Ordered model-to-configuration mapping for a fitted Ensemble artifact.
+    /// Empty for individual experts and legacy artifacts.
+    #[serde(default, skip_serializing_if = "BTreeMap::is_empty")]
+    pub resolved_expert_configurations_sha256: BTreeMap<String, String>,
     #[serde(default)]
     pub external_profile_calibration: Option<crate::input::ExternalProfileCalibration>,
 }
@@ -11497,28 +11575,36 @@ pub fn run_df_layers_with_artifacts(
     };
     let msfdr_mixture_failures = engines.msfdr_mixture_failures.clone();
 
-    let lower_order_artifact = if let Some(artifact) = settings.lower_order_frozen_artifact.as_ref()
-    {
-        Some(artifact.clone())
-    } else {
-        engines.lo_model.as_ref().map(|model| {
-            let reference_candidate_counts = new_features
-                .iter()
-                .filter(|feature| feature.core.rank == 1)
-                .map(|feature| feature.core.lo_spectrum_candidate_count)
-                .filter(|&count| count > 0)
-                .collect();
-            model.to_artifact(
-                settings.lower_order_min_null_rank,
-                settings.lower_order_max_null_rank,
-                settings.lo_evalue_candidate_count_power,
-                settings.lo_evalue_scale,
-                format!("{:?}", settings.lo_tev_transform),
-                settings.lo_tnm_extrapolation_strength,
-                reference_candidate_counts,
-            )
-        })
-    };
+    let moments_settings = ensemble_expert_settings(settings, ModelFit::Moments);
+    let mle_settings = ensemble_expert_settings(settings, ModelFit::Mle);
+    let lower_order_settings = ensemble_expert_settings(settings, ModelFit::LowerOrder);
+    let msfdr_settings = ensemble_expert_settings(settings, ModelFit::Msfdr);
+    let msfdr1_settings = ensemble_expert_settings(settings, ModelFit::Msfdr1Smix);
+    let msfdr2_settings = ensemble_expert_settings(settings, ModelFit::Msfdr2Smix);
+    let nokoi_settings = ensemble_expert_settings(settings, ModelFit::Nokoi);
+
+    let lower_order_artifact =
+        if let Some(artifact) = lower_order_settings.lower_order_frozen_artifact.as_ref() {
+            Some(artifact.clone())
+        } else {
+            engines.lo_model.as_ref().map(|model| {
+                let reference_candidate_counts = new_features
+                    .iter()
+                    .filter(|feature| feature.core.rank == 1)
+                    .map(|feature| feature.core.lo_spectrum_candidate_count)
+                    .filter(|&count| count > 0)
+                    .collect();
+                model.to_artifact(
+                    lower_order_settings.lower_order_min_null_rank,
+                    lower_order_settings.lower_order_max_null_rank,
+                    lower_order_settings.lo_evalue_candidate_count_power,
+                    lower_order_settings.lo_evalue_scale,
+                    format!("{:?}", lower_order_settings.lo_tev_transform),
+                    lower_order_settings.lo_tnm_extrapolation_strength,
+                    reference_candidate_counts,
+                )
+            })
+        };
     let gumbel_artifact = |model_version: &str, min_rank, max_rank, params: Option<(f64, f64)>| {
         params.map(|(mu, beta)| FrozenGumbelParameters {
             schema_version: 1,
@@ -11529,35 +11615,38 @@ pub fn run_df_layers_with_artifacts(
             beta,
         })
     };
-    let moments_artifact = settings.moments_frozen_parameters.clone().or_else(|| {
-        gumbel_artifact(
-            "sage-moments-gumbel-v1",
-            settings.moments_min_null_rank,
-            settings.moments_max_null_rank,
-            engines.mom_params,
-        )
-    });
-    let mle_artifact = settings.mle_frozen_parameters.clone().or_else(|| {
+    let moments_artifact = moments_settings
+        .moments_frozen_parameters
+        .clone()
+        .or_else(|| {
+            gumbel_artifact(
+                "sage-moments-gumbel-v1",
+                moments_settings.moments_min_null_rank,
+                moments_settings.moments_max_null_rank,
+                engines.mom_params,
+            )
+        });
+    let mle_artifact = mle_settings.mle_frozen_parameters.clone().or_else(|| {
         gumbel_artifact(
             "sage-mle-gumbel-v1",
-            settings.mle_min_null_rank,
-            settings.mle_max_null_rank,
+            mle_settings.mle_min_null_rank,
+            mle_settings.mle_max_null_rank,
             engines.mle_params,
         )
     });
-    let msfdr_seeded_artifact = settings
+    let msfdr_seeded_artifact = msfdr_settings
         .msfdr_seeded_frozen_model
         .clone()
         .or_else(|| engines.msfdr_seeded.clone());
-    let msfdr_1smix_artifact = settings
+    let msfdr_1smix_artifact = msfdr1_settings
         .msfdr_1smix_frozen_model
         .clone()
         .or_else(|| engines.msfdr_1smix.clone());
-    let msfdr_2smix_artifact = settings
+    let msfdr_2smix_artifact = msfdr2_settings
         .msfdr_2smix_frozen_model
         .clone()
         .or_else(|| engines.msfdr_2smix.clone());
-    let nokoi_artifact = settings
+    let nokoi_artifact = nokoi_settings
         .nokoi_frozen_artifact
         .clone()
         .or_else(|| engines.nokoi_artifact.clone());
@@ -11572,8 +11661,8 @@ pub fn run_df_layers_with_artifacts(
     let msfdr_seeded_metadata = msfdr_seeded_artifact.as_ref().map(|_| {
         metadata(
             "sage-msfdr-seeded-v1",
-            Some(settings.msfdr_min_null_rank),
-            Some(settings.msfdr_max_null_rank),
+            Some(msfdr_settings.msfdr_min_null_rank),
+            Some(msfdr_settings.msfdr_max_null_rank),
             false,
         )
     });
@@ -11583,8 +11672,8 @@ pub fn run_df_layers_with_artifacts(
     let msfdr_2smix_metadata = msfdr_2smix_artifact.as_ref().map(|_| {
         metadata(
             "sage-msfdr-2smix-v1",
-            Some(settings.msfdr2_smix_min_null_rank),
-            Some(settings.msfdr2_smix_max_null_rank),
+            Some(msfdr2_settings.msfdr2_smix_min_null_rank),
+            Some(msfdr2_settings.msfdr2_smix_max_null_rank),
             false,
         )
     });
@@ -13441,6 +13530,98 @@ mod tests {
     use crate::database::PeptideIx;
     use crate::input::FdrOptions;
     use crate::peptide::Peptide;
+
+    #[test]
+    fn locked_ensemble_resolves_each_expert_from_its_own_complete_options() {
+        use crate::input::{EnsembleExpertOptions, FinalEvidenceSpace, LoStratify, LoTevTransform};
+
+        let entry = |model: ModelFit| FdrOptions {
+            mode: Some(crate::input::FdrMode::DecoyFree),
+            model_fit: Some(model),
+            ..FdrOptions::default()
+        };
+        let mut moments = entry(ModelFit::Moments);
+        moments.moments_purification_factor = Some(0.20);
+        moments.moments_robust_fit = Some(true);
+        let mut mle = entry(ModelFit::Mle);
+        mle.mle_purification_factor = Some(0.10);
+        let mut lower = entry(ModelFit::LowerOrder);
+        lower.lower_order_purification_factor = Some(0.15);
+        lower.lo_stratify = Some(LoStratify::Global);
+        lower.lo_evalue_candidate_count_power = Some(0.75);
+        lower.lo_evalue_scale = Some(0.5);
+        lower.lo_tev_transform = Some(LoTevTransform::NegLogE);
+        lower.lo_tnm_extrapolation_strength = Some(1.5);
+        let mut seeded = entry(ModelFit::Msfdr);
+        seeded.msfdr_seeded_purification_factor = Some(0.20);
+        seeded.msfdr_seeded_top_frac_init = Some(0.10);
+        let mut one = entry(ModelFit::Msfdr1Smix);
+        one.msfdr1_bottom_frac_init = Some(0.40);
+        one.msfdr1_top_frac_init = Some(0.15);
+        let mut two = entry(ModelFit::Msfdr2Smix);
+        two.msfdr2_bottom_frac_init = Some(0.50);
+        two.msfdr2_top_frac_init = Some(0.10);
+        let mut nokoi = entry(ModelFit::Nokoi);
+        nokoi.nokoi_null_purification_factor = Some(0.20);
+        nokoi.nokoi_positive_top_fraction = Some(0.10);
+        nokoi.nokoi_k_folds = Some(5);
+        nokoi.nokoi_l1_lambda_min = Some(0.2);
+        nokoi.nokoi_l1_lambda_max = Some(1.0);
+        nokoi.nokoi_l1_lambda_steps = Some(10);
+
+        let expert_options = vec![
+            (ModelFit::Moments, moments),
+            (ModelFit::Mle, mle),
+            (ModelFit::LowerOrder, lower),
+            (ModelFit::Msfdr, seeded),
+            (ModelFit::Msfdr1Smix, one),
+            (ModelFit::Msfdr2Smix, two),
+            (ModelFit::Nokoi, nokoi),
+        ]
+        .into_iter()
+        .map(|(model, options)| EnsembleExpertOptions {
+            model,
+            options: Box::new(options),
+        })
+        .collect();
+        let outer = FdrSettings::from(FdrOptions {
+            mode: Some(crate::input::FdrMode::DecoyFree),
+            model_fit: Some(ModelFit::Ensemble),
+            final_evidence_space: Some(FinalEvidenceSpace::PValue),
+            moments_purification_factor: Some(0.89),
+            mle_purification_factor: Some(0.88),
+            ensemble_expert_options: expert_options,
+            ..FdrOptions::default()
+        });
+
+        let moments = ensemble_expert_settings(&outer, ModelFit::Moments);
+        let mle = ensemble_expert_settings(&outer, ModelFit::Mle);
+        let lower = ensemble_expert_settings(&outer, ModelFit::LowerOrder);
+        let seeded = ensemble_expert_settings(&outer, ModelFit::Msfdr);
+        let one = ensemble_expert_settings(&outer, ModelFit::Msfdr1Smix);
+        let two = ensemble_expert_settings(&outer, ModelFit::Msfdr2Smix);
+        let nokoi = ensemble_expert_settings(&outer, ModelFit::Nokoi);
+        assert_eq!(moments.moments_purification_factor, 0.20);
+        assert!(moments.moments_robust_fit);
+        assert_eq!(mle.mle_purification_factor, 0.10);
+        assert_eq!(lower.lower_order_purification_factor, 0.15);
+        assert_eq!(lower.lo_stratify, LoStratify::Global);
+        assert_eq!(lower.lo_evalue_candidate_count_power, 0.75);
+        assert_eq!(lower.lo_evalue_scale, 0.5);
+        assert_eq!(lower.lo_tnm_extrapolation_strength, 1.5);
+        assert_eq!(seeded.msfdr_seeded_purification_factor, 0.20);
+        assert_eq!(seeded.msfdr_seeded_top_frac_init, 0.10);
+        assert_eq!(one.msfdr1_bottom_frac_init, 0.40);
+        assert_eq!(one.msfdr1_top_frac_init, 0.15);
+        assert_eq!(two.msfdr2_bottom_frac_init, 0.50);
+        assert_eq!(two.msfdr2_top_frac_init, 0.10);
+        assert_eq!(nokoi.nokoi_null_purification_factor, 0.20);
+        assert_eq!(nokoi.nokoi_positive_top_fraction, 0.10);
+        assert_eq!(nokoi.nokoi_k_folds, 5);
+        assert_eq!(nokoi.nokoi_l1_lambda_min, 0.2);
+        assert_eq!(nokoi.nokoi_l1_lambda_max, 1.0);
+        assert_eq!(nokoi.nokoi_l1_lambda_steps, 10);
+    }
 
     #[test]
     fn selection_audit_masks_all_entrapment_roles_from_production_calibration() {
