@@ -463,7 +463,7 @@ The current production participation policy is:
 - Nokoi requires a complete `sage-nokoi-crossfit-portable-v2` artifact. Legacy v1 artifacts remain
   readable as historical diagnostics but cannot enter an Ensemble or target-only reuse path.
 
-The schema-v9 Ensemble lock copies every actual voter's independently optimized dataset-local
+The schema-v10 Ensemble lock copies every actual voter's independently optimized dataset-local
 window, complete effective expert-local production configuration, configuration hash, fitted
 artifact, and dataset/search/candidate/annotation identities; it never optimizes one combined
 window. Windows alone are insufficient because purification, robust fitting, mixture/classifier,
@@ -471,9 +471,19 @@ and per-expert calibration settings can all change the reconstructed stream. Tar
 `refit_with_locked_window` resolves each expert from its own locked configuration and refits only
 the nuisance state permitted by that model. Workflow defaults cannot replace locked values. The
 separate final Ensemble configuration controls combination and downstream aggregation only.
-Schema-v8 and older incomplete locks fail closed for target-only refit or `compare_both`; users
+Schema-v9 and older optimizer locks fail closed for target-only refit or `compare_both`; users
 must materialize a new lock from the frozen single-value development configuration rather than
 inferring omitted values from contemporary defaults.
+
+For optimizer-produced locks, the root lock is a transactional winner artifact rather than a
+baseline planning record. Sage copies the exact selected trial's final configuration and exact
+expert configuration/artifact mapping into a temporary schema-v10 lock, validates it, atomically
+replaces the root lock, reopens it, and validates it again before workflow completion. Any
+winner/lock disagreement is a nonzero technical failure. An integrity-valid completed checkpoint
+may resume only this materialization step without refitting trials. Effective scientific hashes
+use fully resolved settings, so omitted, `null`, and explicit-default forms (including
+`p_combine_calibration_mode: off`) canonicalize identically; the declared form retains a separate
+audit hash.
 
 A requested voter is excluded only for technical
 failures such as a missing/corrupt artifact, model or dataset/search/analysis mismatch, prohibited

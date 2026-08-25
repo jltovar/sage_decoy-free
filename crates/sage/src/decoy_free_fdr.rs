@@ -11447,7 +11447,7 @@ pub struct FittedArtifactProvenance {
     pub fit_stage: String,
     pub model: String,
     /// Complete effective scientific configuration used to fit this artifact.
-    /// Empty only for legacy artifacts, which cannot enter schema-v9 Ensemble
+    /// Empty only for legacy artifacts, which cannot enter schema-v10 Ensemble
     /// target-only refit/reuse locks.
     #[serde(default)]
     pub resolved_configuration_sha256: String,

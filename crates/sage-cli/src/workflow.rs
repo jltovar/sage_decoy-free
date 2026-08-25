@@ -47,6 +47,7 @@ use sage_core::input::{
 use serde::{Deserialize, Serialize};
 use sha2::{Digest, Sha256};
 use std::collections::{BTreeMap, BTreeSet, HashMap, HashSet};
+use std::io::Write;
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
 
@@ -267,7 +268,35 @@ pub struct ResolvedExpertConfiguration {
     pub active_setting_groups: Vec<String>,
     pub dormant_setting_groups: Vec<String>,
     pub implementation_source_sha256: String,
+    /// Audit identity of the canonicalized JSON option carrier. This preserves
+    /// the declared/effective representation without making scientifically
+    /// equivalent `null`, omitted, and explicit-default forms distinct in the
+    /// scientific configuration identity.
+    #[serde(default)]
+    pub declared_effective_options_sha256: String,
     pub resolved_configuration_sha256: String,
+}
+
+#[derive(Clone, Debug, Serialize, Deserialize)]
+pub struct EnsembleWinnerMaterialization {
+    pub schema_version: u32,
+    pub selected_trial_id: String,
+    pub selected_trial_result_sha256: String,
+    pub selected_fitted_artifact_sha256: String,
+    pub optimizer_scientific_result_sha256: String,
+    pub optimizer_fingerprint: String,
+    pub final_configuration_sha256: String,
+    pub expert_configuration_sha256: BTreeMap<String, String>,
+    pub expert_artifact_sha256: BTreeMap<String, String>,
+    pub candidate_pool_identity: String,
+    pub raw_annotation_cache_identity: Option<String>,
+    pub implementation_source_sha256: String,
+    pub fallback_used: bool,
+    pub technical_validity: String,
+    pub development_selection_eligible: bool,
+    pub empirical_calibration_power: EmpiricalCalibrationPower,
+    pub statistical_validation_status: StatisticalValidationStatus,
+    pub statistical_default_eligibility: StatisticalDefaultEligibility,
 }
 
 #[derive(Clone, Debug, Serialize, Deserialize)]
@@ -394,6 +423,10 @@ pub struct EnsembleLock {
     /// place of an expert-local resolved configuration.
     pub final_ensemble_configuration: ResolvedExpertConfiguration,
     pub final_ensemble_configuration_sha256: String,
+    /// Required for schema-v10 optimizer-produced locks. It binds the durable
+    /// root lock to the exact selected trial and its exact expert inputs.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub winner_materialization: Option<EnsembleWinnerMaterialization>,
 }
 
 fn default_ensemble_external_profile_contract() -> String {
@@ -572,7 +605,10 @@ fn resolved_configuration_payload(
         "schema_version": configuration.schema_version,
         "model": configuration.model,
         "model_version": configuration.model_version,
-        "effective_fdr_options": configuration.effective_fdr_options,
+        // `resolved_fdr_settings` is the canonical effective scientific state.
+        // The option carrier is retained in the artifact for reconstruction
+        // and audit, but omitted from this hash so omitted/null/explicit
+        // defaults with identical production behavior have one identity.
         "resolved_fdr_settings": configuration.resolved_fdr_settings,
         "active_setting_groups": configuration.active_setting_groups,
         "dormant_setting_groups": configuration.dormant_setting_groups,
@@ -582,10 +618,17 @@ fn resolved_configuration_payload(
 
 fn resolved_configuration_hash(configuration: &ResolvedExpertConfiguration) -> Result<String> {
     let mut hasher = Sha256::new();
-    hasher.update(b"sage-resolved-expert-configuration-v1\0");
+    hasher.update(b"sage-resolved-expert-configuration-v2\0");
     hasher.update(serde_json::to_vec(&resolved_configuration_payload(
         configuration,
     ))?);
+    Ok(format!("{:x}", hasher.finalize()))
+}
+
+fn declared_effective_options_hash(options: &FdrOptions) -> Result<String> {
+    let mut hasher = Sha256::new();
+    hasher.update(b"sage-declared-effective-fdr-options-v1\0");
+    hasher.update(serde_json::to_vec(options)?);
     Ok(format!("{:x}", hasher.finalize()))
 }
 
@@ -607,8 +650,10 @@ fn build_resolved_expert_configuration(
     let resolved_fdr_settings =
         serde_json::to_value(FdrSettings::from(effective_fdr_options.clone()))?;
     let (active_setting_groups, dormant_setting_groups) = resolved_setting_groups(model);
+    let declared_effective_options_sha256 =
+        declared_effective_options_hash(&effective_fdr_options)?;
     let mut configuration = ResolvedExpertConfiguration {
-        schema_version: 1,
+        schema_version: 2,
         model: model.clone(),
         model_version: expert_model_version(model).into(),
         effective_fdr_options,
@@ -617,6 +662,7 @@ fn build_resolved_expert_configuration(
         dormant_setting_groups,
         implementation_source_sha256:
             crate::parameter_optimizer::PARAMETER_OPTIMIZER_IMPLEMENTATION_SOURCE_SHA256.into(),
+        declared_effective_options_sha256,
         resolved_configuration_sha256: String::new(),
     };
     configuration.resolved_configuration_sha256 = resolved_configuration_hash(&configuration)?;
@@ -629,7 +675,7 @@ fn validate_resolved_expert_configuration(
     expected_window: &Option<NullWindow>,
 ) -> Result<()> {
     anyhow::ensure!(
-        configuration.schema_version == 1
+        configuration.schema_version == 2
             && configuration.model == *expected_model
             && configuration.model_version == expert_model_version(expected_model),
         "resolved expert configuration model/schema/version is incompatible"
@@ -642,6 +688,17 @@ fn validate_resolved_expert_configuration(
     anyhow::ensure!(
         configuration.resolved_configuration_sha256 == resolved_configuration_hash(configuration)?,
         "resolved expert configuration hash does not match its payload"
+    );
+    anyhow::ensure!(
+        configuration.declared_effective_options_sha256
+            == declared_effective_options_hash(&configuration.effective_fdr_options)?,
+        "resolved expert configuration declared-option audit hash does not match its payload"
+    );
+    anyhow::ensure!(
+        serde_json::to_value(FdrSettings::from(
+            configuration.effective_fdr_options.clone()
+        ))? == configuration.resolved_fdr_settings,
+        "resolved expert configuration settings do not match its effective option carrier"
     );
     let reconstructed = build_resolved_expert_configuration(
         expected_model,
@@ -909,6 +966,11 @@ pub struct StageRecord {
     pub resolved_production_configuration: Option<ResolvedExpertConfiguration>,
     #[serde(default, skip_serializing_if = "BTreeMap::is_empty")]
     pub ensemble_expert_configuration_sha256: BTreeMap<String, String>,
+    /// Exact model-to-artifact mapping consumed by an Ensemble stage. This is
+    /// distinct from configuration identity and prevents a scientifically
+    /// similar artifact (notably Nokoi) from replacing the selected input.
+    #[serde(default, skip_serializing_if = "BTreeMap::is_empty")]
+    pub ensemble_expert_artifact_sha256: BTreeMap<String, String>,
 }
 
 #[derive(Clone, Debug, Serialize, Deserialize)]
@@ -2553,10 +2615,39 @@ fn apply_ensemble_lock(
 ) -> Result<()> {
     fdr.nokoi_application_dataset_fingerprint = Some(dataset.fingerprint.clone());
     anyhow::ensure!(
-        lock.schema_version == 9,
-        "unsupported Ensemble lock schema {}; schema 9 with complete resolved expert configurations is required; old incomplete locks cannot support target-only refit or compare_both",
+        lock.schema_version == 10,
+        "unsupported Ensemble lock schema {}; schema 10 with canonical effective configurations and transactional winner identity is required; schema-v9 optimizer locks cannot support target-only refit or compare_both",
         lock.schema_version
     );
+    if target_only_policy.is_some() && !lock.post_selection_in_scope {
+        let winner = lock.winner_materialization.as_ref().context(
+            "schema-v10 target-only Ensemble lock is not a transactionally materialized optimizer winner",
+        )?;
+        anyhow::ensure!(
+            winner.final_configuration_sha256 == lock.final_ensemble_configuration_sha256
+                && winner.expert_configuration_sha256
+                    == lock
+                        .experts
+                        .iter()
+                        .filter(|expert| expert.enabled)
+                        .map(|expert| (
+                            model_slug(&expert.model).to_owned(),
+                            expert.resolved_configuration_sha256.clone(),
+                        ))
+                        .collect::<BTreeMap<_, _>>()
+                && winner.expert_artifact_sha256
+                    == lock
+                        .experts
+                        .iter()
+                        .filter(|expert| expert.enabled)
+                        .map(|expert| (
+                            model_slug(&expert.model).to_owned(),
+                            expert.optimized_fitted_artifacts_sha256.clone(),
+                        ))
+                        .collect::<BTreeMap<_, _>>(),
+            "target-only Ensemble winner identity disagrees with its final or expert configuration/artifact payload"
+        );
+    }
     anyhow::ensure!(
         lock.evaluable,
         "Ensemble lock is not evaluable: {}",
@@ -2595,12 +2686,22 @@ fn apply_ensemble_lock(
         &ModelFit::Ensemble,
         &None,
     )?;
+    let locked_final_settings = FdrSettings::from(
+        lock.final_ensemble_configuration
+            .effective_fdr_options
+            .clone(),
+    );
     anyhow::ensure!(
         lock.final_ensemble_configuration_sha256
             == lock
                 .final_ensemble_configuration
                 .resolved_configuration_sha256,
         "final Ensemble configuration hash field disagrees with its payload"
+    );
+    anyhow::ensure!(
+        lock.ensemble_p_combiner == locked_final_settings.ensemble_p_combiner
+            && lock.ensemble_pep_combiner == locked_final_settings.ensemble_pep_combiner,
+        "Ensemble lock combiner summary fields disagree with its final configuration"
     );
     let current_final = build_resolved_expert_configuration(&ModelFit::Ensemble, fdr.clone())?;
     anyhow::ensure!(
@@ -3062,7 +3163,7 @@ fn ensemble_lock_analysis_fingerprint(lock: &EnsembleLock) -> Result<String> {
         })
         .collect::<Vec<_>>();
     let value = serde_json::json!({
-        "schema": "sage-ensemble-analysis-v5-resolved-expert-configurations",
+        "schema": "sage-ensemble-analysis-v6-atomic-winner-materialization",
         "post_selection_in_scope": lock.post_selection_in_scope,
         "dataset_fingerprint": lock.dataset_fingerprint,
         "source_configuration_sha256": lock.source_configuration_sha256,
@@ -3082,6 +3183,7 @@ fn ensemble_lock_analysis_fingerprint(lock: &EnsembleLock) -> Result<String> {
         "ensemble_p_combiner": lock.ensemble_p_combiner,
         "ensemble_pep_combiner": lock.ensemble_pep_combiner,
         "final_ensemble_configuration_sha256": lock.final_ensemble_configuration_sha256,
+        "winner_materialization": lock.winner_materialization,
     });
     let mut hasher = Sha256::new();
     hasher.update(serde_json::to_vec(&value)?);
@@ -3092,6 +3194,51 @@ fn stamp_ensemble_lock_analysis_fingerprint(mut lock: EnsembleLock) -> Result<En
     lock = canonicalize_ensemble_lock(lock);
     lock.analysis_fingerprint = ensemble_lock_analysis_fingerprint(&lock)?;
     Ok(lock)
+}
+
+fn validate_expected_ensemble_expert_configurations(
+    config: Option<&ParameterOptimizerConfig>,
+    lock: &EnsembleLock,
+) -> Result<()> {
+    let Some(config) = config.filter(|config| {
+        config.require_expected_expert_configurations
+            || !config.expected_expert_configuration_sha256.is_empty()
+    }) else {
+        return Ok(());
+    };
+    let actual = lock
+        .experts
+        .iter()
+        .filter(|expert| expert.enabled)
+        .map(|expert| {
+            (
+                model_slug(&expert.model).to_owned(),
+                expert.resolved_configuration_sha256.clone(),
+            )
+        })
+        .collect::<BTreeMap<_, _>>();
+    anyhow::ensure!(
+        actual == config.expected_expert_configuration_sha256,
+        "preflight frozen expert configuration hashes differ from the prospectively declared map"
+    );
+    for expert in lock.experts.iter().filter(|expert| expert.enabled) {
+        validate_resolved_expert_configuration(
+            &expert.resolved_configuration,
+            &expert.model,
+            &expert.window,
+        )?;
+        anyhow::ensure!(
+            expert.optimized_fitted_artifacts.is_file()
+                && sha256_file(&expert.optimized_fitted_artifacts)?
+                    == expert.optimized_fitted_artifacts_sha256,
+            "preflight frozen expert {:?} artifact identity differs from its lock",
+            expert.model
+        );
+        let artifacts: DfRunArtifacts =
+            serde_json::from_slice(&std::fs::read(&expert.optimized_fitted_artifacts)?)?;
+        validate_artifact_resolved_configuration(&artifacts, expert)?;
+    }
+    Ok(())
 }
 
 fn interaction_baseline_lock(lock: &EnsembleLock) -> Result<EnsembleLock> {
@@ -3824,7 +3971,7 @@ fn build_ensemble_lock_with_failures(
         .map(|calibration| shared_ensemble_profile_contract_identity(dataset, calibration, &locked))
         .transpose()?;
     stamp_ensemble_lock_analysis_fingerprint(EnsembleLock {
-        schema_version: 9,
+        schema_version: 10,
         post_selection_in_scope: !optimization_only,
         source_manifest_hash: manifest_hash.into(),
         dataset_fingerprint: dataset.fingerprint.clone(),
@@ -3849,6 +3996,7 @@ fn build_ensemble_lock_with_failures(
             .resolved_configuration_sha256
             .clone(),
         final_ensemble_configuration,
+        winner_materialization: None,
     })
 }
 
@@ -4017,7 +4165,7 @@ fn validate_artifact_resolved_configuration(
     let provenance = artifacts
         .provenance
         .as_ref()
-        .context("schema-v9 Ensemble expert artifact has no fitted provenance")?;
+        .context("schema-v10 Ensemble expert artifact has no fitted provenance")?;
     anyhow::ensure!(
         provenance.schema_version == 3,
         "Ensemble expert {:?} artifact provenance schema {} lacks a resolved configuration identity",
@@ -4548,6 +4696,21 @@ fn run_search_stage(
             ))
         })
         .collect::<Result<BTreeMap<_, _>>>()?;
+    let ensemble_expert_artifact_sha256 = optimizer_ensemble_lock
+        .as_ref()
+        .map(|lock| {
+            lock.experts
+                .iter()
+                .filter(|expert| expert.enabled)
+                .map(|expert| {
+                    (
+                        model_slug(&expert.model).to_owned(),
+                        expert.optimized_fitted_artifacts_sha256.clone(),
+                    )
+                })
+                .collect::<BTreeMap<_, _>>()
+        })
+        .unwrap_or_default();
     let inherited_artifact_provenance = if let Some(path) = frozen_model_artifacts {
         let artifacts: DfRunArtifacts = serde_json::from_slice(&std::fs::read(path)?)
             .with_context(|| format!("invalid fitted artifacts {}", path.display()))?;
@@ -4676,6 +4839,7 @@ fn run_search_stage(
             .map(|partition| partition.partition_identity.clone()),
         resolved_production_configuration: Some(resolved_production_configuration),
         ensemble_expert_configuration_sha256,
+        ensemble_expert_artifact_sha256,
     };
     std::fs::create_dir_all(output_directory)?;
     write_json_atomic(&checkpoint, &record)?;
@@ -5428,6 +5592,437 @@ fn final_optimizer_winner_record(result: &OptimizerRunResult) -> Result<&TrialRe
         .context("optimizer final block winner has no trial record")
 }
 
+fn validate_optimizer_ensemble_winner_lock(
+    lock: &EnsembleLock,
+    result: &OptimizerRunResult,
+    winner: &TrialRecord,
+    stage: &StageRecord,
+    fitted_artifacts_path: &Path,
+) -> Result<()> {
+    anyhow::ensure!(
+        lock.schema_version == 10,
+        "optimizer winner lock must use schema 10"
+    );
+    let materialization = lock
+        .winner_materialization
+        .as_ref()
+        .context("schema-v10 optimizer winner lock has no transactional winner identity")?;
+    anyhow::ensure!(
+        materialization.schema_version == 1
+            && materialization.selected_trial_id == winner.request.trial_id
+            && result.winner_trial_id.as_deref() == Some(winner.request.trial_id.as_str())
+            && materialization.optimizer_fingerprint == result.optimizer_fingerprint
+            && materialization.optimizer_scientific_result_sha256
+                == result.scientific_result_sha256,
+        "optimizer winner lock identifies another selected trial or optimizer result"
+    );
+    let results_hash = sha256_file(&stage.results)?;
+    let artifact_hash = sha256_file(fitted_artifacts_path)?;
+    let candidate_pool_identity = stage
+        .candidate_pool
+        .as_ref()
+        .context("selected Ensemble trial has no candidate-pool identity")?
+        .search_fingerprint
+        .as_str();
+    let raw_annotation_cache_identity = stage
+        .ms2rescore_annotation_cache
+        .as_ref()
+        .map(|usage| usage.raw_prediction_cache_fingerprint.as_str());
+    let winner_artifact_record = result
+        .winner_artifacts
+        .get(&winner.request.block_id)
+        .context("optimizer result has no materialized artifact record for its selected block")?;
+    anyhow::ensure!(
+        stage.status == "complete"
+            && stage.model == model_slug(&ModelFit::Ensemble)
+            && !stage.fallback_used
+            && stage.results_sha256 == results_hash
+            && materialization.selected_trial_result_sha256 == results_hash
+            && materialization.selected_fitted_artifact_sha256 == artifact_hash
+            && materialization.candidate_pool_identity == candidate_pool_identity
+            && materialization.raw_annotation_cache_identity.as_deref()
+                == raw_annotation_cache_identity
+            && winner_artifact_record["results_sha256"].as_str()
+                == Some(results_hash.as_str())
+            && winner_artifact_record["fitted_artifact_sha256"].as_str()
+                == Some(artifact_hash.as_str()),
+        "optimizer winner lock result/artifact identity disagrees with the completed selected trial"
+    );
+    let selected_configuration = stage
+        .resolved_production_configuration
+        .as_ref()
+        .context("selected Ensemble trial has no resolved production configuration")?;
+    validate_resolved_expert_configuration(selected_configuration, &ModelFit::Ensemble, &None)?;
+    let selected_settings = FdrSettings::from(selected_configuration.effective_fdr_options.clone());
+    anyhow::ensure!(
+        lock.final_ensemble_configuration_sha256
+            == selected_configuration.resolved_configuration_sha256
+            && lock
+                .final_ensemble_configuration
+                .resolved_configuration_sha256
+                == selected_configuration.resolved_configuration_sha256
+            && resolved_configuration_payload(&lock.final_ensemble_configuration)
+                == resolved_configuration_payload(selected_configuration)
+            && lock
+                .final_ensemble_configuration
+                .declared_effective_options_sha256
+                == selected_configuration.declared_effective_options_sha256
+            && serde_json::to_value(&lock.final_ensemble_configuration.effective_fdr_options)?
+                == serde_json::to_value(&selected_configuration.effective_fdr_options)?
+            && lock.ensemble_p_combiner == selected_settings.ensemble_p_combiner
+            && lock.ensemble_pep_combiner == selected_settings.ensemble_pep_combiner
+            && materialization.final_configuration_sha256
+                == selected_configuration.resolved_configuration_sha256,
+        "root Ensemble configuration does not equal the selected trial configuration"
+    );
+    let expert_configuration_sha256 = lock
+        .experts
+        .iter()
+        .filter(|expert| expert.enabled)
+        .map(|expert| {
+            (
+                model_slug(&expert.model).to_owned(),
+                expert.resolved_configuration_sha256.clone(),
+            )
+        })
+        .collect::<BTreeMap<_, _>>();
+    let expert_artifact_sha256 = lock
+        .experts
+        .iter()
+        .filter(|expert| expert.enabled)
+        .map(|expert| {
+            (
+                model_slug(&expert.model).to_owned(),
+                expert.optimized_fitted_artifacts_sha256.clone(),
+            )
+        })
+        .collect::<BTreeMap<_, _>>();
+    anyhow::ensure!(
+        expert_configuration_sha256 == stage.ensemble_expert_configuration_sha256
+            && expert_configuration_sha256 == materialization.expert_configuration_sha256
+            && expert_artifact_sha256 == stage.ensemble_expert_artifact_sha256
+            && expert_artifact_sha256 == materialization.expert_artifact_sha256
+            && lock.actual_roster.len() == expert_configuration_sha256.len(),
+        "root Ensemble expert configurations, artifacts, or roster disagree with the selected trial inputs"
+    );
+    let fitted_artifacts: DfRunArtifacts =
+        serde_json::from_slice(&std::fs::read(fitted_artifacts_path)?)?;
+    let provenance = fitted_artifacts
+        .provenance
+        .as_ref()
+        .context("selected Ensemble fitted artifact has no provenance")?;
+    anyhow::ensure!(
+        provenance.resolved_configuration_sha256
+            == lock.final_ensemble_configuration_sha256
+            && provenance.resolved_expert_configurations_sha256
+                == expert_configuration_sha256
+            && provenance.implementation_source_sha256
+                == materialization.implementation_source_sha256,
+        "selected Ensemble fitted artifact configuration or expert-input identity disagrees with the winner lock"
+    );
+    anyhow::ensure!(
+        lock.analysis_fingerprint == ensemble_lock_analysis_fingerprint(lock)?,
+        "optimizer winner lock analysis fingerprint disagrees with its payload"
+    );
+    Ok(())
+}
+
+#[cfg(test)]
+thread_local! {
+    static FAIL_ENSEMBLE_WINNER_LOCK_AFTER_RENAME: std::cell::Cell<bool> = const { std::cell::Cell::new(false) };
+}
+
+fn write_optimizer_ensemble_winner_lock_atomic(
+    path: &Path,
+    lock: &EnsembleLock,
+    result: &OptimizerRunResult,
+    winner: &TrialRecord,
+    stage: &StageRecord,
+    fitted_artifacts_path: &Path,
+) -> Result<()> {
+    let parent = path.parent().unwrap_or_else(|| Path::new("."));
+    std::fs::create_dir_all(parent)?;
+    let file_name = path
+        .file_name()
+        .and_then(|name| name.to_str())
+        .unwrap_or("ensemble.lock.json");
+    let (temporary, mut temporary_file) = (0..1_024)
+        .find_map(|ordinal| {
+            let candidate =
+                parent.join(format!(".{file_name}.winner-materialization.{ordinal}.tmp"));
+            match std::fs::OpenOptions::new()
+                .write(true)
+                .create_new(true)
+                .open(&candidate)
+            {
+                Ok(file) => Some(Ok((candidate, file))),
+                Err(error) if error.kind() == std::io::ErrorKind::AlreadyExists => None,
+                Err(error) => Some(Err(error)),
+            }
+        })
+        .transpose()?
+        .context("unable to allocate a unique temporary Ensemble winner lock")?;
+    let bytes = serde_json::to_vec_pretty(lock)?;
+    temporary_file.write_all(&bytes).with_context(|| {
+        format!(
+            "failed to write temporary winner lock {}",
+            temporary.display()
+        )
+    })?;
+    temporary_file.sync_all().with_context(|| {
+        format!(
+            "failed to sync temporary winner lock {}",
+            temporary.display()
+        )
+    })?;
+    drop(temporary_file);
+    let provisional: EnsembleLock = serde_json::from_slice(&std::fs::read(&temporary)?)?;
+    validate_optimizer_ensemble_winner_lock(
+        &provisional,
+        result,
+        winner,
+        stage,
+        fitted_artifacts_path,
+    )?;
+
+    // Preserve the previous durable inode until the replacement has passed
+    // its post-rename reopen/validation gate. A hard link is same-filesystem,
+    // content preserving, and lets an error after rename restore the previous
+    // lock atomically instead of returning failure with a replaced root lock.
+    let previous = if path.is_file() {
+        let backup = (0..1_024)
+            .find_map(|ordinal| {
+                let candidate = parent.join(format!(
+                    ".{file_name}.winner-materialization.{ordinal}.previous"
+                ));
+                match std::fs::hard_link(path, &candidate) {
+                    Ok(()) => Some(Ok(candidate)),
+                    Err(error) if error.kind() == std::io::ErrorKind::AlreadyExists => None,
+                    Err(error) => Some(Err(error)),
+                }
+            })
+            .transpose()?
+            .context("unable to preserve the previous Ensemble winner lock")?;
+        #[cfg(unix)]
+        std::fs::File::open(parent)
+            .and_then(|directory| directory.sync_all())
+            .with_context(|| {
+                format!(
+                    "failed to sync preserved winner-lock directory {}",
+                    parent.display()
+                )
+            })?;
+        Some(backup)
+    } else {
+        None
+    };
+
+    let mut replacement_installed = false;
+    let replacement = (|| -> Result<()> {
+        std::fs::rename(&temporary, path).with_context(|| {
+            format!(
+                "failed to atomically replace root Ensemble lock {}",
+                path.display()
+            )
+        })?;
+        replacement_installed = true;
+        #[cfg(test)]
+        FAIL_ENSEMBLE_WINNER_LOCK_AFTER_RENAME.with(|fail| {
+            if fail.replace(false) {
+                anyhow::bail!("injected post-rename Ensemble winner-lock failure");
+            }
+            Ok::<_, anyhow::Error>(())
+        })?;
+        #[cfg(unix)]
+        std::fs::File::open(parent)
+            .and_then(|directory| directory.sync_all())
+            .with_context(|| {
+                format!("failed to sync winner lock directory {}", parent.display())
+            })?;
+        let durable_bytes = std::fs::read(path)?;
+        let durable: EnsembleLock = serde_json::from_slice(&durable_bytes)?;
+        validate_optimizer_ensemble_winner_lock(
+            &durable,
+            result,
+            winner,
+            stage,
+            fitted_artifacts_path,
+        )?;
+        anyhow::ensure!(
+            durable_bytes == bytes,
+            "durable Ensemble winner lock bytes differ after atomic replacement"
+        );
+        Ok(())
+    })();
+
+    if let Err(error) = replacement {
+        if replacement_installed {
+            let rollback = if let Some(previous) = previous.as_ref() {
+                std::fs::rename(previous, path).with_context(|| {
+                    format!(
+                        "failed to restore previous Ensemble winner lock {}",
+                        path.display()
+                    )
+                })
+            } else if path.exists() {
+                std::fs::remove_file(path).with_context(|| {
+                    format!(
+                        "failed to remove unsuccessful Ensemble winner lock {}",
+                        path.display()
+                    )
+                })
+            } else {
+                Ok(())
+            };
+            if let Err(rollback_error) = rollback {
+                anyhow::bail!(
+                    "Ensemble winner-lock replacement failed: {error:#}; rollback also failed: {rollback_error:#}"
+                );
+            }
+            #[cfg(unix)]
+            std::fs::File::open(parent)
+                .and_then(|directory| directory.sync_all())
+                .with_context(|| {
+                    format!(
+                        "failed to sync winner-lock rollback directory {}",
+                        parent.display()
+                    )
+                })?;
+        }
+        let _ = std::fs::remove_file(&temporary);
+        if let Some(previous) = previous.as_ref() {
+            let _ = std::fs::remove_file(previous);
+        }
+        return Err(error.context(
+            "Ensemble winner-lock replacement failed without changing the prior durable lock",
+        ));
+    }
+
+    if let Some(previous) = previous.as_ref() {
+        if let Err(error) = std::fs::remove_file(previous) {
+            log::warn!(
+                "unable to remove preserved Ensemble winner-lock inode {} after validated replacement: {error}",
+                previous.display()
+            );
+        }
+    }
+    #[cfg(unix)]
+    if let Err(error) = std::fs::File::open(parent).and_then(|directory| directory.sync_all()) {
+        // The replacement itself was already synced and fully revalidated.
+        // This final sync persists only best-effort removal of the recovery
+        // link and cannot turn a valid durable replacement into a failed one.
+        log::warn!(
+            "unable to sync winner-lock recovery-link cleanup in {}: {error}",
+            parent.display()
+        );
+    }
+    Ok(())
+}
+
+fn materialize_optimizer_ensemble_winner_lock(
+    manifest: &WorkflowManifest,
+    base_lock: &EnsembleLock,
+    root: &Path,
+    result: &OptimizerRunResult,
+) -> Result<EnsembleLock> {
+    let winner = final_optimizer_winner_record(result)?;
+    let trial_root = root.join("trials").join(&winner.request.trial_id);
+    let stage_path = trial_root.join("workflow.stage.json");
+    let stage: StageRecord =
+        serde_json::from_slice(&std::fs::read(&stage_path).with_context(|| {
+            format!(
+                "selected Ensemble stage is missing: {}",
+                stage_path.display()
+            )
+        })?)?;
+    let fitted_artifacts_path = trial_root.join("fitted_model_artifacts.json");
+    anyhow::ensure!(
+        stage.results.is_file() && fitted_artifacts_path.is_file(),
+        "selected Ensemble trial result or fitted artifact is missing"
+    );
+    let selected_configuration = stage
+        .resolved_production_configuration
+        .clone()
+        .context("selected Ensemble trial has no resolved production configuration")?;
+    let settings = FdrSettings::from(selected_configuration.effective_fdr_options.clone());
+    let expert_configuration_sha256 = base_lock
+        .experts
+        .iter()
+        .filter(|expert| expert.enabled)
+        .map(|expert| {
+            (
+                model_slug(&expert.model).to_owned(),
+                expert.resolved_configuration_sha256.clone(),
+            )
+        })
+        .collect::<BTreeMap<_, _>>();
+    let expert_artifact_sha256 = base_lock
+        .experts
+        .iter()
+        .filter(|expert| expert.enabled)
+        .map(|expert| {
+            (
+                model_slug(&expert.model).to_owned(),
+                expert.optimized_fitted_artifacts_sha256.clone(),
+            )
+        })
+        .collect::<BTreeMap<_, _>>();
+    anyhow::ensure!(
+        stage.ensemble_expert_configuration_sha256 == expert_configuration_sha256,
+        "selected Ensemble trial used expert configurations different from the root lock inputs"
+    );
+    let candidate_pool_identity = stage
+        .candidate_pool
+        .as_ref()
+        .context("selected Ensemble trial has no candidate-pool identity")?
+        .search_fingerprint
+        .clone();
+    let raw_annotation_cache_identity = stage
+        .ms2rescore_annotation_cache
+        .as_ref()
+        .map(|usage| usage.raw_prediction_cache_fingerprint.clone());
+    let mut lock = base_lock.clone();
+    lock.schema_version = 10;
+    lock.ensemble_p_combiner = settings.ensemble_p_combiner;
+    lock.ensemble_pep_combiner = settings.ensemble_pep_combiner;
+    lock.final_ensemble_configuration_sha256 =
+        selected_configuration.resolved_configuration_sha256.clone();
+    lock.final_ensemble_configuration = selected_configuration;
+    lock.winner_materialization = Some(EnsembleWinnerMaterialization {
+        schema_version: 1,
+        selected_trial_id: winner.request.trial_id.clone(),
+        selected_trial_result_sha256: sha256_file(&stage.results)?,
+        selected_fitted_artifact_sha256: sha256_file(&fitted_artifacts_path)?,
+        optimizer_scientific_result_sha256: result.scientific_result_sha256.clone(),
+        optimizer_fingerprint: result.optimizer_fingerprint.clone(),
+        final_configuration_sha256: lock.final_ensemble_configuration_sha256.clone(),
+        expert_configuration_sha256,
+        expert_artifact_sha256,
+        candidate_pool_identity,
+        raw_annotation_cache_identity,
+        implementation_source_sha256:
+            crate::parameter_optimizer::PARAMETER_OPTIMIZER_IMPLEMENTATION_SOURCE_SHA256.into(),
+        fallback_used: stage.fallback_used,
+        technical_validity: "valid_no_fallback".into(),
+        development_selection_eligible: winner.evaluation.development_selection_eligible,
+        empirical_calibration_power: winner.evaluation.empirical_calibration_power,
+        statistical_validation_status: winner.evaluation.statistical_validation_status,
+        statistical_default_eligibility: winner.evaluation.statistical_default_eligibility,
+    });
+    lock = stamp_ensemble_lock_analysis_fingerprint(lock)?;
+    validate_expected_ensemble_expert_configurations(manifest.parameter_optimizer.as_ref(), &lock)?;
+    let path = manifest.output_root.join("ensemble.lock.json");
+    write_optimizer_ensemble_winner_lock_atomic(
+        &path,
+        &lock,
+        result,
+        winner,
+        &stage,
+        &fitted_artifacts_path,
+    )?;
+    Ok(lock)
+}
+
 fn completed_optimizer_expert(
     manifest: &WorkflowManifest,
     model: &ModelWorkflow,
@@ -5814,6 +6409,11 @@ fn optimize_model_parameters(
             &mut evaluator,
         )?
     };
+    if model.model == ModelFit::Ensemble {
+        let base_lock = ensemble_lock
+            .context("Ensemble optimizer completed without the exact frozen expert input lock")?;
+        materialize_optimizer_ensemble_winner_lock(manifest, base_lock, &root, &result)?;
+    }
     write_json_atomic(&root.join("optimizer.result.json"), &result)?;
     prune_nonwinner_trial_payloads(&root, &result)?;
     anyhow::ensure!(
@@ -6113,6 +6713,34 @@ pub fn execute_workflow(
                     &runtime_expert_failures,
                 )?
             };
+            validate_expected_ensemble_expert_configurations(
+                manifest.parameter_optimizer.as_ref(),
+                &lock,
+            )?;
+            if let Some(config) = manifest.parameter_optimizer.as_ref().filter(|config| {
+                config.require_expected_expert_configurations
+                    || !config.expected_expert_configuration_sha256.is_empty()
+            }) {
+                write_json_atomic(
+                    &manifest
+                        .output_root
+                        .join("ensemble.expert-configurations.preflight.json"),
+                    &serde_json::json!({
+                        "schema_version": 1,
+                        "status": "validated_exact",
+                        "expected_expert_configuration_sha256": config.expected_expert_configuration_sha256,
+                        "resolved_expert_configuration_sha256": lock.experts.iter()
+                            .filter(|expert| expert.enabled)
+                            .map(|expert| (model_slug(&expert.model).to_owned(), expert.resolved_configuration_sha256.clone()))
+                            .collect::<BTreeMap<_, _>>(),
+                        "resolved_expert_artifact_sha256": lock.experts.iter()
+                            .filter(|expert| expert.enabled)
+                            .map(|expert| (model_slug(&expert.model).to_owned(), expert.optimized_fitted_artifacts_sha256.clone()))
+                            .collect::<BTreeMap<_, _>>(),
+                        "roster": lock.actual_roster,
+                    }),
+                )?;
+            }
             write_json_atomic(&manifest.output_root.join("ensemble.lock.json"), &lock)?;
             Some(lock)
         } else {
@@ -6682,6 +7310,7 @@ pub fn execute_workflow(
                     entrapment_partition_identity: None,
                     resolved_production_configuration: None,
                     ensemble_expert_configuration_sha256: BTreeMap::new(),
+                    ensemble_expert_artifact_sha256: BTreeMap::new(),
                 };
                 std::fs::create_dir_all(&target_output_directory)?;
                 write_json_atomic(
@@ -7407,6 +8036,85 @@ mod tests {
         }
     }
 
+    #[test]
+    fn effective_configuration_identity_normalizes_optional_defaults() {
+        use sage_core::input::{PCombineCalibrationMode, QMethod};
+
+        let base = FdrOptions {
+            mode: Some(FdrMode::DecoyFree),
+            model_fit: Some(ModelFit::Ensemble),
+            final_evidence_space: Some(sage_core::input::FinalEvidenceSpace::PValue),
+            ..FdrOptions::default()
+        };
+        let omitted =
+            build_resolved_expert_configuration(&ModelFit::Ensemble, base.clone()).unwrap();
+        let mut explicit = base.clone();
+        explicit.p_combine_calibration_mode = Some(PCombineCalibrationMode::Off);
+        explicit.p_combine_calibration_min_k = Some(2);
+        explicit.p_combine_calibration_max_k = Some(20);
+        explicit.p_combine_calibration_null_replicates = Some(5000);
+        explicit.p_combine_tfisher_tau = Some(0.05);
+        explicit.psm_q_method = Some(QMethod::Storey);
+        let explicit = build_resolved_expert_configuration(&ModelFit::Ensemble, explicit).unwrap();
+        assert_eq!(
+            omitted.resolved_configuration_sha256, explicit.resolved_configuration_sha256,
+            "omitted/null and explicit effective defaults must share scientific identity"
+        );
+        assert_ne!(
+            omitted.declared_effective_options_sha256, explicit.declared_effective_options_sha256,
+            "the declared-form audit identity must retain the representational difference"
+        );
+
+        let null_json = serde_json::json!({
+            "mode": "decoy_free",
+            "model_fit": "ensemble",
+            "final_evidence_space": "p_value",
+            "p_combine_calibration_mode": null
+        });
+        let null_options: FdrOptions = serde_json::from_value(null_json).unwrap();
+        assert_eq!(
+            omitted.resolved_configuration_sha256,
+            build_resolved_expert_configuration(&ModelFit::Ensemble, null_options)
+                .unwrap()
+                .resolved_configuration_sha256
+        );
+
+        let mut changed = base;
+        changed.ensemble_p_combiner = Some(EnsemblePCombiner::SecondBest);
+        assert_ne!(
+            omitted.resolved_configuration_sha256,
+            build_resolved_expert_configuration(&ModelFit::Ensemble, changed)
+                .unwrap()
+                .resolved_configuration_sha256,
+            "a genuinely different active combiner must change scientific identity"
+        );
+    }
+
+    #[test]
+    fn required_expected_expert_configuration_map_fails_closed() {
+        let mut config = test_optimizer_config();
+        config.schema_version = crate::parameter_optimizer::PARAMETER_OPTIMIZER_SCHEMA_VERSION;
+        config.selected_experts = vec![OptimizerExpert::Moments, OptimizerExpert::Ensemble];
+        config.require_expected_expert_configurations = true;
+        assert!(config
+            .validate()
+            .unwrap_err()
+            .to_string()
+            .contains("incomplete"));
+        config
+            .expected_expert_configuration_sha256
+            .insert("moments".into(), "a".repeat(64));
+        config.validate().unwrap();
+        config
+            .expected_expert_configuration_sha256
+            .insert("mle".into(), "b".repeat(64));
+        assert!(config
+            .validate()
+            .unwrap_err()
+            .to_string()
+            .contains("unselected"));
+    }
+
     fn lower_order_artifacts(mu: f64) -> DfRunArtifacts {
         DfRunArtifacts {
             lower_order: Some(sage_core::ml::lower_order::LowerOrderArtifact {
@@ -7438,6 +8146,8 @@ mod tests {
             enabled: true,
             classification: crate::parameter_optimizer::OptimizationClassification::DevelopmentOnly,
             selected_experts: vec![OptimizerExpert::Moments],
+            expected_expert_configuration_sha256: BTreeMap::new(),
+            require_expected_expert_configurations: false,
             compiled_defaults: BTreeMap::new(),
             workflow_defaults: BTreeMap::new(),
             fixed_baseline_values: BTreeMap::new(),
@@ -8473,6 +9183,7 @@ mod tests {
             entrapment_partition_identity: None,
             resolved_production_configuration: None,
             ensemble_expert_configuration_sha256: BTreeMap::new(),
+            ensemble_expert_artifact_sha256: BTreeMap::new(),
         };
         let mut legacy_value = serde_json::to_value(&record).unwrap();
         legacy_value["schema_version"] = serde_json::json!(2);
@@ -9062,7 +9773,7 @@ mod tests {
             .map(|expert| model_slug(&expert.model).to_owned())
             .collect::<Vec<_>>();
         let lock = stamp_ensemble_lock_analysis_fingerprint(EnsembleLock {
-            schema_version: 9,
+            schema_version: 10,
             post_selection_in_scope: true,
             source_manifest_hash: "manifest".into(),
             dataset_fingerprint: dataset.fingerprint.clone(),
@@ -9089,6 +9800,7 @@ mod tests {
                 None,
             )
             .resolved_configuration_sha256,
+            winner_materialization: None,
         })
         .unwrap();
         let mut changed_lock_provenance = lock.clone();
@@ -9718,6 +10430,296 @@ mod tests {
             },
         ];
         let lock = build_ensemble_lock(&manifest, "manifest-hash", &dataset, &experts).unwrap();
+        let mut expected_config = test_optimizer_config();
+        expected_config.selected_experts = vec![
+            OptimizerExpert::Moments,
+            OptimizerExpert::Mle,
+            OptimizerExpert::Ensemble,
+        ];
+        expected_config.require_expected_expert_configurations = true;
+        expected_config.expected_expert_configuration_sha256 = lock
+            .experts
+            .iter()
+            .filter(|expert| expert.enabled)
+            .map(|expert| {
+                (
+                    model_slug(&expert.model).to_owned(),
+                    expert.resolved_configuration_sha256.clone(),
+                )
+            })
+            .collect();
+        validate_expected_ensemble_expert_configurations(Some(&expected_config), &lock).unwrap();
+        let mut wrong_expected = expected_config.clone();
+        wrong_expected
+            .expected_expert_configuration_sha256
+            .insert("moments".into(), "f".repeat(64));
+        assert!(
+            validate_expected_ensemble_expert_configurations(Some(&wrong_expected), &lock)
+                .unwrap_err()
+                .to_string()
+                .contains("prospectively declared")
+        );
+        // Regression for the confirmed stale-root-lock defect: the baseline is
+        // second_best/Storey/Storey/grouping=true, while the second and winning
+        // final-Ensemble candidate is Cauchy/BH/BH/grouping=false. Durable
+        // materialization must use the selected trial, not this base lock.
+        let optimizer_root = directory.join("parameter_optimizer/ensemble");
+        let trial_root = optimizer_root.join("trials/trial-b");
+        std::fs::create_dir_all(&trial_root).unwrap();
+        let results_path = trial_root.join("results.sage.tsv");
+        std::fs::write(&results_path, b"winner\n").unwrap();
+        let mut winner_options = lock
+            .final_ensemble_configuration
+            .effective_fdr_options
+            .clone();
+        winner_options.ensemble_p_combiner = Some(EnsemblePCombiner::Cauchy);
+        winner_options.ensemble_cauchy_penalty = Some(1.0224);
+        winner_options.peptide_q_method = Some(sage_core::input::QMethod::Bh);
+        winner_options.protein_q_method = Some(sage_core::input::QMethod::Bh);
+        winner_options.decoy_free_protein_grouping = Some(false);
+        let winner_configuration =
+            build_resolved_expert_configuration(&ModelFit::Ensemble, winner_options).unwrap();
+        let expert_hashes = lock
+            .experts
+            .iter()
+            .filter(|expert| expert.enabled)
+            .map(|expert| {
+                (
+                    model_slug(&expert.model).to_owned(),
+                    expert.resolved_configuration_sha256.clone(),
+                )
+            })
+            .collect::<BTreeMap<_, _>>();
+        let expert_artifact_hashes = lock
+            .experts
+            .iter()
+            .filter(|expert| expert.enabled)
+            .map(|expert| {
+                (
+                    model_slug(&expert.model).to_owned(),
+                    expert.optimized_fitted_artifacts_sha256.clone(),
+                )
+            })
+            .collect::<BTreeMap<_, _>>();
+        let artifacts_path = trial_root.join("fitted_model_artifacts.json");
+        write_json_atomic(
+            &artifacts_path,
+            &DfRunArtifacts {
+                provenance: Some(fitted_artifact_provenance_with_configuration(
+                    &dataset,
+                    "parameter_optimizer_trial",
+                    &ModelFit::Ensemble,
+                    "test-search-fingerprint",
+                    &winner_configuration.resolved_configuration_sha256,
+                    expert_hashes.clone(),
+                )),
+                ..DfRunArtifacts::default()
+            },
+        )
+        .unwrap();
+        let candidate_usage = CandidatePoolUsage {
+            search_fingerprint: "test-search-fingerprint".into(),
+            analysis_fingerprint: "trial-analysis".into(),
+            manifest: directory.join("candidate.manifest.json"),
+            payload: directory.join("candidate.payload.json"),
+            reused: true,
+            candidate_count: 100,
+            retained_rank_depth: 50,
+            original_source_uris: Vec::new(),
+            current_source_uris: Vec::new(),
+            portable_identity_valid: true,
+            relocation_detected: false,
+        };
+        let stage: StageRecord = serde_json::from_value(serde_json::json!({
+            "schema_version": 5,
+            "stage": "parameter_optimizer_trial",
+            "model": "ensemble",
+            "input_hash": "trial-analysis",
+            "status": "complete",
+            "results": results_path,
+            "config_snapshot": trial_root.join("config.snapshot.json"),
+            "results_sha256": sha256_file(&results_path).unwrap(),
+            "external_features_enabled": false,
+            "calibration_mode": "fit_current_search_space",
+            "candidate_pool": candidate_usage,
+            "resolved_production_configuration": winner_configuration,
+            "ensemble_expert_configuration_sha256": expert_hashes,
+            "ensemble_expert_artifact_sha256": expert_artifact_hashes,
+            "fallback_used": false
+        }))
+        .unwrap();
+        write_json_atomic(&trial_root.join("workflow.stage.json"), &stage).unwrap();
+        let winner_record = TrialRecord {
+            request: TrialRequest {
+                trial_id: "trial-b".into(),
+                block_id: "ensemble-final".into(),
+                pass: 0,
+                ordinal: 1,
+                scope: crate::parameter_optimizer::ParameterScope::EnsembleFinal,
+                expert: Some(OptimizerExpert::Ensemble),
+                parameters: BTreeMap::new(),
+                use_external_features: false,
+                target_only_outcomes_allowed: false,
+            },
+            evaluation: TrialEvaluation {
+                status: TrialStatus::Feasible,
+                technical_reason: None,
+                empirical_reason: Some("underpowered".into()),
+                metrics: Some(TrialMetrics {
+                    level4_proteins: 17,
+                    level4_canonical_peptides: 312,
+                    level4_peptidoforms: 371,
+                    level4_psms: 9_154,
+                    adjusted_entrapment_fdp: Some(0.0),
+                    entrapment_count: 0,
+                    adjusted_entrapment_fdp_by_level: BTreeMap::new(),
+                    entrapment_count_by_level: BTreeMap::new(),
+                    model_complexity: 1,
+                }),
+                development_selection_eligible: true,
+                empirical_point_estimate_within_limit: Some(true),
+                empirical_calibration_power: EmpiricalCalibrationPower::Underpowered,
+                statistical_validation_status:
+                    StatisticalValidationStatus::NotEvaluableUnderpowered,
+                statistical_default_eligibility: StatisticalDefaultEligibility::NotEvaluated,
+                compact_diagnostics: BTreeMap::new(),
+            },
+            reused_from_checkpoint: false,
+        };
+        let optimizer_result = OptimizerRunResult {
+            schema_version: crate::parameter_optimizer::PARAMETER_OPTIMIZER_SCHEMA_VERSION,
+            optimizer_fingerprint: "optimizer-fingerprint".into(),
+            scientific_result_sha256: "scientific-result".into(),
+            parameter_binding_coverage: Vec::new(),
+            classification: crate::parameter_optimizer::OptimizationClassification::DevelopmentOnly,
+            execution_mode: OptimizerExecutionMode::OptimizationOnly,
+            outcome: OptimizerOutcome::UnderpoweredDevelopmentWinner,
+            strategy_classification: "deterministic_heuristic_local".into(),
+            requested_parameter_space: Vec::new(),
+            block_order: vec!["ensemble-final".into()],
+            resolved_parameters: BTreeMap::new(),
+            resolved_parameter_sets: BTreeMap::new(),
+            parameter_precedence: Vec::new(),
+            objective: crate::parameter_optimizer::default_objective(),
+            empirical_constraints: Vec::new(),
+            underpowered_trial_policy:
+                crate::parameter_optimizer::UnderpoweredTrialPolicy::DevelopmentEligible,
+            powered_trial_count: 0,
+            underpowered_trial_count: 1,
+            empirical_power_not_assessed_trial_count: 0,
+            trials: vec![winner_record.clone()],
+            accepted_transitions: Vec::new(),
+            winner_trial_id: Some("trial-b".into()),
+            block_winners: BTreeMap::from([("ensemble-final".into(), "trial-b".into())]),
+            winner_artifacts: BTreeMap::from([(
+                "ensemble-final".into(),
+                serde_json::json!({
+                    "trial_directory": "trials/trial-b",
+                    "results_sha256": sha256_file(&results_path).unwrap(),
+                    "fitted_artifact_sha256": sha256_file(&artifacts_path).unwrap(),
+                    "selected_null_window": null
+                }),
+            )]),
+            target_only_non_leakage: "target_only_outcomes_excluded".into(),
+            development_only: true,
+            independent_evaluation_status: "not_run".into(),
+            statistical_default_status: "not_evaluated".into(),
+            frozen_audit: None,
+        };
+        let selected_lock = materialize_optimizer_ensemble_winner_lock(
+            &manifest,
+            &lock,
+            &optimizer_root,
+            &optimizer_result,
+        )
+        .unwrap();
+        let selected_settings = FdrSettings::from(
+            selected_lock
+                .final_ensemble_configuration
+                .effective_fdr_options
+                .clone(),
+        );
+        assert_eq!(
+            selected_settings.ensemble_p_combiner,
+            EnsemblePCombiner::Cauchy
+        );
+        assert_eq!(selected_settings.ensemble_cauchy_penalty, 1.0224);
+        assert_eq!(
+            selected_settings.peptide_q_method,
+            sage_core::input::QMethod::Bh
+        );
+        assert_eq!(
+            selected_settings.protein_q_method,
+            sage_core::input::QMethod::Bh
+        );
+        assert!(!selected_settings.decoy_free_protein_grouping);
+        assert_eq!(
+            selected_lock.final_ensemble_configuration_sha256,
+            stage
+                .resolved_production_configuration
+                .as_ref()
+                .unwrap()
+                .resolved_configuration_sha256
+        );
+        assert_eq!(
+            selected_lock
+                .winner_materialization
+                .as_ref()
+                .unwrap()
+                .selected_trial_id,
+            "trial-b"
+        );
+        let first_bytes = std::fs::read(directory.join("ensemble.lock.json")).unwrap();
+        let mut invalid_lock = selected_lock.clone();
+        invalid_lock.final_ensemble_configuration_sha256 = "stale-baseline-hash".into();
+        invalid_lock = stamp_ensemble_lock_analysis_fingerprint(invalid_lock).unwrap();
+        assert!(write_optimizer_ensemble_winner_lock_atomic(
+            &directory.join("ensemble.lock.json"),
+            &invalid_lock,
+            &optimizer_result,
+            &winner_record,
+            &stage,
+            &artifacts_path,
+        )
+        .is_err());
+        assert_eq!(
+            first_bytes,
+            std::fs::read(directory.join("ensemble.lock.json")).unwrap(),
+            "failed validation must not replace the last durable valid lock"
+        );
+        let mut post_rename_failure_lock = selected_lock.clone();
+        post_rename_failure_lock.raw_q_interaction_warning_threshold = 0.25;
+        post_rename_failure_lock =
+            stamp_ensemble_lock_analysis_fingerprint(post_rename_failure_lock).unwrap();
+        FAIL_ENSEMBLE_WINNER_LOCK_AFTER_RENAME.with(|fail| fail.set(true));
+        assert!(write_optimizer_ensemble_winner_lock_atomic(
+            &directory.join("ensemble.lock.json"),
+            &post_rename_failure_lock,
+            &optimizer_result,
+            &winner_record,
+            &stage,
+            &artifacts_path,
+        )
+        .unwrap_err()
+        .to_string()
+        .contains("without changing the prior durable lock"));
+        assert_eq!(
+            first_bytes,
+            std::fs::read(directory.join("ensemble.lock.json")).unwrap(),
+            "post-rename failure must atomically restore the last durable valid lock"
+        );
+        materialize_optimizer_ensemble_winner_lock(
+            &manifest,
+            &lock,
+            &optimizer_root,
+            &optimizer_result,
+        )
+        .unwrap();
+        assert_eq!(
+            first_bytes,
+            std::fs::read(directory.join("ensemble.lock.json")).unwrap(),
+            "checkpoint-only winner materialization recovery must be byte deterministic"
+        );
         let canonical_bytes = serde_json::to_vec(&lock).unwrap();
         let mut reversed_experts = experts.clone();
         reversed_experts.reverse();
@@ -9736,7 +10738,7 @@ mod tests {
             canonical_bytes
         );
         assert_eq!(lock.dataset_fingerprint, dataset.fingerprint);
-        assert_eq!(lock.schema_version, 9);
+        assert_eq!(lock.schema_version, 10);
         assert_eq!(lock.requested_roster, vec!["mle", "moments"]);
         assert_eq!(lock.actual_roster, lock.requested_roster);
         assert!(lock.technical_failures.is_empty());
@@ -9821,7 +10823,7 @@ mod tests {
         );
 
         let mut legacy_lock = lock.clone();
-        legacy_lock.schema_version = 8;
+        legacy_lock.schema_version = 9;
         let legacy_error = apply_ensemble_lock(
             &mut FdrOptions::default(),
             &legacy_lock,
@@ -9832,7 +10834,9 @@ mod tests {
             None,
         )
         .unwrap_err();
-        assert!(legacy_error.to_string().contains("old incomplete locks"));
+        assert!(legacy_error
+            .to_string()
+            .contains("schema-v9 optimizer locks"));
 
         let canonical_configuration_bytes =
             serde_json::to_vec(&lock.experts[0].resolved_configuration).unwrap();
