@@ -1223,8 +1223,16 @@ optimizes each constituent window independently within the current dataset; it n
 combined Ensemble window. JSON configuration defines the requested roster. Artifact integrity,
 provenance, dataset/search/analysis identity, supported target-only semantics, fallback, fitted
 external-profile provenance, finite fitted state, and duplicate-vote checks define the actual
-roster. Schema-v7 locks preserve each expert's fitted-profile provenance separately from the one
-canonical dataset-local Ensemble profile contract. The Ensemble profile is fitted once at the
+roster. Schema-v9 locks additionally bind each expert's complete effective production
+configuration and a separate final Ensemble configuration. A target-only refit therefore uses
+the frozen expert-local scientific and calibration settings as well as its window; present-day
+workflow defaults cannot replace locked values. Old locks without complete resolved expert
+configurations cannot support target-only refit or `compare_both` and fail closed instead of
+guessing missing values. Expert configurations, artifact identities, policy-specific streams, and
+the final Ensemble settings remain distinct.
+
+The locks preserve each expert's fitted-profile provenance separately from the one canonical
+dataset-local Ensemble profile contract. The Ensemble profile is fitted once at the
 explicit 9-18 window, independent of expert order; expert-specific profiles cannot overwrite it.
 Statistical diagnostics do not remove a technically valid requested voter. Native and
 MS2Rescore-fitted artifacts remain separate.

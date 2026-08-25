@@ -40,9 +40,9 @@ use crate::validation::{
 use anyhow::{Context, Result};
 use sage_core::decoy_free_fdr::{DfRunArtifacts, FittedArtifactProvenance};
 use sage_core::input::{
-    AdaptiveNullWindowSearchOptions, EnsemblePCombiner, EnsemblePepCombiner, FdrMode, FdrOptions,
-    FdrSettings, ModelFit, NullWindowCandidate, NullWindowOptimizerOptions, NullWindowSearchBounds,
-    NullWindowSearchStrategy, NullWindowValidationScope,
+    AdaptiveNullWindowSearchOptions, EnsembleExpertOptions, EnsemblePCombiner, EnsemblePepCombiner,
+    FdrMode, FdrOptions, FdrSettings, ModelFit, NullWindowCandidate, NullWindowOptimizerOptions,
+    NullWindowSearchBounds, NullWindowSearchStrategy, NullWindowValidationScope,
 };
 use serde::{Deserialize, Serialize};
 use sha2::{Digest, Sha256};
@@ -50,7 +50,7 @@ use std::collections::{BTreeMap, BTreeSet, HashMap, HashSet};
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
 
-#[derive(Clone, Debug, Serialize, Deserialize)]
+#[derive(Clone, Debug, Serialize, Deserialize, PartialEq, Eq)]
 pub struct NullWindow {
     pub min_rank: u32,
     pub max_rank: u32,
@@ -252,10 +252,44 @@ pub struct DatasetIdentity {
     pub search_config_sha256: String,
 }
 
+/// Canonical, portable representation of the complete effective production
+/// configuration consumed by one expert. `effective_fdr_options` is sufficient
+/// to reconstruct the settings, while `resolved_fdr_settings` binds all
+/// compiled defaults after resolution. Runtime artifacts, labels, paths, and
+/// process-local state are deliberately excluded and bound elsewhere.
+#[derive(Clone, Debug, Serialize, Deserialize)]
+pub struct ResolvedExpertConfiguration {
+    pub schema_version: u32,
+    pub model: ModelFit,
+    pub model_version: String,
+    pub effective_fdr_options: FdrOptions,
+    pub resolved_fdr_settings: serde_json::Value,
+    pub active_setting_groups: Vec<String>,
+    pub dormant_setting_groups: Vec<String>,
+    pub implementation_source_sha256: String,
+    pub resolved_configuration_sha256: String,
+}
+
+#[derive(Clone, Debug, Serialize, Deserialize)]
+pub struct ResolvedExpertFitIdentity {
+    pub dataset_fingerprint: String,
+    pub target_fasta_sha256: String,
+    pub search_config_sha256: String,
+    pub candidate_pool_search_fingerprint: String,
+    pub candidate_pool_analysis_fingerprint: String,
+    pub candidate_pool_manifest_sha256: String,
+    pub candidate_pool_payload_sha256: String,
+    pub candidate_count: usize,
+    pub retained_rank_depth: usize,
+}
+
 #[derive(Clone, Debug, Serialize, Deserialize)]
 pub struct EnsembleExpertLock {
     pub model: ModelFit,
     pub window: Option<NullWindow>,
+    pub resolved_configuration: ResolvedExpertConfiguration,
+    pub resolved_configuration_sha256: String,
+    pub fit_identity: ResolvedExpertFitIdentity,
     pub optimized_fitted_artifacts: PathBuf,
     pub optimized_fitted_artifacts_sha256: String,
     #[serde(default)]
@@ -356,6 +390,10 @@ pub struct EnsembleLock {
     pub raw_q_interaction_warning_threshold: f64,
     pub ensemble_p_combiner: EnsemblePCombiner,
     pub ensemble_pep_combiner: EnsemblePepCombiner,
+    /// Final Ensemble-only configuration. Expert fitting never reads this in
+    /// place of an expert-local resolved configuration.
+    pub final_ensemble_configuration: ResolvedExpertConfiguration,
+    pub final_ensemble_configuration_sha256: String,
 }
 
 fn default_ensemble_external_profile_contract() -> String {
@@ -368,6 +406,258 @@ fn path_buf_is_empty(path: &PathBuf) -> bool {
 
 fn default_ensemble_roster_contract() -> String {
     "json_requested_technical_validation_only".into()
+}
+
+fn expert_model_version(model: &ModelFit) -> &'static str {
+    match model {
+        ModelFit::Moments => "sage-moments-gumbel-v1",
+        ModelFit::Mle => "sage-mle-gumbel-v1",
+        ModelFit::LowerOrder => "sage-lower-order-local-lom-v1",
+        ModelFit::Msfdr => "sage-msfdr-seeded-v1",
+        ModelFit::Msfdr1Smix => "sage-msfdr-1smix-v1",
+        ModelFit::Msfdr2Smix => "sage-msfdr-2smix-v1",
+        ModelFit::Nokoi => "sage-nokoi-v2",
+        ModelFit::Ensemble => "sage-ensemble-continuous-psm-first-v1",
+    }
+}
+
+fn resolved_setting_groups(model: &ModelFit) -> (Vec<String>, Vec<String>) {
+    let shared = [
+        "null_support",
+        "storey_and_q_calibration",
+        "level_aggregation",
+    ];
+    let model_group = match model {
+        ModelFit::Moments => "moments",
+        ModelFit::Mle => "mle",
+        ModelFit::LowerOrder => "lower_order",
+        ModelFit::Msfdr => "msfdr_seeded",
+        ModelFit::Msfdr1Smix => "msfdr_1smix",
+        ModelFit::Msfdr2Smix => "msfdr_2smix",
+        ModelFit::Nokoi => "nokoi_v2",
+        ModelFit::Ensemble => "ensemble_final",
+    };
+    let all = [
+        "moments",
+        "mle",
+        "lower_order",
+        "msfdr_seeded",
+        "msfdr_1smix",
+        "msfdr_2smix",
+        "nokoi_v2",
+        "ensemble_final",
+    ];
+    let mut active = shared
+        .iter()
+        .map(|value| (*value).into())
+        .collect::<Vec<_>>();
+    active.push(model_group.into());
+    let dormant = all
+        .into_iter()
+        .filter(|value| *value != model_group)
+        .map(str::to_owned)
+        .collect();
+    (active, dormant)
+}
+
+fn canonical_effective_fdr_options(mut options: FdrOptions, model: &ModelFit) -> FdrOptions {
+    options.mode = Some(FdrMode::DecoyFree);
+    options.model_fit = Some(model.clone());
+    options.selection_entrapment_proteins = None;
+    options.ensemble_expert_options.clear();
+    options.null_window_optimizer = None;
+    options.moments_frozen_parameters = None;
+    options.mle_frozen_parameters = None;
+    options.lower_order_frozen_artifact = None;
+    options.msfdr_seeded_frozen_model = None;
+    options.msfdr_1smix_frozen_model = None;
+    options.msfdr_2smix_frozen_model = None;
+    options.nokoi_frozen_artifact = None;
+    options.external_ms2rescore_frozen_profiles = None;
+    options.nokoi_application_dataset_fingerprint = None;
+    // Ensemble participation is bound once by the lock's canonical requested
+    // and actual rosters. These convenience booleans are reconstructed from
+    // that roster at application time and must not create a second, drifting
+    // representation inside the final Ensemble configuration hash.
+    options.enable_moments = None;
+    options.enable_mle = None;
+    options.enable_lower_order = None;
+    options.enable_msfdr_seeded = None;
+    options.enable_msfdr_1smix = None;
+    options.enable_msfdr_2smix = None;
+    options.enable_nokoi = None;
+    if *model != ModelFit::Moments {
+        options.moments_min_null_rank = None;
+        options.moments_max_null_rank = None;
+        options.moments_purification_factor = None;
+        options.moments_robust_fit = None;
+        options.moments_winsor_lower_q = None;
+        options.moments_winsor_upper_q = None;
+    }
+    if *model != ModelFit::Mle {
+        options.mle_min_null_rank = None;
+        options.mle_max_null_rank = None;
+        options.mle_purification_factor = None;
+        options.mle_robust_fit = None;
+        options.mle_winsor_lower_q = None;
+        options.mle_winsor_upper_q = None;
+    }
+    if *model != ModelFit::LowerOrder {
+        options.lower_order_min_null_rank = None;
+        options.lower_order_max_null_rank = None;
+        options.lower_order_purification_factor = None;
+        options.lo_min_count_per_rank = None;
+        options.lo_stratify = None;
+        options.lo_evalue_candidate_count_power = None;
+        options.lo_evalue_scale = None;
+        options.lo_tev_transform = None;
+        options.lo_tnm_extrapolation_strength = None;
+    }
+    if *model != ModelFit::Msfdr {
+        options.msfdr_min_null_rank = None;
+        options.msfdr_max_null_rank = None;
+        options.msfdr_seeded_purification_factor = None;
+        options.msfdr_seeded_top_frac_init = None;
+        options.msfdr_multistart = None;
+        options.msfdr_pi_clamp_min = None;
+        options.msfdr_pi_clamp_max = None;
+    }
+    if *model != ModelFit::Msfdr1Smix {
+        options.msfdr1_bottom_frac_init = None;
+        options.msfdr1_top_frac_init = None;
+        options.msfdr1_pi_clamp_min = None;
+        options.msfdr1_pi_clamp_max = None;
+    }
+    if *model != ModelFit::Msfdr2Smix {
+        options.msfdr2_smix_min_null_rank = None;
+        options.msfdr2_smix_max_null_rank = None;
+        options.msfdr2_bottom_frac_init = None;
+        options.msfdr2_top_frac_init = None;
+        options.msfdr2_pi_clamp_min = None;
+        options.msfdr2_pi_clamp_max = None;
+    }
+    if *model != ModelFit::Nokoi {
+        options.nokoi_min_null_rank = None;
+        options.nokoi_max_null_rank = None;
+        options.nokoi_null_purification_factor = None;
+        options.nokoi_positive_top_fraction = None;
+        options.nokoi_k_folds = None;
+        options.nokoi_l1_lambda_min = None;
+        options.nokoi_l1_lambda_max = None;
+        options.nokoi_l1_lambda_steps = None;
+    }
+    if *model != ModelFit::Ensemble {
+        options.ensemble_p_combiner = None;
+        options.ensemble_pep_combiner = None;
+        options.ensemble_cauchy_penalty = None;
+        options.ensemble_pep_trim_frac = None;
+        options.ensemble_pep_quantile = None;
+        options.ensemble_pep_top_k = None;
+        options.ensemble_pep_logit_eps = None;
+        options.ensemble_weight_moments = None;
+        options.ensemble_weight_mle = None;
+        options.ensemble_weight_lower_order = None;
+        options.ensemble_weight_msfdr_seeded = None;
+        options.ensemble_weight_msfdr_1smix = None;
+        options.ensemble_weight_msfdr_2smix = None;
+        options.ensemble_weight_nokoi = None;
+    }
+    options
+}
+
+fn resolved_configuration_payload(
+    configuration: &ResolvedExpertConfiguration,
+) -> serde_json::Value {
+    serde_json::json!({
+        "schema_version": configuration.schema_version,
+        "model": configuration.model,
+        "model_version": configuration.model_version,
+        "effective_fdr_options": configuration.effective_fdr_options,
+        "resolved_fdr_settings": configuration.resolved_fdr_settings,
+        "active_setting_groups": configuration.active_setting_groups,
+        "dormant_setting_groups": configuration.dormant_setting_groups,
+        "implementation_source_sha256": configuration.implementation_source_sha256,
+    })
+}
+
+fn resolved_configuration_hash(configuration: &ResolvedExpertConfiguration) -> Result<String> {
+    let mut hasher = Sha256::new();
+    hasher.update(b"sage-resolved-expert-configuration-v1\0");
+    hasher.update(serde_json::to_vec(&resolved_configuration_payload(
+        configuration,
+    ))?);
+    Ok(format!("{:x}", hasher.finalize()))
+}
+
+fn build_resolved_expert_configuration(
+    model: &ModelFit,
+    options: FdrOptions,
+) -> Result<ResolvedExpertConfiguration> {
+    let effective_fdr_options = canonical_effective_fdr_options(options, model);
+    if *model == ModelFit::Ensemble {
+        anyhow::ensure!(
+            matches!(
+                effective_fdr_options.final_evidence_space,
+                Some(sage_core::input::FinalEvidenceSpace::PValue)
+                    | Some(sage_core::input::FinalEvidenceSpace::Pep)
+            ),
+            "resolved final Ensemble configuration requires an explicit p_value or pep evidence space"
+        );
+    }
+    let resolved_fdr_settings =
+        serde_json::to_value(FdrSettings::from(effective_fdr_options.clone()))?;
+    let (active_setting_groups, dormant_setting_groups) = resolved_setting_groups(model);
+    let mut configuration = ResolvedExpertConfiguration {
+        schema_version: 1,
+        model: model.clone(),
+        model_version: expert_model_version(model).into(),
+        effective_fdr_options,
+        resolved_fdr_settings,
+        active_setting_groups,
+        dormant_setting_groups,
+        implementation_source_sha256:
+            crate::parameter_optimizer::PARAMETER_OPTIMIZER_IMPLEMENTATION_SOURCE_SHA256.into(),
+        resolved_configuration_sha256: String::new(),
+    };
+    configuration.resolved_configuration_sha256 = resolved_configuration_hash(&configuration)?;
+    Ok(configuration)
+}
+
+fn validate_resolved_expert_configuration(
+    configuration: &ResolvedExpertConfiguration,
+    expected_model: &ModelFit,
+    expected_window: &Option<NullWindow>,
+) -> Result<()> {
+    anyhow::ensure!(
+        configuration.schema_version == 1
+            && configuration.model == *expected_model
+            && configuration.model_version == expert_model_version(expected_model),
+        "resolved expert configuration model/schema/version is incompatible"
+    );
+    anyhow::ensure!(
+        configuration.implementation_source_sha256
+            == crate::parameter_optimizer::PARAMETER_OPTIMIZER_IMPLEMENTATION_SOURCE_SHA256,
+        "resolved expert configuration implementation identity differs from this binary"
+    );
+    anyhow::ensure!(
+        configuration.resolved_configuration_sha256 == resolved_configuration_hash(configuration)?,
+        "resolved expert configuration hash does not match its payload"
+    );
+    let reconstructed = build_resolved_expert_configuration(
+        expected_model,
+        configuration.effective_fdr_options.clone(),
+    )?;
+    anyhow::ensure!(
+        reconstructed.resolved_configuration_sha256 == configuration.resolved_configuration_sha256,
+        "resolved expert configuration no longer canonicalizes identically"
+    );
+    let settings = FdrSettings::from(configuration.effective_fdr_options.clone());
+    let resolved_window = resolved_expert_window(expected_model, expected_window);
+    anyhow::ensure!(
+        resolved_expert_window_from_settings(expected_model, &settings) == resolved_window,
+        "resolved expert configuration window differs from its lock"
+    );
+    Ok(())
 }
 
 fn resolved_ensemble_combiners(
@@ -385,6 +675,19 @@ fn resolved_ensemble_combiners(
     .context("invalid fdr settings in search configuration")?;
     let settings = FdrSettings::from(options);
     Ok((settings.ensemble_p_combiner, settings.ensemble_pep_combiner))
+}
+
+fn resolved_fdr_options(search_config: &Path) -> Result<FdrOptions> {
+    let value: serde_json::Value = serde_json::from_slice(&std::fs::read(search_config)?)
+        .with_context(|| format!("invalid search configuration {}", search_config.display()))?;
+    serde_json::from_value(
+        value
+            .get("fdr")
+            .filter(|value| !value.is_null())
+            .cloned()
+            .unwrap_or_else(|| serde_json::json!({})),
+    )
+    .context("invalid fdr settings in search configuration")
 }
 
 fn resolved_external_profile_calibration(
@@ -407,6 +710,8 @@ fn resolved_external_profile_calibration(
 struct CompletedExpert {
     model: ModelFit,
     window: Option<NullWindow>,
+    resolved_configuration: ResolvedExpertConfiguration,
+    fit_identity: ResolvedExpertFitIdentity,
     optimized_artifacts: PathBuf,
     optimized_results: PathBuf,
     ms2rescore_artifacts: Option<PathBuf>,
@@ -597,6 +902,13 @@ pub struct StageRecord {
     pub parameter_overrides: BTreeMap<String, ParameterValue>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub entrapment_partition_identity: Option<String>,
+    /// Portable complete effective configuration consumed by this stage. New
+    /// Ensemble locks require this field for every expert; legacy checkpoints
+    /// remain readable but cannot be promoted into a target-only refit lock.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub resolved_production_configuration: Option<ResolvedExpertConfiguration>,
+    #[serde(default, skip_serializing_if = "BTreeMap::is_empty")]
+    pub ensemble_expert_configuration_sha256: BTreeMap<String, String>,
 }
 
 #[derive(Clone, Debug, Serialize, Deserialize)]
@@ -1940,6 +2252,32 @@ fn resolved_expert_window(model: &ModelFit, window: &Option<NullWindow>) -> Opti
     }
 }
 
+fn resolved_expert_window_from_settings(
+    model: &ModelFit,
+    settings: &FdrSettings,
+) -> Option<NullWindow> {
+    let (min_rank, max_rank) = match model {
+        ModelFit::Moments => (
+            settings.moments_min_null_rank,
+            settings.moments_max_null_rank,
+        ),
+        ModelFit::Mle => (settings.mle_min_null_rank, settings.mle_max_null_rank),
+        ModelFit::LowerOrder => (
+            settings.lower_order_min_null_rank,
+            settings.lower_order_max_null_rank,
+        ),
+        ModelFit::Msfdr => (settings.msfdr_min_null_rank, settings.msfdr_max_null_rank),
+        ModelFit::Msfdr1Smix => (1, 1),
+        ModelFit::Msfdr2Smix => (
+            settings.msfdr2_smix_min_null_rank,
+            settings.msfdr2_smix_max_null_rank,
+        ),
+        ModelFit::Nokoi => (settings.nokoi_min_null_rank, settings.nokoi_max_null_rank),
+        ModelFit::Ensemble => return None,
+    };
+    Some(NullWindow { min_rank, max_rank })
+}
+
 fn artifact_contains_model(
     artifacts: &sage_core::decoy_free_fdr::DfRunArtifacts,
     model: &ModelFit,
@@ -2215,8 +2553,8 @@ fn apply_ensemble_lock(
 ) -> Result<()> {
     fdr.nokoi_application_dataset_fingerprint = Some(dataset.fingerprint.clone());
     anyhow::ensure!(
-        lock.schema_version == 8,
-        "unsupported Ensemble lock schema {}; schema 8 is required for independent shared-profile and complete input-provenance identities",
+        lock.schema_version == 9,
+        "unsupported Ensemble lock schema {}; schema 9 with complete resolved expert configurations is required; old incomplete locks cannot support target-only refit or compare_both",
         lock.schema_version
     );
     anyhow::ensure!(
@@ -2251,6 +2589,23 @@ fn apply_ensemble_lock(
         resolved_settings.ensemble_p_combiner == lock.ensemble_p_combiner
             && resolved_settings.ensemble_pep_combiner == lock.ensemble_pep_combiner,
         "Ensemble lock combiner settings do not match the resolved search configuration"
+    );
+    validate_resolved_expert_configuration(
+        &lock.final_ensemble_configuration,
+        &ModelFit::Ensemble,
+        &None,
+    )?;
+    anyhow::ensure!(
+        lock.final_ensemble_configuration_sha256
+            == lock
+                .final_ensemble_configuration
+                .resolved_configuration_sha256,
+        "final Ensemble configuration hash field disagrees with its payload"
+    );
+    let current_final = build_resolved_expert_configuration(&ModelFit::Ensemble, fdr.clone())?;
+    anyhow::ensure!(
+        current_final.resolved_configuration_sha256 == lock.final_ensemble_configuration_sha256,
+        "target-only manifest attempts to change the locked final Ensemble configuration"
     );
     if external {
         anyhow::ensure!(
@@ -2293,6 +2648,7 @@ fn apply_ensemble_lock(
     fdr.enable_msfdr_1smix = Some(false);
     fdr.enable_msfdr_2smix = Some(false);
     fdr.enable_nokoi = Some(false);
+    fdr.ensemble_expert_options.clear();
     let enabled = lock.experts.iter().filter(|expert| expert.enabled).count();
     let all_models = lock
         .experts
@@ -2384,6 +2740,7 @@ fn apply_ensemble_lock(
     }
     let mut optimized_hashes = BTreeSet::new();
     let mut ms2_hashes = BTreeSet::new();
+    let mut resolved_configuration_hashes = BTreeSet::new();
     for expert in lock.experts.iter().filter(|expert| expert.enabled) {
         anyhow::ensure!(
             !expert.optimized_fitted_artifacts_sha256.is_empty()
@@ -2396,12 +2753,49 @@ fn apply_ensemble_lock(
                 "Ensemble lock contains a duplicate MS2Rescore artifact vote"
             );
         }
+        anyhow::ensure!(
+            !expert.resolved_configuration_sha256.is_empty()
+                && resolved_configuration_hashes
+                    .insert(expert.resolved_configuration_sha256.as_str()),
+            "Ensemble lock contains a missing or duplicate resolved expert configuration"
+        );
     }
     anyhow::ensure!(
         enabled >= lock.minimum_required_experts,
         "Ensemble lock has only {enabled} eligible experts"
     );
     for expert in lock.experts.iter().filter(|expert| expert.enabled) {
+        anyhow::ensure!(
+            expert.resolved_configuration_sha256
+                == expert.resolved_configuration.resolved_configuration_sha256,
+            "Ensemble expert {:?} resolved-configuration hash field disagrees with its payload",
+            expert.model
+        );
+        validate_resolved_expert_configuration(
+            &expert.resolved_configuration,
+            &expert.model,
+            &expert.window,
+        )?;
+        anyhow::ensure!(
+            expert.fit_identity.dataset_fingerprint == dataset.fingerprint
+                && expert.fit_identity.target_fasta_sha256 == dataset.target_fasta_sha256
+                && expert.fit_identity.search_config_sha256 == dataset.search_config_sha256
+                && expert.fit_identity.candidate_pool_search_fingerprint
+                    == expert.fit_search_fingerprint
+                && !expert
+                    .fit_identity
+                    .candidate_pool_analysis_fingerprint
+                    .is_empty()
+                && !expert
+                    .fit_identity
+                    .candidate_pool_manifest_sha256
+                    .is_empty()
+                && !expert.fit_identity.candidate_pool_payload_sha256.is_empty()
+                && expert.fit_identity.candidate_count > 0
+                && expert.fit_identity.retained_rank_depth > 0,
+            "Ensemble expert {:?} has incomplete or drifted dataset/search/candidate identity",
+            expert.model
+        );
         anyhow::ensure!(
             expert.participation_decision == "included_technical_validation_passed"
                 && !expert.fallback_used
@@ -2424,6 +2818,7 @@ fn apply_ensemble_lock(
             "Ensemble expert optimized artifact does not contain a valid {:?} model",
             expert.model
         );
+        validate_artifact_resolved_configuration(&optimized_artifacts, expert)?;
         if let Some(path) = expert.ms2rescore_fitted_artifacts.as_ref() {
             let expected = expert
                 .ms2rescore_fitted_artifacts_sha256
@@ -2441,6 +2836,7 @@ fn apply_ensemble_lock(
                 "Ensemble expert MS2Rescore artifact does not contain a valid {:?} model",
                 expert.model
             );
+            validate_artifact_resolved_configuration(&artifacts, expert)?;
             if external {
                 let (identity, calibration) = fitted_external_profile_identity(&artifacts)?
                     .context(
@@ -2508,7 +2904,13 @@ fn apply_ensemble_lock(
                 capability.reason.as_deref().unwrap_or("unsupported policy")
             );
         }
-        apply_window(fdr, &expert.model, &expert.window);
+        let mut expert_options = expert.resolved_configuration.effective_fdr_options.clone();
+        // Runtime population labels and the application-dataset identity are
+        // not portable scientific settings. Carry them from this execution,
+        // never from the fit population stored in the lock.
+        expert_options.selection_entrapment_proteins = fdr.selection_entrapment_proteins.clone();
+        expert_options.nokoi_application_dataset_fingerprint = Some(dataset.fingerprint.clone());
+        apply_window(&mut expert_options, &expert.model, &expert.window);
         match expert.model {
             ModelFit::Moments => fdr.enable_moments = Some(true),
             ModelFit::Mle => fdr.enable_mle = Some(true),
@@ -2520,6 +2922,10 @@ fn apply_ensemble_lock(
             ModelFit::Ensemble => anyhow::bail!("nested Ensemble expert is invalid"),
         }
         if !reuse_fitted_artifacts {
+            fdr.ensemble_expert_options.push(EnsembleExpertOptions {
+                model: expert.model.clone(),
+                options: Box::new(expert_options),
+            });
             continue;
         }
         let (artifact_path, expected_sha256) = if external {
@@ -2559,6 +2965,7 @@ fn apply_ensemble_lock(
             "Ensemble expert artifact does not contain {:?}",
             expert.model
         );
+        validate_artifact_resolved_configuration(&artifacts, expert)?;
         match policy {
             ArtifactReusePolicy::DatasetLocalOnly => anyhow::ensure!(
                 expert.candidate_id_schema == CANDIDATE_ID_SCHEMA
@@ -2584,8 +2991,22 @@ fn apply_ensemble_lock(
             &expert.model,
             Some(&expert.fit_search_fingerprint),
         )?;
-        apply_fitted_artifacts(fdr, &expert.model, artifacts, false, target_only_policy)?;
+        apply_fitted_artifacts(
+            &mut expert_options,
+            &expert.model,
+            artifacts,
+            false,
+            target_only_policy,
+        )?;
+        fdr.ensemble_expert_options.push(EnsembleExpertOptions {
+            model: expert.model.clone(),
+            options: Box::new(expert_options),
+        });
     }
+    anyhow::ensure!(
+        fdr.ensemble_expert_options.len() == enabled,
+        "Ensemble lock did not produce exactly one resolved configuration per enabled expert"
+    );
     Ok(())
 }
 
@@ -2617,6 +3038,8 @@ fn ensemble_lock_analysis_fingerprint(lock: &EnsembleLock) -> Result<String> {
             serde_json::json!({
                 "model": expert.model,
                 "window": expert.window,
+                "resolved_configuration_sha256": expert.resolved_configuration_sha256,
+                "fit_identity": expert.fit_identity,
                 "optimized_fitted_artifacts_sha256": expert.optimized_fitted_artifacts_sha256,
                 "ms2rescore_fitted_artifacts_sha256": expert.ms2rescore_fitted_artifacts_sha256,
                 "target_only_calibration_policy": lock.post_selection_in_scope.then_some(expert.target_only_calibration_policy),
@@ -2639,7 +3062,7 @@ fn ensemble_lock_analysis_fingerprint(lock: &EnsembleLock) -> Result<String> {
         })
         .collect::<Vec<_>>();
     let value = serde_json::json!({
-        "schema": "sage-ensemble-analysis-v4-independent-shared-profile-contract",
+        "schema": "sage-ensemble-analysis-v5-resolved-expert-configurations",
         "post_selection_in_scope": lock.post_selection_in_scope,
         "dataset_fingerprint": lock.dataset_fingerprint,
         "source_configuration_sha256": lock.source_configuration_sha256,
@@ -2658,6 +3081,7 @@ fn ensemble_lock_analysis_fingerprint(lock: &EnsembleLock) -> Result<String> {
         "raw_q_interaction_warning_threshold": lock.raw_q_interaction_warning_threshold,
         "ensemble_p_combiner": lock.ensemble_p_combiner,
         "ensemble_pep_combiner": lock.ensemble_pep_combiner,
+        "final_ensemble_configuration_sha256": lock.final_ensemble_configuration_sha256,
     });
     let mut hasher = Sha256::new();
     hasher.update(serde_json::to_vec(&value)?);
@@ -2760,6 +3184,10 @@ fn build_ensemble_lock_with_failures(
         .is_some_and(ParameterOptimizerConfig::optimization_only);
     let (ensemble_p_combiner, ensemble_pep_combiner) =
         resolved_ensemble_combiners(&manifest.search_config)?;
+    let mut final_ensemble_options = resolved_fdr_options(&manifest.search_config)?;
+    final_ensemble_options.model_fit = Some(ModelFit::Ensemble);
+    let final_ensemble_configuration =
+        build_resolved_expert_configuration(&ModelFit::Ensemble, final_ensemble_options)?;
     struct LockCandidate<'a> {
         expert: &'a CompletedExpert,
         requested: bool,
@@ -3314,9 +3742,20 @@ fn build_ensemble_lock_with_failures(
         } else {
             "excluded_by_json"
         };
+        validate_resolved_expert_configuration(
+            &expert.resolved_configuration,
+            &expert.model,
+            &expert.window,
+        )?;
         locked.push(EnsembleExpertLock {
             model: expert.model.clone(),
             window: expert.window.clone(),
+            resolved_configuration: expert.resolved_configuration.clone(),
+            resolved_configuration_sha256: expert
+                .resolved_configuration
+                .resolved_configuration_sha256
+                .clone(),
+            fit_identity: expert.fit_identity.clone(),
             optimized_fitted_artifacts: expert.optimized_artifacts.clone(),
             optimized_fitted_artifacts_sha256: candidate.optimized_hash,
             ms2rescore_fitted_artifacts: expert.ms2rescore_artifacts.clone(),
@@ -3385,7 +3824,7 @@ fn build_ensemble_lock_with_failures(
         .map(|calibration| shared_ensemble_profile_contract_identity(dataset, calibration, &locked))
         .transpose()?;
     stamp_ensemble_lock_analysis_fingerprint(EnsembleLock {
-        schema_version: 8,
+        schema_version: 9,
         post_selection_in_scope: !optimization_only,
         source_manifest_hash: manifest_hash.into(),
         dataset_fingerprint: dataset.fingerprint.clone(),
@@ -3406,6 +3845,10 @@ fn build_ensemble_lock_with_failures(
         raw_q_interaction_warning_threshold: default_raw_q_interaction_warning_threshold(),
         ensemble_p_combiner,
         ensemble_pep_combiner,
+        final_ensemble_configuration_sha256: final_ensemble_configuration
+            .resolved_configuration_sha256
+            .clone(),
+        final_ensemble_configuration,
     })
 }
 
@@ -3419,14 +3862,16 @@ fn configuration_for_model<'a>(
         .find(|configuration| configuration.model == *model)
 }
 
-fn fitted_artifact_provenance(
+fn fitted_artifact_provenance_with_configuration(
     dataset: &DatasetIdentity,
     stage: &str,
     model: &ModelFit,
     fit_search_fingerprint: &str,
+    resolved_configuration_sha256: &str,
+    resolved_expert_configurations_sha256: BTreeMap<String, String>,
 ) -> FittedArtifactProvenance {
     FittedArtifactProvenance {
-        schema_version: 2,
+        schema_version: 3,
         dataset_id: dataset.dataset_id.clone(),
         dataset_fingerprint: dataset.fingerprint.clone(),
         search_config_sha256: dataset.search_config_sha256.clone(),
@@ -3434,8 +3879,29 @@ fn fitted_artifact_provenance(
         candidate_id_schema: CANDIDATE_ID_SCHEMA.into(),
         fit_stage: stage.into(),
         model: model_slug(model).into(),
+        resolved_configuration_sha256: resolved_configuration_sha256.into(),
+        implementation_source_sha256:
+            crate::parameter_optimizer::PARAMETER_OPTIMIZER_IMPLEMENTATION_SOURCE_SHA256.into(),
+        resolved_expert_configurations_sha256,
         external_profile_calibration: None,
     }
+}
+
+#[cfg(test)]
+fn fitted_artifact_provenance(
+    dataset: &DatasetIdentity,
+    stage: &str,
+    model: &ModelFit,
+    fit_search_fingerprint: &str,
+) -> FittedArtifactProvenance {
+    fitted_artifact_provenance_with_configuration(
+        dataset,
+        stage,
+        model,
+        fit_search_fingerprint,
+        "test-resolved-configuration",
+        BTreeMap::new(),
+    )
 }
 
 fn validate_artifact_reuse(
@@ -3480,7 +3946,7 @@ fn validate_artifact_reuse(
     match policy {
         ArtifactReusePolicy::DatasetLocalOnly => {
             anyhow::ensure!(
-                provenance.schema_version == 2,
+                matches!(provenance.schema_version, 2 | 3),
                 "fitted artifact provenance schema {} lacks Phase 5 search-assumption safeguards",
                 provenance.schema_version
             );
@@ -3520,7 +3986,7 @@ fn validate_artifact_reuse(
             }
         }
         ArtifactReusePolicy::CrossDatasetDiagnostic => {
-            if provenance.schema_version != 2
+            if !matches!(provenance.schema_version, 2 | 3)
                 || provenance.candidate_id_schema != CANDIDATE_ID_SCHEMA
                 || provenance.fit_search_fingerprint.is_empty()
             {
@@ -3544,7 +4010,35 @@ fn validate_artifact_reuse(
     Ok(())
 }
 
-fn stamp_fitted_artifacts(
+fn validate_artifact_resolved_configuration(
+    artifacts: &DfRunArtifacts,
+    expert: &EnsembleExpertLock,
+) -> Result<()> {
+    let provenance = artifacts
+        .provenance
+        .as_ref()
+        .context("schema-v9 Ensemble expert artifact has no fitted provenance")?;
+    anyhow::ensure!(
+        provenance.schema_version == 3,
+        "Ensemble expert {:?} artifact provenance schema {} lacks a resolved configuration identity",
+        expert.model,
+        provenance.schema_version
+    );
+    anyhow::ensure!(
+        provenance.resolved_configuration_sha256 == expert.resolved_configuration_sha256,
+        "Ensemble expert {:?} fitted artifact was created under another effective configuration",
+        expert.model
+    );
+    anyhow::ensure!(
+        provenance.implementation_source_sha256
+            == expert.resolved_configuration.implementation_source_sha256,
+        "Ensemble expert {:?} fitted artifact implementation identity differs from its resolved configuration",
+        expert.model
+    );
+    Ok(())
+}
+
+fn stamp_fitted_artifacts_with_configuration(
     output_directory: &Path,
     dataset: &DatasetIdentity,
     stage: &str,
@@ -3552,6 +4046,8 @@ fn stamp_fitted_artifacts(
     inherited: Option<FittedArtifactProvenance>,
     fit_search_fingerprint: &str,
     fit_analysis_fingerprint: &str,
+    resolved_configuration_sha256: &str,
+    resolved_expert_configurations_sha256: &BTreeMap<String, String>,
 ) -> Result<Option<FittedArtifactProvenance>> {
     let path = output_directory.join("fitted_model_artifacts.json");
     if !path.is_file() {
@@ -3561,8 +4057,26 @@ fn stamp_fitted_artifacts(
         .with_context(|| format!("invalid fitted artifacts {}", path.display()))?;
     let inherited_fit = inherited.is_some();
     let mut provenance = inherited.unwrap_or_else(|| {
-        fitted_artifact_provenance(dataset, stage, model, fit_search_fingerprint)
+        fitted_artifact_provenance_with_configuration(
+            dataset,
+            stage,
+            model,
+            fit_search_fingerprint,
+            resolved_configuration_sha256,
+            resolved_expert_configurations_sha256.clone(),
+        )
     });
+    if inherited_fit && provenance.schema_version >= 3 {
+        anyhow::ensure!(
+            provenance.resolved_configuration_sha256 == resolved_configuration_sha256,
+            "inherited fitted artifact configuration differs from the current effective configuration"
+        );
+        anyhow::ensure!(
+            provenance.resolved_expert_configurations_sha256
+                == *resolved_expert_configurations_sha256,
+            "inherited fitted artifact expert-configuration mapping differs from the current execution"
+        );
+    }
     provenance.external_profile_calibration = artifacts
         .external_ms2rescore
         .as_ref()
@@ -3596,6 +4110,29 @@ fn stamp_fitted_artifacts(
     artifacts.provenance = Some(provenance.clone());
     write_json_atomic(&path, &artifacts)?;
     Ok(Some(provenance))
+}
+
+#[cfg(test)]
+fn stamp_fitted_artifacts(
+    output_directory: &Path,
+    dataset: &DatasetIdentity,
+    stage: &str,
+    model: &ModelFit,
+    inherited: Option<FittedArtifactProvenance>,
+    fit_search_fingerprint: &str,
+    fit_analysis_fingerprint: &str,
+) -> Result<Option<FittedArtifactProvenance>> {
+    stamp_fitted_artifacts_with_configuration(
+        output_directory,
+        dataset,
+        stage,
+        model,
+        inherited,
+        fit_search_fingerprint,
+        fit_analysis_fingerprint,
+        "test-resolved-configuration",
+        &BTreeMap::new(),
+    )
 }
 
 fn fitted_model_artifact_schema(output_directory: &Path, model: &ModelFit) -> Result<Option<u32>> {
@@ -3785,7 +4322,7 @@ fn run_search_stage(
     if manifest.resume && results.is_file() && checkpoint.is_file() {
         let mut old: StageRecord = serde_json::from_slice(&std::fs::read(&checkpoint)?)?;
         anyhow::ensure!(
-            matches!(old.schema_version, 1 | 2 | 3 | 4),
+            matches!(old.schema_version, 1 | 2 | 3 | 4 | 5),
             "unsupported workflow stage checkpoint schema {}",
             old.schema_version
         );
@@ -3925,6 +4462,12 @@ fn run_search_stage(
             let settings = FdrSettings::from(fdr.clone());
             lock.ensemble_p_combiner = settings.ensemble_p_combiner;
             lock.ensemble_pep_combiner = settings.ensemble_pep_combiner;
+            lock.final_ensemble_configuration =
+                build_resolved_expert_configuration(&ModelFit::Ensemble, fdr.clone())?;
+            lock.final_ensemble_configuration_sha256 = lock
+                .final_ensemble_configuration
+                .resolved_configuration_sha256
+                .clone();
             lock.analysis_fingerprint = ensemble_lock_analysis_fingerprint(lock)?;
         }
     }
@@ -3991,6 +4534,20 @@ fn run_search_stage(
             verbose_diagnostics: false,
         });
     }
+    let resolved_production_configuration =
+        build_resolved_expert_configuration(&model.model, fdr.clone())?;
+    let ensemble_expert_configuration_sha256 = fdr
+        .ensemble_expert_options
+        .iter()
+        .map(|entry| {
+            let configuration =
+                build_resolved_expert_configuration(&entry.model, (*entry.options).clone())?;
+            Ok((
+                model_slug(&entry.model).to_owned(),
+                configuration.resolved_configuration_sha256,
+            ))
+        })
+        .collect::<Result<BTreeMap<_, _>>>()?;
     let inherited_artifact_provenance = if let Some(path) = frozen_model_artifacts {
         let artifacts: DfRunArtifacts = serde_json::from_slice(&std::fs::read(path)?)
             .with_context(|| format!("invalid fitted artifacts {}", path.display()))?;
@@ -4020,6 +4577,9 @@ fn run_search_stage(
                     candidate_id_schema: String::new(),
                     fit_stage: "unknown".into(),
                     model: model_slug(&model.model).into(),
+                    resolved_configuration_sha256: String::new(),
+                    implementation_source_sha256: String::new(),
+                    resolved_expert_configurations_sha256: BTreeMap::new(),
                     external_profile_calibration: None,
                 },
             )
@@ -4054,7 +4614,7 @@ fn run_search_stage(
     write_json_atomic(&config_snapshot, &parameters)?;
 
     let mut record = StageRecord {
-        schema_version: 4,
+        schema_version: 5,
         stage: stage.into(),
         model: model_slug(&model.model).into(),
         input_hash,
@@ -4114,6 +4674,8 @@ fn run_search_stage(
         parameter_overrides: parameter_overrides.cloned().unwrap_or_default(),
         entrapment_partition_identity: entrapment_selection
             .map(|partition| partition.partition_identity.clone()),
+        resolved_production_configuration: Some(resolved_production_configuration),
+        ensemble_expert_configuration_sha256,
     };
     std::fs::create_dir_all(output_directory)?;
     write_json_atomic(&checkpoint, &record)?;
@@ -4219,7 +4781,7 @@ fn run_search_stage(
         record.results.is_file(),
         "stage completed without results.sage.tsv"
     );
-    let stamped = stamp_fitted_artifacts(
+    let stamped = stamp_fitted_artifacts_with_configuration(
         output_directory,
         dataset,
         stage,
@@ -4237,6 +4799,13 @@ fn run_search_stage(
             .context("fitted workflow stage has no candidate-pool provenance")?
             .analysis_fingerprint
             .as_str(),
+        record
+            .resolved_production_configuration
+            .as_ref()
+            .context("fitted workflow stage has no resolved production configuration")?
+            .resolved_configuration_sha256
+            .as_str(),
+        &record.ensemble_expert_configuration_sha256,
     )?;
     record.artifact_fit_dataset_fingerprint = stamped
         .as_ref()
@@ -4896,9 +5465,32 @@ fn completed_optimizer_expert(
         .as_ref()
         .context("optimizer-only expert winner has no candidate-pool provenance")?;
     let annotation = stage.ms2rescore_annotation_cache.as_ref();
+    let mut effective = stage
+        .resolved_production_configuration
+        .as_ref()
+        .context(
+            "optimizer winner checkpoint predates complete resolved expert configurations; regenerate the lock from a single-value materialization workflow",
+        )?
+        .effective_fdr_options
+        .clone();
+    apply_window(&mut effective, &model.model, &window);
+    let resolved_configuration = build_resolved_expert_configuration(&model.model, effective)?;
+    let fit_identity = ResolvedExpertFitIdentity {
+        dataset_fingerprint: stage.dataset_fingerprint.clone(),
+        target_fasta_sha256: sha256_file(&manifest.target_fasta)?,
+        search_config_sha256: sha256_file(&manifest.search_config)?,
+        candidate_pool_search_fingerprint: candidate.search_fingerprint.clone(),
+        candidate_pool_analysis_fingerprint: candidate.analysis_fingerprint.clone(),
+        candidate_pool_manifest_sha256: sha256_file(&candidate.manifest)?,
+        candidate_pool_payload_sha256: sha256_file(&candidate.payload)?,
+        candidate_count: candidate.candidate_count,
+        retained_rank_depth: candidate.retained_rank_depth,
+    };
     Ok(CompletedExpert {
         model: model.model.clone(),
         window,
+        resolved_configuration,
+        fit_identity,
         optimized_artifacts: artifacts.clone(),
         optimized_results: stage.results.clone(),
         ms2rescore_artifacts: stage.external_features_enabled.then_some(artifacts),
@@ -6088,6 +6680,8 @@ pub fn execute_workflow(
                     ensemble_interaction_calibration: None,
                     parameter_overrides: parameter_overrides.clone().unwrap_or_default(),
                     entrapment_partition_identity: None,
+                    resolved_production_configuration: None,
+                    ensemble_expert_configuration_sha256: BTreeMap::new(),
                 };
                 std::fs::create_dir_all(&target_output_directory)?;
                 write_json_atomic(
@@ -6160,9 +6754,38 @@ pub fn execute_workflow(
                 let annotation_cache = ms2_record
                     .as_ref()
                     .and_then(|record| record.ms2rescore_annotation_cache.as_ref());
+                let calibration_candidate = calibration_record
+                    .candidate_pool
+                    .as_ref()
+                    .context("calibration stage has no candidate-pool provenance")?;
                 Ok(CompletedExpert {
                     model: locked_model.model.clone(),
                     window: resolved_expert_window(&locked_model.model, &locked_model.window),
+                    resolved_configuration: calibration_record
+                        .resolved_production_configuration
+                        .clone()
+                        .context(
+                            "calibration checkpoint predates complete resolved expert configurations; regenerate the Ensemble lock",
+                        )?,
+                    fit_identity: ResolvedExpertFitIdentity {
+                        dataset_fingerprint: calibration_record.dataset_fingerprint.clone(),
+                        target_fasta_sha256: dataset.target_fasta_sha256.clone(),
+                        search_config_sha256: dataset.search_config_sha256.clone(),
+                        candidate_pool_search_fingerprint: calibration_candidate
+                            .search_fingerprint
+                            .clone(),
+                        candidate_pool_analysis_fingerprint: calibration_candidate
+                            .analysis_fingerprint
+                            .clone(),
+                        candidate_pool_manifest_sha256: sha256_file(
+                            &calibration_candidate.manifest,
+                        )?,
+                        candidate_pool_payload_sha256: sha256_file(
+                            &calibration_candidate.payload,
+                        )?,
+                        candidate_count: calibration_candidate.candidate_count,
+                        retained_rank_depth: calibration_candidate.retained_rank_depth,
+                    },
                     optimized_artifacts: optimized_artifact.clone(),
                     optimized_results: optimized.results.clone(),
                     ms2rescore_artifacts: ms2_artifact.is_file().then_some(ms2_artifact.clone()),
@@ -6183,10 +6806,7 @@ pub fn execute_workflow(
                     },
                     target_only_results: target_only.results,
                     target_only_calibration_policy: target_only_policy,
-                    calibration_search_fingerprint: calibration_record
-                        .candidate_pool
-                        .as_ref()
-                        .context("calibration stage has no candidate-pool provenance")?
+                    calibration_search_fingerprint: calibration_candidate
                         .search_fingerprint
                         .clone(),
                     fitted_external_profile_identity_sha256,
@@ -6756,6 +7376,37 @@ mod tests {
     use sage_core::ml::msfdr::{Msfdr2SmixModel, MsfdrSeededModel};
     use sage_core::ml::skew_normal::SkewNormal;
 
+    fn test_resolved_configuration(
+        model: &ModelFit,
+        window: Option<&NullWindow>,
+    ) -> ResolvedExpertConfiguration {
+        let mut options = FdrOptions {
+            mode: Some(FdrMode::DecoyFree),
+            model_fit: Some(model.clone()),
+            final_evidence_space: Some(sage_core::input::FinalEvidenceSpace::PValue),
+            ..FdrOptions::default()
+        };
+        apply_window(&mut options, model, &window.cloned());
+        build_resolved_expert_configuration(model, options).unwrap()
+    }
+
+    fn test_fit_identity(
+        dataset: &DatasetIdentity,
+        search_fingerprint: &str,
+    ) -> ResolvedExpertFitIdentity {
+        ResolvedExpertFitIdentity {
+            dataset_fingerprint: dataset.fingerprint.clone(),
+            target_fasta_sha256: dataset.target_fasta_sha256.clone(),
+            search_config_sha256: dataset.search_config_sha256.clone(),
+            candidate_pool_search_fingerprint: search_fingerprint.into(),
+            candidate_pool_analysis_fingerprint: "analysis-fingerprint".into(),
+            candidate_pool_manifest_sha256: "manifest-sha256".into(),
+            candidate_pool_payload_sha256: "payload-sha256".into(),
+            candidate_count: 100,
+            retained_rank_depth: 50,
+        }
+    }
+
     fn lower_order_artifacts(mu: f64) -> DfRunArtifacts {
         DfRunArtifacts {
             lower_order: Some(sage_core::ml::lower_order::LowerOrderArtifact {
@@ -7315,7 +7966,12 @@ mod tests {
     fn minimal_manifest(directory: &Path, role: ValidationDatasetRole) -> WorkflowManifest {
         let search_config = directory.join("search.json");
         let target_fasta = directory.join("target.fasta");
-        std::fs::write(&search_config, b"{}\n").unwrap();
+        std::fs::write(
+            &search_config,
+            br#"{"fdr":{"mode":"decoy_free","final_evidence_space":"p_value"}}
+"#,
+        )
+        .unwrap();
         std::fs::write(&target_fasta, b">target\nPEPTIDER\n").unwrap();
         std::fs::write(directory.join("foreign.fasta"), b">foreign\nDIFFERENTK\n").unwrap();
         WorkflowManifest {
@@ -7815,6 +8471,8 @@ mod tests {
             ensemble_interaction_calibration: None,
             parameter_overrides: BTreeMap::new(),
             entrapment_partition_identity: None,
+            resolved_production_configuration: None,
+            ensemble_expert_configuration_sha256: BTreeMap::new(),
         };
         let mut legacy_value = serde_json::to_value(&record).unwrap();
         legacy_value["schema_version"] = serde_json::json!(2);
@@ -8114,6 +8772,9 @@ mod tests {
                 candidate_id_schema: CANDIDATE_ID_SCHEMA.into(),
                 fit_stage: "optimized".into(),
                 model: "moments".into(),
+                resolved_configuration_sha256: String::new(),
+                implementation_source_sha256: String::new(),
+                resolved_expert_configurations_sha256: BTreeMap::new(),
                 external_profile_calibration: None,
             }),
             ..DfRunArtifacts::default()
@@ -8321,34 +8982,43 @@ mod tests {
             search_config_sha256: "configuration".into(),
         };
         let calibration = external_profiles().calibration;
-        let expert = |model, min_rank, max_rank, fitted_profile: &str| EnsembleExpertLock {
-            model,
-            window: Some(NullWindow { min_rank, max_rank }),
-            optimized_fitted_artifacts: PathBuf::from("artifact.json"),
-            optimized_fitted_artifacts_sha256: format!("optimized-{fitted_profile}"),
-            ms2rescore_fitted_artifacts: Some(PathBuf::from("ms2-artifact.json")),
-            ms2rescore_fitted_artifacts_sha256: Some(format!("ms2-{fitted_profile}")),
-            calibration_stage: "ms2rescore".into(),
-            calibration_results: PathBuf::from("calibration.tsv"),
-            target_only_results: PathBuf::from("target.tsv"),
-            target_only_calibration_policy: TargetOnlyCalibrationPolicy::RefitWithLockedWindow,
-            enabled: true,
-            target_peptides: 0,
-            incremental_target_peptides: 0,
-            gate_reasons: Vec::new(),
-            gate_warnings: Vec::new(),
-            fit_search_fingerprint: "shared-search-fingerprint".into(),
-            candidate_id_schema: CANDIDATE_ID_SCHEMA.into(),
-            interaction_baseline: true,
-            participation_decision: "included_technical_validation_passed".into(),
-            fallback_used: false,
-            fallback_reason: None,
-            target_only_policy_capability: None,
-            fitted_external_profile_identity_sha256: Some(fitted_profile.into()),
-            fitted_external_profile_calibration: Some(calibration.clone()),
-            annotation_cache_fingerprint: Some(format!("cache-{fitted_profile}")),
-            annotation_cache_manifest_sha256: Some(format!("manifest-{fitted_profile}")),
-            annotation_cache_payload_sha256: Some(format!("payload-{fitted_profile}")),
+        let expert = |model, min_rank, max_rank, fitted_profile: &str| {
+            let window = NullWindow { min_rank, max_rank };
+            let resolved_configuration = test_resolved_configuration(&model, Some(&window));
+            EnsembleExpertLock {
+                model,
+                window: Some(window),
+                resolved_configuration_sha256: resolved_configuration
+                    .resolved_configuration_sha256
+                    .clone(),
+                resolved_configuration,
+                fit_identity: test_fit_identity(&dataset, "shared-search-fingerprint"),
+                optimized_fitted_artifacts: PathBuf::from("artifact.json"),
+                optimized_fitted_artifacts_sha256: format!("optimized-{fitted_profile}"),
+                ms2rescore_fitted_artifacts: Some(PathBuf::from("ms2-artifact.json")),
+                ms2rescore_fitted_artifacts_sha256: Some(format!("ms2-{fitted_profile}")),
+                calibration_stage: "ms2rescore".into(),
+                calibration_results: PathBuf::from("calibration.tsv"),
+                target_only_results: PathBuf::from("target.tsv"),
+                target_only_calibration_policy: TargetOnlyCalibrationPolicy::RefitWithLockedWindow,
+                enabled: true,
+                target_peptides: 0,
+                incremental_target_peptides: 0,
+                gate_reasons: Vec::new(),
+                gate_warnings: Vec::new(),
+                fit_search_fingerprint: "shared-search-fingerprint".into(),
+                candidate_id_schema: CANDIDATE_ID_SCHEMA.into(),
+                interaction_baseline: true,
+                participation_decision: "included_technical_validation_passed".into(),
+                fallback_used: false,
+                fallback_reason: None,
+                target_only_policy_capability: None,
+                fitted_external_profile_identity_sha256: Some(fitted_profile.into()),
+                fitted_external_profile_calibration: Some(calibration.clone()),
+                annotation_cache_fingerprint: Some(format!("cache-{fitted_profile}")),
+                annotation_cache_manifest_sha256: Some(format!("manifest-{fitted_profile}")),
+                annotation_cache_payload_sha256: Some(format!("payload-{fitted_profile}")),
+            }
         };
         let experts = vec![
             expert(ModelFit::Moments, 9, 18, "moments-profile"),
@@ -8392,7 +9062,7 @@ mod tests {
             .map(|expert| model_slug(&expert.model).to_owned())
             .collect::<Vec<_>>();
         let lock = stamp_ensemble_lock_analysis_fingerprint(EnsembleLock {
-            schema_version: 8,
+            schema_version: 9,
             post_selection_in_scope: true,
             source_manifest_hash: "manifest".into(),
             dataset_fingerprint: dataset.fingerprint.clone(),
@@ -8413,6 +9083,12 @@ mod tests {
             raw_q_interaction_warning_threshold: default_raw_q_interaction_warning_threshold(),
             ensemble_p_combiner: EnsemblePCombiner::SecondBest,
             ensemble_pep_combiner: EnsemblePepCombiner::Median,
+            final_ensemble_configuration: test_resolved_configuration(&ModelFit::Ensemble, None),
+            final_ensemble_configuration_sha256: test_resolved_configuration(
+                &ModelFit::Ensemble,
+                None,
+            )
+            .resolved_configuration_sha256,
         })
         .unwrap();
         let mut changed_lock_provenance = lock.clone();
@@ -8500,11 +9176,14 @@ mod tests {
             spectra_sha256: vec!["spectra-sha256".into()],
             search_config_sha256: sha256_file(&manifest.search_config).unwrap(),
         };
-        artifacts.provenance = Some(fitted_artifact_provenance(
+        let resolved_configuration = test_resolved_configuration(&model, Some(&window));
+        artifacts.provenance = Some(fitted_artifact_provenance_with_configuration(
             &dataset,
             "optimized",
             &model,
             "test-search-fingerprint",
+            &resolved_configuration.resolved_configuration_sha256,
+            BTreeMap::new(),
         ));
         if let Some(artifact) = artifacts.nokoi.as_mut() {
             artifact
@@ -8525,6 +9204,8 @@ mod tests {
         let expert = CompletedExpert {
             model: model.clone(),
             window: Some(window),
+            resolved_configuration,
+            fit_identity: test_fit_identity(&dataset, "test-search-fingerprint"),
             optimized_artifacts: artifact_path,
             optimized_results: calibration.clone(),
             ms2rescore_artifacts: None,
@@ -8551,7 +9232,10 @@ mod tests {
         assert_eq!(lock.actual_roster, lock.requested_roster);
         assert!(lock.experts[0].enabled);
         assert!(lock.technical_failures.is_empty());
-        let mut fdr = FdrOptions::default();
+        let mut fdr = lock
+            .final_ensemble_configuration
+            .effective_fdr_options
+            .clone();
         apply_ensemble_lock(
             &mut fdr,
             &lock,
@@ -8852,7 +9536,12 @@ mod tests {
         let mle_calibration = directory.join("mle.calibration.tsv");
         let mle_target = directory.join("mle.target.tsv");
         let search_config = directory.join("search.json");
-        std::fs::write(&search_config, b"{}\n").unwrap();
+        std::fs::write(
+            &search_config,
+            br#"{"fdr":{"mode":"decoy_free","final_evidence_space":"p_value"}}
+"#,
+        )
+        .unwrap();
         write_validation_tsv(&moments_calibration, 0, 3);
         write_validation_tsv(&moments_target, 0, 0);
         write_validation_tsv(&mle_calibration, 100, 3);
@@ -8950,18 +9639,39 @@ mod tests {
             spectra_sha256: vec!["spectra-sha256".into()],
             search_config_sha256: sha256_file(&search_config).unwrap(),
         };
+        let mut moments_options =
+            test_resolved_configuration(&ModelFit::Moments, manifest.models[0].window.as_ref())
+                .effective_fdr_options;
+        moments_options.moments_purification_factor = Some(0.20);
+        let moments_configuration =
+            build_resolved_expert_configuration(&ModelFit::Moments, moments_options).unwrap();
+        let mut mle_options =
+            test_resolved_configuration(&ModelFit::Mle, manifest.models[1].window.as_ref())
+                .effective_fdr_options;
+        mle_options.mle_purification_factor = Some(0.10);
+        let mle_configuration =
+            build_resolved_expert_configuration(&ModelFit::Mle, mle_options).unwrap();
         for path in [&moments_artifact, &mle_artifact] {
             let mut artifacts: DfRunArtifacts =
                 serde_json::from_slice(&std::fs::read(path).unwrap()).unwrap();
-            artifacts.provenance = Some(fitted_artifact_provenance(
+            let (artifact_model, configuration_hash) = if path == &moments_artifact {
+                (
+                    ModelFit::Moments,
+                    moments_configuration.resolved_configuration_sha256.as_str(),
+                )
+            } else {
+                (
+                    ModelFit::Mle,
+                    mle_configuration.resolved_configuration_sha256.as_str(),
+                )
+            };
+            artifacts.provenance = Some(fitted_artifact_provenance_with_configuration(
                 &dataset,
                 "optimized",
-                if path == &moments_artifact {
-                    &ModelFit::Moments
-                } else {
-                    &ModelFit::Mle
-                },
+                &artifact_model,
                 "test-search-fingerprint",
+                configuration_hash,
+                BTreeMap::new(),
             ));
             write_json_atomic(path, &artifacts).unwrap();
         }
@@ -8969,6 +9679,8 @@ mod tests {
             CompletedExpert {
                 model: ModelFit::Moments,
                 window: manifest.models[0].window.clone(),
+                resolved_configuration: moments_configuration,
+                fit_identity: test_fit_identity(&dataset, "test-search-fingerprint"),
                 optimized_artifacts: moments_artifact,
                 optimized_results: moments_calibration.clone(),
                 ms2rescore_artifacts: None,
@@ -8987,6 +9699,8 @@ mod tests {
             CompletedExpert {
                 model: ModelFit::Mle,
                 window: manifest.models[1].window.clone(),
+                resolved_configuration: mle_configuration,
+                fit_identity: test_fit_identity(&dataset, "test-search-fingerprint"),
                 optimized_artifacts: mle_artifact,
                 optimized_results: mle_calibration.clone(),
                 ms2rescore_artifacts: None,
@@ -9022,7 +9736,7 @@ mod tests {
             canonical_bytes
         );
         assert_eq!(lock.dataset_fingerprint, dataset.fingerprint);
-        assert_eq!(lock.schema_version, 8);
+        assert_eq!(lock.schema_version, 9);
         assert_eq!(lock.requested_roster, vec!["mle", "moments"]);
         assert_eq!(lock.actual_roster, lock.requested_roster);
         assert!(lock.technical_failures.is_empty());
@@ -9062,7 +9776,14 @@ mod tests {
                     .as_ref()
                     .is_some_and(|window| window.min_rank == 8 && window.max_rank == 25)
         }));
-        let mut refit = FdrOptions::default();
+        let mut refit = lock
+            .final_ensemble_configuration
+            .effective_fdr_options
+            .clone();
+        // Deliberately conflicting workflow-level expert defaults are dormant
+        // in the final Ensemble configuration and cannot replace lock values.
+        refit.moments_purification_factor = Some(0.77);
+        refit.mle_purification_factor = Some(0.66);
         apply_ensemble_lock(
             &mut refit,
             &lock,
@@ -9073,14 +9794,35 @@ mod tests {
             None,
         )
         .unwrap();
-        assert_eq!(refit.moments_min_null_rank, Some(9));
-        assert_eq!(refit.moments_max_null_rank, Some(18));
-        assert!(refit.moments_frozen_parameters.is_none());
-        assert!(refit.mle_frozen_parameters.is_none());
+        let moments = refit
+            .ensemble_expert_options
+            .iter()
+            .find(|entry| entry.model == ModelFit::Moments)
+            .unwrap();
+        let mle = refit
+            .ensemble_expert_options
+            .iter()
+            .find(|entry| entry.model == ModelFit::Mle)
+            .unwrap();
+        assert_eq!(moments.options.moments_min_null_rank, Some(9));
+        assert_eq!(moments.options.moments_max_null_rank, Some(18));
+        assert_eq!(moments.options.moments_purification_factor, Some(0.20));
+        assert!(moments.options.moments_frozen_parameters.is_none());
+        assert_eq!(mle.options.mle_min_null_rank, Some(8));
+        assert_eq!(mle.options.mle_max_null_rank, Some(25));
+        assert_eq!(mle.options.mle_purification_factor, Some(0.10));
+        assert!(mle.options.mle_frozen_parameters.is_none());
+        assert_eq!(
+            build_resolved_expert_configuration(&ModelFit::Ensemble, refit.clone())
+                .unwrap()
+                .resolved_configuration_sha256,
+            lock.final_ensemble_configuration_sha256,
+            "roster-derived enable flags must not create a second final Ensemble identity"
+        );
 
         let mut legacy_lock = lock.clone();
-        legacy_lock.schema_version = 7;
-        assert!(apply_ensemble_lock(
+        legacy_lock.schema_version = 8;
+        let legacy_error = apply_ensemble_lock(
             &mut FdrOptions::default(),
             &legacy_lock,
             false,
@@ -9089,7 +9831,89 @@ mod tests {
             false,
             None,
         )
-        .is_err());
+        .unwrap_err();
+        assert!(legacy_error.to_string().contains("old incomplete locks"));
+
+        let canonical_configuration_bytes =
+            serde_json::to_vec(&lock.experts[0].resolved_configuration).unwrap();
+        let replayed_configuration: ResolvedExpertConfiguration =
+            serde_json::from_slice(&canonical_configuration_bytes).unwrap();
+        assert_eq!(
+            serde_json::to_vec(&replayed_configuration).unwrap(),
+            canonical_configuration_bytes
+        );
+        let portable_text = String::from_utf8(canonical_configuration_bytes).unwrap();
+        assert!(!portable_text.contains("/home/"));
+        assert!(!portable_text.contains("/mnt/"));
+        assert!(!portable_text.contains("psm_id"));
+
+        let mut hash_mismatch = lock.clone();
+        hash_mismatch.experts[0]
+            .resolved_configuration
+            .effective_fdr_options
+            .moments_purification_factor = Some(0.33);
+        hash_mismatch = stamp_ensemble_lock_analysis_fingerprint(hash_mismatch).unwrap();
+        let mut mismatch_options = lock
+            .final_ensemble_configuration
+            .effective_fdr_options
+            .clone();
+        let mismatch_error = apply_ensemble_lock(
+            &mut mismatch_options,
+            &hash_mismatch,
+            false,
+            &dataset,
+            &ArtifactReusePolicy::DatasetLocalOnly,
+            false,
+            Some(TargetOnlyCalibrationPolicy::RefitWithLockedWindow),
+        )
+        .unwrap_err()
+        .to_string();
+        assert!(mismatch_error.contains("hash does not match its payload"));
+
+        let mut reassigned = lock.clone();
+        let first = reassigned.experts[0].resolved_configuration.clone();
+        reassigned.experts[0].resolved_configuration =
+            reassigned.experts[1].resolved_configuration.clone();
+        reassigned.experts[0].resolved_configuration_sha256 = reassigned.experts[0]
+            .resolved_configuration
+            .resolved_configuration_sha256
+            .clone();
+        reassigned.experts[1].resolved_configuration = first;
+        reassigned.experts[1].resolved_configuration_sha256 = reassigned.experts[1]
+            .resolved_configuration
+            .resolved_configuration_sha256
+            .clone();
+        reassigned = stamp_ensemble_lock_analysis_fingerprint(reassigned).unwrap();
+        let mut reassigned_options = lock
+            .final_ensemble_configuration
+            .effective_fdr_options
+            .clone();
+        assert!(apply_ensemble_lock(
+            &mut reassigned_options,
+            &reassigned,
+            false,
+            &dataset,
+            &ArtifactReusePolicy::DatasetLocalOnly,
+            false,
+            Some(TargetOnlyCalibrationPolicy::RefitWithLockedWindow),
+        )
+        .unwrap_err()
+        .to_string()
+        .contains("model/schema/version"));
+
+        let mut old_lock_value = serde_json::to_value(&lock).unwrap();
+        old_lock_value["schema_version"] = serde_json::json!(8);
+        for expert in old_lock_value["experts"].as_array_mut().unwrap() {
+            expert
+                .as_object_mut()
+                .unwrap()
+                .remove("resolved_configuration");
+            expert
+                .as_object_mut()
+                .unwrap()
+                .remove("resolved_configuration_sha256");
+        }
+        assert!(serde_json::from_value::<EnsembleLock>(old_lock_value).is_err());
 
         let mut duplicate_lock = lock.clone();
         duplicate_lock.experts.push(lock.experts[0].clone());
@@ -9111,8 +9935,12 @@ mod tests {
                 .clone();
         let duplicate_artifact_vote =
             stamp_ensemble_lock_analysis_fingerprint(duplicate_artifact_vote).unwrap();
+        let mut duplicate_options = lock
+            .final_ensemble_configuration
+            .effective_fdr_options
+            .clone();
         let error = apply_ensemble_lock(
-            &mut FdrOptions::default(),
+            &mut duplicate_options,
             &duplicate_artifact_vote,
             false,
             &dataset,
@@ -9131,8 +9959,12 @@ mod tests {
         missing_failure_provenance.not_evaluable_reasons.clear();
         let missing_failure_provenance =
             stamp_ensemble_lock_analysis_fingerprint(missing_failure_provenance).unwrap();
+        let mut missing_failure_options = lock
+            .final_ensemble_configuration
+            .effective_fdr_options
+            .clone();
         let error = apply_ensemble_lock(
-            &mut FdrOptions::default(),
+            &mut missing_failure_options,
             &missing_failure_provenance,
             false,
             &dataset,
@@ -9144,7 +9976,10 @@ mod tests {
         .to_string();
         assert!(error.contains("actual roster or technical failures"));
 
-        let mut reuse = FdrOptions::default();
+        let mut reuse = lock
+            .final_ensemble_configuration
+            .effective_fdr_options
+            .clone();
         apply_ensemble_lock(
             &mut reuse,
             &lock,
@@ -9155,8 +9990,22 @@ mod tests {
             None,
         )
         .unwrap();
-        assert!(reuse.moments_frozen_parameters.is_some());
-        assert!(reuse.mle_frozen_parameters.is_some());
+        assert!(reuse
+            .ensemble_expert_options
+            .iter()
+            .find(|entry| entry.model == ModelFit::Moments)
+            .unwrap()
+            .options
+            .moments_frozen_parameters
+            .is_some());
+        assert!(reuse
+            .ensemble_expert_options
+            .iter()
+            .find(|entry| entry.model == ModelFit::Mle)
+            .unwrap()
+            .options
+            .mle_frozen_parameters
+            .is_some());
 
         // Statistical diagnostics, overlap, thresholds, and dataset role do
         // not change the configured technically valid voter roster.
@@ -9345,11 +10194,15 @@ mod tests {
         };
         let artifact_path = directory.join("lower-order.artifacts.json");
         let mut artifacts = lower_order_artifacts(-1.5);
-        artifacts.provenance = Some(fitted_artifact_provenance(
+        let resolved_configuration =
+            test_resolved_configuration(&ModelFit::LowerOrder, manifest.models[0].window.as_ref());
+        artifacts.provenance = Some(fitted_artifact_provenance_with_configuration(
             &dataset,
             "optimized",
             &ModelFit::LowerOrder,
             "test-search-fingerprint",
+            &resolved_configuration.resolved_configuration_sha256,
+            BTreeMap::new(),
         ));
         write_json_atomic(&artifact_path, &artifacts).unwrap();
         let calibration = directory.join("lower-order.calibration.tsv");
@@ -9359,6 +10212,8 @@ mod tests {
         let expert = CompletedExpert {
             model: ModelFit::LowerOrder,
             window: manifest.models[0].window.clone(),
+            resolved_configuration,
+            fit_identity: test_fit_identity(&dataset, "test-search-fingerprint"),
             optimized_artifacts: artifact_path.clone(),
             optimized_results: calibration.clone(),
             ms2rescore_artifacts: None,
@@ -9391,7 +10246,10 @@ mod tests {
                 TargetOnlyCalibrationPolicy::RefitWithLockedWindow,
             ))
         );
-        let mut target_refit = FdrOptions::default();
+        let mut target_refit = lock
+            .final_ensemble_configuration
+            .effective_fdr_options
+            .clone();
         apply_ensemble_lock(
             &mut target_refit,
             &lock,
@@ -9403,8 +10261,12 @@ mod tests {
         )
         .unwrap();
         assert_eq!(target_refit.enable_lower_order, Some(true));
+        let mut reuse_options = lock
+            .final_ensemble_configuration
+            .effective_fdr_options
+            .clone();
         let error = apply_ensemble_lock(
-            &mut FdrOptions::default(),
+            &mut reuse_options,
             &lock,
             false,
             &dataset,

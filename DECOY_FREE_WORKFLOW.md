@@ -463,8 +463,19 @@ The current production participation policy is:
 - Nokoi requires a complete `sage-nokoi-crossfit-portable-v2` artifact. Legacy v1 artifacts remain
   readable as historical diagnostics but cannot enter an Ensemble or target-only reuse path.
 
-The Ensemble lock copies every actual voter's independently optimized dataset-local window and
-artifact; it never optimizes one combined window. A requested voter is excluded only for technical
+The schema-v9 Ensemble lock copies every actual voter's independently optimized dataset-local
+window, complete effective expert-local production configuration, configuration hash, fitted
+artifact, and dataset/search/candidate/annotation identities; it never optimizes one combined
+window. Windows alone are insufficient because purification, robust fitting, mixture/classifier,
+and per-expert calibration settings can all change the reconstructed stream. Target-only
+`refit_with_locked_window` resolves each expert from its own locked configuration and refits only
+the nuisance state permitted by that model. Workflow defaults cannot replace locked values. The
+separate final Ensemble configuration controls combination and downstream aggregation only.
+Schema-v8 and older incomplete locks fail closed for target-only refit or `compare_both`; users
+must materialize a new lock from the frozen single-value development configuration rather than
+inferring omitted values from contemporary defaults.
+
+A requested voter is excluded only for technical
 failures such as a missing/corrupt artifact, model or dataset/search/analysis mismatch, prohibited
 fallback, incompatible candidate/annotation/fitted-profile provenance, unsupported target-only
 state, nonfinite or invalid fitted state, or duplicate model/artifact vote. Statistical measures—
