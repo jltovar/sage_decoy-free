@@ -161,6 +161,7 @@
       "msfdr1_smix", "msfdr2_smix", "nokoi", "ensemble"
     ],
     "expected_expert_configuration_sha256": {},
+    "frozen_expert_configuration_artifact": null,
     "require_expected_expert_configurations": false,
     "compiled_defaults": {},
     "workflow_defaults": {

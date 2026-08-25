@@ -19,13 +19,13 @@ use crate::external_feature_cache::{
 };
 use crate::input::Input;
 use crate::parameter_optimizer::{
-    apply_fdr_overrides, parameter_catalog_fingerprint, run_optimizer, AuditLevelMetrics,
-    EmpiricalCalibrationPower, EntrapmentValidationMode, FrozenWinnerAuditEvaluation,
-    OptimizerBlock, OptimizerExecutionMode, OptimizerExpert, OptimizerIdentity, OptimizerOutcome,
-    OptimizerRunResult, OptimizerStageKind, OptimizerWindowSearch, ParameterOptimizerConfig,
-    ParameterOptimizerStageProjection, ParameterValue, StatisticalDefaultEligibility,
-    StatisticalValidationStatus, TrialEvaluation, TrialEvaluator, TrialMetrics, TrialRecord,
-    TrialRequest, TrialStatus,
+    apply_fdr_overrides, parameter_catalog_fingerprint, resolve_unique_frozen_block_parameters,
+    run_optimizer, AuditLevelMetrics, EmpiricalCalibrationPower, EntrapmentValidationMode,
+    FrozenWinnerAuditEvaluation, OptimizerBlock, OptimizerExecutionMode, OptimizerExpert,
+    OptimizerIdentity, OptimizerOutcome, OptimizerRunResult, OptimizerStageKind,
+    OptimizerWindowSearch, ParameterOptimizerConfig, ParameterOptimizerStageProjection,
+    ParameterValue, StatisticalDefaultEligibility, StatisticalValidationStatus, TrialEvaluation,
+    TrialEvaluator, TrialMetrics, TrialRecord, TrialRequest, TrialStatus,
 };
 use crate::provenance::{freeze_baseline, sha256_file, write_json_atomic, BaselineManifest};
 use crate::runner::Runner;
@@ -277,6 +277,38 @@ pub struct ResolvedExpertConfiguration {
     #[serde(default)]
     pub declared_effective_options_sha256: String,
     pub resolved_configuration_sha256: String,
+}
+
+/// Inputs-only, portable freeze of every expert configuration that a formal
+/// final-Ensemble workflow will consume. This artifact has its own schema and
+/// is deliberately independent of the Ensemble lock schema.
+#[derive(Clone, Debug, Serialize, Deserialize)]
+pub struct FrozenExpertConfigurationResolution {
+    pub schema_version: u32,
+    pub resolved_configuration_schema_version: u32,
+    pub implementation_source_sha256: String,
+    pub parameter_catalog_sha256: String,
+    pub workflow_root_provenance_sha256: String,
+    pub root_optimizer_provenance_sha256: String,
+    pub ordered_expert_roster: Vec<ExpertIdentity>,
+    pub experts: Vec<FrozenExpertConfigurationEntry>,
+    #[serde(
+        deserialize_with = "sage_core::input::deserialize_expert_map",
+        serialize_with = "sage_core::input::serialize_expert_map"
+    )]
+    pub expected_expert_configuration_sha256: BTreeMap<ExpertIdentity, String>,
+    pub payload_sha256: String,
+}
+
+#[derive(Clone, Debug, Serialize, Deserialize)]
+pub struct FrozenExpertConfigurationEntry {
+    pub expert: ExpertIdentity,
+    pub model_version: String,
+    pub frozen_null_window: NullWindow,
+    pub effective_configuration: ResolvedExpertConfiguration,
+    pub scientific_configuration_sha256: String,
+    pub declared_options_audit_sha256: String,
+    pub stage_projection_provenance_sha256: String,
 }
 
 #[derive(Clone, Debug, Serialize, Deserialize)]
@@ -724,6 +756,366 @@ fn validate_resolved_expert_configuration(
         "resolved expert configuration window differs from its lock"
     );
     Ok(())
+}
+
+fn frozen_resolution_payload(artifact: &FrozenExpertConfigurationResolution) -> serde_json::Value {
+    serde_json::json!({
+        "schema_version": artifact.schema_version,
+        "resolved_configuration_schema_version": artifact.resolved_configuration_schema_version,
+        "implementation_source_sha256": artifact.implementation_source_sha256,
+        "parameter_catalog_sha256": artifact.parameter_catalog_sha256,
+        "workflow_root_provenance_sha256": artifact.workflow_root_provenance_sha256,
+        "root_optimizer_provenance_sha256": artifact.root_optimizer_provenance_sha256,
+        "ordered_expert_roster": artifact.ordered_expert_roster,
+        "experts": artifact.experts,
+        "expected_expert_configuration_sha256": artifact.expected_expert_configuration_sha256,
+    })
+}
+
+fn frozen_resolution_payload_sha256(
+    artifact: &FrozenExpertConfigurationResolution,
+) -> Result<String> {
+    let mut hasher = Sha256::new();
+    hasher.update(b"sage-frozen-expert-configuration-resolution-v1\0");
+    hasher.update(serde_json::to_vec(&frozen_resolution_payload(artifact))?);
+    Ok(format!("{:x}", hasher.finalize()))
+}
+
+fn normalized_frozen_resolution_optimizer_config(
+    config: &ParameterOptimizerConfig,
+) -> Result<ParameterOptimizerConfig> {
+    let mut normalized = config.clone();
+    normalized.expected_expert_configuration_sha256.clear();
+    normalized.frozen_expert_configuration_artifact = None;
+    normalized.require_expected_expert_configurations = false;
+    normalized.selected_experts.sort_by_key(|expert| {
+        let identity = ExpertIdentity::from(*expert);
+        (identity == ExpertIdentity::Ensemble, identity)
+    });
+    normalized.validate()?;
+    Ok(normalized)
+}
+
+fn frozen_resolution_workflow_provenance_sha256(
+    manifest: &WorkflowManifest,
+    root_optimizer_provenance_sha256: &str,
+    ordered_expert_roster: &[ExpertIdentity],
+) -> Result<String> {
+    let models = ordered_expert_roster
+        .iter()
+        .map(|identity| {
+            let model = manifest
+                .models
+                .iter()
+                .find(|model| expert_identity(&model.model) == *identity)
+                .context("frozen expert disappeared while computing workflow provenance")?;
+            Ok(serde_json::json!({
+                "expert": identity,
+                "model_version": identity.model_version(),
+                "window": resolved_expert_window(&model.model, &model.window),
+            }))
+        })
+        .collect::<Result<Vec<_>>>()?;
+    let payload = serde_json::json!({
+        "schema_version": 1,
+        "search_configuration_sha256": sha256_file(&manifest.search_config)?,
+        "root_optimizer_provenance_sha256": root_optimizer_provenance_sha256,
+        "models": models,
+    });
+    let mut hasher = Sha256::new();
+    hasher.update(b"sage-frozen-expert-workflow-provenance-v1\0");
+    hasher.update(serde_json::to_vec(&payload)?);
+    Ok(format!("{:x}", hasher.finalize()))
+}
+
+fn resolve_frozen_expert_configurations_from_manifest(
+    manifest: &WorkflowManifest,
+) -> Result<FrozenExpertConfigurationResolution> {
+    let root = manifest
+        .parameter_optimizer
+        .as_ref()
+        .filter(|config| config.enabled)
+        .context("frozen expert resolution requires an enabled parameter_optimizer")?;
+    let root = normalized_frozen_resolution_optimizer_config(root)?;
+    anyhow::ensure!(
+        root.selected_experts.contains(&OptimizerExpert::Ensemble),
+        "formal frozen expert resolution requires a final Ensemble stage"
+    );
+    let selected = root
+        .selected_experts
+        .iter()
+        .copied()
+        .filter(|expert| *expert != OptimizerExpert::Ensemble)
+        .map(ExpertIdentity::from)
+        .collect::<BTreeSet<_>>();
+    let roster = ExpertIdentity::INDIVIDUALS
+        .into_iter()
+        .filter(|expert| selected.contains(expert))
+        .collect::<Vec<_>>();
+    anyhow::ensure!(
+        !roster.is_empty(),
+        "frozen expert resolution requires at least one individual expert"
+    );
+    let models = manifest
+        .models
+        .iter()
+        .filter(|model| model.enabled && model.model != ModelFit::Ensemble)
+        .map(|model| (expert_identity(&model.model), model))
+        .collect::<BTreeMap<_, _>>();
+    anyhow::ensure!(
+        models.keys().copied().collect::<BTreeSet<_>>()
+            == roster.iter().copied().collect::<BTreeSet<_>>(),
+        "frozen expert manifest models do not exactly match the selected root expert roster"
+    );
+    let base_options = resolved_fdr_options(&manifest.search_config)?;
+    let mut root_optimizer_provenance_sha256 = None;
+    let mut experts = Vec::with_capacity(roster.len());
+    let mut expected = BTreeMap::new();
+    for identity in &roster {
+        let optimizer = OptimizerExpert::from(*identity);
+        let projection = optimizer_config_for_expert(&root, optimizer)?
+            .context("selected frozen expert has no projected optimizer block")?;
+        if let Some(existing) = root_optimizer_provenance_sha256.as_ref() {
+            anyhow::ensure!(
+                existing == &projection.root_optimizer_provenance_sha256,
+                "single-expert projections disagree on immutable root provenance"
+            );
+        } else {
+            root_optimizer_provenance_sha256 =
+                Some(projection.root_optimizer_provenance_sha256.clone());
+        }
+        let model = models
+            .get(identity)
+            .context("selected frozen expert has no model workflow")?;
+        anyhow::ensure!(
+            model.candidate_windows.is_empty() && model.window_optimizer.is_none(),
+            "frozen expert {} must not declare candidate windows or window optimization",
+            identity
+        );
+        anyhow::ensure!(
+            *identity == ExpertIdentity::Msfdr1Smix || model.window.is_some(),
+            "frozen expert {} requires an explicit model-local null window",
+            identity
+        );
+        let parameters = resolve_unique_frozen_block_parameters(&projection.config)?;
+        let mut options = base_options.clone();
+        options.mode = Some(FdrMode::DecoyFree);
+        options.model_fit = Some(model.model.clone());
+        apply_fdr_overrides(&mut options, &parameters)?;
+        apply_window(&mut options, &model.model, &model.window);
+        let configuration = build_resolved_expert_configuration(&model.model, options)?;
+        let window = resolved_expert_window_from_settings(
+            &model.model,
+            &FdrSettings::from(configuration.effective_fdr_options.clone()),
+        )
+        .context("individual frozen expert has no resolved null window")?;
+        validate_resolved_expert_configuration(
+            &configuration,
+            &model.model,
+            &Some(window.clone()),
+        )?;
+        anyhow::ensure!(
+            expected
+                .insert(
+                    *identity,
+                    configuration.resolved_configuration_sha256.clone()
+                )
+                .is_none(),
+            "duplicate frozen expert {}",
+            identity
+        );
+        experts.push(FrozenExpertConfigurationEntry {
+            expert: *identity,
+            model_version: configuration.model_version.clone(),
+            frozen_null_window: window,
+            scientific_configuration_sha256: configuration.resolved_configuration_sha256.clone(),
+            declared_options_audit_sha256: configuration.declared_effective_options_sha256.clone(),
+            effective_configuration: configuration,
+            stage_projection_provenance_sha256: projection.stage_optimizer_provenance_sha256,
+        });
+    }
+    let root_optimizer_provenance_sha256 = root_optimizer_provenance_sha256.unwrap();
+    let mut artifact = FrozenExpertConfigurationResolution {
+        schema_version: 1,
+        resolved_configuration_schema_version: 2,
+        implementation_source_sha256:
+            crate::parameter_optimizer::PARAMETER_OPTIMIZER_IMPLEMENTATION_SOURCE_SHA256.into(),
+        parameter_catalog_sha256: parameter_catalog_fingerprint()?,
+        workflow_root_provenance_sha256: frozen_resolution_workflow_provenance_sha256(
+            manifest,
+            &root_optimizer_provenance_sha256,
+            &roster,
+        )?,
+        root_optimizer_provenance_sha256,
+        ordered_expert_roster: roster,
+        experts,
+        expected_expert_configuration_sha256: expected,
+        payload_sha256: String::new(),
+    };
+    artifact.payload_sha256 = frozen_resolution_payload_sha256(&artifact)?;
+    validate_frozen_expert_configuration_resolution(&artifact)?;
+    Ok(artifact)
+}
+
+fn validate_frozen_expert_configuration_resolution(
+    artifact: &FrozenExpertConfigurationResolution,
+) -> Result<()> {
+    anyhow::ensure!(
+        artifact.schema_version == 1 && artifact.resolved_configuration_schema_version == 2,
+        "unsupported frozen expert configuration resolution schema"
+    );
+    anyhow::ensure!(
+        artifact.implementation_source_sha256
+            == crate::parameter_optimizer::PARAMETER_OPTIMIZER_IMPLEMENTATION_SOURCE_SHA256,
+        "frozen expert resolution implementation source differs from this binary"
+    );
+    anyhow::ensure!(
+        artifact.parameter_catalog_sha256 == parameter_catalog_fingerprint()?,
+        "frozen expert resolution parameter catalog differs from this binary"
+    );
+    anyhow::ensure!(
+        artifact.payload_sha256 == frozen_resolution_payload_sha256(artifact)?,
+        "frozen expert resolution payload hash does not match its contents"
+    );
+    let roster = artifact
+        .ordered_expert_roster
+        .iter()
+        .copied()
+        .collect::<BTreeSet<_>>();
+    anyhow::ensure!(
+        roster.len() == artifact.ordered_expert_roster.len()
+            && roster.iter().all(|expert| expert.is_individual()),
+        "frozen expert resolution roster contains duplicates or non-expert identities"
+    );
+    let mut actual = BTreeMap::new();
+    for entry in &artifact.experts {
+        anyhow::ensure!(
+            roster.contains(&entry.expert)
+                && entry.model_version == entry.expert.model_version()
+                && entry.scientific_configuration_sha256
+                    == entry.effective_configuration.resolved_configuration_sha256
+                && entry.declared_options_audit_sha256
+                    == entry
+                        .effective_configuration
+                        .declared_effective_options_sha256,
+            "frozen expert resolution entry identity is internally inconsistent"
+        );
+        validate_resolved_expert_configuration(
+            &entry.effective_configuration,
+            &ModelFit::from(entry.expert),
+            &Some(entry.frozen_null_window.clone()),
+        )?;
+        anyhow::ensure!(
+            actual
+                .insert(entry.expert, entry.scientific_configuration_sha256.clone())
+                .is_none(),
+            "frozen expert resolution contains a duplicate logical expert"
+        );
+    }
+    anyhow::ensure!(
+        actual.len() == roster.len() && actual == artifact.expected_expert_configuration_sha256,
+        "frozen expert resolution roster, entries, and expected map disagree"
+    );
+    Ok(())
+}
+
+fn write_frozen_expert_configuration_resolution_atomic(
+    path: &Path,
+    artifact: &FrozenExpertConfigurationResolution,
+) -> Result<()> {
+    validate_frozen_expert_configuration_resolution(artifact)?;
+    anyhow::ensure!(
+        !path.exists(),
+        "frozen expert configuration resolution artifact already exists: {}",
+        path.display()
+    );
+    let parent = path.parent().unwrap_or_else(|| Path::new("."));
+    std::fs::create_dir_all(parent)?;
+    let file_name = path
+        .file_name()
+        .and_then(|name| name.to_str())
+        .unwrap_or("frozen-expert-configurations.json");
+    let (temporary, mut file) = (0..1_024)
+        .find_map(|ordinal| {
+            let candidate = parent.join(format!(".{file_name}.resolution.{ordinal}.tmp"));
+            match std::fs::OpenOptions::new()
+                .write(true)
+                .create_new(true)
+                .open(&candidate)
+            {
+                Ok(file) => Some(Ok((candidate, file))),
+                Err(error) if error.kind() == std::io::ErrorKind::AlreadyExists => None,
+                Err(error) => Some(Err(error)),
+            }
+        })
+        .transpose()?
+        .context("unable to allocate frozen expert resolution temporary file")?;
+    let bytes = serde_json::to_vec_pretty(artifact)?;
+    file.write_all(&bytes)?;
+    file.sync_all()?;
+    drop(file);
+    let provisional: FrozenExpertConfigurationResolution =
+        serde_json::from_slice(&std::fs::read(&temporary)?)?;
+    validate_frozen_expert_configuration_resolution(&provisional)?;
+    if let Err(error) = std::fs::hard_link(&temporary, path) {
+        let _ = std::fs::remove_file(&temporary);
+        return Err(error).with_context(|| {
+            format!(
+                "failed to atomically install immutable frozen expert resolution {}",
+                path.display()
+            )
+        });
+    }
+    #[cfg(unix)]
+    std::fs::File::open(parent)?.sync_all()?;
+    let durable_bytes = std::fs::read(path)?;
+    let durable: FrozenExpertConfigurationResolution = serde_json::from_slice(&durable_bytes)?;
+    if let Err(error) = validate_frozen_expert_configuration_resolution(&durable).and_then(|()| {
+        anyhow::ensure!(
+            durable_bytes == bytes,
+            "durable frozen expert resolution bytes changed after installation"
+        );
+        Ok(())
+    }) {
+        let _ = std::fs::remove_file(path);
+        let _ = std::fs::remove_file(&temporary);
+        #[cfg(unix)]
+        let _ = std::fs::File::open(parent).and_then(|directory| directory.sync_all());
+        return Err(error);
+    }
+    std::fs::remove_file(&temporary)?;
+    #[cfg(unix)]
+    std::fs::File::open(parent)?.sync_all()?;
+    Ok(())
+}
+
+/// Resolve and durably freeze every selected individual expert without
+/// touching spectra, candidate pools, raw annotations, target-only resources,
+/// model fitting, or optimizer evaluation.
+pub fn resolve_frozen_expert_configurations(
+    manifest_path: &Path,
+    output_path: &Path,
+) -> Result<FrozenExpertConfigurationResolution> {
+    let manifest = WorkflowManifest::load(manifest_path)?;
+    let config = manifest
+        .parameter_optimizer
+        .as_ref()
+        .context("frozen expert resolution requires parameter_optimizer")?;
+    anyhow::ensure!(
+        config.expected_expert_configuration_sha256.is_empty()
+            && config.frozen_expert_configuration_artifact.is_none(),
+        "inputs-only resolution requires a prospective manifest without expected hashes or a prior resolution artifact"
+    );
+    let artifact = resolve_frozen_expert_configurations_from_manifest(&manifest)?;
+    write_frozen_expert_configuration_resolution_atomic(output_path, &artifact)?;
+    let reopened: FrozenExpertConfigurationResolution =
+        serde_json::from_slice(&std::fs::read(output_path)?)?;
+    validate_frozen_expert_configuration_resolution(&reopened)?;
+    anyhow::ensure!(
+        serde_json::to_vec(&artifact)? == serde_json::to_vec(&reopened)?,
+        "reopened frozen expert resolution differs from the resolved artifact"
+    );
+    Ok(reopened)
 }
 
 fn resolved_ensemble_combiners(
@@ -3255,11 +3647,96 @@ fn validate_expected_expert_configuration_hashes(
     config: &ParameterOptimizerConfig,
     actual: &BTreeMap<ExpertIdentity, String>,
 ) -> Result<()> {
+    validate_expected_expert_hash_maps(&config.expected_expert_configuration_sha256, actual)
+}
+
+fn validate_expected_expert_hash_maps(
+    expected: &BTreeMap<ExpertIdentity, String>,
+    actual: &BTreeMap<ExpertIdentity, String>,
+) -> Result<()> {
+    let identities = expected
+        .keys()
+        .chain(actual.keys())
+        .copied()
+        .collect::<BTreeSet<_>>();
+    let mismatches = identities
+        .into_iter()
+        .filter_map(
+            |expert| match (expected.get(&expert), actual.get(&expert)) {
+                (Some(expected), Some(actual)) if expected != actual => Some(format!(
+                    "{}: expected {}, resolved {}",
+                    expert, expected, actual
+                )),
+                (Some(expected), None) => Some(format!(
+                    "{}: expected {}, resolved missing",
+                    expert, expected
+                )),
+                (None, Some(actual)) => Some(format!("{}: unexpected resolved {}", expert, actual)),
+                _ => None,
+            },
+        )
+        .collect::<Vec<_>>();
     anyhow::ensure!(
-        actual == &config.expected_expert_configuration_sha256,
-        "preflight frozen expert configuration hashes differ from the prospectively declared map"
+        mismatches.is_empty(),
+        "preflight frozen expert configuration mismatches against prospectively declared values:\n{}",
+        mismatches.join("\n")
     );
     Ok(())
+}
+
+fn prepare_frozen_expert_configuration_preflight(
+    manifest: &mut WorkflowManifest,
+) -> Result<Option<FrozenExpertConfigurationResolution>> {
+    let Some(config) = manifest.parameter_optimizer.as_ref().filter(|config| {
+        config.enabled
+            && (config.require_expected_expert_configurations
+                || !config.expected_expert_configuration_sha256.is_empty()
+                || config.frozen_expert_configuration_artifact.is_some())
+    }) else {
+        return Ok(None);
+    };
+    let declared_expected = config.expected_expert_configuration_sha256.clone();
+    let artifact_path = config.frozen_expert_configuration_artifact.clone();
+    let actual = resolve_frozen_expert_configurations_from_manifest(manifest)?;
+    let expected = if let Some(path) = artifact_path.as_ref() {
+        let frozen: FrozenExpertConfigurationResolution =
+            serde_json::from_slice(&std::fs::read(path).with_context(|| {
+                format!(
+                    "failed to read frozen expert configuration artifact {}",
+                    path.display()
+                )
+            })?)?;
+        validate_frozen_expert_configuration_resolution(&frozen)?;
+        // Report every scientific expert mismatch in one pass before checking
+        // the remaining artifact-wide lineage fields.
+        validate_expected_expert_hash_maps(
+            &frozen.expected_expert_configuration_sha256,
+            &actual.expected_expert_configuration_sha256,
+        )?;
+        anyhow::ensure!(
+            frozen_resolution_payload(&frozen) == frozen_resolution_payload(&actual)
+                && frozen.payload_sha256 == actual.payload_sha256,
+            "referenced frozen expert configuration artifact does not match current production resolution"
+        );
+        if !declared_expected.is_empty() {
+            validate_expected_expert_hash_maps(
+                &declared_expected,
+                &frozen.expected_expert_configuration_sha256,
+            )?;
+        }
+        frozen.expected_expert_configuration_sha256
+    } else {
+        declared_expected
+    };
+    validate_expected_expert_hash_maps(&expected, &actual.expected_expert_configuration_sha256)?;
+    let config = manifest
+        .parameter_optimizer
+        .as_mut()
+        .expect("validated optimizer disappeared");
+    config.expected_expert_configuration_sha256 = expected;
+    config.require_expected_expert_configurations = true;
+    manifest.validate()?;
+    Ok(Some(actual))
 }
 
 fn validate_stage_expected_expert_configuration(
@@ -6506,6 +6983,11 @@ pub fn execute_workflow(
 ) -> Result<WorkflowState> {
     let mut manifest = WorkflowManifest::load(manifest_path)?;
     let manifest_hash = sha256_file(manifest_path)?;
+    // Resolve and compare the complete frozen expert roster before computing
+    // dataset identities or touching spectra, candidate pools, annotations,
+    // fitted artifacts, or optimizer checkpoints. Runtime stage validation
+    // repeats the per-stage check as defense in depth.
+    prepare_frozen_expert_configuration_preflight(&mut manifest)?;
     let dataset = compute_dataset_identity(&manifest)?;
     let strict_preflight_enabled =
         manifest.require_existing_candidate_pool || manifest.require_existing_annotation_cache;
@@ -8169,7 +8651,7 @@ mod tests {
             .validate()
             .unwrap_err()
             .to_string()
-            .contains("incomplete"));
+            .contains("need either a complete expected hash map or a resolution artifact"));
         config
             .expected_expert_configuration_sha256
             .insert(ExpertIdentity::Moments, "a".repeat(64));
@@ -8177,11 +8659,9 @@ mod tests {
         config
             .expected_expert_configuration_sha256
             .insert(ExpertIdentity::Mle, "b".repeat(64));
-        assert!(config
-            .validate()
-            .unwrap_err()
-            .to_string()
-            .contains("unselected"));
+        // Root final-Ensemble shape errors are aggregated by the prospective
+        // all-expert preflight; projected stage configurations remain exact.
+        config.validate().unwrap();
     }
 
     fn lower_order_artifacts(mu: f64) -> DfRunArtifacts {
@@ -8216,6 +8696,7 @@ mod tests {
             classification: crate::parameter_optimizer::OptimizationClassification::DevelopmentOnly,
             selected_experts: vec![OptimizerExpert::Moments],
             expected_expert_configuration_sha256: BTreeMap::new(),
+            frozen_expert_configuration_artifact: None,
             require_expected_expert_configurations: false,
             compiled_defaults: BTreeMap::new(),
             workflow_defaults: BTreeMap::new(),
@@ -8261,6 +8742,364 @@ mod tests {
                 max_passes: None,
             }],
         }
+    }
+
+    fn frozen_seven_expert_manifest(directory: &Path) -> WorkflowManifest {
+        let mut manifest = minimal_manifest(directory, ValidationDatasetRole::Development);
+        manifest.require_existing_candidate_pool = true;
+        manifest.require_existing_annotation_cache = true;
+        let model_values = [
+            (ModelFit::Moments, Some((9, 13))),
+            (ModelFit::Mle, Some((10, 24))),
+            (ModelFit::LowerOrder, Some((6, 9))),
+            (ModelFit::Msfdr, Some((9, 13))),
+            (ModelFit::Msfdr1Smix, None),
+            (ModelFit::Msfdr2Smix, Some((8, 16))),
+            (ModelFit::Nokoi, Some((5, 13))),
+            (ModelFit::Ensemble, None),
+        ];
+        manifest.models = model_values
+            .into_iter()
+            .map(|(model, window)| ModelWorkflow {
+                model,
+                window: window.map(|(min_rank, max_rank)| NullWindow { min_rank, max_rank }),
+                candidate_windows: Vec::new(),
+                window_optimizer: None,
+                enabled: true,
+                ms2rescore: Ms2RescorePolicy::Never,
+                maximum_raw_fdp_increase: None,
+                minimum_level4_peptide_gain: None,
+                target_only_calibration_policy: None,
+                ensemble_participation: EnsembleParticipation::Auto,
+                ensemble_exclusion_reason: None,
+                ensemble_interaction_baseline: true,
+            })
+            .collect();
+        let definitions = [
+            (
+                "moments_frozen",
+                OptimizerExpert::Moments,
+                "moments_purification_factor",
+                ParameterValue::Float(0.2),
+            ),
+            (
+                "mle_frozen",
+                OptimizerExpert::Mle,
+                "mle_purification_factor",
+                ParameterValue::Float(0.1),
+            ),
+            (
+                "lower_order_frozen",
+                OptimizerExpert::LowerOrder,
+                "lower_order_purification_factor",
+                ParameterValue::Float(0.15),
+            ),
+            (
+                "msfdr_frozen",
+                OptimizerExpert::MsfdrSeeded,
+                "msfdr_seeded_purification_factor",
+                ParameterValue::Float(0.2),
+            ),
+            (
+                "msfdr1_frozen",
+                OptimizerExpert::Msfdr1Smix,
+                "msfdr1_bottom_frac_init",
+                ParameterValue::Float(0.3),
+            ),
+            (
+                "msfdr2_frozen",
+                OptimizerExpert::Msfdr2Smix,
+                "msfdr2_bottom_frac_init",
+                ParameterValue::Float(0.5),
+            ),
+            (
+                "nokoi_frozen",
+                OptimizerExpert::Nokoi,
+                "nokoi_k_folds",
+                ParameterValue::Integer(5),
+            ),
+        ];
+        let mut optimizer = test_optimizer_config();
+        optimizer.schema_version = crate::parameter_optimizer::PARAMETER_OPTIMIZER_SCHEMA_VERSION;
+        optimizer.execution_mode = OptimizerExecutionMode::OptimizationOnly;
+        optimizer.maximum_trial_budget = 16;
+        optimizer.selected_experts = definitions
+            .iter()
+            .map(|(_, expert, _, _)| *expert)
+            .chain(std::iter::once(OptimizerExpert::Ensemble))
+            .collect();
+        optimizer.blocks = definitions
+            .into_iter()
+            .map(|(id, expert, parameter, value)| OptimizerBlock {
+                id: id.into(),
+                enabled: true,
+                scope: crate::parameter_optimizer::ParameterScope::PerExpert,
+                expert: Some(expert),
+                strategy: crate::parameter_optimizer::OptimizerStrategy::ExhaustiveGrid,
+                structural_comparison: true,
+                fixed: BTreeMap::new(),
+                space: BTreeMap::from([(parameter.into(), vec![value])]),
+                window_search: None,
+                use_external_features: false,
+                max_trials: Some(1),
+                max_passes: Some(1),
+            })
+            .collect();
+        optimizer.blocks.push(OptimizerBlock {
+            id: "ensemble_final".into(),
+            enabled: true,
+            scope: crate::parameter_optimizer::ParameterScope::EnsembleFinal,
+            expert: Some(OptimizerExpert::Ensemble),
+            strategy: crate::parameter_optimizer::OptimizerStrategy::ExhaustiveGrid,
+            structural_comparison: true,
+            fixed: BTreeMap::from([
+                (
+                    "final_evidence_space".into(),
+                    ParameterValue::String("p_value".into()),
+                ),
+                (
+                    "ensemble_p_combiner".into(),
+                    ParameterValue::String("cauchy".into()),
+                ),
+            ]),
+            space: BTreeMap::from([(
+                "ensemble_cauchy_penalty".into(),
+                vec![ParameterValue::Float(1.0224)],
+            )]),
+            window_search: None,
+            use_external_features: false,
+            max_trials: Some(1),
+            max_passes: Some(1),
+        });
+        optimizer.block_order = optimizer
+            .blocks
+            .iter()
+            .map(|block| block.id.clone())
+            .collect();
+        manifest.parameter_optimizer = Some(optimizer);
+        manifest
+    }
+
+    #[test]
+    fn inputs_only_resolver_freezes_all_experts_and_is_deterministic() {
+        let directory = test_directory("frozen-expert-inputs-only");
+        let manifest = frozen_seven_expert_manifest(&directory);
+        manifest.validate().unwrap();
+        let first = resolve_frozen_expert_configurations_from_manifest(&manifest).unwrap();
+        let second = resolve_frozen_expert_configurations_from_manifest(&manifest).unwrap();
+        assert_eq!(first.ordered_expert_roster, ExpertIdentity::INDIVIDUALS);
+        assert_eq!(first.experts.len(), 7);
+        assert_eq!(first.expected_expert_configuration_sha256.len(), 7);
+        assert_eq!(
+            serde_json::to_vec(&first).unwrap(),
+            serde_json::to_vec(&second).unwrap()
+        );
+        let portable = serde_json::to_string(&first).unwrap();
+        assert!(!portable.contains("/home/"));
+        assert!(!portable.contains("/mnt/"));
+        assert!(!portable.contains("unresolved-test.mzML"));
+        assert!(!portable.contains("psm_id"));
+        let mut aliased = serde_json::to_value(&manifest).unwrap();
+        for model in aliased["models"].as_array_mut().unwrap() {
+            if model["model"] == "msfdr" {
+                model["model"] = serde_json::json!("msfdr_seeded");
+            }
+        }
+        let optimizer = aliased["parameter_optimizer"].as_object_mut().unwrap();
+        for expert in optimizer["selected_experts"].as_array_mut().unwrap() {
+            if *expert == "msfdr" {
+                *expert = serde_json::json!("msfdr_seeded");
+            }
+        }
+        for block in optimizer["blocks"].as_array_mut().unwrap() {
+            if block["expert"] == "msfdr" {
+                block["expert"] = serde_json::json!("msfdr_seeded");
+            }
+        }
+        let aliased: WorkflowManifest = serde_json::from_value(aliased).unwrap();
+        assert_eq!(
+            first.payload_sha256,
+            resolve_frozen_expert_configurations_from_manifest(&aliased)
+                .unwrap()
+                .payload_sha256
+        );
+        for entry in &first.experts {
+            let optimizer = OptimizerExpert::from(entry.expert);
+            let projection = optimizer_config_for_expert(
+                &normalized_frozen_resolution_optimizer_config(
+                    manifest.parameter_optimizer.as_ref().unwrap(),
+                )
+                .unwrap(),
+                optimizer,
+            )
+            .unwrap()
+            .unwrap();
+            let values = resolve_unique_frozen_block_parameters(&projection.config).unwrap();
+            let model = manifest
+                .models
+                .iter()
+                .find(|model| expert_identity(&model.model) == entry.expert)
+                .unwrap();
+            let mut options = resolved_fdr_options(&manifest.search_config).unwrap();
+            options.mode = Some(FdrMode::DecoyFree);
+            options.model_fit = Some(model.model.clone());
+            apply_fdr_overrides(&mut options, &values).unwrap();
+            apply_window(&mut options, &model.model, &model.window);
+            assert_eq!(
+                build_resolved_expert_configuration(&model.model, options)
+                    .unwrap()
+                    .resolved_configuration_sha256,
+                entry.scientific_configuration_sha256
+            );
+        }
+        assert!(!manifest.output_root.exists());
+        assert!(!directory.join("candidate_pools").exists());
+        assert!(!directory.join("ms2rescore_annotations").exists());
+        let mut first_path = manifest.parameter_optimizer.clone().unwrap();
+        first_path.frozen_expert_configuration_artifact = Some(PathBuf::from("/machine/a.json"));
+        let mut second_path = first_path.clone();
+        second_path.frozen_expert_configuration_artifact = Some(PathBuf::from("/machine/b.json"));
+        let requested = BTreeSet::from([ExpertIdentity::Moments]);
+        assert_eq!(
+            first_path
+                .project_for_stage(&requested, OptimizerStageKind::SingleExpert)
+                .unwrap()
+                .stage_optimizer_provenance_sha256,
+            second_path
+                .project_for_stage(&requested, OptimizerStageKind::SingleExpert)
+                .unwrap()
+                .stage_optimizer_provenance_sha256
+        );
+        let output = directory.join("frozen.json");
+        write_frozen_expert_configuration_resolution_atomic(&output, &first).unwrap();
+        assert_eq!(
+            std::fs::read(&output).unwrap(),
+            serde_json::to_vec_pretty(&first).unwrap()
+        );
+        assert!(
+            write_frozen_expert_configuration_resolution_atomic(&output, &first)
+                .unwrap_err()
+                .to_string()
+                .contains("already exists")
+        );
+        std::fs::remove_dir_all(directory).unwrap();
+    }
+
+    #[test]
+    fn frozen_resolver_rejects_nonunique_blocks_and_localizes_changes() {
+        let directory = test_directory("frozen-expert-nonunique");
+        let manifest = frozen_seven_expert_manifest(&directory);
+        let baseline = resolve_frozen_expert_configurations_from_manifest(&manifest).unwrap();
+        let mut changed = manifest.clone();
+        let moments = changed
+            .parameter_optimizer
+            .as_mut()
+            .unwrap()
+            .blocks
+            .iter_mut()
+            .find(|block| block.expert == Some(OptimizerExpert::Moments))
+            .unwrap();
+        moments.space.insert(
+            "moments_purification_factor".into(),
+            vec![ParameterValue::Float(0.2), ParameterValue::Float(0.25)],
+        );
+        moments.max_trials = Some(2);
+        assert!(resolve_frozen_expert_configurations_from_manifest(&changed)
+            .unwrap_err()
+            .to_string()
+            .contains("no unique prospective configuration"));
+
+        let mut changed = manifest.clone();
+        let moments = changed
+            .parameter_optimizer
+            .as_mut()
+            .unwrap()
+            .blocks
+            .iter_mut()
+            .find(|block| block.expert == Some(OptimizerExpert::Moments))
+            .unwrap();
+        moments.space.insert(
+            "moments_purification_factor".into(),
+            vec![ParameterValue::Float(0.25)],
+        );
+        let active_change = resolve_frozen_expert_configurations_from_manifest(&changed).unwrap();
+        for expert in ExpertIdentity::INDIVIDUALS {
+            let equal = baseline.expected_expert_configuration_sha256[&expert]
+                == active_change.expected_expert_configuration_sha256[&expert];
+            assert_eq!(equal, expert != ExpertIdentity::Moments);
+        }
+        let mut changed = manifest;
+        changed
+            .models
+            .iter_mut()
+            .find(|model| model.model == ModelFit::Nokoi)
+            .unwrap()
+            .window = Some(NullWindow {
+            min_rank: 6,
+            max_rank: 13,
+        });
+        let window_change = resolve_frozen_expert_configurations_from_manifest(&changed).unwrap();
+        for expert in ExpertIdentity::INDIVIDUALS {
+            let equal = baseline.expected_expert_configuration_sha256[&expert]
+                == window_change.expected_expert_configuration_sha256[&expert];
+            assert_eq!(equal, expert != ExpertIdentity::Nokoi);
+        }
+        std::fs::remove_dir_all(directory).unwrap();
+    }
+
+    #[test]
+    fn generated_artifact_drives_complete_preflight_and_old_hashes_fail_together() {
+        let directory = test_directory("frozen-expert-preflight");
+        let mut manifest = frozen_seven_expert_manifest(&directory);
+        let artifact = resolve_frozen_expert_configurations_from_manifest(&manifest).unwrap();
+        let artifact_path = directory.join("frozen.json");
+        write_frozen_expert_configuration_resolution_atomic(&artifact_path, &artifact).unwrap();
+        let config = manifest.parameter_optimizer.as_mut().unwrap();
+        config.frozen_expert_configuration_artifact = Some(artifact_path);
+        config.require_expected_expert_configurations = true;
+        assert!(config.expected_expert_configuration_sha256.is_empty());
+        let prepared = prepare_frozen_expert_configuration_preflight(&mut manifest)
+            .unwrap()
+            .unwrap();
+        assert_eq!(prepared.payload_sha256, artifact.payload_sha256);
+        assert_eq!(
+            manifest
+                .parameter_optimizer
+                .as_ref()
+                .unwrap()
+                .expected_expert_configuration_sha256,
+            artifact.expected_expert_configuration_sha256
+        );
+
+        let mut incorrect = frozen_seven_expert_manifest(&directory);
+        let config = incorrect.parameter_optimizer.as_mut().unwrap();
+        config.require_expected_expert_configurations = true;
+        config.expected_expert_configuration_sha256 = artifact
+            .experts
+            .iter()
+            .map(|entry| {
+                let mut old_record = entry.effective_configuration.clone();
+                old_record.implementation_source_sha256 = "0".repeat(64);
+                old_record.resolved_configuration_sha256 =
+                    resolved_configuration_hash(&old_record).unwrap();
+                (entry.expert, old_record.resolved_configuration_sha256)
+            })
+            .collect();
+        let error = prepare_frozen_expert_configuration_preflight(&mut incorrect)
+            .unwrap_err()
+            .to_string();
+        for expert in ExpertIdentity::INDIVIDUALS {
+            assert!(error.contains(expert.as_str()));
+        }
+        assert!(!incorrect.output_root.exists());
+        let manifest_path = directory.join("incorrect.workflow.json");
+        write_json_atomic(&manifest_path, &incorrect).unwrap();
+        let execution_error = execute_workflow(&manifest_path, &directory, 1, true)
+            .unwrap_err()
+            .to_string();
+        assert!(execution_error.contains("preflight frozen expert configuration mismatches"));
+        assert!(!incorrect.output_root.exists());
+        std::fs::remove_dir_all(directory).unwrap();
     }
 
     #[derive(Default)]

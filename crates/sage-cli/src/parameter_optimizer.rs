@@ -2864,6 +2864,13 @@ pub struct ParameterOptimizerConfig {
         serialize_with = "sage_core::input::serialize_expert_map"
     )]
     pub expected_expert_configuration_sha256: BTreeMap<ExpertIdentity, String>,
+    /// Optional immutable output from
+    /// `sage resolve-frozen-expert-configurations`. When present, workflow
+    /// preflight validates the artifact against the current production
+    /// resolver and installs its canonical expected-hash map before any
+    /// candidate, spectrum, annotation, or optimizer-trial access.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub frozen_expert_configuration_artifact: Option<std::path::PathBuf>,
     #[serde(default)]
     pub require_expected_expert_configurations: bool,
     #[serde(default)]
@@ -2938,9 +2945,11 @@ fn optimizer_config_provenance_sha256(
     domain: &[u8],
     config: &ParameterOptimizerConfig,
 ) -> Result<String> {
+    let mut portable = config.clone();
+    portable.frozen_expert_configuration_artifact = None;
     let mut hasher = Sha256::new();
     hasher.update(domain);
-    hasher.update(serde_json::to_vec(config)?);
+    hasher.update(serde_json::to_vec(&portable)?);
     Ok(format!("{:x}", hasher.finalize()))
 }
 
@@ -3230,8 +3239,8 @@ impl ParameterOptimizerConfig {
         anyhow::ensure!(
             self.expected_expert_configuration_sha256
                 .keys()
-                .all(|model| model.is_individual() && selected_models.contains(model)),
-            "expected_expert_configuration_sha256 contains an unselected or non-expert model"
+                .all(|model| model.is_individual()),
+            "expected_expert_configuration_sha256 contains a non-expert model"
         );
         anyhow::ensure!(
             self.expected_expert_configuration_sha256
@@ -3243,16 +3252,26 @@ impl ParameterOptimizerConfig {
         );
         if self.require_expected_expert_configurations
             || !self.expected_expert_configuration_sha256.is_empty()
+            || self.frozen_expert_configuration_artifact.is_some()
         {
-            let expected = self
-                .expected_expert_configuration_sha256
-                .keys()
-                .cloned()
-                .collect::<BTreeSet<_>>();
-            anyhow::ensure!(
-                expected == selected_models,
-                "expected expert configuration map is incomplete or disagrees with the selected frozen expert roster"
-            );
+            if !self.selected_experts.contains(&OptimizerExpert::Ensemble)
+                && !self.expected_expert_configuration_sha256.is_empty()
+            {
+                let expected = self
+                    .expected_expert_configuration_sha256
+                    .keys()
+                    .cloned()
+                    .collect::<BTreeSet<_>>();
+                anyhow::ensure!(
+                    expected == selected_models,
+                    "expected expert configuration map is incomplete or disagrees with the selected frozen expert roster"
+                );
+            } else if self.expected_expert_configuration_sha256.is_empty() {
+                anyhow::ensure!(
+                    self.frozen_expert_configuration_artifact.is_some(),
+                    "required frozen expert configurations need either a complete expected hash map or a resolution artifact"
+                );
+            }
             anyhow::ensure!(
                 self.selected_experts.contains(&OptimizerExpert::Ensemble)
                     || (self.selected_experts.len() == 1 && selected_models.len() == 1),
@@ -3328,6 +3347,61 @@ impl ParameterOptimizerConfig {
         );
         Ok(())
     }
+}
+
+/// Resolve the one immutable parameter assignment represented by a projected
+/// single-expert optimizer stage. This uses the same precedence and validation
+/// machinery as `run_optimizer`; it merely rejects any block that could
+/// produce more than one scientific assignment instead of evaluating one.
+pub(crate) fn resolve_unique_frozen_block_parameters(
+    config: &ParameterOptimizerConfig,
+) -> Result<BTreeMap<String, ParameterValue>> {
+    config.validate()?;
+    anyhow::ensure!(
+        config.selected_experts.len() == 1
+            && config.selected_experts[0] != OptimizerExpert::Ensemble,
+        "frozen expert resolution requires one projected individual expert"
+    );
+    let mut resolved_parameter_sets = BTreeMap::<String, BTreeMap<String, ParameterValue>>::new();
+    let mut final_values = None;
+    for block_id in &config.block_order {
+        let block = config
+            .blocks
+            .iter()
+            .find(|block| block.enabled && &block.id == block_id)
+            .context("validated frozen expert block disappeared")?;
+        anyhow::ensure!(
+            block.strategy == OptimizerStrategy::ExhaustiveGrid,
+            "frozen expert resolution requires exhaustive_grid blocks with exactly one assignment"
+        );
+        anyhow::ensure!(
+            block.window_search.is_none(),
+            "frozen expert resolution requires a fixed model-local window, not window_search"
+        );
+        let parameter_set_key = block_parameter_set_key(block);
+        let mut values = resolve_baseline_for_block(config, block);
+        if let Some(previous) = resolved_parameter_sets.get(&parameter_set_key) {
+            values.extend(previous.clone());
+        }
+        values.extend(block.fixed.clone());
+        let active_parameters = block.space.keys().cloned().collect::<BTreeSet<_>>();
+        for (name, candidates) in &block.space {
+            let candidates = sorted_values(candidates);
+            anyhow::ensure!(
+                candidates.len() == 1,
+                "frozen expert block {} parameter {} has {} distinct values; no unique prospective configuration exists",
+                block.id,
+                name,
+                candidates.len()
+            );
+            values.insert(name.clone(), candidates[0].clone());
+        }
+        validate_assignment(&values)?;
+        validate_active_dependencies(&values, &active_parameters)?;
+        resolved_parameter_sets.insert(parameter_set_key, values.clone());
+        final_values = Some(values);
+    }
+    final_values.context("frozen expert resolution requires at least one enabled block")
 }
 
 fn validate_block(
@@ -3956,10 +4030,12 @@ pub fn optimizer_fingerprint(
     identity: &OptimizerIdentity,
     config: &ParameterOptimizerConfig,
 ) -> Result<String> {
+    let mut portable = config.clone();
+    portable.frozen_expert_configuration_artifact = None;
     let mut hasher = Sha256::new();
     hasher.update(b"sage-decoy-free-parameter-optimizer-v1\0");
     hasher.update(serde_json::to_vec(identity)?);
-    hasher.update(serde_json::to_vec(config)?);
+    hasher.update(serde_json::to_vec(&portable)?);
     Ok(format!("{:x}", hasher.finalize()))
 }
 
@@ -4895,6 +4971,7 @@ mod tests {
             classification: OptimizationClassification::DevelopmentOnly,
             selected_experts: vec![OptimizerExpert::Moments, OptimizerExpert::Mle],
             expected_expert_configuration_sha256: BTreeMap::new(),
+            frozen_expert_configuration_artifact: None,
             require_expected_expert_configurations: false,
             compiled_defaults: BTreeMap::from([
                 (

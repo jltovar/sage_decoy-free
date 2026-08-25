@@ -475,6 +475,24 @@ Schema-v9 and older optimizer locks fail closed for target-only refit or `compar
 must materialize a new lock from the frozen single-value development configuration rather than
 inferring omitted values from contemporary defaults.
 
+Before a formal frozen-expert run, resolve every expert prospectively with:
+
+```text
+sage resolve-frozen-expert-configurations WORKFLOW.json \
+  --output frozen-expert-configurations.json
+```
+
+The preparation manifest contains the complete single-valued expert blocks and fixed windows but
+no expected hashes. This inputs-only command uses the production stage projection and effective
+configuration resolver, writes one immutable schema-v1 artifact with all expert schema-v2 hashes,
+and never reads spectra, candidate pools, annotations, target-only inputs, or biological results.
+It never fits a model or evaluates an optimizer trial. Freeze the artifact, then either populate
+`expected_expert_configuration_sha256` from its canonical map or reference it through
+`frozen_expert_configuration_artifact`. Strict preflight re-resolves all experts and compares the
+complete map before any dataset/resource access; all mismatches are reported together. Never
+derive current hashes by modifying an older stage record, because resolved defaults and dormant
+groups are part of the current effective `FdrSettings` identity.
+
 All expert-keyed workflow state uses the canonical public identities `moments`, `mle`,
 `lower_order`, `msfdr`, `msfdr1_smix`, `msfdr2_smix`, and `nokoi`. Legacy MSFDR aliases are
 accepted only while parsing and normalize before map validation and fingerprinting. Locks,
