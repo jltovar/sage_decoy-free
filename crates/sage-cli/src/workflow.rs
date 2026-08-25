@@ -41,8 +41,9 @@ use anyhow::{Context, Result};
 use sage_core::decoy_free_fdr::{DfRunArtifacts, FittedArtifactProvenance};
 use sage_core::input::{
     AdaptiveNullWindowSearchOptions, EnsembleExpertOptions, EnsemblePCombiner, EnsemblePepCombiner,
-    FdrMode, FdrOptions, FdrSettings, ModelFit, NullWindowCandidate, NullWindowOptimizerOptions,
-    NullWindowSearchBounds, NullWindowSearchStrategy, NullWindowValidationScope,
+    ExpertIdentity, FdrMode, FdrOptions, FdrSettings, ModelFit, NullWindowCandidate,
+    NullWindowOptimizerOptions, NullWindowSearchBounds, NullWindowSearchStrategy,
+    NullWindowValidationScope,
 };
 use serde::{Deserialize, Serialize};
 use sha2::{Digest, Sha256};
@@ -286,8 +287,16 @@ pub struct EnsembleWinnerMaterialization {
     pub optimizer_scientific_result_sha256: String,
     pub optimizer_fingerprint: String,
     pub final_configuration_sha256: String,
-    pub expert_configuration_sha256: BTreeMap<String, String>,
-    pub expert_artifact_sha256: BTreeMap<String, String>,
+    #[serde(
+        deserialize_with = "sage_core::input::deserialize_expert_map",
+        serialize_with = "sage_core::input::serialize_expert_map"
+    )]
+    pub expert_configuration_sha256: BTreeMap<ExpertIdentity, String>,
+    #[serde(
+        deserialize_with = "sage_core::input::deserialize_expert_map",
+        serialize_with = "sage_core::input::serialize_expert_map"
+    )]
+    pub expert_artifact_sha256: BTreeMap<ExpertIdentity, String>,
     pub candidate_pool_identity: String,
     pub raw_annotation_cache_identity: Option<String>,
     pub implementation_source_sha256: String,
@@ -377,16 +386,24 @@ pub struct EnsembleLock {
     pub experts: Vec<EnsembleExpertLock>,
     /// Canonical JSON-requested voter roster, before technical validation.
     #[serde(default)]
-    pub requested_roster: Vec<String>,
+    pub requested_roster: Vec<ExpertIdentity>,
     /// Canonical roster that passed technical validation and will vote.
     #[serde(default)]
-    pub actual_roster: Vec<String>,
+    pub actual_roster: Vec<ExpertIdentity>,
     /// Explicit JSON exclusions, separate from technical failures.
     #[serde(default)]
-    pub explicit_exclusions: BTreeMap<String, String>,
+    #[serde(
+        deserialize_with = "sage_core::input::deserialize_expert_map",
+        serialize_with = "sage_core::input::serialize_expert_map"
+    )]
+    pub explicit_exclusions: BTreeMap<ExpertIdentity, String>,
     /// Per-model technical failures that prevented a requested vote.
     #[serde(default)]
-    pub technical_failures: BTreeMap<String, Vec<String>>,
+    #[serde(
+        deserialize_with = "sage_core::input::deserialize_expert_map",
+        serialize_with = "sage_core::input::serialize_expert_map"
+    )]
+    pub technical_failures: BTreeMap<ExpertIdentity, Vec<String>>,
     #[serde(default = "default_ensemble_roster_contract")]
     pub roster_contract: String,
     pub minimum_required_experts: usize,
@@ -442,16 +459,7 @@ fn default_ensemble_roster_contract() -> String {
 }
 
 fn expert_model_version(model: &ModelFit) -> &'static str {
-    match model {
-        ModelFit::Moments => "sage-moments-gumbel-v1",
-        ModelFit::Mle => "sage-mle-gumbel-v1",
-        ModelFit::LowerOrder => "sage-lower-order-local-lom-v1",
-        ModelFit::Msfdr => "sage-msfdr-seeded-v1",
-        ModelFit::Msfdr1Smix => "sage-msfdr-1smix-v1",
-        ModelFit::Msfdr2Smix => "sage-msfdr-2smix-v1",
-        ModelFit::Nokoi => "sage-nokoi-v2",
-        ModelFit::Ensemble => "sage-ensemble-continuous-psm-first-v1",
-    }
+    expert_identity(model).model_version()
 }
 
 fn resolved_setting_groups(model: &ModelFit) -> (Vec<String>, Vec<String>) {
@@ -844,7 +852,11 @@ pub struct WorkflowManifest {
     #[serde(default)]
     pub ensemble_lock: Option<PathBuf>,
     #[serde(default)]
-    pub locked_expert_artifacts: BTreeMap<String, PathBuf>,
+    #[serde(
+        deserialize_with = "sage_core::input::deserialize_expert_map",
+        serialize_with = "sage_core::input::serialize_expert_map"
+    )]
+    pub locked_expert_artifacts: BTreeMap<ExpertIdentity, PathBuf>,
     #[serde(default)]
     pub artifact_reuse_policy: ArtifactReusePolicy,
     /// Dataset-local target-only calibration semantics. The parity-oriented
@@ -862,7 +874,7 @@ pub struct WorkflowManifest {
 pub struct WindowProvenance {
     pub schema_version: u32,
     pub source_stage: String,
-    pub source_model: String,
+    pub source_model: ExpertIdentity,
     pub source_dataset_id: String,
     pub source_dataset_fingerprint: String,
     #[serde(default)]
@@ -891,7 +903,7 @@ pub struct StageRecord {
     #[serde(default = "default_schema")]
     pub schema_version: u32,
     pub stage: String,
-    pub model: String,
+    pub model: ExpertIdentity,
     pub input_hash: String,
     pub status: String,
     pub results: PathBuf,
@@ -965,12 +977,20 @@ pub struct StageRecord {
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub resolved_production_configuration: Option<ResolvedExpertConfiguration>,
     #[serde(default, skip_serializing_if = "BTreeMap::is_empty")]
-    pub ensemble_expert_configuration_sha256: BTreeMap<String, String>,
+    #[serde(
+        deserialize_with = "sage_core::input::deserialize_expert_map",
+        serialize_with = "sage_core::input::serialize_expert_map"
+    )]
+    pub ensemble_expert_configuration_sha256: BTreeMap<ExpertIdentity, String>,
     /// Exact model-to-artifact mapping consumed by an Ensemble stage. This is
     /// distinct from configuration identity and prevents a scientifically
     /// similar artifact (notably Nokoi) from replacing the selected input.
     #[serde(default, skip_serializing_if = "BTreeMap::is_empty")]
-    pub ensemble_expert_artifact_sha256: BTreeMap<String, String>,
+    #[serde(
+        deserialize_with = "sage_core::input::deserialize_expert_map",
+        serialize_with = "sage_core::input::serialize_expert_map"
+    )]
+    pub ensemble_expert_artifact_sha256: BTreeMap<ExpertIdentity, String>,
 }
 
 #[derive(Clone, Debug, Serialize, Deserialize)]
@@ -1150,7 +1170,7 @@ fn optimizer_execution_report(
 #[derive(Clone, Debug, Serialize, Deserialize, PartialEq, Eq)]
 pub struct PlannedModelReport {
     pub order: usize,
-    pub model: String,
+    pub model: ExpertIdentity,
     pub window_mode: String,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub fixed_window: Option<[u32; 2]>,
@@ -1395,7 +1415,7 @@ impl WorkflowManifest {
         let mut canonical_models = BTreeSet::new();
         for model in &self.models {
             anyhow::ensure!(
-                canonical_models.insert(model_slug(&model.model)),
+                canonical_models.insert(expert_identity(&model.model)),
                 "workflow contains duplicate canonical model {}",
                 model_slug(&model.model)
             );
@@ -1627,7 +1647,7 @@ impl WorkflowManifest {
                     );
                     anyhow::ensure!(
                         self.locked_expert_artifacts
-                            .get(model_slug(&model.model))
+                            .get(&expert_identity(&model.model))
                             .is_some_and(|path| path.is_file()),
                         "cross-dataset diagnostic model {:?} requires locked_expert_artifacts entry",
                         model.model
@@ -1683,17 +1703,12 @@ fn compute_dataset_identity(manifest: &WorkflowManifest) -> Result<DatasetIdenti
     })
 }
 
+fn expert_identity(model: &ModelFit) -> ExpertIdentity {
+    ExpertIdentity::from(model)
+}
+
 fn model_slug(model: &ModelFit) -> &'static str {
-    match model {
-        ModelFit::Moments => "moments",
-        ModelFit::Mle => "mle",
-        ModelFit::LowerOrder => "lower_order",
-        ModelFit::Msfdr => "msfdr",
-        ModelFit::Msfdr1Smix => "msfdr1_smix",
-        ModelFit::Msfdr2Smix => "msfdr2_smix",
-        ModelFit::Nokoi => "nokoi",
-        ModelFit::Ensemble => "ensemble",
-    }
+    expert_identity(model).as_str()
 }
 
 fn planned_model_reports(manifest: &WorkflowManifest) -> Vec<PlannedModelReport> {
@@ -1723,7 +1738,7 @@ fn planned_model_reports(manifest: &WorkflowManifest) -> Vec<PlannedModelReport>
             };
             PlannedModelReport {
                 order,
-                model: model_slug(&model.model).into(),
+                model: expert_identity(&model.model),
                 window_mode,
                 fixed_window,
                 ms2rescore_policy: match model.ms2rescore {
@@ -2631,7 +2646,7 @@ fn apply_ensemble_lock(
                         .iter()
                         .filter(|expert| expert.enabled)
                         .map(|expert| (
-                            model_slug(&expert.model).to_owned(),
+                            expert_identity(&expert.model),
                             expert.resolved_configuration_sha256.clone(),
                         ))
                         .collect::<BTreeMap<_, _>>()
@@ -2641,7 +2656,7 @@ fn apply_ensemble_lock(
                         .iter()
                         .filter(|expert| expert.enabled)
                         .map(|expert| (
-                            model_slug(&expert.model).to_owned(),
+                            expert_identity(&expert.model),
                             expert.optimized_fitted_artifacts_sha256.clone(),
                         ))
                         .collect::<BTreeMap<_, _>>(),
@@ -2754,7 +2769,7 @@ fn apply_ensemble_lock(
     let all_models = lock
         .experts
         .iter()
-        .map(|expert| model_slug(&expert.model))
+        .map(|expert| expert_identity(&expert.model))
         .collect::<BTreeSet<_>>();
     anyhow::ensure!(
         all_models.len() == lock.experts.len(),
@@ -2764,7 +2779,7 @@ fn apply_ensemble_lock(
         .experts
         .iter()
         .filter(|expert| expert.enabled)
-        .map(|expert| model_slug(&expert.model))
+        .map(|expert| expert_identity(&expert.model))
         .collect::<BTreeSet<_>>();
     anyhow::ensure!(
         unique_enabled.len() == enabled,
@@ -2777,10 +2792,7 @@ fn apply_ensemble_lock(
         requested == lock.requested_roster && requested_unique.len() == requested.len(),
         "Ensemble lock requested roster is not canonical and unique"
     );
-    let actual = unique_enabled
-        .iter()
-        .map(|model| (*model).to_owned())
-        .collect::<Vec<_>>();
+    let actual = unique_enabled.iter().copied().collect::<Vec<_>>();
     anyhow::ensure!(
         actual == lock.actual_roster,
         "Ensemble lock actual roster disagrees with enabled experts"
@@ -2812,8 +2824,8 @@ fn apply_ensemble_lock(
         "Ensemble lock explicit exclusions overlap the requested roster"
     );
     for expert in &lock.experts {
-        let model = model_slug(&expert.model);
-        let was_requested = requested_unique.contains(&model.to_owned());
+        let model = expert_identity(&expert.model);
+        let was_requested = requested_unique.contains(&model);
         if expert.enabled {
             anyhow::ensure!(
                 was_requested
@@ -2828,13 +2840,13 @@ fn apply_ensemble_lock(
                 expert.participation_decision == "excluded_technical_failure"
                     && lock
                         .technical_failures
-                        .get(model)
+                        .get(&model)
                         .is_some_and(|failures| failures == &expert.gate_reasons),
                 "requested disabled Ensemble expert {model} lacks matching technical-failure provenance"
             );
         } else if !was_requested {
             anyhow::ensure!(
-                lock.explicit_exclusions.contains_key(model),
+                lock.explicit_exclusions.contains_key(&model),
                 "unrequested Ensemble expert {model} lacks explicit-exclusion provenance"
             );
         }
@@ -3212,15 +3224,12 @@ fn validate_expected_ensemble_expert_configurations(
         .filter(|expert| expert.enabled)
         .map(|expert| {
             (
-                model_slug(&expert.model).to_owned(),
+                expert_identity(&expert.model),
                 expert.resolved_configuration_sha256.clone(),
             )
         })
         .collect::<BTreeMap<_, _>>();
-    anyhow::ensure!(
-        actual == config.expected_expert_configuration_sha256,
-        "preflight frozen expert configuration hashes differ from the prospectively declared map"
-    );
+    validate_expected_expert_configuration_hashes(config, &actual)?;
     for expert in lock.experts.iter().filter(|expert| expert.enabled) {
         validate_resolved_expert_configuration(
             &expert.resolved_configuration,
@@ -3241,6 +3250,17 @@ fn validate_expected_ensemble_expert_configurations(
     Ok(())
 }
 
+fn validate_expected_expert_configuration_hashes(
+    config: &ParameterOptimizerConfig,
+    actual: &BTreeMap<ExpertIdentity, String>,
+) -> Result<()> {
+    anyhow::ensure!(
+        actual == &config.expected_expert_configuration_sha256,
+        "preflight frozen expert configuration hashes differ from the prospectively declared map"
+    );
+    Ok(())
+}
+
 fn interaction_baseline_lock(lock: &EnsembleLock) -> Result<EnsembleLock> {
     let mut baseline = lock.clone();
     baseline.roster_contract = "interaction_diagnostic_baseline".into();
@@ -3252,7 +3272,7 @@ fn interaction_baseline_lock(lock: &EnsembleLock) -> Result<EnsembleLock> {
                 .gate_reasons
                 .push("not a member of the preregistered Ensemble interaction baseline".into());
             baseline.explicit_exclusions.insert(
-                model_slug(&expert.model).into(),
+                expert_identity(&expert.model),
                 "nonblocking interaction-diagnostic baseline exclusion".into(),
             );
         }
@@ -3261,7 +3281,7 @@ fn interaction_baseline_lock(lock: &EnsembleLock) -> Result<EnsembleLock> {
         .experts
         .iter()
         .filter(|expert| expert.enabled)
-        .map(|expert| model_slug(&expert.model).into())
+        .map(|expert| expert_identity(&expert.model))
         .collect();
     baseline.actual_roster.sort();
     let enabled = baseline
@@ -3282,8 +3302,8 @@ fn interaction_baseline_lock(lock: &EnsembleLock) -> Result<EnsembleLock> {
 }
 
 fn unavailable_interaction_report(
-    baseline_experts: Vec<String>,
-    final_experts: Vec<String>,
+    baseline_experts: Vec<ExpertIdentity>,
+    final_experts: Vec<ExpertIdentity>,
     reason: impl Into<String>,
 ) -> EnsembleInteractionCalibration {
     let baseline = baseline_experts.iter().cloned().collect::<BTreeSet<_>>();
@@ -3323,7 +3343,7 @@ fn build_ensemble_lock_with_failures(
     manifest_hash: &str,
     dataset: &DatasetIdentity,
     experts: &[CompletedExpert],
-    runtime_failures: &BTreeMap<String, Vec<String>>,
+    runtime_failures: &BTreeMap<ExpertIdentity, Vec<String>>,
 ) -> Result<EnsembleLock> {
     let optimization_only = manifest
         .parameter_optimizer
@@ -3355,7 +3375,7 @@ fn build_ensemble_lock_with_failures(
                 && model.model != ModelFit::Ensemble
                 && model.ensemble_participation == EnsembleParticipation::Auto
         })
-        .map(|model| model_slug(&model.model).to_owned())
+        .map(|model| expert_identity(&model.model))
         .collect::<Vec<_>>();
     requested_roster.sort();
     anyhow::ensure!(
@@ -3372,7 +3392,7 @@ fn build_ensemble_lock_with_failures(
         })
         .map(|model| {
             (
-                model_slug(&model.model).to_owned(),
+                expert_identity(&model.model),
                 model
                     .ensemble_exclusion_reason
                     .clone()
@@ -3800,7 +3820,7 @@ fn build_ensemble_lock_with_failures(
     candidates.sort_by_key(|candidate| model_slug(&candidate.expert.model));
     let completed_models = candidates
         .iter()
-        .map(|candidate| model_slug(&candidate.expert.model))
+        .map(|candidate| expert_identity(&candidate.expert.model))
         .collect::<BTreeSet<_>>();
     let requested_set = requested_roster.iter().cloned().collect::<BTreeSet<_>>();
     let mut technical_failures = runtime_failures
@@ -3809,7 +3829,7 @@ fn build_ensemble_lock_with_failures(
         .map(|(model, failures)| (model.clone(), failures.clone()))
         .collect::<BTreeMap<_, _>>();
     for requested in &requested_roster {
-        if !completed_models.contains(requested.as_str()) {
+        if !completed_models.contains(requested) {
             technical_failures
                 .entry(requested.clone())
                 .or_insert_with(|| {
@@ -3841,17 +3861,17 @@ fn build_ensemble_lock_with_failures(
         .filter(|candidate| candidate.requested && candidate.technical_failures.is_empty())
         .map(|candidate| {
             (
-                model_slug(&candidate.expert.model),
+                expert_identity(&candidate.expert.model),
                 candidate.peptides.clone(),
             )
         })
         .collect::<BTreeMap<_, _>>();
     let mut locked = Vec::new();
-    let mut enabled_optimized_hashes = BTreeMap::<String, String>::new();
-    let mut enabled_ms2_hashes = BTreeMap::<String, String>::new();
+    let mut enabled_optimized_hashes = BTreeMap::<String, ExpertIdentity>::new();
+    let mut enabled_ms2_hashes = BTreeMap::<String, ExpertIdentity>::new();
     for candidate in candidates {
         let expert = candidate.expert;
-        let model = model_slug(&expert.model).to_owned();
+        let model = expert_identity(&expert.model);
         let mut failures = candidate.technical_failures;
         let unique_peptides = candidate
             .peptides
@@ -3859,20 +3879,18 @@ fn build_ensemble_lock_with_failures(
             .filter(|peptide| {
                 !requested_valid_peptide_sets
                     .iter()
-                    .any(|(other, peptides)| {
-                        *other != model.as_str() && peptides.contains(*peptide)
-                    })
+                    .any(|(other, peptides)| *other != model && peptides.contains(*peptide))
             })
             .count();
         let enabled = candidate.requested && failures.is_empty();
         if enabled {
             if let Some(previous) =
-                enabled_optimized_hashes.insert(candidate.optimized_hash.clone(), model.clone())
+                enabled_optimized_hashes.insert(candidate.optimized_hash.clone(), model)
             {
                 anyhow::bail!("duplicate optimized artifact vote for {previous} and {model}");
             }
             if let Some(hash) = candidate.ms2_hash.as_ref() {
-                if let Some(previous) = enabled_ms2_hashes.insert(hash.clone(), model.clone()) {
+                if let Some(previous) = enabled_ms2_hashes.insert(hash.clone(), model) {
                     anyhow::bail!("duplicate MS2Rescore artifact vote for {previous} and {model}");
                 }
             }
@@ -3880,7 +3898,7 @@ fn build_ensemble_lock_with_failures(
         if candidate.requested && !failures.is_empty() {
             failures.sort();
             failures.dedup();
-            technical_failures.insert(model.clone(), failures.clone());
+            technical_failures.insert(model, failures.clone());
         }
         let participation_decision = if enabled {
             "included_technical_validation_passed"
@@ -3952,7 +3970,7 @@ fn build_ensemble_lock_with_failures(
     let mut actual_roster = locked
         .iter()
         .filter(|expert| expert.enabled)
-        .map(|expert| model_slug(&expert.model).to_owned())
+        .map(|expert| expert_identity(&expert.model))
         .collect::<Vec<_>>();
     actual_roster.sort();
     let enabled = actual_roster.len();
@@ -4016,7 +4034,7 @@ fn fitted_artifact_provenance_with_configuration(
     model: &ModelFit,
     fit_search_fingerprint: &str,
     resolved_configuration_sha256: &str,
-    resolved_expert_configurations_sha256: BTreeMap<String, String>,
+    resolved_expert_configurations_sha256: BTreeMap<ExpertIdentity, String>,
 ) -> FittedArtifactProvenance {
     FittedArtifactProvenance {
         schema_version: 3,
@@ -4026,7 +4044,7 @@ fn fitted_artifact_provenance_with_configuration(
         fit_search_fingerprint: fit_search_fingerprint.into(),
         candidate_id_schema: CANDIDATE_ID_SCHEMA.into(),
         fit_stage: stage.into(),
-        model: model_slug(model).into(),
+        model: expert_identity(model),
         resolved_configuration_sha256: resolved_configuration_sha256.into(),
         implementation_source_sha256:
             crate::parameter_optimizer::PARAMETER_OPTIMIZER_IMPLEMENTATION_SOURCE_SHA256.into(),
@@ -4074,7 +4092,7 @@ fn validate_artifact_reuse(
     };
     let dataset_matches = provenance.dataset_fingerprint == dataset.fingerprint;
     let config_matches = provenance.search_config_sha256 == dataset.search_config_sha256;
-    let model_matches = provenance.model == model_slug(expected_model);
+    let model_matches = provenance.model == expert_identity(expected_model);
     if expected_model == &ModelFit::Nokoi {
         let artifact = artifacts
             .nokoi
@@ -4195,7 +4213,7 @@ fn stamp_fitted_artifacts_with_configuration(
     fit_search_fingerprint: &str,
     fit_analysis_fingerprint: &str,
     resolved_configuration_sha256: &str,
-    resolved_expert_configurations_sha256: &BTreeMap<String, String>,
+    resolved_expert_configurations_sha256: &BTreeMap<ExpertIdentity, String>,
 ) -> Result<Option<FittedArtifactProvenance>> {
     let path = output_directory.join("fitted_model_artifacts.json");
     if !path.is_file() {
@@ -4385,7 +4403,7 @@ fn stage_checkpoint_identity_matches(
     record.status == "complete"
         && record.input_hash == input_hash
         && record.stage == stage
-        && record.model == model_slug(model)
+        && record.model == expert_identity(model)
         && record.dataset_id == dataset.dataset_id
         && record.dataset_fingerprint == dataset.fingerprint
         && record.results == results
@@ -4691,7 +4709,7 @@ fn run_search_stage(
             let configuration =
                 build_resolved_expert_configuration(&entry.model, (*entry.options).clone())?;
             Ok((
-                model_slug(&entry.model).to_owned(),
+                expert_identity(&entry.model),
                 configuration.resolved_configuration_sha256,
             ))
         })
@@ -4704,7 +4722,7 @@ fn run_search_stage(
                 .filter(|expert| expert.enabled)
                 .map(|expert| {
                     (
-                        model_slug(&expert.model).to_owned(),
+                        expert_identity(&expert.model),
                         expert.optimized_fitted_artifacts_sha256.clone(),
                     )
                 })
@@ -4739,7 +4757,7 @@ fn run_search_stage(
                     fit_search_fingerprint: String::new(),
                     candidate_id_schema: String::new(),
                     fit_stage: "unknown".into(),
-                    model: model_slug(&model.model).into(),
+                    model: expert_identity(&model.model),
                     resolved_configuration_sha256: String::new(),
                     implementation_source_sha256: String::new(),
                     resolved_expert_configurations_sha256: BTreeMap::new(),
@@ -4779,7 +4797,7 @@ fn run_search_stage(
     let mut record = StageRecord {
         schema_version: 5,
         stage: stage.into(),
-        model: model_slug(&model.model).into(),
+        model: expert_identity(&model.model),
         input_hash,
         status: if plan_only { "planned" } else { "running" }.into(),
         results,
@@ -4997,16 +5015,7 @@ fn run_search_stage(
 }
 
 fn optimizer_expert(model: &ModelFit) -> OptimizerExpert {
-    match model {
-        ModelFit::Moments => OptimizerExpert::Moments,
-        ModelFit::Mle => OptimizerExpert::Mle,
-        ModelFit::LowerOrder => OptimizerExpert::LowerOrder,
-        ModelFit::Msfdr => OptimizerExpert::MsfdrSeeded,
-        ModelFit::Msfdr1Smix => OptimizerExpert::Msfdr1Smix,
-        ModelFit::Msfdr2Smix => OptimizerExpert::Msfdr2Smix,
-        ModelFit::Nokoi => OptimizerExpert::Nokoi,
-        ModelFit::Ensemble => OptimizerExpert::Ensemble,
-    }
+    OptimizerExpert::from(expert_identity(model))
 }
 
 fn optimizer_config_for_expert(
@@ -5634,7 +5643,7 @@ fn validate_optimizer_ensemble_winner_lock(
         .context("optimizer result has no materialized artifact record for its selected block")?;
     anyhow::ensure!(
         stage.status == "complete"
-            && stage.model == model_slug(&ModelFit::Ensemble)
+            && stage.model == ExpertIdentity::Ensemble
             && !stage.fallback_used
             && stage.results_sha256 == results_hash
             && materialization.selected_trial_result_sha256 == results_hash
@@ -5681,7 +5690,7 @@ fn validate_optimizer_ensemble_winner_lock(
         .filter(|expert| expert.enabled)
         .map(|expert| {
             (
-                model_slug(&expert.model).to_owned(),
+                expert_identity(&expert.model),
                 expert.resolved_configuration_sha256.clone(),
             )
         })
@@ -5692,7 +5701,7 @@ fn validate_optimizer_ensemble_winner_lock(
         .filter(|expert| expert.enabled)
         .map(|expert| {
             (
-                model_slug(&expert.model).to_owned(),
+                expert_identity(&expert.model),
                 expert.optimized_fitted_artifacts_sha256.clone(),
             )
         })
@@ -5951,7 +5960,7 @@ fn materialize_optimizer_ensemble_winner_lock(
         .filter(|expert| expert.enabled)
         .map(|expert| {
             (
-                model_slug(&expert.model).to_owned(),
+                expert_identity(&expert.model),
                 expert.resolved_configuration_sha256.clone(),
             )
         })
@@ -5962,7 +5971,7 @@ fn materialize_optimizer_ensemble_winner_lock(
         .filter(|expert| expert.enabled)
         .map(|expert| {
             (
-                model_slug(&expert.model).to_owned(),
+                expert_identity(&expert.model),
                 expert.optimized_fitted_artifacts_sha256.clone(),
             )
         })
@@ -6664,7 +6673,7 @@ pub fn execute_workflow(
 
     let mut stages = Vec::new();
     let mut completed_experts = Vec::new();
-    let mut runtime_expert_failures = BTreeMap::<String, Vec<String>>::new();
+    let mut runtime_expert_failures = BTreeMap::<ExpertIdentity, Vec<String>>::new();
     let mut ensemble_interaction_report = None;
     let mut runtime = WorkflowRuntime::default();
     let mut optimization_results = Vec::new();
@@ -6682,7 +6691,7 @@ pub fn execute_workflow(
         {
             manifest
                 .locked_expert_artifacts
-                .get(model_slug(&model.model))
+                .get(&expert_identity(&model.model))
                 .map(PathBuf::as_path)
         } else {
             None
@@ -6731,11 +6740,11 @@ pub fn execute_workflow(
                         "expected_expert_configuration_sha256": config.expected_expert_configuration_sha256,
                         "resolved_expert_configuration_sha256": lock.experts.iter()
                             .filter(|expert| expert.enabled)
-                            .map(|expert| (model_slug(&expert.model).to_owned(), expert.resolved_configuration_sha256.clone()))
+                            .map(|expert| (expert_identity(&expert.model), expert.resolved_configuration_sha256.clone()))
                             .collect::<BTreeMap<_, _>>(),
                         "resolved_expert_artifact_sha256": lock.experts.iter()
                             .filter(|expert| expert.enabled)
-                            .map(|expert| (model_slug(&expert.model).to_owned(), expert.optimized_fitted_artifacts_sha256.clone()))
+                            .map(|expert| (expert_identity(&expert.model), expert.optimized_fitted_artifacts_sha256.clone()))
                             .collect::<BTreeMap<_, _>>(),
                         "roster": lock.actual_roster,
                     }),
@@ -6823,7 +6832,7 @@ pub fn execute_workflow(
                 let reason = format!("optimized expert stage failed technically: {error:#}");
                 log::warn!("workflow: excluding {}: {reason}", model_slug(&model.model));
                 runtime_expert_failures
-                    .entry(model_slug(&model.model).into())
+                    .entry(expert_identity(&model.model))
                     .or_default()
                     .push(reason);
                 continue;
@@ -6855,7 +6864,7 @@ pub fn execute_workflow(
                     let reason = format!("optimized expert window is invalid: {error:#}");
                     log::warn!("workflow: excluding {}: {reason}", model_slug(&model.model));
                     runtime_expert_failures
-                        .entry(model_slug(&model.model).into())
+                        .entry(expert_identity(&model.model))
                         .or_default()
                         .push(reason);
                     continue;
@@ -6891,7 +6900,7 @@ pub fn execute_workflow(
                     let reason = format!("MS2Rescore expert stage failed technically: {error:#}");
                     log::warn!("workflow: excluding {}: {reason}", model_slug(&model.model));
                     runtime_expert_failures
-                        .entry(model_slug(&model.model).into())
+                        .entry(expert_identity(&model.model))
                         .or_default()
                         .push(reason);
                     continue;
@@ -7007,7 +7016,7 @@ pub fn execute_workflow(
                 .experts
                 .iter()
                 .filter(|expert| expert.enabled)
-                .map(|expert| model_slug(&expert.model).into())
+                .map(|expert| expert_identity(&expert.model))
                 .collect::<Vec<_>>();
             let baseline_experts = baseline_lock
                 .as_ref()
@@ -7015,7 +7024,7 @@ pub fn execute_workflow(
                     lock.experts
                         .iter()
                         .filter(|expert| expert.enabled)
-                        .map(|expert| model_slug(&expert.model).into())
+                        .map(|expert| expert_identity(&expert.model))
                         .collect::<Vec<_>>()
                 })
                 .unwrap_or_default();
@@ -7178,7 +7187,7 @@ pub fn execute_workflow(
                 "fitted model artifacts were not produced by the entrapment search".to_owned();
             log::warn!("workflow: excluding {}: {reason}", model_slug(&model.model));
             runtime_expert_failures
-                .entry(model_slug(&model.model).into())
+                .entry(expert_identity(&model.model))
                 .or_default()
                 .push(reason);
             continue;
@@ -7194,7 +7203,7 @@ pub fn execute_workflow(
         let window_provenance = WindowProvenance {
             schema_version: 1,
             source_stage: calibration_record.stage.clone(),
-            source_model: model_slug(&locked_model.model).into(),
+            source_model: expert_identity(&locked_model.model),
             source_dataset_id: dataset.dataset_id.clone(),
             source_dataset_fingerprint: dataset.fingerprint.clone(),
             min_rank: locked_model.window.as_ref().map(|window| window.min_rank),
@@ -7262,7 +7271,7 @@ pub fn execute_workflow(
                 let record = StageRecord {
                     schema_version: 4,
                     stage: policy.stage_name().into(),
-                    model: model_slug(&locked_model.model).into(),
+                    model: expert_identity(&locked_model.model),
                     input_hash,
                     status: "not_evaluable".into(),
                     results: target_output_directory.join("results.sage.tsv"),
@@ -7345,7 +7354,7 @@ pub fn execute_workflow(
                     let reason = format!("target-only expert stage failed technically: {error:#}");
                     log::warn!("workflow: excluding {}: {reason}", model_slug(&model.model));
                     runtime_expert_failures
-                        .entry(model_slug(&model.model).into())
+                        .entry(expert_identity(&model.model))
                         .or_default()
                         .push(reason);
                     continue 'models;
@@ -7456,7 +7465,7 @@ pub fn execute_workflow(
                     let reason = format!("expert completion provenance is invalid: {error:#}");
                     log::warn!("workflow: excluding {}: {reason}", model_slug(&model.model));
                     runtime_expert_failures
-                        .entry(model_slug(&model.model).into())
+                        .entry(expert_identity(&model.model))
                         .or_default()
                         .push(reason);
                     continue;
@@ -7594,7 +7603,7 @@ pub fn execute_workflow(
         .iter()
         .map(|expert| {
             (
-                model_slug(&expert.model).to_owned(),
+                expert_identity(&expert.model),
                 expert.calibration_stage.clone(),
             )
         })
@@ -7602,7 +7611,7 @@ pub fn execute_workflow(
     let mut runs = manifest.validation.additional_runs.clone();
     runs.extend(stages.iter().filter(|stage| stage.evaluable).map(|stage| {
         ValidationRun {
-            method: stage.model.clone(),
+            method: stage.model.to_string(),
             stage: stage.stage.clone(),
             results: stage.results.clone(),
             mode: ValidationMode::DecoyFree,
@@ -8103,11 +8112,11 @@ mod tests {
             .contains("incomplete"));
         config
             .expected_expert_configuration_sha256
-            .insert("moments".into(), "a".repeat(64));
+            .insert(ExpertIdentity::Moments, "a".repeat(64));
         config.validate().unwrap();
         config
             .expected_expert_configuration_sha256
-            .insert("mle".into(), "b".repeat(64));
+            .insert(ExpertIdentity::Mle, "b".repeat(64));
         assert!(config
             .validate()
             .unwrap_err()
@@ -8929,7 +8938,7 @@ mod tests {
 
         let state = execute_workflow(&manifest_path, &directory, 1, true).unwrap();
         assert_eq!(state.planned_models.len(), 1);
-        assert_eq!(state.planned_models[0].model, "moments");
+        assert_eq!(state.planned_models[0].model, ExpertIdentity::Moments);
         assert_eq!(
             state.planned_models[0].window_mode,
             "dataset_local_explicit_grid"
@@ -9032,14 +9041,17 @@ mod tests {
     #[test]
     fn unavailable_interaction_diagnostic_has_no_participation_effect() {
         let report = unavailable_interaction_report(
-            vec!["moments".into()],
-            vec!["moments".into(), "mle".into()],
+            vec![ExpertIdentity::Moments],
+            vec![ExpertIdentity::Moments, ExpertIdentity::Mle],
             "missing validation table",
         );
         assert!(!report.evaluable);
         assert!(!report.final_level4_calibration_pass);
         assert_eq!(report.participation_effect, "none_nonblocking_diagnostic");
-        assert_eq!(report.final_experts, vec!["moments", "mle"]);
+        assert_eq!(
+            report.final_experts,
+            vec![ExpertIdentity::Moments, ExpertIdentity::Mle]
+        );
     }
 
     #[test]
@@ -9147,7 +9159,7 @@ mod tests {
         let mut record = StageRecord {
             schema_version: 3,
             stage: "optimized".into(),
-            model: "moments".into(),
+            model: ExpertIdentity::Moments,
             input_hash: "input".into(),
             status: "running".into(),
             results: results.clone(),
@@ -9482,7 +9494,7 @@ mod tests {
                 fit_search_fingerprint: "isb-search".into(),
                 candidate_id_schema: CANDIDATE_ID_SCHEMA.into(),
                 fit_stage: "optimized".into(),
-                model: "moments".into(),
+                model: ExpertIdentity::Moments,
                 resolved_configuration_sha256: String::new(),
                 implementation_source_sha256: String::new(),
                 resolved_expert_configurations_sha256: BTreeMap::new(),
@@ -9555,7 +9567,7 @@ mod tests {
         manifest.models[0].ms2rescore = Ms2RescorePolicy::Always;
         manifest
             .locked_expert_artifacts
-            .insert("moments".into(), artifact);
+            .insert(ExpertIdentity::Moments, artifact);
         manifest.artifact_reuse_policy = ArtifactReusePolicy::CrossDatasetDiagnostic;
         assert!(manifest.validate().is_err());
         manifest.validation.diagnostic_only = true;
@@ -9770,7 +9782,7 @@ mod tests {
         );
         let requested_roster = experts
             .iter()
-            .map(|expert| model_slug(&expert.model).to_owned())
+            .map(|expert| expert_identity(&expert.model))
             .collect::<Vec<_>>();
         let lock = stamp_ensemble_lock_analysis_fingerprint(EnsembleLock {
             schema_version: 10,
@@ -9940,7 +9952,7 @@ mod tests {
             std::slice::from_ref(&expert),
         )
         .unwrap();
-        assert_eq!(lock.requested_roster, vec![model_slug(&model)]);
+        assert_eq!(lock.requested_roster, vec![expert_identity(&model)]);
         assert_eq!(lock.actual_roster, lock.requested_roster);
         assert!(lock.experts[0].enabled);
         assert!(lock.technical_failures.is_empty());
@@ -9978,7 +9990,7 @@ mod tests {
         assert_eq!(
             excluded
                 .explicit_exclusions
-                .get(model_slug(&model))
+                .get(&expert_identity(&model))
                 .map(String::as_str),
             Some("explicit test exclusion")
         );
@@ -10443,7 +10455,7 @@ mod tests {
             .filter(|expert| expert.enabled)
             .map(|expert| {
                 (
-                    model_slug(&expert.model).to_owned(),
+                    expert_identity(&expert.model),
                     expert.resolved_configuration_sha256.clone(),
                 )
             })
@@ -10452,7 +10464,7 @@ mod tests {
         let mut wrong_expected = expected_config.clone();
         wrong_expected
             .expected_expert_configuration_sha256
-            .insert("moments".into(), "f".repeat(64));
+            .insert(ExpertIdentity::Moments, "f".repeat(64));
         assert!(
             validate_expected_ensemble_expert_configurations(Some(&wrong_expected), &lock)
                 .unwrap_err()
@@ -10485,7 +10497,7 @@ mod tests {
             .filter(|expert| expert.enabled)
             .map(|expert| {
                 (
-                    model_slug(&expert.model).to_owned(),
+                    expert_identity(&expert.model),
                     expert.resolved_configuration_sha256.clone(),
                 )
             })
@@ -10496,7 +10508,7 @@ mod tests {
             .filter(|expert| expert.enabled)
             .map(|expert| {
                 (
-                    model_slug(&expert.model).to_owned(),
+                    expert_identity(&expert.model),
                     expert.optimized_fitted_artifacts_sha256.clone(),
                 )
             })
@@ -10739,11 +10751,14 @@ mod tests {
         );
         assert_eq!(lock.dataset_fingerprint, dataset.fingerprint);
         assert_eq!(lock.schema_version, 10);
-        assert_eq!(lock.requested_roster, vec!["mle", "moments"]);
+        assert_eq!(
+            lock.requested_roster,
+            vec![ExpertIdentity::Mle, ExpertIdentity::Moments]
+        );
         assert_eq!(lock.actual_roster, lock.requested_roster);
         assert!(lock.technical_failures.is_empty());
         let runtime_failure = BTreeMap::from([(
-            "mle".into(),
+            ExpertIdentity::Mle,
             vec!["target-only expert stage failed technically: corrupt payload".into()],
         )]);
         let reduced = build_ensemble_lock_with_failures(
@@ -10754,8 +10769,11 @@ mod tests {
             &runtime_failure,
         )
         .unwrap();
-        assert_eq!(reduced.requested_roster, vec!["mle", "moments"]);
-        assert_eq!(reduced.actual_roster, vec!["moments"]);
+        assert_eq!(
+            reduced.requested_roster,
+            vec![ExpertIdentity::Mle, ExpertIdentity::Moments]
+        );
+        assert_eq!(reduced.actual_roster, vec![ExpertIdentity::Moments]);
         assert_eq!(reduced.technical_failures, runtime_failure);
         assert!(!reduced.evaluable);
         assert!(lock.evaluable);
@@ -11299,5 +11317,113 @@ mod tests {
             .iter()
             .any(|reason| reason.contains("artifact")));
         std::fs::remove_dir_all(directory).unwrap();
+    }
+
+    #[test]
+    fn seven_expert_identity_is_canonical_across_preflight_runtime_and_target_policy() {
+        let optimizer_experts = [
+            OptimizerExpert::Moments,
+            OptimizerExpert::Mle,
+            OptimizerExpert::LowerOrder,
+            OptimizerExpert::MsfdrSeeded,
+            OptimizerExpert::Msfdr1Smix,
+            OptimizerExpert::Msfdr2Smix,
+            OptimizerExpert::Nokoi,
+        ];
+        let models = [
+            ModelFit::Moments,
+            ModelFit::Mle,
+            ModelFit::LowerOrder,
+            ModelFit::Msfdr,
+            ModelFit::Msfdr1Smix,
+            ModelFit::Msfdr2Smix,
+            ModelFit::Nokoi,
+        ];
+        let mut expected = BTreeMap::new();
+        for (ordinal, (optimizer, model)) in
+            optimizer_experts.into_iter().zip(models.iter()).enumerate()
+        {
+            let from_optimizer = ExpertIdentity::from(optimizer);
+            let from_workflow = expert_identity(model);
+            assert_eq!(from_optimizer, from_workflow);
+            assert_eq!(
+                target_only_policy_capability(
+                    model,
+                    TargetOnlyCalibrationPolicy::RefitWithLockedWindow
+                )
+                .model,
+                from_optimizer
+            );
+            expected.insert(from_optimizer, format!("{:064x}", ordinal + 1));
+        }
+
+        let mut config = test_optimizer_config();
+        config.selected_experts = optimizer_experts
+            .into_iter()
+            .chain(std::iter::once(OptimizerExpert::Ensemble))
+            .collect();
+        config.require_expected_expert_configurations = true;
+        config.expected_expert_configuration_sha256 = expected.clone();
+        config.validate().unwrap();
+        validate_expected_expert_configuration_hashes(&config, &expected).unwrap();
+        let mut missing = expected.clone();
+        missing.remove(&ExpertIdentity::Nokoi);
+        assert!(validate_expected_expert_configuration_hashes(&config, &missing).is_err());
+        let mut wrong = expected.clone();
+        wrong.insert(ExpertIdentity::Msfdr, "f".repeat(64));
+        assert!(validate_expected_expert_configuration_hashes(&config, &wrong).is_err());
+        assert_ne!(ExpertIdentity::Msfdr, ExpertIdentity::Msfdr1Smix);
+        assert_ne!(ExpertIdentity::Msfdr, ExpertIdentity::Msfdr2Smix);
+        assert_ne!(ExpertIdentity::Msfdr1Smix, ExpertIdentity::Msfdr2Smix);
+
+        let canonical_json = serde_json::to_string(&config).unwrap();
+        let alias_json = canonical_json
+            .replace("\"msfdr\"", "\"msfdr_seeded\"")
+            .replace("\"msfdr1_smix\"", "\"msfdr_1smix\"")
+            .replace("\"msfdr2_smix\"", "\"msfdr_2smix\"");
+        let aliased: ParameterOptimizerConfig = serde_json::from_str(&alias_json).unwrap();
+        aliased.validate().unwrap();
+        validate_expected_expert_configuration_hashes(&aliased, &expected).unwrap();
+        assert_eq!(
+            serde_json::to_value(&config).unwrap(),
+            serde_json::to_value(&aliased).unwrap()
+        );
+
+        let artifact_hashes = expected
+            .keys()
+            .copied()
+            .enumerate()
+            .map(|(ordinal, expert)| (expert, format!("{:064x}", ordinal + 101)))
+            .collect::<BTreeMap<_, _>>();
+        let materialization = EnsembleWinnerMaterialization {
+            schema_version: 1,
+            selected_trial_id: "nonbaseline-winner".into(),
+            selected_trial_result_sha256: "1".repeat(64),
+            selected_fitted_artifact_sha256: "2".repeat(64),
+            optimizer_scientific_result_sha256: "3".repeat(64),
+            optimizer_fingerprint: "4".repeat(64),
+            final_configuration_sha256: "5".repeat(64),
+            expert_configuration_sha256: expected.clone(),
+            expert_artifact_sha256: artifact_hashes.clone(),
+            candidate_pool_identity: "candidate".into(),
+            raw_annotation_cache_identity: Some("raw-cache".into()),
+            implementation_source_sha256: "6".repeat(64),
+            fallback_used: false,
+            technical_validity: "valid_no_fallback".into(),
+            development_selection_eligible: true,
+            empirical_calibration_power: EmpiricalCalibrationPower::Underpowered,
+            statistical_validation_status: StatisticalValidationStatus::NotEvaluableUnderpowered,
+            statistical_default_eligibility: StatisticalDefaultEligibility::NotEvaluated,
+        };
+        let serialized = serde_json::to_string(&materialization).unwrap();
+        assert!(serialized.contains("\"msfdr\""));
+        assert!(!serialized.contains("\"msfdr_seeded\""));
+        let round_trip: EnsembleWinnerMaterialization = serde_json::from_str(&serialized).unwrap();
+        assert_eq!(round_trip.expert_configuration_sha256, expected);
+        assert_eq!(round_trip.expert_artifact_sha256, artifact_hashes);
+        assert_eq!(
+            round_trip.expert_artifact_sha256[&ExpertIdentity::Nokoi],
+            materialization.expert_artifact_sha256[&ExpertIdentity::Nokoi]
+        );
     }
 }

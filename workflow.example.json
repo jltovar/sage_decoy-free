@@ -157,8 +157,8 @@
     "enabled": false,
     "classification": "development_only",
     "selected_experts": [
-      "moments", "mle", "lower_order", "msfdr_seeded",
-      "msfdr_1smix", "msfdr_2smix", "nokoi", "ensemble"
+      "moments", "mle", "lower_order", "msfdr",
+      "msfdr1_smix", "msfdr2_smix", "nokoi", "ensemble"
     ],
     "expected_expert_configuration_sha256": {},
     "require_expected_expert_configurations": false,

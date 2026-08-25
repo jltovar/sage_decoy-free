@@ -1,7 +1,11 @@
 use crate::ml::lower_order::LowerOrderArtifact;
 use crate::ml::msfdr::{Msfdr1SmixModel, Msfdr2SmixModel, MsfdrSeededModel};
 use crate::ml::nokoi::{NokoiArtifact, NokoiArtifactApplicationMode};
-use serde::{Deserialize, Serialize};
+use serde::de::{Error as DeError, MapAccess, Visitor};
+use serde::ser::SerializeMap;
+use serde::{Deserialize, Deserializer, Serialize, Serializer};
+use std::collections::BTreeMap;
+use std::fmt;
 
 #[derive(Clone, Serialize, Deserialize, Debug, Default, PartialEq, Eq)]
 #[serde(rename_all = "snake_case")]
@@ -9,6 +13,83 @@ pub enum FdrMode {
     #[default]
     Tdc,
     DecoyFree,
+}
+
+#[cfg(test)]
+mod expert_identity_tests {
+    use super::*;
+
+    #[derive(Debug, Serialize, Deserialize)]
+    struct IdentityMapFixture {
+        #[serde(
+            deserialize_with = "deserialize_expert_map",
+            serialize_with = "serialize_expert_map"
+        )]
+        values: BTreeMap<ExpertIdentity, String>,
+    }
+
+    #[test]
+    fn canonical_and_legacy_expert_identifiers_normalize_and_serialize_canonically() {
+        let canonical = [
+            ("moments", ExpertIdentity::Moments),
+            ("mle", ExpertIdentity::Mle),
+            ("lower_order", ExpertIdentity::LowerOrder),
+            ("msfdr", ExpertIdentity::Msfdr),
+            ("msfdr1_smix", ExpertIdentity::Msfdr1Smix),
+            ("msfdr2_smix", ExpertIdentity::Msfdr2Smix),
+            ("nokoi", ExpertIdentity::Nokoi),
+        ];
+        for (declared, expected) in canonical {
+            assert_eq!(ExpertIdentity::parse(declared).unwrap(), expected);
+            assert_eq!(
+                serde_json::to_string(&expected).unwrap(),
+                format!("\"{declared}\"")
+            );
+        }
+        for (alias, expected) in [
+            ("msfdr_seeded", ExpertIdentity::Msfdr),
+            ("msfdr_1smix", ExpertIdentity::Msfdr1Smix),
+            ("msfdr_2smix", ExpertIdentity::Msfdr2Smix),
+        ] {
+            assert_eq!(ExpertIdentity::parse(alias).unwrap(), expected);
+            assert_eq!(
+                serde_json::from_str::<ExpertIdentity>(&format!("\"{alias}\"")).unwrap(),
+                expected
+            );
+            assert_eq!(
+                serde_json::to_string(&expected).unwrap(),
+                format!("\"{}\"", expected.as_str())
+            );
+        }
+        assert!(ExpertIdentity::parse("msfdr3").is_err());
+    }
+
+    #[test]
+    fn expert_maps_reject_duplicate_logical_experts_and_unknown_keys() {
+        for json in [
+            r#"{"values":{"msfdr":"a","msfdr_seeded":"b"}}"#,
+            r#"{"values":{"msfdr1_smix":"a","msfdr_1smix":"b"}}"#,
+            r#"{"values":{"unknown":"a"}}"#,
+        ] {
+            assert!(serde_json::from_str::<IdentityMapFixture>(json).is_err());
+        }
+    }
+
+    #[test]
+    fn model_fit_aliases_share_the_canonical_identity() {
+        for (alias, expected) in [
+            ("msfdr_seeded", ExpertIdentity::Msfdr),
+            ("msfdr_1smix", ExpertIdentity::Msfdr1Smix),
+            ("msfdr_2smix", ExpertIdentity::Msfdr2Smix),
+        ] {
+            let model: ModelFit = serde_json::from_str(&format!("\"{alias}\"")).unwrap();
+            assert_eq!(ExpertIdentity::from(&model), expected);
+            assert_eq!(
+                serde_json::to_string(&model).unwrap(),
+                format!("\"{}\"", expected.as_str())
+            );
+        }
+    }
 }
 
 #[derive(Clone, Serialize, Deserialize, Debug, Default, PartialEq, Eq)]
@@ -20,12 +101,213 @@ pub enum ModelFit {
     LowerOrder,
 
     // MSFDR family
+    #[serde(alias = "msfdr_seeded")]
     Msfdr,
+    #[serde(alias = "msfdr_1smix")]
     Msfdr1Smix,
+    #[serde(alias = "msfdr_2smix")]
     Msfdr2Smix,
 
     Nokoi,
     Ensemble,
+}
+
+/// Canonical public identity shared by workflow manifests, optimizer records,
+/// fitted artifacts, Ensemble locks, and target-only reconstruction.
+///
+/// Legacy MSFDR spellings are accepted only at deserialization boundaries.
+/// Serialization, ordering, equality, hashing, and map lookup always use the
+/// canonical public spelling.
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
+pub enum ExpertIdentity {
+    Moments,
+    Mle,
+    LowerOrder,
+    Msfdr,
+    Msfdr1Smix,
+    Msfdr2Smix,
+    Nokoi,
+    Ensemble,
+}
+
+impl ExpertIdentity {
+    pub const INDIVIDUALS: [Self; 7] = [
+        Self::Moments,
+        Self::Mle,
+        Self::LowerOrder,
+        Self::Msfdr,
+        Self::Msfdr1Smix,
+        Self::Msfdr2Smix,
+        Self::Nokoi,
+    ];
+
+    pub const fn as_str(self) -> &'static str {
+        match self {
+            Self::Moments => "moments",
+            Self::Mle => "mle",
+            Self::LowerOrder => "lower_order",
+            Self::Msfdr => "msfdr",
+            Self::Msfdr1Smix => "msfdr1_smix",
+            Self::Msfdr2Smix => "msfdr2_smix",
+            Self::Nokoi => "nokoi",
+            Self::Ensemble => "ensemble",
+        }
+    }
+
+    pub const fn is_individual(self) -> bool {
+        !matches!(self, Self::Ensemble)
+    }
+
+    pub fn parse(value: &str) -> Result<Self, String> {
+        match value {
+            "moments" => Ok(Self::Moments),
+            "mle" => Ok(Self::Mle),
+            "lower_order" => Ok(Self::LowerOrder),
+            "msfdr" | "msfdr_seeded" => Ok(Self::Msfdr),
+            "msfdr1_smix" | "msfdr_1smix" => Ok(Self::Msfdr1Smix),
+            "msfdr2_smix" | "msfdr_2smix" => Ok(Self::Msfdr2Smix),
+            "nokoi" => Ok(Self::Nokoi),
+            "ensemble" => Ok(Self::Ensemble),
+            _ => Err(format!("unknown Decoy-Free expert identifier {value:?}")),
+        }
+    }
+
+    pub const fn model_version(self) -> &'static str {
+        match self {
+            Self::Moments => "sage-moments-gumbel-v1",
+            Self::Mle => "sage-mle-gumbel-v1",
+            Self::LowerOrder => "sage-lower-order-local-lom-v1",
+            Self::Msfdr => "sage-msfdr-seeded-v1",
+            Self::Msfdr1Smix => "sage-msfdr-1smix-v1",
+            Self::Msfdr2Smix => "sage-msfdr-2smix-v1",
+            Self::Nokoi => "sage-nokoi-v2",
+            Self::Ensemble => "sage-ensemble-continuous-psm-first-v1",
+        }
+    }
+}
+
+impl fmt::Display for ExpertIdentity {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        formatter.write_str(self.as_str())
+    }
+}
+
+impl PartialOrd for ExpertIdentity {
+    fn partial_cmp(&self, other: &Self) -> Option<std::cmp::Ordering> {
+        Some(self.cmp(other))
+    }
+}
+
+impl Ord for ExpertIdentity {
+    fn cmp(&self, other: &Self) -> std::cmp::Ordering {
+        self.as_str().cmp(other.as_str())
+    }
+}
+
+impl Serialize for ExpertIdentity {
+    fn serialize<S>(&self, serializer: S) -> Result<S::Ok, S::Error>
+    where
+        S: Serializer,
+    {
+        serializer.serialize_str(self.as_str())
+    }
+}
+
+impl<'de> Deserialize<'de> for ExpertIdentity {
+    fn deserialize<D>(deserializer: D) -> Result<Self, D::Error>
+    where
+        D: Deserializer<'de>,
+    {
+        let value = String::deserialize(deserializer)?;
+        Self::parse(&value).map_err(D::Error::custom)
+    }
+}
+
+impl From<&ModelFit> for ExpertIdentity {
+    fn from(value: &ModelFit) -> Self {
+        match value {
+            ModelFit::Moments => Self::Moments,
+            ModelFit::Mle => Self::Mle,
+            ModelFit::LowerOrder => Self::LowerOrder,
+            ModelFit::Msfdr => Self::Msfdr,
+            ModelFit::Msfdr1Smix => Self::Msfdr1Smix,
+            ModelFit::Msfdr2Smix => Self::Msfdr2Smix,
+            ModelFit::Nokoi => Self::Nokoi,
+            ModelFit::Ensemble => Self::Ensemble,
+        }
+    }
+}
+
+impl From<ExpertIdentity> for ModelFit {
+    fn from(value: ExpertIdentity) -> Self {
+        match value {
+            ExpertIdentity::Moments => Self::Moments,
+            ExpertIdentity::Mle => Self::Mle,
+            ExpertIdentity::LowerOrder => Self::LowerOrder,
+            ExpertIdentity::Msfdr => Self::Msfdr,
+            ExpertIdentity::Msfdr1Smix => Self::Msfdr1Smix,
+            ExpertIdentity::Msfdr2Smix => Self::Msfdr2Smix,
+            ExpertIdentity::Nokoi => Self::Nokoi,
+            ExpertIdentity::Ensemble => Self::Ensemble,
+        }
+    }
+}
+
+/// Serialize a typed expert map with canonical keys.
+pub fn serialize_expert_map<S, T>(
+    value: &BTreeMap<ExpertIdentity, T>,
+    serializer: S,
+) -> Result<S::Ok, S::Error>
+where
+    S: Serializer,
+    T: Serialize,
+{
+    let mut map = serializer.serialize_map(Some(value.len()))?;
+    for (expert, item) in value {
+        map.serialize_entry(expert.as_str(), item)?;
+    }
+    map.end()
+}
+
+/// Deserialize and normalize an expert-keyed map while rejecting canonical
+/// plus alias duplicates (or two aliases for the same logical expert).
+pub fn deserialize_expert_map<'de, D, T>(
+    deserializer: D,
+) -> Result<BTreeMap<ExpertIdentity, T>, D::Error>
+where
+    D: Deserializer<'de>,
+    T: Deserialize<'de>,
+{
+    struct ExpertMapVisitor<T>(std::marker::PhantomData<T>);
+
+    impl<'de, T> Visitor<'de> for ExpertMapVisitor<T>
+    where
+        T: Deserialize<'de>,
+    {
+        type Value = BTreeMap<ExpertIdentity, T>;
+
+        fn expecting(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+            formatter.write_str("a map keyed by canonical or supported legacy expert identifiers")
+        }
+
+        fn visit_map<A>(self, mut access: A) -> Result<Self::Value, A::Error>
+        where
+            A: MapAccess<'de>,
+        {
+            let mut normalized = BTreeMap::new();
+            while let Some((declared, value)) = access.next_entry::<String, T>()? {
+                let expert = ExpertIdentity::parse(&declared).map_err(A::Error::custom)?;
+                if normalized.insert(expert, value).is_some() {
+                    return Err(A::Error::custom(format!(
+                        "duplicate logical expert {expert} through canonical/alias spelling"
+                    )));
+                }
+            }
+            Ok(normalized)
+        }
+    }
+
+    deserializer.deserialize_map(ExpertMapVisitor(std::marker::PhantomData))
 }
 
 #[derive(Clone, Copy, Serialize, Deserialize, Debug, PartialEq, Eq, Hash)]

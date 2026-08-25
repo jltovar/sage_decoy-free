@@ -6,6 +6,7 @@
 
 use crate::provenance::write_json_atomic;
 use anyhow::{Context, Result};
+use sage_core::input::ExpertIdentity;
 use serde::{Deserialize, Serialize};
 use sha2::{Digest, Sha256};
 use std::collections::{BTreeMap, BTreeSet};
@@ -49,29 +50,57 @@ pub enum ParameterKind {
 }
 
 #[derive(Clone, Copy, Debug, Serialize, Deserialize, PartialEq, Eq, PartialOrd, Ord)]
-#[serde(rename_all = "snake_case")]
 pub enum OptimizerExpert {
+    #[serde(rename = "moments")]
     Moments,
+    #[serde(rename = "mle")]
     Mle,
+    #[serde(rename = "lower_order")]
     LowerOrder,
+    #[serde(rename = "msfdr", alias = "msfdr_seeded")]
     MsfdrSeeded,
+    #[serde(rename = "msfdr1_smix", alias = "msfdr_1smix")]
     Msfdr1Smix,
+    #[serde(rename = "msfdr2_smix", alias = "msfdr_2smix")]
     Msfdr2Smix,
+    #[serde(rename = "nokoi")]
     Nokoi,
+    #[serde(rename = "ensemble")]
     Ensemble,
 }
 
 impl OptimizerExpert {
     pub fn slug(self) -> &'static str {
-        match self {
-            Self::Moments => "moments",
-            Self::Mle => "mle",
-            Self::LowerOrder => "lower_order",
-            Self::MsfdrSeeded => "msfdr_seeded",
-            Self::Msfdr1Smix => "msfdr_1smix",
-            Self::Msfdr2Smix => "msfdr_2smix",
-            Self::Nokoi => "nokoi",
-            Self::Ensemble => "ensemble",
+        ExpertIdentity::from(self).as_str()
+    }
+}
+
+impl From<OptimizerExpert> for ExpertIdentity {
+    fn from(value: OptimizerExpert) -> Self {
+        match value {
+            OptimizerExpert::Moments => Self::Moments,
+            OptimizerExpert::Mle => Self::Mle,
+            OptimizerExpert::LowerOrder => Self::LowerOrder,
+            OptimizerExpert::MsfdrSeeded => Self::Msfdr,
+            OptimizerExpert::Msfdr1Smix => Self::Msfdr1Smix,
+            OptimizerExpert::Msfdr2Smix => Self::Msfdr2Smix,
+            OptimizerExpert::Nokoi => Self::Nokoi,
+            OptimizerExpert::Ensemble => Self::Ensemble,
+        }
+    }
+}
+
+impl From<ExpertIdentity> for OptimizerExpert {
+    fn from(value: ExpertIdentity) -> Self {
+        match value {
+            ExpertIdentity::Moments => Self::Moments,
+            ExpertIdentity::Mle => Self::Mle,
+            ExpertIdentity::LowerOrder => Self::LowerOrder,
+            ExpertIdentity::Msfdr => Self::MsfdrSeeded,
+            ExpertIdentity::Msfdr1Smix => Self::Msfdr1Smix,
+            ExpertIdentity::Msfdr2Smix => Self::Msfdr2Smix,
+            ExpertIdentity::Nokoi => Self::Nokoi,
+            ExpertIdentity::Ensemble => Self::Ensemble,
         }
     }
 }
@@ -1114,7 +1143,7 @@ pub fn parameter_contracts() -> Vec<ParameterContract> {
         ),
         contract!(
             "msfdr_min_null_rank",
-            "msfdr_seeded",
+            "msfdr",
             PER_EXPERT,
             Integer,
             ScientificOptimizationCandidate,
@@ -1127,7 +1156,7 @@ pub fn parameter_contracts() -> Vec<ParameterContract> {
         ),
         contract!(
             "msfdr_max_null_rank",
-            "msfdr_seeded",
+            "msfdr",
             PER_EXPERT,
             Integer,
             ScientificOptimizationCandidate,
@@ -1140,7 +1169,7 @@ pub fn parameter_contracts() -> Vec<ParameterContract> {
         ),
         contract!(
             "msfdr_seeded_purification_factor",
-            "msfdr_seeded",
+            "msfdr",
             PER_EXPERT,
             Float,
             ScientificOptimizationCandidate,
@@ -1153,7 +1182,7 @@ pub fn parameter_contracts() -> Vec<ParameterContract> {
         ),
         contract!(
             "msfdr_seeded_top_frac_init",
-            "msfdr_seeded",
+            "msfdr",
             PER_EXPERT,
             Float,
             ScientificOptimizationCandidate,
@@ -1166,7 +1195,7 @@ pub fn parameter_contracts() -> Vec<ParameterContract> {
         ),
         contract!(
             "msfdr_multistart",
-            "msfdr_seeded",
+            "msfdr",
             PER_EXPERT,
             Integer,
             UnsafeOrUnsupported,
@@ -1179,7 +1208,7 @@ pub fn parameter_contracts() -> Vec<ParameterContract> {
         ),
         contract!(
             "msfdr_pi_clamp_min",
-            "msfdr_seeded",
+            "msfdr",
             PER_EXPERT,
             Float,
             ScientificOptimizationCandidate,
@@ -1192,7 +1221,7 @@ pub fn parameter_contracts() -> Vec<ParameterContract> {
         ),
         contract!(
             "msfdr_pi_clamp_max",
-            "msfdr_seeded",
+            "msfdr",
             PER_EXPERT,
             Float,
             ScientificOptimizationCandidate,
@@ -1231,7 +1260,7 @@ pub fn parameter_contracts() -> Vec<ParameterContract> {
         ),
         contract!(
             "msfdr1_bottom_frac_init",
-            "msfdr_1smix",
+            "msfdr1_smix",
             PER_EXPERT,
             Float,
             ScientificOptimizationCandidate,
@@ -1244,7 +1273,7 @@ pub fn parameter_contracts() -> Vec<ParameterContract> {
         ),
         contract!(
             "msfdr1_top_frac_init",
-            "msfdr_1smix",
+            "msfdr1_smix",
             PER_EXPERT,
             Float,
             ScientificOptimizationCandidate,
@@ -1257,7 +1286,7 @@ pub fn parameter_contracts() -> Vec<ParameterContract> {
         ),
         contract!(
             "msfdr1_pi_clamp_min",
-            "msfdr_1smix",
+            "msfdr1_smix",
             PER_EXPERT,
             Float,
             ScientificOptimizationCandidate,
@@ -1270,7 +1299,7 @@ pub fn parameter_contracts() -> Vec<ParameterContract> {
         ),
         contract!(
             "msfdr1_pi_clamp_max",
-            "msfdr_1smix",
+            "msfdr1_smix",
             PER_EXPERT,
             Float,
             ScientificOptimizationCandidate,
@@ -1283,7 +1312,7 @@ pub fn parameter_contracts() -> Vec<ParameterContract> {
         ),
         contract!(
             "msfdr2_smix_min_null_rank",
-            "msfdr_2smix",
+            "msfdr2_smix",
             PER_EXPERT,
             Integer,
             ScientificOptimizationCandidate,
@@ -1296,7 +1325,7 @@ pub fn parameter_contracts() -> Vec<ParameterContract> {
         ),
         contract!(
             "msfdr2_smix_max_null_rank",
-            "msfdr_2smix",
+            "msfdr2_smix",
             PER_EXPERT,
             Integer,
             ScientificOptimizationCandidate,
@@ -1309,7 +1338,7 @@ pub fn parameter_contracts() -> Vec<ParameterContract> {
         ),
         contract!(
             "msfdr2_bottom_frac_init",
-            "msfdr_2smix",
+            "msfdr2_smix",
             PER_EXPERT,
             Float,
             ScientificOptimizationCandidate,
@@ -1322,7 +1351,7 @@ pub fn parameter_contracts() -> Vec<ParameterContract> {
         ),
         contract!(
             "msfdr2_top_frac_init",
-            "msfdr_2smix",
+            "msfdr2_smix",
             PER_EXPERT,
             Float,
             ScientificOptimizationCandidate,
@@ -1335,7 +1364,7 @@ pub fn parameter_contracts() -> Vec<ParameterContract> {
         ),
         contract!(
             "msfdr2_pi_clamp_min",
-            "msfdr_2smix",
+            "msfdr2_smix",
             PER_EXPERT,
             Float,
             ScientificOptimizationCandidate,
@@ -1348,7 +1377,7 @@ pub fn parameter_contracts() -> Vec<ParameterContract> {
         ),
         contract!(
             "msfdr2_pi_clamp_max",
-            "msfdr_2smix",
+            "msfdr2_smix",
             PER_EXPERT,
             Float,
             ScientificOptimizationCandidate,
@@ -2830,7 +2859,11 @@ pub struct ParameterOptimizerConfig {
     /// `require_expected_expert_configurations` so preflight cannot silently
     /// substitute a different expert configuration or artifact.
     #[serde(default)]
-    pub expected_expert_configuration_sha256: BTreeMap<String, String>,
+    #[serde(
+        deserialize_with = "sage_core::input::deserialize_expert_map",
+        serialize_with = "sage_core::input::serialize_expert_map"
+    )]
+    pub expected_expert_configuration_sha256: BTreeMap<ExpertIdentity, String>,
     #[serde(default)]
     pub require_expected_expert_configurations: bool,
     #[serde(default)]
@@ -3053,12 +3086,12 @@ impl ParameterOptimizerConfig {
             .selected_experts
             .iter()
             .filter(|expert| **expert != OptimizerExpert::Ensemble)
-            .map(|expert| expert.slug().to_owned())
+            .map(|expert| ExpertIdentity::from(*expert))
             .collect::<BTreeSet<_>>();
         anyhow::ensure!(
             self.expected_expert_configuration_sha256
                 .keys()
-                .all(|model| selected_models.contains(model)),
+                .all(|model| model.is_individual() && selected_models.contains(model)),
             "expected_expert_configuration_sha256 contains an unselected or non-expert model"
         );
         anyhow::ensure!(
@@ -3286,15 +3319,15 @@ fn validate_owner(contract: &ParameterContract, expert: Option<OptimizerExpert>)
     let Some(expert) = expert else {
         return Ok(());
     };
-    let owner = expert.slug();
+    let expert_identity = ExpertIdentity::from(expert);
+    let parameter_expert = ExpertIdentity::parse(contract.owner).ok();
     let compatible = matches!(
         contract.owner,
         "evidence" | "aggregation" | "q_value" | "shared_null" | "storey"
     ) || matches!(
         contract.owner,
         "physical" | "reproducibility" | "hierarchical" | "validation"
-    ) || contract.owner == owner
-        || (contract.owner == "ensemble" && expert == OptimizerExpert::Ensemble)
+    ) || parameter_expert == Some(expert_identity)
         || (contract.owner == "msfdr_mixtures"
             && matches!(
                 expert,
@@ -3305,7 +3338,7 @@ fn validate_owner(contract: &ParameterContract, expert: Option<OptimizerExpert>)
         "parameter {} belongs to {}, not {}",
         contract.name,
         contract.owner,
-        owner
+        expert_identity
     );
     Ok(())
 }
@@ -6490,7 +6523,7 @@ mod tests {
         let mut frozen_experts = cfg.clone();
         frozen_experts
             .expected_expert_configuration_sha256
-            .insert("moments".into(), "a".repeat(64));
+            .insert(ExpertIdentity::Moments, "a".repeat(64));
         assert_ne!(
             first,
             optimizer_fingerprint(&identity(), &frozen_experts).unwrap(),
@@ -6498,6 +6531,64 @@ mod tests {
         );
         let serialized = serde_json::to_string(&identity()).unwrap();
         assert!(!serialized.contains(std::env::temp_dir().to_string_lossy().as_ref()));
+    }
+
+    #[test]
+    fn canonical_and_alias_expert_manifests_share_one_normalized_fingerprint() {
+        let mut canonical = config();
+        canonical.selected_experts = vec![
+            OptimizerExpert::Moments,
+            OptimizerExpert::Mle,
+            OptimizerExpert::LowerOrder,
+            OptimizerExpert::MsfdrSeeded,
+            OptimizerExpert::Msfdr1Smix,
+            OptimizerExpert::Msfdr2Smix,
+            OptimizerExpert::Nokoi,
+            OptimizerExpert::Ensemble,
+        ];
+        canonical.expected_expert_configuration_sha256 = ExpertIdentity::INDIVIDUALS
+            .into_iter()
+            .map(|expert| (expert, format!("{:064x}", expert as u8 + 1)))
+            .collect();
+        canonical.require_expected_expert_configurations = true;
+        let canonical_json = serde_json::to_string(&canonical).unwrap();
+        assert!(canonical_json.contains("\"msfdr\""));
+        assert!(!canonical_json.contains("\"msfdr_seeded\""));
+
+        let alias_json = canonical_json
+            .replace("\"msfdr\"", "\"msfdr_seeded\"")
+            .replace("\"msfdr1_smix\"", "\"msfdr_1smix\"")
+            .replace("\"msfdr2_smix\"", "\"msfdr_2smix\"");
+        let alias: ParameterOptimizerConfig = serde_json::from_str(&alias_json).unwrap();
+        assert_eq!(
+            serde_json::to_value(&canonical).unwrap(),
+            serde_json::to_value(&alias).unwrap()
+        );
+        assert_eq!(
+            optimizer_fingerprint(&identity(), &canonical).unwrap(),
+            optimizer_fingerprint(&identity(), &alias).unwrap()
+        );
+        canonical.validate().unwrap();
+        alias.validate().unwrap();
+    }
+
+    #[test]
+    fn expected_expert_hash_map_rejects_alias_duplicates() {
+        let json = r#"{
+          "schema_version":4,"enabled":false,"classification":"development_only",
+          "selected_experts":[],
+          "expected_expert_configuration_sha256":{
+            "msfdr":"aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa",
+            "msfdr_seeded":"bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb"
+          },
+          "seed":1,"maximum_trial_budget":1,"maximum_optimization_passes":1,
+          "objective":[],"fixed_evaluation_threshold":0.01,"resume":true,
+          "materialize_winner":true,"require_existing_candidate_pool":true,
+          "require_existing_raw_annotation_cache":true,
+          "target_only_outcomes_excluded":true,"blocks":[]
+        }"#;
+        let error = serde_json::from_str::<ParameterOptimizerConfig>(json).unwrap_err();
+        assert!(error.to_string().contains("duplicate logical expert msfdr"));
     }
 
     #[test]

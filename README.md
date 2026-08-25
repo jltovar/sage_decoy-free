@@ -136,6 +136,11 @@ checkpoint resume, and strict immutable candidate/raw-cache reuse. It never trea
 thresholds as tunable variables and never consumes target-only outcomes. See
 [PARAMETER_OPTIMIZER.md](PARAMETER_OPTIMIZER.md) for the schema, ownership and precedence rules,
 objective semantics, portable fingerprint, and failure classifications.
+Expert identities are canonical across manifests, checkpoints, artifacts, Ensemble locks, and
+target-only reconstruction: `moments`, `mle`, `lower_order`, `msfdr`, `msfdr1_smix`,
+`msfdr2_smix`, and `nokoi`. Legacy input aliases `msfdr_seeded`, `msfdr_1smix`, and
+`msfdr_2smix` normalize before validation and fingerprinting; durable output uses canonical names,
+and duplicate canonical/alias map entries fail closed.
 Every executable candidate has serialized production-binding coverage. A bounded
 production-smoke mode verifies real +entrapment fitting and objective selection without entering
 target-only reporting.
