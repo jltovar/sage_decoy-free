@@ -2843,6 +2843,54 @@ pub struct OptimizerBlock {
     pub max_passes: Option<usize>,
 }
 
+/// One prospectively enumerated optimizer proposal that production will
+/// either evaluate or reject before model fitting. The dependency reason is
+/// produced by the same resolver used immediately before runtime evaluation.
+#[derive(Clone, Debug, Serialize, Deserialize, PartialEq, Eq)]
+pub struct OptimizerDependencyIssue {
+    pub pass: usize,
+    pub proposal_ordinal: usize,
+    pub disposition: String,
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub affected_fields: Vec<String>,
+    pub reason: String,
+}
+
+#[derive(Clone, Debug, Serialize, Deserialize, PartialEq, Eq)]
+pub struct OptimizerBlockDependencyPreflight {
+    pub block_id: String,
+    pub strategy: OptimizerStrategy,
+    pub declared_proposal_upper_bound: usize,
+    pub canonical_proposals: usize,
+    pub production_evaluable_proposals: usize,
+    pub dependency_pruned_proposals: usize,
+    pub duplicate_canonical_configurations: usize,
+    pub invalid_proposals: usize,
+    pub at_least_one_valid_candidate: bool,
+    pub runtime_transition_dependent: bool,
+    pub issues: Vec<OptimizerDependencyIssue>,
+}
+
+#[derive(Clone, Debug, Serialize, Deserialize, PartialEq, Eq)]
+pub struct OptimizerDependencyPreflightReport {
+    pub schema_version: u32,
+    pub blocks: Vec<OptimizerBlockDependencyPreflight>,
+    pub declared_proposal_upper_bound: usize,
+    pub canonical_proposals: usize,
+    pub production_evaluable_proposals: usize,
+    pub dependency_pruned_proposals: usize,
+    pub duplicate_canonical_configurations: usize,
+    pub invalid_proposals: usize,
+    pub all_blocks_have_valid_candidates: bool,
+    pub biological_evaluation_performed: bool,
+}
+
+#[derive(Clone, Debug, PartialEq, Eq)]
+struct ActiveDependencyViolation {
+    affected_fields: Vec<String>,
+    reason: String,
+}
+
 fn default_true() -> bool {
     true
 }
@@ -3696,6 +3744,24 @@ fn validate_active_dependencies(
     values: &BTreeMap<String, ParameterValue>,
     active: &BTreeSet<String>,
 ) -> Result<()> {
+    let violations = active_dependency_violations(values, active);
+    if violations.is_empty() {
+        return Ok(());
+    }
+    anyhow::bail!(
+        "{}",
+        violations
+            .iter()
+            .map(|violation| violation.reason.as_str())
+            .collect::<Vec<_>>()
+            .join("; ")
+    )
+}
+
+fn active_dependency_violations(
+    values: &BTreeMap<String, ParameterValue>,
+    active: &BTreeSet<String>,
+) -> Vec<ActiveDependencyViolation> {
     let string_value = |name: &str| match values.get(name) {
         Some(ParameterValue::String(value)) => Some(value.as_str()),
         _ => None,
@@ -3706,120 +3772,166 @@ fn validate_active_dependencies(
     };
     let any_active = |names: &[&str]| names.iter().any(|name| active.contains(*name));
 
+    let mut violations = Vec::new();
+    let mut record = |affected_fields: Vec<String>, condition: bool, reason: String| {
+        if !condition {
+            violations.push(ActiveDependencyViolation {
+                affected_fields,
+                reason,
+            });
+        }
+    };
+
     if any_active(&["moments_winsor_lower_q", "moments_winsor_upper_q"]) {
-        anyhow::ensure!(
+        record(
+            ["moments_winsor_lower_q", "moments_winsor_upper_q"]
+                .into_iter()
+                .filter(|name| active.contains(*name))
+                .map(str::to_owned)
+                .collect(),
             bool_value("moments_robust_fit") == Some(true),
-            "dependency violated: Moments winsor quantiles require moments_robust_fit=true"
+            "dependency violated: Moments winsor quantiles require moments_robust_fit=true".into(),
         );
     }
     if any_active(&["mle_winsor_lower_q", "mle_winsor_upper_q"]) {
-        anyhow::ensure!(
+        record(
+            ["mle_winsor_lower_q", "mle_winsor_upper_q"]
+                .into_iter()
+                .filter(|name| active.contains(*name))
+                .map(str::to_owned)
+                .collect(),
             bool_value("mle_robust_fit") == Some(true),
-            "dependency violated: MLE winsor quantiles require mle_robust_fit=true"
+            "dependency violated: MLE winsor quantiles require mle_robust_fit=true".into(),
         );
     }
     if active.contains("ensemble_p_combiner") {
-        anyhow::ensure!(
+        record(
+            vec!["ensemble_p_combiner".into()],
             string_value("final_evidence_space") == Some("p_value"),
-            "dependency violated: ensemble_p_combiner affects the selected decision stream only when final_evidence_space=p_value"
+            "dependency violated: ensemble_p_combiner affects the selected decision stream only when final_evidence_space=p_value".into(),
         );
     }
     if active.contains("ensemble_pep_combiner") {
-        anyhow::ensure!(
+        record(
+            vec!["ensemble_pep_combiner".into()],
             string_value("final_evidence_space") == Some("pep"),
-            "dependency violated: ensemble_pep_combiner affects the selected decision stream only when final_evidence_space=pep"
+            "dependency violated: ensemble_pep_combiner affects the selected decision stream only when final_evidence_space=pep".into(),
         );
     }
     if active.contains("ensemble_cauchy_penalty") {
-        anyhow::ensure!(
+        record(
+            vec!["ensemble_cauchy_penalty".into()],
             string_value("final_evidence_space") == Some("p_value")
                 && string_value("ensemble_p_combiner") == Some("cauchy"),
-            "dependency violated: ensemble_cauchy_penalty requires final_evidence_space=p_value and ensemble_p_combiner=cauchy"
+            "dependency violated: ensemble_cauchy_penalty requires final_evidence_space=p_value and ensemble_p_combiner=cauchy".into(),
         );
     }
     if active.contains("ensemble_pep_trim_frac") {
-        anyhow::ensure!(
+        record(
+            vec!["ensemble_pep_trim_frac".into()],
             string_value("final_evidence_space") == Some("pep")
                 && matches!(
                     string_value("ensemble_pep_combiner"),
                     Some("trimmed_mean" | "winsorized_mean")
                 ),
-            "dependency violated: ensemble_pep_trim_frac requires final_evidence_space=pep and a trimmed or winsorized PEP combiner"
+            "dependency violated: ensemble_pep_trim_frac requires final_evidence_space=pep and a trimmed or winsorized PEP combiner".into(),
         );
     }
     if active.contains("ensemble_pep_quantile") {
-        anyhow::ensure!(
+        record(
+            vec!["ensemble_pep_quantile".into()],
             string_value("final_evidence_space") == Some("pep")
                 && string_value("ensemble_pep_combiner") == Some("quantile"),
-            "dependency violated: ensemble_pep_quantile requires final_evidence_space=pep and ensemble_pep_combiner=quantile"
+            "dependency violated: ensemble_pep_quantile requires final_evidence_space=pep and ensemble_pep_combiner=quantile".into(),
         );
     }
     if active.contains("ensemble_pep_top_k") {
-        anyhow::ensure!(
+        record(
+            vec!["ensemble_pep_top_k".into()],
             string_value("final_evidence_space") == Some("pep")
                 && string_value("ensemble_pep_combiner") == Some("top_k_mean"),
-            "dependency violated: ensemble_pep_top_k requires final_evidence_space=pep and ensemble_pep_combiner=top_k_mean"
+            "dependency violated: ensemble_pep_top_k requires final_evidence_space=pep and ensemble_pep_combiner=top_k_mean".into(),
         );
     }
-    if active
+    let active_weights = active
         .iter()
-        .any(|name| name.starts_with("ensemble_weight_"))
-    {
-        anyhow::ensure!(
+        .filter(|name| name.starts_with("ensemble_weight_"))
+        .cloned()
+        .collect::<Vec<_>>();
+    if !active_weights.is_empty() {
+        record(
+            active_weights,
             string_value("final_evidence_space") == Some("pep")
                 && matches!(
                     string_value("ensemble_pep_combiner"),
                     Some("weighted_mean" | "weighted_median")
                 ),
-            "dependency violated: expert weights affect the selected decision stream only when final_evidence_space=pep and ensemble_pep_combiner is weighted_mean or weighted_median"
+            "dependency violated: expert weights affect the selected decision stream only when final_evidence_space=pep and ensemble_pep_combiner is weighted_mean or weighted_median".into(),
         );
     }
     if any_active(&["p_combine_calibration_min_k", "p_combine_calibration_max_k"]) {
-        anyhow::ensure!(
+        record(
+            ["p_combine_calibration_min_k", "p_combine_calibration_max_k"]
+                .into_iter()
+                .filter(|name| active.contains(*name))
+                .map(str::to_owned)
+                .collect(),
             string_value("p_combine_calibration_mode") == Some("rank_null"),
-            "dependency violated: p-combination calibration bounds require rank_null mode"
+            "dependency violated: p-combination calibration bounds require rank_null mode".into(),
         );
     }
     if active.contains("p_combine_tfisher_tau") {
-        anyhow::ensure!(
+        record(
+            vec!["p_combine_tfisher_tau".into()],
             matches!(string_value("peptide_p_combine"), Some("t_fisher"))
                 || matches!(string_value("protein_p_combine"), Some("t_fisher")),
             "dependency violated: p_combine_tfisher_tau requires a selected t_fisher combiner"
+                .into(),
         );
     }
     if active.contains("bky_alpha") {
-        anyhow::ensure!(
+        record(
+            vec!["bky_alpha".into()],
             ["psm_q_method", "peptide_q_method", "protein_q_method"]
                 .iter()
                 .any(|name| string_value(name) == Some("bky")),
-            "dependency violated: bky_alpha requires an applicable q-value method=bky"
+            "dependency violated: bky_alpha requires an applicable q-value method=bky".into(),
         );
     }
     if active.contains("sfdr_gamma") {
-        anyhow::ensure!(
+        record(
+            vec!["sfdr_gamma".into()],
             ["psm_q_method", "peptide_q_method", "protein_q_method"]
                 .iter()
                 .any(|name| string_value(name) == Some("sfdr")),
-            "dependency violated: sfdr_gamma requires an applicable q-value method=sfdr"
+            "dependency violated: sfdr_gamma requires an applicable q-value method=sfdr".into(),
         );
     }
     for level in ["psm", "peptide", "protein"] {
-        if any_active(&[
-            &format!("{level}_q_covariate"),
-            &format!("{level}_q_covariate_bins"),
-            &format!("{level}_q_covariate_weight_strength"),
-        ]) {
-            anyhow::ensure!(
+        let fields = [
+            format!("{level}_q_covariate"),
+            format!("{level}_q_covariate_bins"),
+            format!("{level}_q_covariate_weight_strength"),
+        ];
+        let active_fields = fields
+            .iter()
+            .filter(|name| active.contains(name.as_str()))
+            .cloned()
+            .collect::<Vec<_>>();
+        if !active_fields.is_empty() {
+            record(
+                active_fields.clone(),
                 string_value(&format!("{level}_q_method")) == Some("covariate_weighted_bh"),
-                "dependency violated: {level} q-value covariate settings require covariate_weighted_bh"
+                format!("dependency violated: {level} q-value covariate settings require covariate_weighted_bh"),
             );
-            anyhow::ensure!(
+            record(
+                active_fields,
                 string_value(&format!("{level}_q_covariate")).is_some_and(|value| value != "none"),
-                "dependency violated: {level} q-value covariate settings require a non-none validated covariate"
+                format!("dependency violated: {level} q-value covariate settings require a non-none validated covariate"),
             );
         }
     }
-    Ok(())
+    violations
 }
 
 /// Apply a validated flat parameter map to JSON-exposed FDR options. Dotted
@@ -4561,6 +4673,287 @@ fn exhaustive_combinations(
     Ok(combinations)
 }
 
+/// Prospectively enumerate optimizer proposals without opening biological
+/// inputs or invoking a trial evaluator. Runtime calls the same assignment and
+/// active-dependency validators immediately before evaluation.
+pub fn preflight_optimizer_dependencies(
+    config: &ParameterOptimizerConfig,
+) -> Result<OptimizerDependencyPreflightReport> {
+    config.validate()?;
+    if !config.enabled {
+        return Ok(OptimizerDependencyPreflightReport {
+            schema_version: 1,
+            blocks: Vec::new(),
+            declared_proposal_upper_bound: 0,
+            canonical_proposals: 0,
+            production_evaluable_proposals: 0,
+            dependency_pruned_proposals: 0,
+            duplicate_canonical_configurations: 0,
+            invalid_proposals: 0,
+            all_blocks_have_valid_candidates: true,
+            biological_evaluation_performed: false,
+        });
+    }
+
+    let mut reports = Vec::new();
+    for block_id in &config.block_order {
+        let block = config
+            .blocks
+            .iter()
+            .find(|block| block.enabled && &block.id == block_id)
+            .context("validated optimizer block disappeared during dependency preflight")?;
+        reports.push(preflight_optimizer_block_dependencies(config, block)?);
+    }
+
+    let report = OptimizerDependencyPreflightReport {
+        schema_version: 1,
+        declared_proposal_upper_bound: reports.iter().try_fold(0usize, |total, block| {
+            total
+                .checked_add(block.declared_proposal_upper_bound)
+                .context("optimizer preflight proposal upper bound overflow")
+        })?,
+        canonical_proposals: reports.iter().map(|block| block.canonical_proposals).sum(),
+        production_evaluable_proposals: reports
+            .iter()
+            .map(|block| block.production_evaluable_proposals)
+            .sum(),
+        dependency_pruned_proposals: reports
+            .iter()
+            .map(|block| block.dependency_pruned_proposals)
+            .sum(),
+        duplicate_canonical_configurations: reports
+            .iter()
+            .map(|block| block.duplicate_canonical_configurations)
+            .sum(),
+        invalid_proposals: reports.iter().map(|block| block.invalid_proposals).sum(),
+        all_blocks_have_valid_candidates: reports
+            .iter()
+            .all(|block| block.at_least_one_valid_candidate),
+        biological_evaluation_performed: false,
+        blocks: reports,
+    };
+    let failures = report
+        .blocks
+        .iter()
+        .filter(|block| !block.at_least_one_valid_candidate || block.invalid_proposals > 0)
+        .map(|block| {
+            let reasons = block
+                .issues
+                .iter()
+                .filter(|issue| issue.disposition == "invalid")
+                .map(|issue| {
+                    format!(
+                        "proposal {} fields [{}]: {}",
+                        issue.proposal_ordinal,
+                        issue.affected_fields.join(", "),
+                        issue.reason
+                    )
+                })
+                .collect::<Vec<_>>();
+            let summary = format!(
+                "declared={}, canonical={}, evaluable={}, dependency_pruned={}, duplicates={}, invalid={}",
+                block.declared_proposal_upper_bound,
+                block.canonical_proposals,
+                block.production_evaluable_proposals,
+                block.dependency_pruned_proposals,
+                block.duplicate_canonical_configurations,
+                block.invalid_proposals
+            );
+            if reasons.is_empty() {
+                format!(
+                    "block {} ({summary}) has no production-evaluable proposal",
+                    block.block_id,
+                )
+            } else {
+                format!(
+                    "block {} ({summary}): {}",
+                    block.block_id,
+                    reasons.join("; ")
+                )
+            }
+        })
+        .collect::<Vec<_>>();
+    anyhow::ensure!(
+        failures.is_empty(),
+        "strict optimizer dependency preflight failed before data access:\n{}",
+        failures.join("\n")
+    );
+    Ok(report)
+}
+
+fn preflight_optimizer_block_dependencies(
+    config: &ParameterOptimizerConfig,
+    block: &OptimizerBlock,
+) -> Result<OptimizerBlockDependencyPreflight> {
+    let mut base = resolve_baseline_for_block(config, block);
+    base.extend(block.fixed.clone());
+    let mut issues = Vec::new();
+    let mut production_evaluable = 0usize;
+    let mut dependency_pruned = 0usize;
+    let mut invalid = 0usize;
+
+    match block.strategy {
+        OptimizerStrategy::ExhaustiveGrid => {
+            let declared = block.space.values().try_fold(1usize, |total, values| {
+                total
+                    .checked_mul(values.len())
+                    .context("exhaustive dependency-preflight grid overflows proposal count")
+            })?;
+            let proposals = exhaustive_combinations(&block.space)?;
+            let canonical = proposals.len();
+            let frozen = canonical == 1;
+            let active = block.space.keys().cloned().collect::<BTreeSet<_>>();
+            for (ordinal, proposal) in proposals.into_iter().enumerate() {
+                let mut values = base.clone();
+                values.extend(proposal);
+                if let Err(error) = validate_assignment(&values) {
+                    invalid += 1;
+                    issues.push(OptimizerDependencyIssue {
+                        pass: 1,
+                        proposal_ordinal: ordinal,
+                        disposition: "invalid".into(),
+                        affected_fields: active.iter().cloned().collect(),
+                        reason: format!("{error:#}"),
+                    });
+                    continue;
+                }
+                let violations = active_dependency_violations(&values, &active);
+                if violations.is_empty() {
+                    production_evaluable += 1;
+                } else if frozen {
+                    invalid += 1;
+                    issues.extend(violations.into_iter().map(|violation| {
+                        OptimizerDependencyIssue {
+                            pass: 1,
+                            proposal_ordinal: ordinal,
+                            disposition: "invalid".into(),
+                            affected_fields: violation.affected_fields,
+                            reason: violation.reason,
+                        }
+                    }));
+                } else {
+                    dependency_pruned += 1;
+                    issues.extend(violations.into_iter().map(|violation| {
+                        OptimizerDependencyIssue {
+                            pass: 1,
+                            proposal_ordinal: ordinal,
+                            disposition: "dependency_pruned".into(),
+                            affected_fields: violation.affected_fields,
+                            reason: violation.reason,
+                        }
+                    }));
+                }
+            }
+            Ok(OptimizerBlockDependencyPreflight {
+                block_id: block.id.clone(),
+                strategy: block.strategy,
+                declared_proposal_upper_bound: declared,
+                canonical_proposals: canonical,
+                production_evaluable_proposals: production_evaluable,
+                dependency_pruned_proposals: dependency_pruned,
+                duplicate_canonical_configurations: declared.saturating_sub(canonical),
+                invalid_proposals: invalid,
+                at_least_one_valid_candidate: production_evaluable > 0,
+                runtime_transition_dependent: false,
+                issues,
+            })
+        }
+        OptimizerStrategy::StagedCoordinate => {
+            let passes = block
+                .max_passes
+                .unwrap_or(config.maximum_optimization_passes)
+                .min(config.maximum_optimization_passes);
+            let declared_per_pass = block.space.values().try_fold(0usize, |total, values| {
+                total
+                    .checked_add(values.len())
+                    .context("staged dependency-preflight proposal count overflow")
+            })?;
+            let canonical_per_pass = block.space.values().try_fold(0usize, |total, values| {
+                total
+                    .checked_add(sorted_values(values).len())
+                    .context("staged canonical proposal count overflow")
+            })?;
+            let declared = 1usize
+                .checked_add(
+                    passes
+                        .checked_mul(declared_per_pass)
+                        .context("staged dependency-preflight pass count overflow")?,
+                )
+                .context("staged dependency-preflight proposal count overflow")?;
+            let canonical = 1usize
+                .checked_add(
+                    passes
+                        .checked_mul(canonical_per_pass)
+                        .context("staged canonical pass count overflow")?,
+                )
+                .context("staged canonical proposal count overflow")?;
+            if let Err(error) = validate_assignment(&base) {
+                invalid += 1;
+                issues.push(OptimizerDependencyIssue {
+                    pass: 0,
+                    proposal_ordinal: 0,
+                    disposition: "invalid".into(),
+                    affected_fields: Vec::new(),
+                    reason: format!("{error:#}"),
+                });
+            } else {
+                production_evaluable += 1;
+            }
+            for pass in 1..=passes {
+                for (parameter_index, (name, candidates)) in block.space.iter().enumerate() {
+                    for (candidate_index, candidate) in
+                        sorted_values(candidates).into_iter().enumerate()
+                    {
+                        let ordinal = pass * 1_000_000 + parameter_index * 10_000 + candidate_index;
+                        let mut values = base.clone();
+                        values.insert(name.clone(), candidate);
+                        let active = BTreeSet::from([name.clone()]);
+                        if let Err(error) = validate_assignment(&values) {
+                            invalid += 1;
+                            issues.push(OptimizerDependencyIssue {
+                                pass,
+                                proposal_ordinal: ordinal,
+                                disposition: "invalid".into(),
+                                affected_fields: vec![name.clone()],
+                                reason: format!("{error:#}"),
+                            });
+                            continue;
+                        }
+                        let violations = active_dependency_violations(&values, &active);
+                        if violations.is_empty() {
+                            production_evaluable += 1;
+                        } else {
+                            dependency_pruned += 1;
+                            issues.extend(violations.into_iter().map(|violation| {
+                                OptimizerDependencyIssue {
+                                    pass,
+                                    proposal_ordinal: ordinal,
+                                    disposition: "dependency_pruned".into(),
+                                    affected_fields: violation.affected_fields,
+                                    reason: violation.reason,
+                                }
+                            }));
+                        }
+                    }
+                }
+            }
+            Ok(OptimizerBlockDependencyPreflight {
+                block_id: block.id.clone(),
+                strategy: block.strategy,
+                declared_proposal_upper_bound: declared,
+                canonical_proposals: canonical,
+                production_evaluable_proposals: production_evaluable,
+                dependency_pruned_proposals: dependency_pruned,
+                duplicate_canonical_configurations: declared.saturating_sub(canonical),
+                invalid_proposals: invalid,
+                at_least_one_valid_candidate: production_evaluable > 0,
+                runtime_transition_dependent: true,
+                issues,
+            })
+        }
+    }
+}
+
 fn trial_id(
     fingerprint: &str,
     block: &OptimizerBlock,
@@ -5142,6 +5535,361 @@ mod tests {
         cfg.block_order = cfg.blocks.iter().map(|block| block.id.clone()).collect();
         cfg.maximum_trial_budget = 16;
         cfg
+    }
+
+    fn frozen_ensemble_dependency_config() -> ParameterOptimizerConfig {
+        let mut cfg = seven_expert_root_config();
+        cfg.maximum_trial_budget = 500;
+        cfg.maximum_optimization_passes = 2;
+        cfg.fixed_baseline_values.extend([
+            (
+                "final_evidence_space".into(),
+                ParameterValue::String("p_value".into()),
+            ),
+            (
+                "ensemble_p_combiner".into(),
+                ParameterValue::String("cauchy".into()),
+            ),
+            (
+                "ensemble_cauchy_penalty".into(),
+                ParameterValue::Float(1.0224),
+            ),
+            (
+                "ensemble_pep_combiner".into(),
+                ParameterValue::String("median".into()),
+            ),
+            ("ensemble_pep_trim_frac".into(), ParameterValue::Float(0.2)),
+        ]);
+        for expert in [
+            "moments",
+            "mle",
+            "lower_order",
+            "msfdr_seeded",
+            "msfdr_1smix",
+            "msfdr_2smix",
+            "nokoi",
+        ] {
+            cfg.fixed_baseline_values.insert(
+                format!("ensemble_weight_{expert}"),
+                ParameterValue::Float(1.0),
+            );
+        }
+        cfg.blocks = vec![OptimizerBlock {
+            id: "ensemble_combination".into(),
+            enabled: true,
+            scope: ParameterScope::EnsembleFinal,
+            expert: Some(OptimizerExpert::Ensemble),
+            strategy: OptimizerStrategy::ExhaustiveGrid,
+            structural_comparison: true,
+            fixed: BTreeMap::new(),
+            space: BTreeMap::from([
+                (
+                    "final_evidence_space".into(),
+                    vec![ParameterValue::String("p_value".into())],
+                ),
+                (
+                    "ensemble_p_combiner".into(),
+                    vec![ParameterValue::String("cauchy".into())],
+                ),
+                (
+                    "ensemble_cauchy_penalty".into(),
+                    vec![ParameterValue::Float(1.0224)],
+                ),
+            ]),
+            window_search: None,
+            use_external_features: false,
+            max_trials: Some(1),
+            max_passes: Some(1),
+        }];
+        cfg.block_order = vec!["ensemble_combination".into()];
+        cfg
+    }
+
+    fn original_ensemble_96_proposal_config() -> ParameterOptimizerConfig {
+        let mut cfg = frozen_ensemble_dependency_config();
+        for parameter in [
+            "ensemble_p_combiner",
+            "ensemble_pep_combiner",
+            "peptide_p_combine",
+            "protein_p_combine",
+        ] {
+            cfg.statistical_validity_contracts.insert(
+                format!("{parameter}:statistical_validity"),
+                "prospectively declared synthetic regression contract".into(),
+            );
+        }
+        cfg.blocks = vec![
+            OptimizerBlock {
+                id: "ensemble_combination".into(),
+                enabled: true,
+                scope: ParameterScope::EnsembleFinal,
+                expert: Some(OptimizerExpert::Ensemble),
+                strategy: OptimizerStrategy::StagedCoordinate,
+                structural_comparison: true,
+                fixed: BTreeMap::new(),
+                space: BTreeMap::from([
+                    (
+                        "ensemble_cauchy_penalty".into(),
+                        vec![
+                            ParameterValue::Float(1.0),
+                            ParameterValue::Float(1.0224),
+                            ParameterValue::Float(1.25),
+                        ],
+                    ),
+                    (
+                        "ensemble_p_combiner".into(),
+                        ["second_best", "cauchy", "sidak_min_p"]
+                            .map(|value| ParameterValue::String(value.into()))
+                            .to_vec(),
+                    ),
+                    (
+                        "ensemble_pep_combiner".into(),
+                        ["median", "trimmed_mean", "weighted_median"]
+                            .map(|value| ParameterValue::String(value.into()))
+                            .to_vec(),
+                    ),
+                    (
+                        "ensemble_pep_trim_frac".into(),
+                        vec![
+                            ParameterValue::Float(0.1),
+                            ParameterValue::Float(0.2),
+                            ParameterValue::Float(0.3),
+                        ],
+                    ),
+                    (
+                        "final_evidence_space".into(),
+                        ["p_value", "pep"]
+                            .map(|value| ParameterValue::String(value.into()))
+                            .to_vec(),
+                    ),
+                ]),
+                window_search: None,
+                use_external_features: false,
+                max_trials: Some(71),
+                max_passes: Some(2),
+            },
+            OptimizerBlock {
+                id: "ensemble_aggregation".into(),
+                enabled: true,
+                scope: ParameterScope::EnsembleFinal,
+                expert: Some(OptimizerExpert::Ensemble),
+                strategy: OptimizerStrategy::StagedCoordinate,
+                structural_comparison: true,
+                fixed: BTreeMap::from([
+                    (
+                        "decoy_free_protein_grouping".into(),
+                        ParameterValue::Bool(false),
+                    ),
+                    (
+                        "p_combine_calibration_mode".into(),
+                        ParameterValue::String("off".into()),
+                    ),
+                    (
+                        "peptide_q_covariate".into(),
+                        ParameterValue::String("none".into()),
+                    ),
+                    (
+                        "protein_q_covariate".into(),
+                        ParameterValue::String("none".into()),
+                    ),
+                    (
+                        "psm_q_covariate".into(),
+                        ParameterValue::String("none".into()),
+                    ),
+                ]),
+                space: BTreeMap::from([
+                    (
+                        "peptide_p_combine".into(),
+                        ["cauchy", "fisher", "sidak_min_p"]
+                            .map(|value| ParameterValue::String(value.into()))
+                            .to_vec(),
+                    ),
+                    (
+                        "peptide_q_method".into(),
+                        ["storey", "bh"]
+                            .map(|value| ParameterValue::String(value.into()))
+                            .to_vec(),
+                    ),
+                    (
+                        "protein_p_combine".into(),
+                        ["cauchy", "fisher", "sidak_min_p"]
+                            .map(|value| ParameterValue::String(value.into()))
+                            .to_vec(),
+                    ),
+                    (
+                        "protein_q_method".into(),
+                        ["storey", "bh"]
+                            .map(|value| ParameterValue::String(value.into()))
+                            .to_vec(),
+                    ),
+                    (
+                        "psm_q_method".into(),
+                        ["storey", "bh"]
+                            .map(|value| ParameterValue::String(value.into()))
+                            .to_vec(),
+                    ),
+                ]),
+                window_search: None,
+                use_external_features: false,
+                max_trials: Some(25),
+                max_passes: Some(2),
+            },
+        ];
+        for expert in [
+            "moments",
+            "mle",
+            "lower_order",
+            "msfdr_seeded",
+            "msfdr_1smix",
+            "msfdr_2smix",
+            "nokoi",
+        ] {
+            cfg.blocks[0].space.insert(
+                format!("ensemble_weight_{expert}"),
+                vec![
+                    ParameterValue::Float(0.5),
+                    ParameterValue::Float(1.0),
+                    ParameterValue::Float(2.0),
+                ],
+            );
+        }
+        cfg.block_order = vec!["ensemble_combination".into(), "ensemble_aggregation".into()];
+        cfg
+    }
+
+    #[test]
+    fn strict_dependency_preflight_rejects_amendment_zero_and_accepts_one() {
+        let mut amendment_zero = frozen_ensemble_dependency_config();
+        let block = &mut amendment_zero.blocks[0];
+        block.space.extend([
+            (
+                "ensemble_pep_combiner".into(),
+                vec![ParameterValue::String("median".into())],
+            ),
+            (
+                "ensemble_pep_trim_frac".into(),
+                vec![ParameterValue::Float(0.2)],
+            ),
+        ]);
+        for expert in [
+            "moments",
+            "mle",
+            "lower_order",
+            "msfdr_seeded",
+            "msfdr_1smix",
+            "msfdr_2smix",
+            "nokoi",
+        ] {
+            block.space.insert(
+                format!("ensemble_weight_{expert}"),
+                vec![ParameterValue::Float(1.0)],
+            );
+        }
+        let block = amendment_zero.blocks[0].clone();
+        let report = preflight_optimizer_block_dependencies(&amendment_zero, &block).unwrap();
+        assert_eq!(report.canonical_proposals, 1);
+        assert_eq!(report.production_evaluable_proposals, 0);
+        assert_eq!(report.invalid_proposals, 1);
+        let offending = report
+            .issues
+            .iter()
+            .flat_map(|issue| issue.affected_fields.iter())
+            .cloned()
+            .collect::<BTreeSet<_>>();
+        assert!(offending.contains("ensemble_pep_combiner"));
+        assert!(offending.contains("ensemble_pep_trim_frac"));
+        assert!(offending.contains("ensemble_weight_moments"));
+        let error = preflight_optimizer_dependencies(&amendment_zero)
+            .unwrap_err()
+            .to_string();
+        assert!(error.contains("before data access"));
+        assert!(error.contains("ensemble_pep_combiner"));
+
+        let amendment_one = frozen_ensemble_dependency_config();
+        let report = preflight_optimizer_dependencies(&amendment_one).unwrap();
+        assert_eq!(report.canonical_proposals, 1);
+        assert_eq!(report.production_evaluable_proposals, 1);
+        assert_eq!(report.dependency_pruned_proposals, 0);
+        assert_eq!(report.invalid_proposals, 0);
+        assert!(!report.biological_evaluation_performed);
+        assert_eq!(
+            resolve_baseline_for_block(&amendment_zero, &amendment_zero.blocks[0]),
+            resolve_baseline_for_block(&amendment_one, &amendment_one.blocks[0])
+        );
+    }
+
+    #[test]
+    fn original_ensemble_grid_predicts_96_proposals_with_42_evaluable() {
+        let cfg = original_ensemble_96_proposal_config();
+        let report = preflight_optimizer_dependencies(&cfg).unwrap();
+        assert_eq!(report.declared_proposal_upper_bound, 96);
+        assert_eq!(report.canonical_proposals, 96);
+        assert_eq!(report.production_evaluable_proposals, 42);
+        assert_eq!(report.dependency_pruned_proposals, 54);
+        assert_eq!(report.invalid_proposals, 0);
+        assert!(report.all_blocks_have_valid_candidates);
+        assert!(report
+            .blocks
+            .iter()
+            .all(|block| block.runtime_transition_dependent));
+        assert_eq!(cfg.selected_experts.len(), 8);
+    }
+
+    #[test]
+    fn dependency_preflight_distinguishes_defaults_pruning_and_invalid_inputs() {
+        let defaults_only = frozen_ensemble_dependency_config();
+        preflight_optimizer_dependencies(&defaults_only).unwrap();
+
+        let mut mixed = frozen_ensemble_dependency_config();
+        mixed.blocks[0].space = BTreeMap::from([
+            (
+                "final_evidence_space".into(),
+                ["p_value", "pep"]
+                    .map(|value| ParameterValue::String(value.into()))
+                    .to_vec(),
+            ),
+            (
+                "ensemble_pep_combiner".into(),
+                vec![ParameterValue::String("median".into())],
+            ),
+        ]);
+        mixed.blocks[0].max_trials = Some(2);
+        let report = preflight_optimizer_dependencies(&mixed).unwrap();
+        assert_eq!(report.production_evaluable_proposals, 1);
+        assert_eq!(report.dependency_pruned_proposals, 1);
+
+        let mut unknown = defaults_only.clone();
+        unknown.blocks[0]
+            .space
+            .insert("unknown_parameter".into(), vec![ParameterValue::Bool(true)]);
+        assert!(preflight_optimizer_dependencies(&unknown)
+            .unwrap_err()
+            .to_string()
+            .contains("unknown optimizer parameter"));
+
+        let mut out_of_domain = defaults_only.clone();
+        out_of_domain.blocks[0].space.insert(
+            "ensemble_cauchy_penalty".into(),
+            vec![ParameterValue::Float(-1.0)],
+        );
+        assert!(preflight_optimizer_dependencies(&out_of_domain)
+            .unwrap_err()
+            .to_string()
+            .contains("below minimum"));
+
+        let mut wrong_combiner = defaults_only.clone();
+        wrong_combiner.blocks[0].space = BTreeMap::from([(
+            "ensemble_cauchy_penalty".into(),
+            vec![ParameterValue::Float(1.0224)],
+        )]);
+        wrong_combiner.fixed_baseline_values.insert(
+            "ensemble_p_combiner".into(),
+            ParameterValue::String("second_best".into()),
+        );
+        assert!(preflight_optimizer_dependencies(&wrong_combiner)
+            .unwrap_err()
+            .to_string()
+            .contains("requires final_evidence_space=p_value and ensemble_p_combiner=cauchy"));
     }
 
     #[test]

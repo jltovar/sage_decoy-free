@@ -86,6 +86,26 @@ trial identity and consumes one declared trial-budget position, then is recorded
 `parameter_dependency_invalid_before_production` without calling the production evaluator. Such
 points are therefore counted in conservative upper bounds but pruned before fitting.
 
+Strict preflight now invokes that same production dependency resolver before dataset identity,
+spectra, candidate pools, raw annotations, checkpoints, fitting, or trial evaluation. Its
+versioned report lists each block's declared upper bound, canonical and production-evaluable
+proposals, dependency-pruned proposals, duplicate canonical configurations, invalid proposals,
+and the affected fields and predicates. Multi-valued conditional search spaces remain valid when
+at least one production-evaluable proposal exists; dependency-inapplicable points are predicted as
+pruned, not scientific failures. Staged-coordinate counts are prospective per pass/block and are
+explicitly marked transition-dependent because accepted coordinates are known only at runtime.
+
+A single canonical frozen/materialization proposal is stricter: an explicitly declared dormant,
+unknown, incompatible, noncanonical, or out-of-domain optimizer override fails preflight. It is
+not silently removed. Canonical effective defaults may remain in the complete resolved
+`FdrSettings` and locks for auxiliary evidence; only active optimizer proposal dimensions belong
+in a frozen trial override. Runtime repeats dependency validation immediately before production
+evaluation as defense in depth.
+
+This additive schema-v1 preflight report does not change workflow-manifest or Ensemble-lock
+schemas. The implementation-source change participates in analysis/optimizer/checkpoint identity;
+strict search, immutable candidate-pool, and raw-annotation-cache identities are unchanged.
+
 A model block may include `window_search` with `explicit_grid` or `landscape_adaptive`. The window
 is selected inside that model trial using the existing bounded null-window implementation and the
 same declared development objective. Every expert retains its selected dataset-local window and

@@ -250,12 +250,24 @@ and current source URIs remain provenance, while equality uses the portable dige
 ordered spectrum ordinals and content hashes, normalized search settings, schema, retained depth,
 counts, and manifest/payload integrity. Paths and filenames alone never establish equivalence.
 
+Optimizer dependency preflight precedes that resource work. After manifest/identity normalization
+and frozen-expert resolution, Sage validates optimizer names/domains and prospectively enumerates
+the same dependency predicates used by runtime. A multi-valued conditional grid may contain
+dependency-pruned proposals as long as a valid proposal remains. A single frozen proposal may not
+explicitly carry a dormant override, even when the same value is a permitted canonical default in
+the complete effective configuration. The preflight report separates declared, canonical,
+evaluable, pruned, duplicate, and invalid counts without fitting a model or inspecting biological
+outcomes. Only after this report passes does Sage inspect dataset, candidate-pool, or annotation
+resources.
+
 Layered preflight distinguishes raw inference from stage calibration:
 
-1. **Phase A — static read-only preflight.** Validate FASTAs, spectra, search identity, portable
+1. **Phase 0 — optimizer configuration preflight.** Resolve frozen expert identities/hashes,
+   validate parameter names/domains, and enumerate dependency predicates without data access.
+2. **Phase A — static read-only preflight.** Validate FASTAs, spectra, search identity, portable
    candidate pools, counts, rank depth, durable generator/model provenance, and the exact raw
    manifest/payload/full stable-ID join. A strict hit is reported as `validated_exact`.
-2. **Phase B — stage-local calibration.** Native Rust optimization/fitting resolves the window and
+3. **Phase B — stage-local calibration.** Native Rust optimization/fitting resolves the window and
    preliminary stream, derives the stage-calibration identity, and fits the compact external
    profile from the joined raw values. Plan-only reports these stages as
    `deferred_until_calibration`; this is not a missing raw cache and never authorizes generation.

@@ -19,9 +19,10 @@ use crate::external_feature_cache::{
 };
 use crate::input::Input;
 use crate::parameter_optimizer::{
-    apply_fdr_overrides, parameter_catalog_fingerprint, resolve_unique_frozen_block_parameters,
-    run_optimizer, AuditLevelMetrics, EmpiricalCalibrationPower, EntrapmentValidationMode,
-    FrozenWinnerAuditEvaluation, OptimizerBlock, OptimizerExecutionMode, OptimizerExpert,
+    apply_fdr_overrides, parameter_catalog_fingerprint, preflight_optimizer_dependencies,
+    resolve_unique_frozen_block_parameters, run_optimizer, AuditLevelMetrics,
+    EmpiricalCalibrationPower, EntrapmentValidationMode, FrozenWinnerAuditEvaluation,
+    OptimizerBlock, OptimizerDependencyPreflightReport, OptimizerExecutionMode, OptimizerExpert,
     OptimizerIdentity, OptimizerOutcome, OptimizerRunResult, OptimizerStageKind,
     OptimizerWindowSearch, ParameterOptimizerConfig, ParameterOptimizerStageProjection,
     ParameterValue, StatisticalDefaultEligibility, StatisticalValidationStatus, TrialEvaluation,
@@ -1420,6 +1421,10 @@ pub struct WorkflowState {
     pub ensemble_interaction_calibration: Option<EnsembleInteractionCalibration>,
     #[serde(default)]
     pub resource_preflight: Vec<ResourcePreflightReport>,
+    /// Inputs-only optimizer proposal/dependency enumeration performed before
+    /// dataset identity or resource preflight.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub optimizer_dependency_preflight: Option<OptimizerDependencyPreflightReport>,
     #[serde(default)]
     pub planned_models: Vec<PlannedModelReport>,
     /// Development-only parameter-optimization provenance. Target-only
@@ -1717,15 +1722,29 @@ impl WorkflowManifest {
     }
 
     pub fn load(path: &Path) -> Result<Self> {
-        let bytes = std::fs::read(path)
-            .with_context(|| format!("failed to read workflow manifest {}", path.display()))?;
-        let manifest: Self = serde_json::from_slice(&bytes)
-            .with_context(|| format!("invalid workflow manifest {}", path.display()))?;
+        let manifest = Self::load_before_resource_access(path)?;
         manifest.validate()?;
         Ok(manifest)
     }
 
+    fn load_before_resource_access(path: &Path) -> Result<Self> {
+        let bytes = std::fs::read(path)
+            .with_context(|| format!("failed to read workflow manifest {}", path.display()))?;
+        let manifest: Self = serde_json::from_slice(&bytes)
+            .with_context(|| format!("invalid workflow manifest {}", path.display()))?;
+        manifest.validate_before_resource_access()?;
+        Ok(manifest)
+    }
+
     fn validate(&self) -> Result<()> {
+        self.validate_impl(true)
+    }
+
+    fn validate_before_resource_access(&self) -> Result<()> {
+        self.validate_impl(false)
+    }
+
+    fn validate_impl(&self, validate_resource_paths: bool) -> Result<()> {
         anyhow::ensure!(self.schema_version == 1, "unsupported workflow schema");
         anyhow::ensure!(
             !(self.require_existing_annotation_cache
@@ -1737,8 +1756,10 @@ impl WorkflowManifest {
             "schema-v2 annotation-cache migration requires require_existing_candidate_pool=true"
         );
         anyhow::ensure!(!self.name.trim().is_empty(), "workflow name is required");
-        anyhow::ensure!(self.search_config.is_file(), "search_config does not exist");
-        anyhow::ensure!(self.target_fasta.is_file(), "target_fasta does not exist");
+        if validate_resource_paths {
+            anyhow::ensure!(self.search_config.is_file(), "search_config does not exist");
+            anyhow::ensure!(self.target_fasta.is_file(), "target_fasta does not exist");
+        }
         anyhow::ensure!(
             !self.spectra.is_empty(),
             "at least one spectrum file is required"
@@ -1776,7 +1797,9 @@ impl WorkflowManifest {
                         .partition_artifact
                         .as_ref()
                         .context("selection_audit requires entrapment.partition_artifact")?;
-                    if optimizer.entrapment_validation.require_existing_partition {
+                    if validate_resource_paths
+                        && optimizer.entrapment_validation.require_existing_partition
+                    {
                         anyhow::ensure!(
                             path.is_file(),
                             "required existing entrapment partition does not exist: {}",
@@ -1823,12 +1846,14 @@ impl WorkflowManifest {
                     !self.entrapment.foreign_fastas.is_empty(),
                     "native entrapment generation requires at least one foreign FASTA"
                 );
-                for fasta in &self.entrapment.foreign_fastas {
-                    anyhow::ensure!(
-                        fasta.is_file(),
-                        "foreign FASTA does not exist: {}",
-                        fasta.display()
-                    );
+                if validate_resource_paths {
+                    for fasta in &self.entrapment.foreign_fastas {
+                        anyhow::ensure!(
+                            fasta.is_file(),
+                            "foreign FASTA does not exist: {}",
+                            fasta.display()
+                        );
+                    }
                 }
                 anyhow::ensure!(
                     self.entrapment.frozen_legacy_fasta.is_none(),
@@ -1840,46 +1865,55 @@ impl WorkflowManifest {
                         "automatic source selection must not declare selected_foreign_fasta"
                     ),
                     ForeignSourceMode::Explicit | ForeignSourceMode::AutomaticWithOverride => {
-                        anyhow::ensure!(
-                            self.entrapment
-                                .selected_foreign_fasta
-                                .as_ref()
-                                .is_some_and(|path| path.is_file()),
-                            "{:?} source selection requires an existing selected_foreign_fasta",
-                            self.entrapment.foreign_source_mode
-                        );
+                        let selected =
+                            self.entrapment.selected_foreign_fasta.as_ref().context(
+                                "explicit source selection requires selected_foreign_fasta",
+                            )?;
+                        if validate_resource_paths {
+                            anyhow::ensure!(
+                                selected.is_file(),
+                                "{:?} source selection requires an existing selected_foreign_fasta",
+                                self.entrapment.foreign_source_mode
+                            );
+                        }
                     }
                 }
-                if let Some(reference) = &self.entrapment.legacy_parity_reference {
-                    anyhow::ensure!(
-                        reference.fasta.is_file(),
-                        "legacy parity FASTA does not exist: {}",
-                        reference.fasta.display()
-                    );
-                    if let Some(path) = reference.foreign_fasta.as_ref() {
+                if validate_resource_paths {
+                    if let Some(reference) = &self.entrapment.legacy_parity_reference {
                         anyhow::ensure!(
-                            path.is_file(),
-                            "legacy foreign source does not exist: {}",
-                            path.display()
+                            reference.fasta.is_file(),
+                            "legacy parity FASTA does not exist: {}",
+                            reference.fasta.display()
                         );
-                    }
-                    if let Some(path) = reference.generation_log.as_ref() {
-                        anyhow::ensure!(
-                            path.is_file(),
-                            "legacy generation log does not exist: {}",
-                            path.display()
-                        );
+                        if let Some(path) = reference.foreign_fasta.as_ref() {
+                            anyhow::ensure!(
+                                path.is_file(),
+                                "legacy foreign source does not exist: {}",
+                                path.display()
+                            );
+                        }
+                        if let Some(path) = reference.generation_log.as_ref() {
+                            anyhow::ensure!(
+                                path.is_file(),
+                                "legacy generation log does not exist: {}",
+                                path.display()
+                            );
+                        }
                     }
                 }
             }
             EntrapmentDatabaseMode::FrozenLegacy => {
-                anyhow::ensure!(
-                    self.entrapment
-                        .frozen_legacy_fasta
-                        .as_ref()
-                        .is_some_and(|path| path.is_file()),
-                    "frozen_legacy mode requires an existing frozen_legacy_fasta"
-                );
+                let frozen = self
+                    .entrapment
+                    .frozen_legacy_fasta
+                    .as_ref()
+                    .context("frozen_legacy mode requires frozen_legacy_fasta")?;
+                if validate_resource_paths {
+                    anyhow::ensure!(
+                        frozen.is_file(),
+                        "frozen_legacy mode requires an existing frozen_legacy_fasta"
+                    );
+                }
                 anyhow::ensure!(
                     self.entrapment.legacy_parity_reference.is_none(),
                     "FASTA-generation parity is separate from frozen optimizer-input parity"
@@ -2008,7 +2042,8 @@ impl WorkflowManifest {
                 }
             }
         }
-        if self.validation.dataset_role == ValidationDatasetRole::Holdout {
+        if validate_resource_paths && self.validation.dataset_role == ValidationDatasetRole::Holdout
+        {
             if let Some(path) = self.validation.external_parity_evidence.as_ref() {
                 anyhow::ensure!(
                     path.is_file(),
@@ -6981,13 +7016,24 @@ pub fn execute_workflow(
     parallel: usize,
     plan_only: bool,
 ) -> Result<WorkflowState> {
-    let mut manifest = WorkflowManifest::load(manifest_path)?;
+    let mut manifest = WorkflowManifest::load_before_resource_access(manifest_path)?;
     let manifest_hash = sha256_file(manifest_path)?;
     // Resolve and compare the complete frozen expert roster before computing
     // dataset identities or touching spectra, candidate pools, annotations,
     // fitted artifacts, or optimizer checkpoints. Runtime stage validation
     // repeats the per-stage check as defense in depth.
     prepare_frozen_expert_configuration_preflight(&mut manifest)?;
+    // Enumerate names, domains, canonical proposals, and production dependency
+    // predicates before dataset identity or any spectrum/pool/cache access.
+    // Runtime repeats the same dependency validation immediately before each
+    // trial evaluator call.
+    let optimizer_dependency_preflight = manifest
+        .parameter_optimizer
+        .as_ref()
+        .filter(|config| config.enabled)
+        .map(preflight_optimizer_dependencies)
+        .transpose()?;
+    manifest.validate()?;
     let dataset = compute_dataset_identity(&manifest)?;
     let strict_preflight_enabled =
         manifest.require_existing_candidate_pool || manifest.require_existing_annotation_cache;
@@ -7031,6 +7077,7 @@ pub fn execute_workflow(
             pending_validation_gates: Vec::new(),
             ensemble_interaction_calibration: None,
             resource_preflight,
+            optimizer_dependency_preflight,
             planned_models,
             parameter_optimization: Vec::new(),
             parameter_optimizer_execution: manifest.parameter_optimizer.as_ref().map(|config| {
@@ -8133,6 +8180,7 @@ pub fn execute_workflow(
             pending_validation_gates: vec![scope_reason.into()],
             ensemble_interaction_calibration: None,
             resource_preflight,
+            optimizer_dependency_preflight,
             planned_models: planned_model_reports(&manifest),
             parameter_optimization: optimization_results,
             parameter_optimizer_execution: Some(execution),
@@ -8537,6 +8585,7 @@ pub fn execute_workflow(
         pending_validation_gates,
         ensemble_interaction_calibration: ensemble_interaction_report,
         resource_preflight,
+        optimizer_dependency_preflight,
         planned_models: planned_model_reports(&manifest),
         parameter_optimization: optimization_results,
         parameter_optimizer_execution,
@@ -9777,6 +9826,59 @@ mod tests {
     }
 
     #[test]
+    fn invalid_frozen_dependencies_fail_before_dataset_or_cache_access() {
+        let directory = test_directory("dependency-preflight-before-data");
+        let mut manifest = frozen_seven_expert_manifest(&directory);
+        manifest.search_config = directory.join("must-not-open-search-config.json");
+        manifest.target_fasta = directory.join("must-not-open-target.fasta");
+        manifest.spectra = vec![directory
+            .join("must-not-open-spectrum.mzML")
+            .display()
+            .to_string()];
+        manifest.candidate_pool_root = Some(directory.join("must-not-open-candidate-pool"));
+        manifest.annotation_cache_root = Some(directory.join("must-not-open-annotation-cache"));
+        manifest.output_root = directory.join("must-not-create-output");
+        let optimizer = manifest.parameter_optimizer.as_mut().unwrap();
+        let ensemble = optimizer
+            .blocks
+            .iter_mut()
+            .find(|block| block.expert == Some(OptimizerExpert::Ensemble))
+            .unwrap();
+        ensemble.space.extend([
+            (
+                "ensemble_pep_combiner".into(),
+                vec![ParameterValue::String("median".into())],
+            ),
+            (
+                "ensemble_pep_trim_frac".into(),
+                vec![ParameterValue::Float(0.2)],
+            ),
+            (
+                "ensemble_weight_moments".into(),
+                vec![ParameterValue::Float(1.0)],
+            ),
+        ]);
+        ensemble.max_trials = Some(1);
+        let manifest_path = directory.join("workflow.json");
+        write_json_atomic(&manifest_path, &manifest).unwrap();
+
+        let error = execute_workflow(&manifest_path, &directory, 1, true)
+            .unwrap_err()
+            .to_string();
+        assert!(
+            error.contains("strict optimizer dependency preflight failed before data access"),
+            "{error}"
+        );
+        assert!(error.contains("ensemble_pep_combiner"));
+        assert!(error.contains("ensemble_pep_trim_frac"));
+        assert!(!error.contains("must-not-open"));
+        assert!(!manifest.output_root.exists());
+        assert!(!manifest.candidate_pool_root.as_ref().unwrap().exists());
+        assert!(!manifest.annotation_cache_root.as_ref().unwrap().exists());
+        std::fs::remove_dir_all(directory).unwrap();
+    }
+
+    #[test]
     fn strict_plan_preflights_both_spaces_without_creating_output() {
         let directory = test_directory("strict-resource-plan");
         let workspace = Path::new(env!("CARGO_MANIFEST_DIR")).join("../..");
@@ -9958,6 +10060,11 @@ mod tests {
         manifest.parameter_optimizer = Some(optimizer);
         write_json_atomic(&manifest_path, &manifest).unwrap();
         let state = execute_workflow(&manifest_path, &directory, 1, true).unwrap();
+        let dependency = state.optimizer_dependency_preflight.as_ref().unwrap();
+        assert_eq!(dependency.canonical_proposals, 2);
+        assert_eq!(dependency.production_evaluable_proposals, 2);
+        assert_eq!(dependency.dependency_pruned_proposals, 0);
+        assert!(!dependency.biological_evaluation_performed);
         assert_eq!(state.resource_preflight.len(), 3);
         assert!(state
             .resource_preflight

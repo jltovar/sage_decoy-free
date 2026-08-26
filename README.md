@@ -158,6 +158,12 @@ expert block, emits one immutable canonical artifact, and performs no spectra, c
 target-only, or optimizer-trial work. Strict preflight independently resolves and compares the
 complete roster before any production trial. Do not manufacture current hashes by editing older
 stage records or replacing only their implementation identity.
+Strict preflight also runs the production optimizer dependency resolver before dataset or cache
+access. Conditional multi-valued grids report and retain legitimate dependency pruning, while a
+single frozen proposal fails if it explicitly declares a dormant override. Complete effective
+configurations may still store canonical defaults for auxiliary evidence; those defaults are
+distinct from active optimizer proposal overrides. Runtime dependency validation remains enabled
+as an independent fail-closed check.
 Schema-v2 optimizer manifests can additionally set `execution_mode: optimization_only` for a full
 development run that materializes all individual and final Ensemble +entrapment winners and then
 returns successfully without resolving or executing any target-only resource or stage. Omitting
