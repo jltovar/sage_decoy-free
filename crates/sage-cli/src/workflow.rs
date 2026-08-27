@@ -18,6 +18,7 @@ use crate::external_feature_cache::{
     RAW_EXTERNAL_PREDICTION_CACHE_SCHEMA_VERSION,
 };
 use crate::input::Input;
+use crate::input_path_identity::{input_path_identity, InputPathIdentity, InputPathKind};
 use crate::parameter_optimizer::{
     apply_fdr_overrides, parameter_catalog_fingerprint, preflight_optimizer_dependencies,
     resolve_unique_frozen_block_parameters, run_optimizer, AuditLevelMetrics,
@@ -253,6 +254,8 @@ pub struct DatasetIdentity {
     pub fingerprint: String,
     pub target_fasta_sha256: String,
     pub spectra_sha256: Vec<String>,
+    #[serde(default)]
+    pub spectral_input_identities: Vec<InputPathIdentity>,
     pub search_config_sha256: String,
 }
 
@@ -2090,13 +2093,16 @@ impl WorkflowManifest {
 fn compute_dataset_identity(manifest: &WorkflowManifest) -> Result<DatasetIdentity> {
     let target_fasta_sha256 = content_sha256(&manifest.target_fasta)?;
     let search_config_sha256 = sha256_file(&manifest.search_config)?;
-    let mut spectra_sha256 = manifest
+    let mut spectral_input_identities = manifest
         .spectra
         .iter()
         .map(|source| {
-            let path = Path::new(source);
-            if path.is_file() {
-                content_sha256(path)
+            let url = sage_cloudpath::to_url(source)?;
+            if url.scheme() == "file" {
+                let path = url
+                    .to_file_path()
+                    .map_err(|_| anyhow::anyhow!("invalid local spectrum URL: {url}"))?;
+                input_path_identity(&path)
             } else {
                 // Remote/cloud sources cannot be content-hashed here. Their
                 // stable source string is still incorporated fail-closed into
@@ -2104,12 +2110,26 @@ fn compute_dataset_identity(manifest: &WorkflowManifest) -> Result<DatasetIdenti
                 let mut hasher = Sha256::new();
                 hasher.update(b"unresolved-spectrum-source:");
                 hasher.update(source.as_bytes());
-                Ok(format!("{:x}", hasher.finalize()))
+                Ok(InputPathIdentity {
+                    kind: InputPathKind::RemoteSource,
+                    sha256: format!("{:x}", hasher.finalize()),
+                    directory_schema: None,
+                    regular_file_count: None,
+                    total_bytes: 0,
+                })
             }
         })
         .collect::<Result<Vec<_>>>()?;
     // Dataset identity is independent of input ordering and host-specific
     // paths when files are locally available.
+    spectral_input_identities.sort_by(|left, right| {
+        (left.kind.as_str(), left.sha256.as_str())
+            .cmp(&(right.kind.as_str(), right.sha256.as_str()))
+    });
+    let mut spectra_sha256 = spectral_input_identities
+        .iter()
+        .map(|identity| identity.sha256.clone())
+        .collect::<Vec<_>>();
     spectra_sha256.sort();
     let mut hasher = Sha256::new();
     hasher.update(b"sage-decoy-free-dataset-v1\0");
@@ -2127,6 +2147,7 @@ fn compute_dataset_identity(manifest: &WorkflowManifest) -> Result<DatasetIdenti
         fingerprint: format!("{:x}", hasher.finalize()),
         target_fasta_sha256,
         spectra_sha256,
+        spectral_input_identities,
         search_config_sha256,
     })
 }
@@ -9764,6 +9785,54 @@ mod tests {
     }
 
     #[test]
+    fn workflow_and_candidate_pool_share_directory_spectrum_identity() {
+        let directory = test_directory("shared-directory-input-identity");
+        let spectrum_directory = directory.join("synthetic.d");
+        std::fs::create_dir_all(spectrum_directory.join("nested")).unwrap();
+        std::fs::write(spectrum_directory.join("analysis.tdf"), b"vendor-data").unwrap();
+        std::fs::write(spectrum_directory.join("nested/index.bin"), b"index").unwrap();
+
+        let mut manifest = minimal_manifest(&directory, ValidationDatasetRole::Development);
+        manifest.spectra = vec![spectrum_directory.display().to_string()];
+        let dataset = compute_dataset_identity(&manifest).unwrap();
+
+        let workspace = Path::new(env!("CARGO_MANIFEST_DIR")).join("../..");
+        let mut input = Input::load(
+            workspace
+                .join("tests/config.json")
+                .to_string_lossy()
+                .as_ref(),
+        )
+        .unwrap();
+        input.database.fasta = Some(workspace.join("tests/Q99536.fasta").display().to_string());
+        input.mzml_paths = Some(vec![spectrum_directory.display().to_string()]);
+        let search = search_fingerprint(&input.build().unwrap()).unwrap();
+
+        assert_eq!(dataset.spectral_input_identities.len(), 1);
+        assert_eq!(
+            dataset.spectral_input_identities[0].sha256,
+            search.spectra[0].sha256
+        );
+        assert_eq!(
+            dataset.spectral_input_identities[0].kind,
+            search.spectra[0].input_kind
+        );
+        assert_eq!(
+            dataset.spectral_input_identities[0].directory_schema,
+            search.spectra[0].directory_identity_schema
+        );
+        assert_eq!(
+            dataset.spectral_input_identities[0].regular_file_count,
+            search.spectra[0].regular_file_count
+        );
+        assert_eq!(
+            dataset.spectral_input_identities[0].total_bytes,
+            search.spectra[0].total_bytes.unwrap()
+        );
+        std::fs::remove_dir_all(directory).unwrap();
+    }
+
+    #[test]
     fn holdout_runs_its_own_declared_optimizer() {
         let directory = test_directory("holdout-local-optimizer");
         let mut manifest = minimal_manifest(&directory, ValidationDatasetRole::Holdout);
@@ -10210,6 +10279,7 @@ mod tests {
             fingerprint: "dataset-fingerprint".into(),
             target_fasta_sha256: "fasta".into(),
             spectra_sha256: vec!["spectra".into()],
+            spectral_input_identities: Vec::new(),
             search_config_sha256: "config".into(),
         };
         let mut record = StageRecord {
@@ -10399,6 +10469,7 @@ mod tests {
             fingerprint: "dataset-fingerprint".into(),
             target_fasta_sha256: "target".into(),
             spectra_sha256: vec!["spectra".into()],
+            spectral_input_identities: Vec::new(),
             search_config_sha256: "config".into(),
         };
         stamp_fitted_artifacts(
@@ -10539,6 +10610,7 @@ mod tests {
             fingerprint: "pxd-fingerprint".into(),
             target_fasta_sha256: "pxd-target".into(),
             spectra_sha256: vec!["pxd-spectra".into()],
+            spectral_input_identities: Vec::new(),
             search_config_sha256: "same-config".into(),
         };
         let artifacts = DfRunArtifacts {
@@ -10584,6 +10656,7 @@ mod tests {
             fingerprint: "isb-fingerprint".into(),
             target_fasta_sha256: "isb-target".into(),
             spectra_sha256: vec!["isb-spectra".into()],
+            spectral_input_identities: Vec::new(),
             search_config_sha256: "same-config".into(),
         };
         let artifacts = DfRunArtifacts {
@@ -10758,6 +10831,7 @@ mod tests {
             fingerprint: "dataset-fingerprint".into(),
             target_fasta_sha256: "target".into(),
             spectra_sha256: vec!["spectrum".into()],
+            spectral_input_identities: Vec::new(),
             search_config_sha256: "configuration".into(),
         };
         let calibration = external_profiles().calibration;
@@ -10954,6 +11028,7 @@ mod tests {
             fingerprint: "dataset-fingerprint".into(),
             target_fasta_sha256: "target-sha256".into(),
             spectra_sha256: vec!["spectra-sha256".into()],
+            spectral_input_identities: Vec::new(),
             search_config_sha256: sha256_file(&manifest.search_config).unwrap(),
         };
         let resolved_configuration = test_resolved_configuration(&model, Some(&window));
@@ -11227,6 +11302,7 @@ mod tests {
             fingerprint: "dataset-fingerprint".into(),
             target_fasta_sha256: "target".into(),
             spectra_sha256: vec!["spectra".into()],
+            spectral_input_identities: Vec::new(),
             search_config_sha256: "config".into(),
         };
         stamp_fitted_artifacts(
@@ -11263,6 +11339,7 @@ mod tests {
             fingerprint: "other-dataset-fingerprint".into(),
             target_fasta_sha256: "other-target".into(),
             spectra_sha256: vec!["other-spectra".into()],
+            spectral_input_identities: Vec::new(),
             search_config_sha256: dataset.search_config_sha256.clone(),
         };
         assert!(validate_artifact_reuse(
@@ -11417,6 +11494,7 @@ mod tests {
             fingerprint: "dataset-fingerprint".into(),
             target_fasta_sha256: "target-sha256".into(),
             spectra_sha256: vec!["spectra-sha256".into()],
+            spectral_input_identities: Vec::new(),
             search_config_sha256: sha256_file(&search_config).unwrap(),
         };
         let mut moments_options =
@@ -12268,6 +12346,7 @@ mod tests {
             fingerprint: "dataset-fingerprint".into(),
             target_fasta_sha256: "target-sha256".into(),
             spectra_sha256: vec!["spectra-sha256".into()],
+            spectral_input_identities: Vec::new(),
             search_config_sha256: sha256_file(&manifest.search_config).unwrap(),
         };
         let artifact_path = directory.join("lower-order.artifacts.json");

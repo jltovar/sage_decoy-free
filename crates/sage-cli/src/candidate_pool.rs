@@ -1,36 +1,35 @@
 use crate::input::Search;
+use crate::input_path_identity::{input_path_identity, InputPathIdentity, InputPathKind};
 use crate::provenance::{sha256_file, write_json_atomic};
-use anyhow::{Context, Result};
+use anyhow::{ensure, Context, Result};
 use sage_cloudpath::Url;
 use sage_core::database::{IndexedDatabase, PeptideIx};
 use sage_core::scoring::{ExternalPsmFeatures, FeatureCore};
 use serde::{Deserialize, Serialize};
 use sha2::{Digest, Sha256};
-use std::collections::{HashMap, HashSet};
+use std::collections::HashSet;
 use std::fs::File;
 use std::io::{BufReader, BufWriter};
 use std::path::{Path, PathBuf};
-use std::sync::{Mutex, OnceLock};
 
 pub const CANDIDATE_POOL_SCHEMA_VERSION: u32 = 1;
 pub const CANDIDATE_ID_SCHEMA: &str = "sage-candidate-id-v1";
 const SEARCH_FINGERPRINT_SCHEMA: &str = "sage-search-fingerprint-v1";
 const ANALYSIS_FINGERPRINT_SCHEMA: &str = "sage-analysis-fingerprint-v1";
 
-#[derive(Clone)]
-struct CachedFileDigest {
-    size: u64,
-    modified_nanos: Option<u128>,
-    sha256: String,
-}
-
-static FILE_DIGEST_CACHE: OnceLock<Mutex<HashMap<PathBuf, CachedFileDigest>>> = OnceLock::new();
-
 #[derive(Clone, Debug, Serialize, Deserialize, PartialEq, Eq)]
 pub struct SpectrumFingerprint {
     pub ordinal: usize,
     pub source: String,
     pub sha256: String,
+    #[serde(default)]
+    pub input_kind: InputPathKind,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub directory_identity_schema: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub regular_file_count: Option<u64>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub total_bytes: Option<u64>,
 }
 
 #[derive(Clone, Debug, Serialize, Deserialize, PartialEq, Eq)]
@@ -189,53 +188,26 @@ fn sha256_bytes(bytes: &[u8]) -> String {
 }
 
 pub(crate) fn content_sha256(path: &Path) -> Result<String> {
-    let canonical = path
-        .canonicalize()
-        .with_context(|| format!("resolving fingerprint input {}", path.display()))?;
-    let metadata = canonical
-        .metadata()
-        .with_context(|| format!("reading fingerprint metadata {}", canonical.display()))?;
-    let modified_nanos = metadata
-        .modified()
-        .ok()
-        .and_then(|value| value.duration_since(std::time::UNIX_EPOCH).ok())
-        .map(|duration| duration.as_nanos());
-    let cache = FILE_DIGEST_CACHE.get_or_init(|| Mutex::new(HashMap::new()));
-    if let Some(cached) = cache
-        .lock()
-        .expect("candidate fingerprint cache mutex poisoned")
-        .get(&canonical)
-        .filter(|cached| cached.size == metadata.len() && cached.modified_nanos == modified_nanos)
-        .cloned()
-    {
-        return Ok(cached.sha256);
-    }
-    let sha256 = sha256_file(&canonical)?;
-    cache
-        .lock()
-        .expect("candidate fingerprint cache mutex poisoned")
-        .insert(
-            canonical,
-            CachedFileDigest {
-                size: metadata.len(),
-                modified_nanos,
-                sha256: sha256.clone(),
-            },
-        );
-    Ok(sha256)
+    sha256_file(path)
 }
 
-fn source_sha256(url: &Url) -> Result<String> {
+fn source_identity(url: &Url) -> Result<InputPathIdentity> {
     if url.scheme() == "file" {
         let path = url
             .to_file_path()
             .map_err(|_| anyhow::anyhow!("invalid local spectrum URL: {url}"))?;
-        return content_sha256(&path);
+        return input_path_identity(&path);
     }
     let mut hasher = Sha256::new();
     hasher.update(b"unresolved-spectrum-source\0");
     hasher.update(url.as_str().as_bytes());
-    Ok(format!("{:x}", hasher.finalize()))
+    Ok(InputPathIdentity {
+        kind: InputPathKind::RemoteSource,
+        sha256: format!("{:x}", hasher.finalize()),
+        directory_schema: None,
+        regular_file_count: None,
+        total_bytes: 0,
+    })
 }
 
 fn normalized_search_value(search: &Search) -> Result<serde_json::Value> {
@@ -265,17 +237,30 @@ fn normalized_search_value(search: &Search) -> Result<serde_json::Value> {
 pub fn search_fingerprint(search: &Search) -> Result<SearchFingerprint> {
     let fasta_url = sage_cloudpath::to_url(&search.database.fasta)
         .with_context(|| format!("resolving candidate-pool FASTA {}", search.database.fasta))?;
-    let fasta_sha256 = source_sha256(&fasta_url)
-        .with_context(|| format!("hashing candidate-pool FASTA {}", search.database.fasta))?;
+    let fasta_sha256 = if fasta_url.scheme() == "file" {
+        let path = fasta_url
+            .to_file_path()
+            .map_err(|_| anyhow::anyhow!("invalid local FASTA URL: {fasta_url}"))?;
+        content_sha256(&path)
+    } else {
+        Ok(source_identity(&fasta_url)?.sha256)
+    }
+    .with_context(|| format!("hashing candidate-pool FASTA {}", search.database.fasta))?;
     let spectra = search
         .mzml_paths
         .iter()
         .enumerate()
         .map(|(ordinal, source)| {
+            let identity = source_identity(source)?;
             Ok(SpectrumFingerprint {
                 ordinal,
                 source: source.to_string(),
-                sha256: source_sha256(source)?,
+                sha256: identity.sha256,
+                input_kind: identity.kind,
+                directory_identity_schema: identity.directory_schema,
+                regular_file_count: identity.regular_file_count,
+                total_bytes: (identity.kind == InputPathKind::Directory)
+                    .then_some(identity.total_bytes),
             })
         })
         .collect::<Result<Vec<_>>>()?;
@@ -330,6 +315,24 @@ pub fn analysis_fingerprint(
         digest: format!("{:x}", hasher.finalize()),
         search_fingerprint: search_fingerprint.digest.clone(),
     })
+}
+
+/// Resolve and validate the complete scientific identity required before the
+/// candidate-pool-only boundary is allowed to enter native spectrum search.
+pub fn candidate_pool_identity_preflight(
+    search: &Search,
+    required_rank_depth: usize,
+) -> Result<(SearchFingerprint, AnalysisFingerprint)> {
+    ensure!(required_rank_depth > 0, "rank depth must be positive");
+    let search_fingerprint = search_fingerprint(search)?;
+    ensure!(
+        required_rank_depth == search_fingerprint.retained_rank_depth,
+        "candidate-pool-only --rank-depth={} must exactly equal the frozen search retained depth {}",
+        required_rank_depth,
+        search_fingerprint.retained_rank_depth
+    );
+    let analysis_fingerprint = analysis_fingerprint(search, &search_fingerprint)?;
+    Ok((search_fingerprint, analysis_fingerprint))
 }
 
 pub fn stable_candidate_id(search_fingerprint: &str, core: &FeatureCore, peptide: &str) -> String {
@@ -422,7 +425,19 @@ pub fn portable_search_fingerprint_matches(
             .iter()
             .zip(&current.spectra)
             .all(|(left, right)| {
-                !left.sha256.is_empty()
+                let directory_metadata_matches = match (left.input_kind, right.input_kind) {
+                    (InputPathKind::Directory, InputPathKind::Directory) => {
+                        left.directory_identity_schema.is_some()
+                            && left.directory_identity_schema == right.directory_identity_schema
+                            && left.regular_file_count == right.regular_file_count
+                            && left.total_bytes == right.total_bytes
+                    }
+                    (InputPathKind::RegularFile, InputPathKind::RegularFile) => true,
+                    (InputPathKind::RemoteSource, InputPathKind::RemoteSource) => true,
+                    _ => false,
+                };
+                directory_metadata_matches
+                    && !left.sha256.is_empty()
                     && !right.sha256.is_empty()
                     && left.ordinal == right.ordinal
                     && left.sha256 == right.sha256
@@ -800,6 +815,118 @@ mod tests {
     }
 
     #[test]
+    fn regular_file_strict_search_fingerprint_is_backward_compatible() {
+        let workspace = Path::new(env!("CARGO_MANIFEST_DIR")).join("../..");
+        let mut input = Input::load(
+            workspace
+                .join("tests/config.json")
+                .to_string_lossy()
+                .as_ref(),
+        )
+        .unwrap();
+        input.database.fasta = Some(workspace.join("tests/Q99536.fasta").display().to_string());
+        input.mzml_paths = Some(vec![workspace
+            .join("tests/LQSRPAAPPAPGPGQLTLR.mzML")
+            .display()
+            .to_string()]);
+        let search = input.build().unwrap();
+        let (fingerprint, analysis) =
+            candidate_pool_identity_preflight(&search, search.report_psms).unwrap();
+        assert_eq!(
+            fingerprint.digest,
+            "ccfbc7b99c167bc4f1c13e7f6b7608fd577f6006cd01576652b5c429e6e21e7b"
+        );
+        assert_eq!(
+            fingerprint.spectra[0].input_kind,
+            InputPathKind::RegularFile
+        );
+        assert_eq!(
+            fingerprint.spectra[0].sha256,
+            "b22b4253ab566878b74c0ade3afc4abd1986edf6b62fafb18545377c4327adb2"
+        );
+        assert_eq!(analysis.search_fingerprint, fingerprint.digest);
+    }
+
+    #[test]
+    fn candidate_pool_identity_preflight_accepts_directory_backed_spectrum() {
+        let workspace = Path::new(env!("CARGO_MANIFEST_DIR")).join("../..");
+        let root = std::env::temp_dir().join(format!(
+            "sage-candidate-directory-preflight-{}-{}",
+            std::process::id(),
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .unwrap()
+                .as_nanos()
+        ));
+        std::fs::create_dir_all(root.join("nested")).unwrap();
+        std::fs::write(root.join("analysis.tdf"), b"synthetic vendor data").unwrap();
+        std::fs::write(root.join("nested/metadata.bin"), b"metadata").unwrap();
+        let mut input = Input::load(
+            workspace
+                .join("tests/config.json")
+                .to_string_lossy()
+                .as_ref(),
+        )
+        .unwrap();
+        input.database.fasta = Some(workspace.join("tests/Q99536.fasta").display().to_string());
+        input.mzml_paths = Some(vec![root.display().to_string()]);
+        let search = input.build().unwrap();
+        let (fingerprint, analysis) =
+            candidate_pool_identity_preflight(&search, search.report_psms).unwrap();
+        let spectrum = &fingerprint.spectra[0];
+        assert_eq!(spectrum.input_kind, InputPathKind::Directory);
+        assert_eq!(
+            spectrum.directory_identity_schema.as_deref(),
+            Some(crate::input_path_identity::DIRECTORY_IDENTITY_SCHEMA)
+        );
+        assert_eq!(spectrum.regular_file_count, Some(2));
+        assert_eq!(spectrum.total_bytes, Some(29));
+        assert!(!fingerprint.digest.is_empty());
+        assert_eq!(analysis.search_fingerprint, fingerprint.digest);
+        let core = FeatureCore::default();
+        let stable_before = stable_candidate_id(&fingerprint.digest, &core, "PEPTIDE");
+        std::fs::write(root.join("analysis.tdf"), b"changed synthetic vendor data").unwrap();
+        let changed = search_fingerprint(&search).unwrap();
+        assert_ne!(changed.digest, fingerprint.digest);
+        assert_ne!(
+            stable_candidate_id(&changed.digest, &core, "PEPTIDE"),
+            stable_before
+        );
+        std::fs::remove_dir_all(root).unwrap();
+    }
+
+    #[test]
+    fn missing_directory_backed_spectrum_fails_before_search() {
+        let workspace = Path::new(env!("CARGO_MANIFEST_DIR")).join("../..");
+        let missing = std::env::temp_dir().join(format!(
+            "sage-candidate-directory-missing-{}-{}",
+            std::process::id(),
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .unwrap()
+                .as_nanos()
+        ));
+        let mut input = Input::load(
+            workspace
+                .join("tests/config.json")
+                .to_string_lossy()
+                .as_ref(),
+        )
+        .unwrap();
+        input.database.fasta = Some(workspace.join("tests/Q99536.fasta").display().to_string());
+        input.mzml_paths = Some(vec![missing.display().to_string()]);
+        let error = input
+            .build()
+            .and_then(|search| search_fingerprint(&search))
+            .unwrap_err();
+        assert!(
+            error.to_string().contains("failed to stat input path")
+                || error.to_string().contains("No such file or directory")
+        );
+        assert!(!missing.exists());
+    }
+
+    #[test]
     fn pool_is_capability_checked_and_payload_verified() {
         let root = std::env::temp_dir().join(format!(
             "sage-candidate-pool-test-{}-{}",
@@ -863,11 +990,19 @@ mod tests {
                     ordinal: 0,
                     source: format!("file://{root}/first.mzML"),
                     sha256: "first-content".into(),
+                    input_kind: InputPathKind::RegularFile,
+                    directory_identity_schema: None,
+                    regular_file_count: None,
+                    total_bytes: None,
                 },
                 SpectrumFingerprint {
                     ordinal: 1,
                     source: format!("file://{root}/second.mzML"),
                     sha256: "second-content".into(),
+                    input_kind: InputPathKind::RegularFile,
+                    directory_identity_schema: None,
+                    regular_file_count: None,
+                    total_bytes: None,
                 },
             ],
             normalized_search_sha256: "search-configuration".into(),
@@ -909,6 +1044,10 @@ mod tests {
             ordinal: 2,
             source: "file:///mnt/e/third.mzML".into(),
             sha256: "third-content".into(),
+            input_kind: InputPathKind::RegularFile,
+            directory_identity_schema: None,
+            regular_file_count: None,
+            total_bytes: None,
         });
         assert!(!portable_search_fingerprint_matches(&macos, &added));
 
@@ -927,6 +1066,16 @@ mod tests {
         let mut schema = wsl.clone();
         schema.candidate_schema = "different-candidate-schema".into();
         assert!(!portable_search_fingerprint_matches(&macos, &schema));
+
+        let mut legacy_directory = wsl.clone();
+        legacy_directory.spectra[0].input_kind = InputPathKind::Directory;
+        legacy_directory.spectra[0].directory_identity_schema = None;
+        legacy_directory.spectra[0].regular_file_count = None;
+        legacy_directory.spectra[0].total_bytes = None;
+        assert!(!portable_search_fingerprint_matches(
+            &legacy_directory,
+            &legacy_directory
+        ));
 
         let mut missing = wsl;
         missing.spectra[0].sha256.clear();

@@ -47,6 +47,13 @@ native spectral work needed for the immutable pre-FDR pool, including native RT/
 when that frozen search setting is enabled. It then atomically publishes and fully reopens the
 manifest and compressed payload before writing its report.
 
+Identity preflight occurs before `batch_files` enters native spectrum search. Every local spectrum
+source must resolve through the canonical input-path identity implementation. Ordinary files keep
+their legacy full-file SHA-256 behavior. Directory-backed sources require the versioned recursive
+content identity described in [`INPUT_PATH_IDENTITY.md`](INPUT_PATH_IDENTITY.md); no path-only,
+directory-metadata-only, or legacy directory identity is accepted. A missing, empty, unreadable,
+mutating, symlink-containing, or special-entry directory therefore fails before search.
+
 If the content-addressed final directory already exists, Sage fully verifies and reuses it without
 searching. An incomplete, corrupt, or identity-incompatible final directory is an error; it is not
 overwritten and does not trigger a fallback search.
@@ -101,6 +108,10 @@ atomic JSON writer and are reopened and identity-checked by the CLI before succe
 Safe resumption therefore means rerunning the same boundary with byte-identical scientific inputs:
 a complete exact resource is verified and reused, while any mismatch stops. There is no `--force`
 or repair path in either command.
+
+Directory-backed spectra add a second resumption condition: the stored input kind, directory
+schema, root-relative entry count, total bytes, and content digest must match the newly resolved
+identity. Manifests lacking this directory identity cannot reopen a directory-backed pool.
 
 ## Scientific and operational audit scope
 

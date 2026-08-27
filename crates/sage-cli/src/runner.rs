@@ -2,9 +2,9 @@ use super::input::{ExternalFeatureUseMode, Search};
 use super::output::SageResults;
 use super::telemetry;
 use crate::candidate_pool::{
-    analysis_fingerprint, inspect_compatible_pool, load_pool, load_required_pool, manifest_path,
-    pool_directory, publish_pool_atomic, relocation_provenance, search_fingerprint, write_pool,
-    CandidatePoolRequest, CandidatePoolUsage,
+    analysis_fingerprint, candidate_pool_identity_preflight, inspect_compatible_pool, load_pool,
+    load_required_pool, manifest_path, pool_directory, publish_pool_atomic, relocation_provenance,
+    search_fingerprint, write_pool, CandidatePoolRequest, CandidatePoolUsage,
 };
 use crate::external_feature_cache::{ExternalAnnotationCacheRequest, ExternalAnnotationCacheUsage};
 use crate::external_features::{
@@ -191,16 +191,8 @@ impl Runner {
                 && !self.parameters.annotate_matches,
             "candidate-pool-only prohibits LFQ, TMT, and matched-fragment annotation"
         );
-        anyhow::ensure!(required_rank_depth > 0, "rank depth must be positive");
-
-        let search = search_fingerprint(&self.parameters)?;
-        anyhow::ensure!(
-            required_rank_depth == search.retained_rank_depth,
-            "candidate-pool-only --rank-depth={} must exactly equal the frozen search retained depth {}",
-            required_rank_depth,
-            search.retained_rank_depth
-        );
-        let analysis = analysis_fingerprint(&self.parameters, &search)?;
+        let (search, analysis) =
+            candidate_pool_identity_preflight(&self.parameters, required_rank_depth)?;
         let directory = pool_directory(&root, &search);
 
         let (manifest, reused_existing_exact, native_search_performed) = if directory.exists() {

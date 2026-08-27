@@ -4,6 +4,7 @@ pub mod entrapment;
 pub mod external_feature_cache;
 pub mod external_features;
 pub mod input;
+pub mod input_path_identity;
 pub mod output;
 pub mod parameter_optimizer;
 pub mod provenance;
