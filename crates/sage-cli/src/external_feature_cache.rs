@@ -434,6 +434,34 @@ struct OperationalFileIdentity {
 }
 
 #[derive(Clone, Debug, Serialize, Deserialize)]
+pub struct RawGeneratorSourceIdentity {
+    pub source: String,
+    pub kind: String,
+    pub sha256: String,
+}
+
+#[derive(Clone, Debug, Serialize, Deserialize)]
+pub struct RawGeneratorFileIdentity {
+    pub path: PathBuf,
+    pub size_bytes: u64,
+    pub sha256: String,
+}
+
+#[derive(Clone, Debug, Serialize, Deserialize)]
+pub struct RawGeneratorProvenance {
+    pub schema_version: u32,
+    pub generator_settings_sha256: String,
+    pub command: Option<RawGeneratorSourceIdentity>,
+    pub python: Option<RawGeneratorSourceIdentity>,
+    pub python_environment: Option<String>,
+    pub package_metadata: Vec<RawGeneratorFileIdentity>,
+    pub model_components: Vec<ModelComponentIdentity>,
+    pub model_files: Vec<RawGeneratorFileIdentity>,
+    pub probe_path: Option<PathBuf>,
+    pub probe_sha256: Option<String>,
+}
+
+#[derive(Clone, Debug, Serialize, Deserialize)]
 struct GeneratorProbeCache {
     schema_version: u32,
     probe_key: String,
@@ -724,6 +752,71 @@ fn raw_generator_identity(
         sha256_bytes(&serde_json::to_vec(&value)?),
         probe.model_components,
     ))
+}
+
+/// Resolve the complete durable provenance consumed by raw-cache-only
+/// construction. The returned record makes wrapper, Python environment,
+/// package metadata, and selected model-file identities independently
+/// inspectable instead of leaving them only inside a composite digest.
+pub fn raw_generator_provenance(
+    settings: &ExternalFeatureGenerationSettings,
+    probe_root: &Path,
+    require_existing_probe: bool,
+) -> Result<RawGeneratorProvenance> {
+    let (generator_settings_sha256, model_components) =
+        raw_generator_identity(settings, Some(probe_root), require_existing_probe)?;
+    let probe = resolve_generator_probe(settings, Some(probe_root), true)?;
+    anyhow::ensure!(
+        probe.model_components == model_components,
+        "raw generator model identities changed while resolving durable provenance"
+    );
+    let command = settings
+        .command_path
+        .as_deref()
+        .map(source_identity)
+        .transpose()?
+        .map(|identity| RawGeneratorSourceIdentity {
+            source: identity.source,
+            kind: identity.kind,
+            sha256: identity.sha256,
+        });
+    let python = settings
+        .python_executable
+        .as_deref()
+        .map(source_identity)
+        .transpose()?
+        .map(|identity| RawGeneratorSourceIdentity {
+            source: identity.source,
+            kind: identity.kind,
+            sha256: identity.sha256,
+        });
+    let probe_path = Some(
+        probe_root
+            .join("generator_identity_probes")
+            .join(format!("{}.json", probe.probe_key)),
+    );
+    let probe_sha256 = probe_path
+        .as_ref()
+        .filter(|path| path.is_file())
+        .map(|path| sha256_file(path))
+        .transpose()?;
+    let map_file = |file: &OperationalFileIdentity| RawGeneratorFileIdentity {
+        path: file.path.clone(),
+        size_bytes: file.size_bytes,
+        sha256: file.sha256.clone(),
+    };
+    Ok(RawGeneratorProvenance {
+        schema_version: 1,
+        generator_settings_sha256,
+        command,
+        python,
+        python_environment: probe.python_environment,
+        package_metadata: probe.package_metadata.iter().map(map_file).collect(),
+        model_components,
+        model_files: probe.model_files.iter().map(map_file).collect(),
+        probe_path,
+        probe_sha256,
+    })
 }
 
 fn validate_model_independent_generator_contract(
@@ -1422,6 +1515,84 @@ pub fn write_raw_cache(
     Ok(manifest)
 }
 
+/// Publish a raw prediction cache as one verified directory transaction.
+/// Exact existing caches are reopened and reused; an incompatible final path
+/// fails closed and is never overwritten or regenerated in place.
+pub fn publish_raw_cache_atomic(
+    directory: &Path,
+    identity: &RawExternalPredictionIdentity,
+    records: Vec<ExternalAnnotationRecord>,
+) -> Result<(RawExternalPredictionCacheManifest, bool)> {
+    if directory.exists() {
+        let (manifest, existing) = load_raw_cache(directory, identity)?
+            .context("existing final raw prediction cache is incomplete or incompatible")?;
+        anyhow::ensure!(
+            bincode::serialize(&existing)? == bincode::serialize(&records)?,
+            "raw predictions changed under an existing portable identity"
+        );
+        return Ok((manifest, true));
+    }
+
+    let parent = directory
+        .parent()
+        .context("raw prediction cache directory has no parent")?;
+    std::fs::create_dir_all(parent)?;
+    let stem = directory
+        .file_name()
+        .and_then(|name| name.to_str())
+        .unwrap_or("raw-predictions");
+    let nonce = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .unwrap_or_default()
+        .as_nanos();
+    let staging = parent.join(format!(".{stem}.partial.{}.{}", std::process::id(), nonce));
+    anyhow::ensure!(
+        !staging.exists(),
+        "raw-cache staging directory already exists: {}",
+        staging.display()
+    );
+
+    let result = (|| -> Result<RawExternalPredictionCacheManifest> {
+        let written = write_raw_cache(&staging, identity, records, None)?;
+        let (verified, _) = load_raw_cache(&staging, identity)?
+            .context("raw-cache staging verification did not find a complete cache")?;
+        anyhow::ensure!(
+            verified.payload_sha256 == written.payload_sha256
+                && verified.prediction_count == written.prediction_count
+                && verified.joined_prediction_count == written.joined_prediction_count,
+            "raw-cache staging verification disagrees with the written resource"
+        );
+        anyhow::ensure!(
+            !directory.exists(),
+            "raw-cache final directory appeared during generation; refusing to overwrite {}",
+            directory.display()
+        );
+        std::fs::rename(&staging, directory).with_context(|| {
+            format!(
+                "atomically publishing raw cache {} -> {}",
+                staging.display(),
+                directory.display()
+            )
+        })?;
+        #[cfg(unix)]
+        std::fs::File::open(parent)?.sync_all()?;
+        let (published, _) = load_raw_cache(directory, identity)?
+            .context("published raw cache failed immutable reopen verification")?;
+        anyhow::ensure!(
+            published.payload_sha256 == written.payload_sha256
+                && published.prediction_count == written.prediction_count
+                && published.joined_prediction_count == written.joined_prediction_count,
+            "published raw cache differs from the verified staging resource"
+        );
+        Ok(published)
+    })();
+
+    if result.is_err() && staging.exists() {
+        let _ = std::fs::remove_dir_all(&staging);
+    }
+    result.map(|manifest| (manifest, false))
+}
+
 pub fn raw_cache_usage(
     directory: &Path,
     manifest: &RawExternalPredictionCacheManifest,
@@ -1945,6 +2116,68 @@ mod tests {
         .unwrap();
         std::fs::write(directory.join(manifest.payload_file), b"corrupt").unwrap();
         assert!(load_raw_cache(&directory, &identity).is_err());
+        std::fs::remove_dir_all(root).unwrap();
+    }
+
+    #[test]
+    fn atomic_raw_cache_publication_never_accepts_partial_or_incompatible_state() {
+        let root = std::env::temp_dir().join(format!(
+            "sage-atomic-raw-cache-test-{}-{}",
+            std::process::id(),
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .unwrap()
+                .as_nanos()
+        ));
+        let settings = layered_settings();
+        let inputs = [ExternalAnnotationInput {
+            stable_id: "candidate".into(),
+            score: 10.0,
+            q_value: None,
+            pep: None,
+            retention_time: 12.0,
+            ion_mobility: 1.1,
+            precursor_mass: 900.0,
+            charge: 2,
+            rank: 1,
+        }];
+        let identity =
+            raw_prediction_identity_with_probe_root("search", &settings, &inputs, 1, &root, false)
+                .unwrap();
+        let directory = raw_cache_directory(&root, &identity);
+
+        assert!(publish_raw_cache_atomic(&directory, &identity, Vec::new()).is_err());
+        assert!(!directory.exists());
+
+        let record = ExternalAnnotationRecord {
+            stable_id: "candidate".into(),
+            features: complete_features(),
+        };
+        let (manifest, reused) =
+            publish_raw_cache_atomic(&directory, &identity, vec![record.clone()]).unwrap();
+        assert!(!reused);
+        assert_eq!(manifest.prediction_count, 1);
+        let (_, reused) =
+            publish_raw_cache_atomic(&directory, &identity, vec![record.clone()]).unwrap();
+        assert!(reused);
+
+        let mut changed = record;
+        changed.features.ms2rescore_deeplc_rt_error = 2.0;
+        let changed_error = publish_raw_cache_atomic(&directory, &identity, vec![changed])
+            .unwrap_err()
+            .to_string();
+        assert!(changed_error.contains("raw predictions changed"));
+
+        std::fs::write(directory.join(&manifest.payload_file), b"corrupt").unwrap();
+        assert!(publish_raw_cache_atomic(
+            &directory,
+            &identity,
+            vec![ExternalAnnotationRecord {
+                stable_id: "candidate".into(),
+                features: complete_features(),
+            }],
+        )
+        .is_err());
         std::fs::remove_dir_all(root).unwrap();
     }
 

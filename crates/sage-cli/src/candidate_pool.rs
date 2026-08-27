@@ -535,6 +535,90 @@ pub fn write_pool(
     Ok(manifest)
 }
 
+/// Publish a complete candidate pool as one directory-level transaction.
+///
+/// An exact existing pool is verified and reused. An incomplete or
+/// incompatible final directory is never overwritten and never triggers a
+/// fallback search. New payloads are written and fully reopened under a
+/// uniquely named sibling staging directory before the final atomic rename.
+pub fn publish_pool_atomic(
+    directory: &Path,
+    fingerprint: &SearchFingerprint,
+    features: &[FeatureCore],
+    db: &IndexedDatabase,
+) -> Result<(CandidatePoolManifest, bool)> {
+    if directory.exists() {
+        let (manifest, _) =
+            load_pool_entries(directory, fingerprint, fingerprint.retained_rank_depth, db)
+                .with_context(|| {
+                    format!(
+                        "existing final candidate-pool directory is incomplete or incompatible: {}",
+                        directory.display()
+                    )
+                })?;
+        return Ok((manifest, true));
+    }
+
+    let parent = directory
+        .parent()
+        .context("candidate-pool directory has no parent")?;
+    std::fs::create_dir_all(parent)?;
+    let stem = directory
+        .file_name()
+        .and_then(|name| name.to_str())
+        .unwrap_or("candidate-pool");
+    let nonce = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .unwrap_or_default()
+        .as_nanos();
+    let staging = parent.join(format!(".{stem}.partial.{}.{}", std::process::id(), nonce));
+    anyhow::ensure!(
+        !staging.exists(),
+        "candidate-pool staging directory already exists: {}",
+        staging.display()
+    );
+
+    let result = (|| -> Result<CandidatePoolManifest> {
+        let written = write_pool(&staging, fingerprint, features, db)?;
+        let (verified, reopened) =
+            load_pool_entries(&staging, fingerprint, fingerprint.retained_rank_depth, db)?;
+        anyhow::ensure!(
+            reopened.len() == features.len()
+                && verified.candidate_count == written.candidate_count
+                && verified.payload_sha256 == written.payload_sha256,
+            "candidate-pool staging verification disagrees with the written population"
+        );
+        anyhow::ensure!(
+            !directory.exists(),
+            "candidate-pool final directory appeared during construction; refusing to overwrite {}",
+            directory.display()
+        );
+        std::fs::rename(&staging, directory).with_context(|| {
+            format!(
+                "atomically publishing candidate pool {} -> {}",
+                staging.display(),
+                directory.display()
+            )
+        })?;
+        #[cfg(unix)]
+        std::fs::File::open(parent)?.sync_all()?;
+        let (published, reopened) =
+            load_pool_entries(directory, fingerprint, fingerprint.retained_rank_depth, db)?;
+        anyhow::ensure!(
+            reopened.len() == features.len()
+                && published.candidate_count == written.candidate_count
+                && published.payload_sha256 == written.payload_sha256,
+            "published candidate pool failed immutable reopen verification"
+        );
+        Ok(published)
+    })();
+
+    if result.is_err() && staging.exists() {
+        let _ = std::fs::remove_dir_all(&staging);
+    }
+    result.map(|manifest| (manifest, false))
+}
+
 pub fn load_pool_entries(
     directory: &Path,
     expected: &SearchFingerprint,
@@ -965,6 +1049,186 @@ mod tests {
         std::fs::write(&payload, original_payload).unwrap();
 
         std::fs::remove_dir_all(root).unwrap();
+    }
+
+    #[test]
+    fn atomic_pool_publication_never_accepts_partial_or_incompatible_state() {
+        use sage_core::peptide::Peptide;
+
+        let root = std::env::temp_dir().join(format!(
+            "sage-candidate-pool-atomic-test-{}-{}",
+            std::process::id(),
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .unwrap()
+                .as_nanos()
+        ));
+        let fingerprint = SearchFingerprint {
+            schema_version: CANDIDATE_POOL_SCHEMA_VERSION,
+            digest: "atomic-search".into(),
+            fasta_sha256: "fasta".into(),
+            spectra: Vec::new(),
+            normalized_search_sha256: "config".into(),
+            retained_rank_depth: 1,
+            candidate_schema: CANDIDATE_ID_SCHEMA.into(),
+        };
+        let database = IndexedDatabase {
+            peptides: vec![Peptide {
+                sequence: std::sync::Arc::from(&b"PEPTIDE"[..]),
+                ..Peptide::default()
+            }],
+            ..IndexedDatabase::default()
+        };
+        let feature = FeatureCore {
+            spec_id: "scan=1".into(),
+            rank: 1,
+            peptide_idx: PeptideIx(0),
+            ..FeatureCore::default()
+        };
+        let final_directory = pool_directory(&root, &fingerprint);
+
+        let duplicate_error = publish_pool_atomic(
+            &final_directory,
+            &fingerprint,
+            &[feature.clone(), feature.clone()],
+            &database,
+        )
+        .unwrap_err();
+        assert!(duplicate_error.to_string().contains("duplicate stable"));
+        assert!(!final_directory.exists());
+
+        let (manifest, reused) = publish_pool_atomic(
+            &final_directory,
+            &fingerprint,
+            std::slice::from_ref(&feature),
+            &database,
+        )
+        .unwrap();
+        assert!(!reused);
+        assert_eq!(manifest.candidate_count, 1);
+        let (_, reused) = publish_pool_atomic(
+            &final_directory,
+            &fingerprint,
+            std::slice::from_ref(&feature),
+            &database,
+        )
+        .unwrap();
+        assert!(reused);
+
+        std::fs::write(final_directory.join(&manifest.payload_file), b"corrupt").unwrap();
+        let error = publish_pool_atomic(
+            &final_directory,
+            &fingerprint,
+            std::slice::from_ref(&feature),
+            &database,
+        )
+        .unwrap_err();
+        assert!(error
+            .to_string()
+            .contains("existing final candidate-pool directory"));
+        std::fs::remove_dir_all(root).unwrap();
+    }
+
+    #[test]
+    fn candidate_pool_only_stops_before_external_and_statistical_stages() {
+        let workspace = Path::new(env!("CARGO_MANIFEST_DIR")).join("../..");
+        let root = std::env::temp_dir().join(format!(
+            "sage-candidate-pool-only-test-{}-{}",
+            std::process::id(),
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .unwrap()
+                .as_nanos()
+        ));
+        let output = root.join("ordinary-output-must-remain-empty");
+        let marker = root.join("external-generator-must-not-run");
+        let mut input = Input::load(
+            workspace
+                .join("tests/config.json")
+                .to_string_lossy()
+                .as_ref(),
+        )
+        .unwrap();
+        input.database.fasta = Some(workspace.join("tests/Q99536.fasta").display().to_string());
+        input.database.generate_decoys = Some(false);
+        input.mzml_paths = Some(vec![workspace
+            .join("tests/LQSRPAAPPAPGPGQLTLR.mzML")
+            .display()
+            .to_string()]);
+        input.output_directory = Some(output.display().to_string());
+        let mut search = input.build().unwrap();
+        search.fdr.mode = FdrMode::DecoyFree;
+        search.fdr.model_fit = ModelFit::Moments;
+        search.external_features.enabled = true;
+        search.external_features.command_path = Some(marker.display().to_string());
+        let report = Runner::new(search, 1)
+            .unwrap()
+            .construct_candidate_pool_only(1, root.join("pools"), 10)
+            .unwrap();
+        assert_eq!(report.execution_scope, "candidate_pool_only");
+        assert_eq!(report.status, "verified_complete");
+        assert!(report.native_search_performed);
+        assert!(report.downstream_stages_entered.is_empty());
+        assert!(report.manifest.is_file());
+        assert!(report.payload.is_file());
+        assert!(!marker.exists());
+        assert!(!output.join("results.sage.tsv").exists());
+        assert!(!output.join("fitted_model_artifacts.json").exists());
+        assert!(!output
+            .join("null_window_optimizer.checkpoint.json")
+            .exists());
+        std::fs::remove_dir_all(root).unwrap();
+    }
+
+    #[test]
+    fn raw_cache_only_missing_pool_fails_before_search_or_wrapper_fallback() {
+        let workspace = Path::new(env!("CARGO_MANIFEST_DIR")).join("../..");
+        let root = std::env::temp_dir().join(format!(
+            "sage-raw-cache-only-missing-pool-test-{}-{}",
+            std::process::id(),
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .unwrap()
+                .as_nanos()
+        ));
+        let output = root.join("ordinary-output-must-remain-empty");
+        let marker = root.join("external-generator-must-not-run");
+        let mut input = Input::load(
+            workspace
+                .join("tests/config.json")
+                .to_string_lossy()
+                .as_ref(),
+        )
+        .unwrap();
+        input.database.fasta = Some(workspace.join("tests/Q99536.fasta").display().to_string());
+        input.database.generate_decoys = Some(false);
+        input.database.prefilter = Some(false);
+        input.mzml_paths = Some(vec![workspace
+            .join("tests/LQSRPAAPPAPGPGQLTLR.mzML")
+            .display()
+            .to_string()]);
+        input.output_directory = Some(output.display().to_string());
+        let mut search = input.build().unwrap();
+        search.fdr.mode = FdrMode::DecoyFree;
+        search.external_features.enabled = true;
+        search.external_features.max_rank = Some(10);
+        search.external_features.command_path = Some(marker.display().to_string());
+        let error = Runner::new(search, 1)
+            .unwrap()
+            .construct_raw_annotation_cache_only(
+                root.join("missing-pools"),
+                root.join("annotations"),
+                10,
+            )
+            .unwrap_err()
+            .to_string();
+        assert!(error.contains("search fallback is prohibited"));
+        assert!(!marker.exists());
+        assert!(!root.join("annotations").exists());
+        assert!(!output.join("results.sage.tsv").exists());
+        if root.exists() {
+            std::fs::remove_dir_all(root).unwrap();
+        }
     }
 
     #[test]
