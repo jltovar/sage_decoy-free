@@ -105,6 +105,15 @@ ordered spectrum ordinals and content hashes, normalized search configuration, c
 rank depth, candidate count, and payload hash. A macOS path and a WSL path can therefore reference
 the same pool content; reordering or changing any input still fails closed.
 
+Regular-file spectra retain their historical full-file SHA-256 identity. Directory-backed vendor
+spectra use the versioned `sage-input-directory-content-v1` identity: Sage recursively freezes and
+sorts normalized root-relative regular-file entries, hashes every complete file, and binds each
+entry type, path, size, and content digest with length framing. Absolute roots, root-directory
+names, permissions, ownership, and timestamps are excluded, so an unchanged dataset may relocate.
+Symlinks, special entries, unreadable files, empty directories, duplicate normalized paths, and
+inventory or file mutation during hashing fail closed. See
+[`INPUT_PATH_IDENTITY.md`](INPUT_PATH_IDENTITY.md) for the production call graph and schema.
+
 For controlled construction without entering any statistical or annotation stage, use the
 dedicated `sage candidate-pool-only` boundary. It atomically publishes and reopens the immutable
 pool, emits a construction report, and returns. The corresponding `sage raw-cache-only` boundary

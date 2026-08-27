@@ -101,6 +101,17 @@ and preprocessing settings, candidate schema, Sage version, and retained search 
 search fingerprint automatically selects a separate pool. The pool manifest also declares its
 rank-depth and feature capabilities; an analysis cannot request a rank that was not retained.
 
+Spectrum content hashes come from one canonical path-identity implementation shared with dataset
+identity and raw-cache provenance. Regular files preserve the pre-existing file SHA-256 semantics.
+For directory-backed vendor inputs, `sage-input-directory-content-v1` binds the sorted normalized
+root-relative regular-file inventory, sizes, and complete per-file content hashes while excluding
+absolute locations and filesystem metadata. The inventory is frozen and checked again after all
+files are hashed; per-file type and stability metadata are checked before and after hashing.
+Unsupported entries or concurrent change fail closed. The detailed kind, schema, file count, byte
+count, and digest are persisted in workflow provenance and candidate-pool manifests, so a legacy
+directory-backed artifact without that identity cannot resume. The complete schema and caller map
+are documented in [INPUT_PATH_IDENTITY.md](INPUT_PATH_IDENTITY.md).
+
 The separate analysis fingerprint contains the Decoy-Free model/window, evidence and p-value
 combination settings, q-value methods/covariates, Storey settings, FDR thresholds, protein
 grouping, RT/IMS gates, reproducibility rescue, hierarchical reporting, entrapment ratios, and

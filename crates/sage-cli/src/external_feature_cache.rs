@@ -1,5 +1,6 @@
 use crate::candidate_pool::CANDIDATE_ID_SCHEMA;
 use crate::input::ExternalFeatureGenerationSettings;
+use crate::input_path_identity::{input_path_identity, InputPathKind};
 use crate::provenance::{sha256_file, write_json_atomic};
 use anyhow::{Context, Result};
 use sage_core::scoring::ExternalPsmFeatures;
@@ -231,12 +232,24 @@ struct SourceIdentity {
     source: String,
     kind: String,
     sha256: String,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    directory_schema: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    regular_file_count: Option<u64>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    total_bytes: Option<u64>,
 }
 
 #[derive(Clone, Debug, Serialize)]
 struct PortableSourceIdentity {
     kind: String,
     sha256: String,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    directory_schema: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    regular_file_count: Option<u64>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    total_bytes: Option<u64>,
 }
 
 impl From<SourceIdentity> for PortableSourceIdentity {
@@ -244,6 +257,9 @@ impl From<SourceIdentity> for PortableSourceIdentity {
         Self {
             kind: value.kind,
             sha256: value.sha256,
+            directory_schema: value.directory_schema,
+            regular_file_count: value.regular_file_count,
+            total_bytes: value.total_bytes,
         }
     }
 }
@@ -289,81 +305,32 @@ fn portable_feature_generators(value: &serde_json::Value) -> serde_json::Value {
     value
 }
 
-fn directory_sha256(path: &Path) -> Result<String> {
-    let canonical = path
-        .canonicalize()
-        .with_context(|| format!("resolving annotation source directory {}", path.display()))?;
-    let mut pending = vec![canonical.clone()];
-    let mut visited_directories = HashSet::new();
-    let mut files = Vec::new();
-    while let Some(directory) = pending.pop() {
-        let directory = directory.canonicalize().with_context(|| {
-            format!(
-                "resolving annotation source directory {}",
-                directory.display()
-            )
-        })?;
-        if !visited_directories.insert(directory.clone()) {
-            continue;
-        }
-        let mut entries = std::fs::read_dir(&directory)
-            .with_context(|| {
-                format!(
-                    "reading annotation source directory {}",
-                    directory.display()
-                )
-            })?
-            .collect::<std::io::Result<Vec<_>>>()?;
-        entries.sort_by_key(|entry| entry.file_name());
-        for entry in entries {
-            let file_type = entry.file_type()?;
-            if file_type.is_dir() {
-                pending.push(entry.path());
-            } else if file_type.is_file() {
-                files.push(entry.path());
-            } else if file_type.is_symlink() {
-                let target = entry.path().canonicalize()?;
-                if target.is_dir() {
-                    pending.push(target);
-                } else if target.is_file() {
-                    files.push(target);
-                }
-            }
-        }
-    }
-    files.sort();
-    let mut hasher = Sha256::new();
-    hasher.update(b"sage-annotation-directory-v1\0");
-    for file in files {
-        let relative = file.strip_prefix(&canonical).unwrap_or(&file);
-        hasher.update(relative.to_string_lossy().as_bytes());
-        hasher.update(b"\0");
-        hasher.update(sha256_file(&file)?.as_bytes());
-        hasher.update(b"\0");
-    }
-    Ok(format!("{:x}", hasher.finalize()))
-}
-
 fn source_identity(source: &str) -> Result<SourceIdentity> {
     let path = Path::new(source);
-    if path.is_file() {
+    if path.exists() {
+        let identity = input_path_identity(path)?;
         return Ok(SourceIdentity {
             source: source.into(),
-            kind: "file".into(),
-            sha256: sha256_file(path)?,
-        });
-    }
-    if path.is_dir() {
-        return Ok(SourceIdentity {
-            source: source.into(),
-            kind: "directory".into(),
-            sha256: directory_sha256(path)?,
+            kind: match identity.kind {
+                InputPathKind::RegularFile => "file",
+                InputPathKind::Directory => "directory",
+                InputPathKind::RemoteSource => unreachable!("local path cannot be remote"),
+            }
+            .into(),
+            sha256: identity.sha256,
+            directory_schema: identity.directory_schema,
+            regular_file_count: identity.regular_file_count,
+            total_bytes: (identity.kind == InputPathKind::Directory)
+                .then_some(identity.total_bytes),
         });
     }
     Ok(SourceIdentity {
         source: source.into(),
         kind: "unresolved".into(),
         sha256: sha256_bytes(source.as_bytes()),
+        directory_schema: None,
+        regular_file_count: None,
+        total_bytes: None,
     })
 }
 
