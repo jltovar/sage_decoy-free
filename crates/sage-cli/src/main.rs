@@ -95,6 +95,82 @@ fn main() -> anyhow::Result<()> {
                 ),
         )
         .subcommand(
+            Command::new("candidate-pool-only")
+                .about("Construct and verify one immutable candidate pool, then stop before every statistical or annotation stage")
+                .arg(
+                    Arg::new("parameters")
+                        .required(true)
+                        .value_parser(clap::builder::NonEmptyStringValueParser::new())
+                        .value_hint(ValueHint::FilePath)
+                        .help("Frozen Sage search-parameter JSON"),
+                )
+                .arg(
+                    Arg::new("candidate-pool-root")
+                        .required(true)
+                        .long("candidate-pool-root")
+                        .value_parser(clap::builder::NonEmptyStringValueParser::new())
+                        .value_hint(ValueHint::DirPath)
+                        .help("Root for content-addressed immutable candidate pools"),
+                )
+                .arg(
+                    Arg::new("rank-depth")
+                        .required(true)
+                        .long("rank-depth")
+                        .value_parser(value_parser!(u32).range(1..))
+                        .help("Required retained candidate rank depth"),
+                )
+                .arg(
+                    Arg::new("report")
+                        .required(true)
+                        .long("report")
+                        .value_parser(clap::builder::NonEmptyStringValueParser::new())
+                        .value_hint(ValueHint::FilePath)
+                        .help("Atomic construction-boundary report JSON"),
+                ),
+        )
+        .subcommand(
+            Command::new("raw-cache-only")
+                .about("Verify an exact candidate pool, construct and verify one raw MS2PIP/DeepLC cache, then stop")
+                .arg(
+                    Arg::new("parameters")
+                        .required(true)
+                        .value_parser(clap::builder::NonEmptyStringValueParser::new())
+                        .value_hint(ValueHint::FilePath)
+                        .help("Frozen Sage search-parameter JSON with external_features enabled"),
+                )
+                .arg(
+                    Arg::new("candidate-pool-root")
+                        .required(true)
+                        .long("candidate-pool-root")
+                        .value_parser(clap::builder::NonEmptyStringValueParser::new())
+                        .value_hint(ValueHint::DirPath)
+                        .help("Root containing the exact immutable candidate pool"),
+                )
+                .arg(
+                    Arg::new("annotation-cache-root")
+                        .required(true)
+                        .long("annotation-cache-root")
+                        .value_parser(clap::builder::NonEmptyStringValueParser::new())
+                        .value_hint(ValueHint::DirPath)
+                        .help("Root for content-addressed raw external predictions"),
+                )
+                .arg(
+                    Arg::new("rank-depth")
+                        .required(true)
+                        .long("rank-depth")
+                        .value_parser(value_parser!(u32).range(1..))
+                        .help("Rank depth; must equal frozen external_features.max_rank"),
+                )
+                .arg(
+                    Arg::new("report")
+                        .required(true)
+                        .long("report")
+                        .value_parser(clap::builder::NonEmptyStringValueParser::new())
+                        .value_hint(ValueHint::FilePath)
+                        .help("Atomic raw-cache construction catalog/report JSON"),
+                ),
+        )
+        .subcommand(
             Command::new("audit-entrapment")
                 .about("Generate or inspect an entrapment FASTA without running spectral searches")
                 .arg(
@@ -236,6 +312,82 @@ fn main() -> anyhow::Result<()> {
             report.database.measured().peptide_ratio,
             report.database.measured().peptidoform_ratio
         );
+        return Ok(());
+    }
+    if let Some(("candidate-pool-only", boundary_matches)) = matches.subcommand() {
+        let parameters = boundary_matches
+            .get_one::<String>("parameters")
+            .expect("required search parameters");
+        let root = boundary_matches
+            .get_one::<String>("candidate-pool-root")
+            .expect("required candidate-pool root");
+        let rank_depth = boundary_matches
+            .get_one::<u32>("rank-depth")
+            .copied()
+            .expect("required rank depth") as usize;
+        let report_path = boundary_matches
+            .get_one::<String>("report")
+            .expect("required report path");
+        let input = Input::load(parameters)?;
+        let runner = input
+            .build()
+            .and_then(|parameters| Runner::new(parameters, parallel))?;
+        let report = runner.construct_candidate_pool_only(
+            parallel,
+            std::path::PathBuf::from(root),
+            rank_depth,
+        )?;
+        write_json_atomic(std::path::Path::new(report_path), &report)?;
+        let reopened: sage_cli::runner::CandidatePoolConstructionReport =
+            serde_json::from_slice(&std::fs::read(report_path)?)?;
+        anyhow::ensure!(
+            reopened.status == "verified_complete"
+                && reopened.search_fingerprint == report.search_fingerprint
+                && reopened.payload_sha256 == report.payload_sha256,
+            "candidate-pool-only report failed atomic reopen verification"
+        );
+        println!("{}", serde_json::to_string_pretty(&reopened)?);
+        return Ok(());
+    }
+    if let Some(("raw-cache-only", boundary_matches)) = matches.subcommand() {
+        let parameters = boundary_matches
+            .get_one::<String>("parameters")
+            .expect("required search parameters");
+        let candidate_root = boundary_matches
+            .get_one::<String>("candidate-pool-root")
+            .expect("required candidate-pool root");
+        let annotation_root = boundary_matches
+            .get_one::<String>("annotation-cache-root")
+            .expect("required annotation-cache root");
+        let rank_depth = boundary_matches
+            .get_one::<u32>("rank-depth")
+            .copied()
+            .expect("required rank depth") as usize;
+        let report_path = boundary_matches
+            .get_one::<String>("report")
+            .expect("required report path");
+        let input = Input::load(parameters)?;
+        let parameters = input.build()?;
+        anyhow::ensure!(
+            !parameters.database.prefilter,
+            "raw-cache-only prohibits database.prefilter before Runner construction because it can launch a native spectrum search"
+        );
+        let runner = Runner::new(parameters, parallel)?;
+        let report = runner.construct_raw_annotation_cache_only(
+            std::path::PathBuf::from(candidate_root),
+            std::path::PathBuf::from(annotation_root),
+            rank_depth,
+        )?;
+        write_json_atomic(std::path::Path::new(report_path), &report)?;
+        let reopened: sage_cli::runner::RawCacheConstructionReport =
+            serde_json::from_slice(&std::fs::read(report_path)?)?;
+        anyhow::ensure!(
+            reopened.status == "verified_complete"
+                && reopened.raw_cache.identity == report.raw_cache.identity
+                && reopened.raw_cache.payload_sha256 == report.raw_cache.payload_sha256,
+            "raw-cache-only report failed atomic reopen verification"
+        );
+        println!("{}", serde_json::to_string_pretty(&reopened)?);
         return Ok(());
     }
     if let Some(("materialize-entrapment-partition", partition_matches)) = matches.subcommand() {

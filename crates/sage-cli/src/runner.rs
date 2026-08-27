@@ -3,11 +3,14 @@ use super::output::SageResults;
 use super::telemetry;
 use crate::candidate_pool::{
     analysis_fingerprint, inspect_compatible_pool, load_pool, load_required_pool, manifest_path,
-    pool_directory, relocation_provenance, search_fingerprint, write_pool, CandidatePoolRequest,
-    CandidatePoolUsage,
+    pool_directory, publish_pool_atomic, relocation_provenance, search_fingerprint, write_pool,
+    CandidatePoolRequest, CandidatePoolUsage,
 };
 use crate::external_feature_cache::{ExternalAnnotationCacheRequest, ExternalAnnotationCacheUsage};
-use crate::external_features::maybe_add_external_features;
+use crate::external_features::{
+    construct_raw_cache_only, maybe_add_external_features, RawCacheOnlyConstructionResult,
+};
+use crate::provenance::sha256_file;
 use anyhow::Context;
 use csv::ByteRecord;
 use log::info;
@@ -62,6 +65,43 @@ pub struct Runner {
     pub parameters: Search,
     pub start: Instant,
     pub decoy_free_mode: bool,
+}
+
+#[derive(Clone, Debug, serde::Serialize, serde::Deserialize)]
+pub struct CandidatePoolConstructionReport {
+    pub schema_version: u32,
+    pub execution_scope: String,
+    pub status: String,
+    pub search_fingerprint: String,
+    pub analysis_fingerprint: String,
+    pub requested_root: std::path::PathBuf,
+    pub pool_directory: std::path::PathBuf,
+    pub manifest: std::path::PathBuf,
+    pub payload: std::path::PathBuf,
+    pub manifest_sha256: String,
+    pub payload_sha256: String,
+    pub candidate_count: usize,
+    pub spectrum_count: usize,
+    pub retained_rank_depth: usize,
+    pub observed_max_rank: u32,
+    pub reused_existing_exact: bool,
+    pub native_search_performed: bool,
+    pub native_rt_ims_prediction_performed: bool,
+    pub downstream_stages_entered: Vec<String>,
+    pub stop_guarantee: Vec<String>,
+}
+
+#[derive(Clone, Debug, serde::Serialize, serde::Deserialize)]
+pub struct RawCacheConstructionReport {
+    pub schema_version: u32,
+    pub execution_scope: String,
+    pub status: String,
+    pub candidate_pool: CandidatePoolUsage,
+    pub candidate_pool_manifest_sha256: String,
+    pub candidate_pool_payload_sha256: String,
+    pub raw_cache: RawCacheOnlyConstructionResult,
+    pub downstream_stages_entered: Vec<String>,
+    pub stop_guarantee: Vec<String>,
 }
 
 #[derive(Default)]
@@ -129,6 +169,236 @@ enum DfDynamicColumn {
 }
 
 impl Runner {
+    /// Construct or exactly reopen one immutable candidate pool and return
+    /// before any Decoy-Free statistical or external-annotation stage.
+    pub fn construct_candidate_pool_only(
+        self,
+        parallel: usize,
+        root: std::path::PathBuf,
+        required_rank_depth: usize,
+    ) -> anyhow::Result<CandidatePoolConstructionReport> {
+        anyhow::ensure!(
+            self.decoy_free_mode,
+            "candidate-pool-only requires fdr.mode=decoy_free"
+        );
+        anyhow::ensure!(
+            !self.parameters.database.generate_decoys,
+            "candidate-pool-only requires database.generate_decoys=false"
+        );
+        anyhow::ensure!(
+            !self.parameters.quant.lfq
+                && self.parameters.quant.tmt.is_none()
+                && !self.parameters.annotate_matches,
+            "candidate-pool-only prohibits LFQ, TMT, and matched-fragment annotation"
+        );
+        anyhow::ensure!(required_rank_depth > 0, "rank depth must be positive");
+
+        let search = search_fingerprint(&self.parameters)?;
+        anyhow::ensure!(
+            required_rank_depth == search.retained_rank_depth,
+            "candidate-pool-only --rank-depth={} must exactly equal the frozen search retained depth {}",
+            required_rank_depth,
+            search.retained_rank_depth
+        );
+        let analysis = analysis_fingerprint(&self.parameters, &search)?;
+        let directory = pool_directory(&root, &search);
+
+        let (manifest, reused_existing_exact, native_search_performed) = if directory.exists() {
+            let (manifest, _) = load_required_pool(
+                &directory,
+                &search,
+                search.retained_rank_depth,
+                &self.database,
+            )
+            .with_context(|| {
+                format!(
+                    "existing final candidate-pool directory is incomplete or incompatible; fallback search is prohibited: {}",
+                    directory.display()
+                )
+            })?;
+            (manifest, true, false)
+        } else {
+            let scorer = Scorer {
+                db: &self.database,
+                precursor_tol: self.parameters.precursor_tol,
+                fragment_tol: self.parameters.fragment_tol,
+                min_matched_peaks: self.parameters.min_matched_peaks,
+                min_isotope_err: self.parameters.isotope_errors.0,
+                max_isotope_err: self.parameters.isotope_errors.1,
+                min_precursor_charge: self.parameters.precursor_charge.0,
+                max_precursor_charge: self.parameters.precursor_charge.1,
+                override_precursor_charge: self.parameters.override_precursor_charge,
+                max_fragment_charge: self.parameters.max_fragment_charge,
+                chimera: self.parameters.chimera,
+                report_psms: self.parameters.report_psms,
+                wide_window: self.parameters.wide_window,
+                annotate_matches: false,
+                score_type: self.parameters.score_type,
+            };
+            let mut outputs = self.batch_files(&scorer, parallel);
+            outputs.features.retain(|feature| feature.label != -1);
+
+            if self.parameters.predict_rt {
+                let selector = |feature: &FeatureCore| feature.rank == 1 && feature.label == 1;
+                let _ = sage_core::ml::retention_alignment::global_alignment(
+                    &mut outputs.features,
+                    self.parameters.mzml_paths.len(),
+                    selector,
+                );
+                let _ = sage_core::ml::retention_model::predict(
+                    &self.database,
+                    &mut outputs.features,
+                    selector,
+                );
+                let _ = sage_core::ml::mobility_model::predict(
+                    &self.database,
+                    &mut outputs.features,
+                    selector,
+                );
+            }
+
+            let (manifest, reused) =
+                publish_pool_atomic(&directory, &search, &outputs.features, &self.database)?;
+            anyhow::ensure!(
+                !reused,
+                "candidate-pool final directory appeared during native search; refusing ambiguous publication"
+            );
+            (manifest, false, true)
+        };
+
+        let (
+            original_source_uris,
+            current_source_uris,
+            portable_identity_valid,
+            relocation_detected,
+        ) = relocation_provenance(&manifest.search_fingerprint, &search);
+        let usage = CandidatePoolUsage {
+            search_fingerprint: search.digest.clone(),
+            analysis_fingerprint: analysis.digest.clone(),
+            manifest: manifest_path(&directory),
+            payload: directory.join(&manifest.payload_file),
+            reused: reused_existing_exact,
+            candidate_count: manifest.candidate_count,
+            retained_rank_depth: manifest.capabilities.retained_rank_depth,
+            original_source_uris,
+            current_source_uris,
+            portable_identity_valid,
+            relocation_detected,
+        };
+        crate::candidate_pool::verify_usage(&usage)?;
+        let manifest_sha256 = sha256_file(&usage.manifest)?;
+        let payload_sha256 = sha256_file(&usage.payload)?;
+        anyhow::ensure!(
+            payload_sha256 == manifest.payload_sha256,
+            "candidate-pool payload changed after publication"
+        );
+
+        Ok(CandidatePoolConstructionReport {
+            schema_version: 1,
+            execution_scope: "candidate_pool_only".into(),
+            status: "verified_complete".into(),
+            search_fingerprint: search.digest,
+            analysis_fingerprint: analysis.digest,
+            requested_root: root,
+            pool_directory: directory,
+            manifest: usage.manifest,
+            payload: usage.payload,
+            manifest_sha256,
+            payload_sha256,
+            candidate_count: manifest.candidate_count,
+            spectrum_count: manifest.spectrum_count,
+            retained_rank_depth: manifest.capabilities.retained_rank_depth,
+            observed_max_rank: manifest.observed_max_rank,
+            reused_existing_exact,
+            native_search_performed,
+            native_rt_ims_prediction_performed: native_search_performed
+                && self.parameters.predict_rt,
+            downstream_stages_entered: Vec::new(),
+            stop_guarantee: vec![
+                "no Decoy-Free fitting or q-value calculation".into(),
+                "no parameter or null-window optimization".into(),
+                "no external annotation process".into(),
+                "no audit, target-only, or TDC stage".into(),
+                "no ordinary results table or fitted artifact".into(),
+            ],
+        })
+    }
+
+    /// Construct or exactly reopen only the model-independent raw external
+    /// prediction cache from a required immutable candidate pool. The method
+    /// has no search fallback and never enters ordinary workflow stages.
+    pub fn construct_raw_annotation_cache_only(
+        self,
+        candidate_pool_root: std::path::PathBuf,
+        annotation_cache_root: std::path::PathBuf,
+        required_rank_depth: usize,
+    ) -> anyhow::Result<RawCacheConstructionReport> {
+        anyhow::ensure!(
+            self.decoy_free_mode,
+            "raw-cache-only requires fdr.mode=decoy_free"
+        );
+        anyhow::ensure!(
+            !self.parameters.database.prefilter,
+            "raw-cache-only prohibits database.prefilter because rebuilding a prefiltered index can launch a native spectrum search"
+        );
+        anyhow::ensure!(required_rank_depth > 0, "rank depth must be positive");
+        anyhow::ensure!(
+            self.parameters.external_features.enabled,
+            "raw-cache-only requires external_features.enabled=true"
+        );
+        anyhow::ensure!(
+            self.parameters.external_features.max_rank == Some(required_rank_depth as u32),
+            "raw-cache-only --rank-depth must exactly equal frozen external_features.max_rank"
+        );
+        let request = CandidatePoolRequest {
+            root: candidate_pool_root,
+            required_rank_depth,
+            allow_reuse: true,
+            require_existing: true,
+        };
+        let (candidate_usage, candidates) = self
+            .preflight_existing_candidate_pool(&request)
+            .context("raw-cache-only exact candidate-pool verification failed; search fallback is prohibited")?;
+        crate::candidate_pool::verify_usage(&candidate_usage)?;
+        let candidate_pool_manifest_sha256 = sha256_file(&candidate_usage.manifest)?;
+        let candidate_pool_payload_sha256 = sha256_file(&candidate_usage.payload)?;
+        let mut features = candidates
+            .into_iter()
+            .map(FeatureCore::to_df)
+            .collect::<Vec<_>>();
+        let raw_cache = construct_raw_cache_only(
+            &mut features,
+            &self.parameters.external_features,
+            &self.parameters.mzml_paths,
+            &self.database,
+            &candidate_usage.search_fingerprint,
+            &annotation_cache_root,
+        )?;
+        anyhow::ensure!(
+            raw_cache.requested_candidate_count == features.len()
+                && raw_cache.joined_candidate_count == features.len(),
+            "raw-cache-only coverage differs from the verified candidate-pool population"
+        );
+
+        Ok(RawCacheConstructionReport {
+            schema_version: 1,
+            execution_scope: "raw_annotation_cache_only".into(),
+            status: "verified_complete".into(),
+            candidate_pool: candidate_usage,
+            candidate_pool_manifest_sha256,
+            candidate_pool_payload_sha256,
+            raw_cache,
+            downstream_stages_entered: Vec::new(),
+            stop_guarantee: vec![
+                "required candidate pool fully verified before generator provenance resolution"
+                    .into(),
+                "no spectrum-search fallback".into(),
+                "no stage calibration or statistical fitting".into(),
+                "no optimizer, audit, winner, target-only, or TDC stage".into(),
+            ],
+        })
+    }
+
     /// Read-only strict candidate-pool preflight. It validates the complete
     /// manifest, compressed payload, stable IDs, count, schema, and rank depth
     /// without searching spectra or writing workflow state.

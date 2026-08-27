@@ -10,9 +10,11 @@ use std::process::Command;
 use crate::candidate_pool::stable_candidate_id;
 use crate::external_feature_cache::{
     annotation_identity_with_probe_root, cache_directory, load_cache, load_raw_cache,
-    raw_cache_directory, raw_cache_usage, raw_prediction_identity_with_probe_root,
-    stage_calibration_identity, write_raw_cache, ExternalAnnotationCacheRequest,
-    ExternalAnnotationCacheUsage, ExternalAnnotationInput, ExternalAnnotationRecord,
+    publish_raw_cache_atomic, raw_cache_directory, raw_cache_manifest_path, raw_cache_usage,
+    raw_generator_provenance, raw_prediction_identity_with_probe_root, stage_calibration_identity,
+    write_raw_cache, ExternalAnnotationCacheRequest, ExternalAnnotationCacheUsage,
+    ExternalAnnotationInput, ExternalAnnotationRecord, RawExternalPredictionCacheManifest,
+    RawExternalPredictionIdentity, RawGeneratorProvenance,
 };
 use crate::input::{
     ExternalFeatureEngine, ExternalFeatureFailPolicy, ExternalFeatureGenerationSettings,
@@ -38,6 +40,346 @@ pub struct ParsedExternalPsmFeatures {
 pub struct ParsedExternalFeatureTable {
     pub by_psm_id: HashMap<u64, ParsedExternalPsmFeatures>,
     pub by_key: HashMap<ExternalFeatureJoinKey, ParsedExternalPsmFeatures>,
+    pub row_count: usize,
+    pub duplicate_psm_ids: usize,
+    pub duplicate_join_keys: usize,
+}
+
+#[derive(Clone, Debug, serde::Serialize, serde::Deserialize)]
+pub struct RawCacheOnlyConstructionResult {
+    pub schema_version: u32,
+    pub execution_scope: String,
+    pub status: String,
+    pub identity: RawExternalPredictionIdentity,
+    pub generator_provenance: RawGeneratorProvenance,
+    pub directory: PathBuf,
+    pub manifest: RawExternalPredictionCacheManifest,
+    pub manifest_path: PathBuf,
+    pub manifest_sha256: String,
+    pub payload_path: PathBuf,
+    pub payload_sha256: String,
+    pub candidate_id_coverage_sha256: String,
+    pub requested_candidate_count: usize,
+    pub joined_candidate_count: usize,
+    pub reused_existing_exact: bool,
+    pub external_generator_invoked: bool,
+    pub stage_calibration_performed: bool,
+    pub downstream_stages_entered: Vec<String>,
+    pub stop_guarantee: Vec<String>,
+}
+
+/// Generate or exactly reopen only the model-independent raw external
+/// prediction layer. This path deliberately has no stage-calibration request
+/// and returns before any Decoy-Free fitting, window logic, or aggregation.
+pub fn construct_raw_cache_only(
+    features: &mut [DfFeature],
+    settings: &ExternalFeatureGenerationSettings,
+    mzml_paths: &[Url],
+    db: &IndexedDatabase,
+    search_fingerprint: &str,
+    cache_root: &Path,
+) -> Result<RawCacheOnlyConstructionResult> {
+    anyhow::ensure!(
+        settings.enabled,
+        "raw-cache-only requires external_features.enabled=true"
+    );
+    anyhow::ensure!(
+        settings.feature_only,
+        "raw-cache-only requires external_features.feature_only=true"
+    );
+    anyhow::ensure!(
+        matches!(settings.fail_policy, ExternalFeatureFailPolicy::Error),
+        "raw-cache-only requires external_features.fail_policy=error; warning/disable fallback is prohibited"
+    );
+    let command_path = settings
+        .command_path
+        .as_deref()
+        .context("raw-cache-only requires external_features.command_path")?;
+    anyhow::ensure!(
+        Path::new(command_path).is_file(),
+        "raw-cache-only wrapper is missing or is not a file: {command_path}"
+    );
+    if let Some(python) = settings.python_executable.as_deref() {
+        anyhow::ensure!(
+            Path::new(python).is_file(),
+            "raw-cache-only Python executable is missing or is not a file: {python}"
+        );
+    }
+
+    let requested_max_rank = settings.max_rank.unwrap_or_else(|| {
+        features
+            .iter()
+            .map(|feature| feature.core.rank)
+            .max()
+            .unwrap_or(0)
+    });
+    anyhow::ensure!(
+        requested_max_rank > 0,
+        "raw-cache-only rank depth must be positive"
+    );
+    let (inputs, candidate_indices) =
+        annotation_inputs(features, db, search_fingerprint, requested_max_rank);
+    anyhow::ensure!(
+        !inputs.is_empty(),
+        "raw-cache-only candidate population is empty"
+    );
+    let unique_ids = inputs
+        .iter()
+        .map(|input| input.stable_id.as_str())
+        .collect::<std::collections::HashSet<_>>();
+    anyhow::ensure!(
+        unique_ids.len() == inputs.len(),
+        "raw-cache-only candidate pool contains duplicate stable candidate IDs"
+    );
+
+    let identity = raw_prediction_identity_with_probe_root(
+        search_fingerprint,
+        settings,
+        &inputs,
+        requested_max_rank,
+        cache_root,
+        false,
+    )?;
+    let provenance = raw_generator_provenance(settings, cache_root, true)?;
+    anyhow::ensure!(
+        provenance.generator_settings_sha256 == identity.generator_settings_sha256,
+        "raw-cache-only generator provenance disagrees with the raw identity"
+    );
+    anyhow::ensure!(
+        provenance
+            .command
+            .as_ref()
+            .is_some_and(|source| source.kind == "file"),
+        "raw-cache-only wrapper identity is not a durable file identity"
+    );
+
+    let configured_generators = settings
+        .feature_generators
+        .as_ref()
+        .and_then(serde_json::Value::as_object);
+    let python_generators = ["ms2pip", "deeplc", "im2deep"]
+        .into_iter()
+        .filter(|generator| {
+            configured_generators.is_some_and(|generators| generators.contains_key(*generator))
+        })
+        .collect::<Vec<_>>();
+    if !python_generators.is_empty() {
+        anyhow::ensure!(
+            provenance
+                .python
+                .as_ref()
+                .is_some_and(|source| source.kind == "file"),
+            "raw-cache-only MS2PIP/DeepLC generation requires a durable Python executable identity"
+        );
+        anyhow::ensure!(
+            provenance.python_environment.is_some() && !provenance.package_metadata.is_empty(),
+            "raw-cache-only Python/package provenance is incomplete"
+        );
+        let environment: serde_json::Value = serde_json::from_str(
+            provenance
+                .python_environment
+                .as_deref()
+                .context("raw-cache-only Python environment identity is missing")?,
+        )
+        .context("raw-cache-only Python environment identity is invalid JSON")?;
+        let packages = environment
+            .get("packages")
+            .and_then(serde_json::Value::as_object)
+            .context("raw-cache-only Python environment identity has no package catalog")?;
+        for package in python_generators
+            .iter()
+            .chain(std::iter::once(&"psm-utils"))
+        {
+            anyhow::ensure!(
+                packages
+                    .get(*package)
+                    .is_some_and(|version| !version.is_null()),
+                "raw-cache-only required Python package {package} is missing"
+            );
+        }
+        let wrapper_package = match settings.engine {
+            ExternalFeatureEngine::Ms2rescore | ExternalFeatureEngine::Tims2rescore => "ms2rescore",
+        };
+        anyhow::ensure!(
+            packages
+                .get(wrapper_package)
+                .is_some_and(|version| !version.is_null()),
+            "raw-cache-only required Python package {wrapper_package} is missing"
+        );
+    }
+
+    let requires_python_models = configured_generators.is_some_and(|generators| {
+        generators.contains_key("ms2pip") || generators.contains_key("deeplc")
+    });
+    if requires_python_models {
+        anyhow::ensure!(
+            !provenance.model_components.is_empty()
+                && provenance.model_components.len() == provenance.model_files.len(),
+            "raw-cache-only model provenance is incomplete"
+        );
+        for generator in ["ms2pip", "deeplc"] {
+            if configured_generators.is_some_and(|generators| generators.contains_key(generator)) {
+                anyhow::ensure!(
+                    provenance
+                        .model_components
+                        .iter()
+                        .any(|component| component.generator == generator),
+                    "raw-cache-only selected {generator} model has no content identity"
+                );
+            }
+        }
+    }
+
+    let directory = raw_cache_directory(cache_root, &identity);
+    let mut generator_invoked = false;
+    let manifest = if directory.exists() {
+        load_raw_cache(&directory, &identity)?
+            .context("existing final raw cache is incomplete or incompatible; generation fallback is prohibited")?
+            .0
+    } else {
+        let base = settings
+            .temp_directory
+            .as_deref()
+            .map(PathBuf::from)
+            .unwrap_or_else(std::env::temp_dir);
+        let nonce = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .unwrap_or_default()
+            .as_nanos();
+        let temporary = base.join(format!(
+            "sage-raw-cache-only.{}.{}",
+            std::process::id(),
+            nonce
+        ));
+        std::fs::create_dir_all(&temporary).with_context(|| {
+            format!(
+                "creating raw-cache-only temporary directory {}",
+                temporary.display()
+            )
+        })?;
+        let generation = (|| -> Result<RawExternalPredictionCacheManifest> {
+            let psm_path = temporary.join("candidates.input.tsv");
+            let config_path = temporary.join("generator.config.json");
+            let output_root = temporary.join("generator.output");
+            let output_tsv = PathBuf::from(format!("{}.psms.tsv", output_root.display()));
+            export_candidate_table(
+                features,
+                &psm_path,
+                mzml_paths,
+                db,
+                Some(requested_max_rank),
+                true,
+            )?;
+            write_feature_config(settings, &psm_path, &output_root, &config_path, mzml_paths)?;
+            anyhow::ensure!(
+                !output_tsv.exists(),
+                "raw-cache-only temporary output unexpectedly exists before generator invocation"
+            );
+            let current = raw_prediction_identity_with_probe_root(
+                search_fingerprint,
+                settings,
+                &inputs,
+                requested_max_rank,
+                cache_root,
+                true,
+            )?;
+            anyhow::ensure!(
+                current == identity,
+                "raw-cache-only generator identity changed after candidate export"
+            );
+            generator_invoked = true;
+            run_external_process(settings, &config_path)?;
+            let parsed = parse_feature_output(&output_tsv).with_context(|| {
+                format!("parsing raw-cache-only output {}", output_tsv.display())
+            })?;
+            anyhow::ensure!(
+                parsed.row_count == inputs.len()
+                    && parsed.by_psm_id.len() == inputs.len()
+                    && parsed.duplicate_psm_ids == 0,
+                "raw-cache-only wrapper output is not a one-to-one candidate catalog: requested={} rows={} unique_psm_ids={} duplicate_psm_ids={}",
+                inputs.len(),
+                parsed.row_count,
+                parsed.by_psm_id.len(),
+                parsed.duplicate_psm_ids
+            );
+            join_features(features, parsed, mzml_paths, db)?;
+            let records = candidate_indices
+                .iter()
+                .map(|(index, stable_id)| ExternalAnnotationRecord {
+                    stable_id: stable_id.clone(),
+                    features: features[*index].core.external_features,
+                })
+                .collect::<Vec<_>>();
+            let current = raw_prediction_identity_with_probe_root(
+                search_fingerprint,
+                settings,
+                &inputs,
+                requested_max_rank,
+                cache_root,
+                true,
+            )?;
+            anyhow::ensure!(
+                current == identity,
+                "raw-cache-only generator identity changed during annotation"
+            );
+            let (manifest, reused) = publish_raw_cache_atomic(&directory, &identity, records)?;
+            anyhow::ensure!(
+                !reused,
+                "raw-cache final directory appeared during generation; refusing ambiguous publication"
+            );
+            Ok(manifest)
+        })();
+        if settings.output_directory.is_none() && temporary.exists() {
+            let _ = std::fs::remove_dir_all(&temporary);
+        }
+        generation?
+    };
+
+    let (verified, records) = load_raw_cache(&directory, &identity)?
+        .context("raw-cache-only published resource failed reopen verification")?;
+    anyhow::ensure!(
+        records.len() == identity.requested_candidate_count
+            && verified.prediction_count == identity.requested_candidate_count
+            && verified.joined_prediction_count == identity.requested_candidate_count,
+        "raw-cache-only candidate-ID coverage is incomplete"
+    );
+    let manifest_path = raw_cache_manifest_path(&directory);
+    let payload_path = directory.join(&verified.payload_file);
+    let manifest_sha256 = crate::provenance::sha256_file(&manifest_path)?;
+    let payload_sha256 = crate::provenance::sha256_file(&payload_path)?;
+    anyhow::ensure!(
+        payload_sha256 == verified.payload_sha256
+            && verified.payload_sha256 == manifest.payload_sha256,
+        "raw-cache-only payload changed after publication"
+    );
+
+    Ok(RawCacheOnlyConstructionResult {
+        schema_version: 1,
+        execution_scope: "raw_annotation_cache_only".into(),
+        status: "verified_complete".into(),
+        identity: identity.clone(),
+        generator_provenance: provenance,
+        directory,
+        manifest: verified.clone(),
+        manifest_path,
+        manifest_sha256,
+        payload_path,
+        payload_sha256,
+        candidate_id_coverage_sha256: identity.raw_input_sha256.clone(),
+        requested_candidate_count: identity.requested_candidate_count,
+        joined_candidate_count: verified.joined_prediction_count,
+        reused_existing_exact: !generator_invoked,
+        external_generator_invoked: generator_invoked,
+        stage_calibration_performed: false,
+        downstream_stages_entered: Vec::new(),
+        stop_guarantee: vec![
+            "exact existing candidate pool required and fully reopened".into(),
+            "no native spectrum-search fallback".into(),
+            "no model/window-specific calibration".into(),
+            "no Decoy-Free fitting, q-value calculation, or optimizer trial".into(),
+            "no winner selection, audit, target-only, or TDC stage".into(),
+        ],
+    })
 }
 
 pub fn maybe_add_external_features(
@@ -895,20 +1237,29 @@ fn parse_feature_output(path: &Path) -> Result<ParsedExternalFeatureTable> {
         };
 
         if let Some(id) = psm_id {
-            out.by_psm_id.insert(id, parsed.clone());
+            if out.by_psm_id.insert(id, parsed.clone()).is_some() {
+                out.duplicate_psm_ids += 1;
+            }
         }
 
-        out.by_key.insert(
-            ExternalFeatureJoinKey {
-                raw_file,
-                spectrum_id,
-                modified_peptide,
-                charge,
-                rank,
-            },
-            parsed,
-        );
+        if out
+            .by_key
+            .insert(
+                ExternalFeatureJoinKey {
+                    raw_file,
+                    spectrum_id,
+                    modified_peptide,
+                    charge,
+                    rank,
+                },
+                parsed,
+            )
+            .is_some()
+        {
+            out.duplicate_join_keys += 1;
+        }
     }
+    out.row_count = row_count;
 
     log::info!(
         "parsed {} external feature rows: {} keyed by psm_id, {} keyed by compound key",
@@ -1651,6 +2002,21 @@ fn get_f32(row: &csv::StringRecord, headers: &csv::StringRecord, names: &[&str])
 mod path_tests {
     use super::*;
 
+    fn complete_external_features() -> ExternalPsmFeatures {
+        ExternalPsmFeatures {
+            ms2rescore_ms2pip_pcc: 0.8,
+            ms2rescore_spectral_angle: 0.7,
+            ms2rescore_fragment_intensity_agreement: 0.6,
+            ms2rescore_deeplc_predicted_rt: 12.5,
+            ms2rescore_deeplc_calibrated_rt: 12.0,
+            ms2rescore_deeplc_rt_error: 0.5,
+            ms2rescore_deeplc_abs_rt_error: 0.5,
+            tims2rescore_observed_ion_mobility: 1.1,
+            ms2rescore_feature_joined: true,
+            ..ExternalPsmFeatures::default()
+        }
+    }
+
     #[test]
     fn local_url_round_trips_at_external_process_boundary() {
         let path = std::env::current_dir().unwrap().join("sample name.mzML");
@@ -1684,5 +2050,147 @@ mod path_tests {
 
         assert_eq!(external_process_path(&url).unwrap(), url.as_str());
         assert_eq!(raw_file_name_for_url(&url), "sample.mzML");
+    }
+
+    #[test]
+    fn raw_cache_only_exact_reopen_never_invokes_generator_or_calibration() {
+        use sage_core::database::PeptideIx;
+        use sage_core::peptide::Peptide;
+        use sage_core::scoring::FeatureCore;
+
+        let root = std::env::temp_dir().join(format!(
+            "sage-raw-cache-only-reopen-test-{}-{}",
+            std::process::id(),
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .unwrap()
+                .as_nanos()
+        ));
+        std::fs::create_dir_all(&root).unwrap();
+        let marker = root.join("generator-must-not-run");
+        let wrapper = root.join("wrapper");
+        std::fs::write(
+            &wrapper,
+            format!("#!/bin/sh\ntouch '{}'\nexit 99\n", marker.display()),
+        )
+        .unwrap();
+        let settings = ExternalFeatureGenerationSettings {
+            enabled: true,
+            command_path: Some(wrapper.display().to_string()),
+            max_rank: Some(1),
+            feature_generators: Some(serde_json::json!({"basic": {}})),
+            ..ExternalFeatureGenerationSettings::default()
+        };
+        let database = IndexedDatabase {
+            peptides: vec![Peptide {
+                sequence: std::sync::Arc::from(&b"PEPTIDE"[..]),
+                ..Peptide::default()
+            }],
+            ..IndexedDatabase::default()
+        };
+        let mut features = vec![FeatureCore {
+            spec_id: "scan=1".into(),
+            rank: 1,
+            peptide_idx: PeptideIx(0),
+            ..FeatureCore::default()
+        }
+        .to_df()];
+        let (inputs, _) = annotation_inputs(&features, &database, "search", 1);
+        let identity =
+            raw_prediction_identity_with_probe_root("search", &settings, &inputs, 1, &root, false)
+                .unwrap();
+        let directory = raw_cache_directory(&root, &identity);
+        publish_raw_cache_atomic(
+            &directory,
+            &identity,
+            vec![ExternalAnnotationRecord {
+                stable_id: inputs[0].stable_id.clone(),
+                features: complete_external_features(),
+            }],
+        )
+        .unwrap();
+
+        let report =
+            construct_raw_cache_only(&mut features, &settings, &[], &database, "search", &root)
+                .unwrap();
+        assert_eq!(report.execution_scope, "raw_annotation_cache_only");
+        assert_eq!(report.status, "verified_complete");
+        assert!(report.reused_existing_exact);
+        assert!(!report.external_generator_invoked);
+        assert!(!report.stage_calibration_performed);
+        assert!(report.downstream_stages_entered.is_empty());
+        assert_eq!(report.requested_candidate_count, 1);
+        assert_eq!(report.joined_candidate_count, 1);
+        assert!(!marker.exists());
+        std::fs::remove_dir_all(root).unwrap();
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn raw_cache_only_generation_stops_immediately_after_verified_publication() {
+        use sage_core::database::PeptideIx;
+        use sage_core::peptide::Peptide;
+        use sage_core::scoring::FeatureCore;
+        use std::os::unix::fs::PermissionsExt;
+
+        let root = std::env::temp_dir().join(format!(
+            "sage-raw-cache-only-generation-test-{}-{}",
+            std::process::id(),
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .unwrap()
+                .as_nanos()
+        ));
+        std::fs::create_dir_all(&root).unwrap();
+        let marker = root.join("wrapper-ran-once");
+        let wrapper = root.join("wrapper");
+        std::fs::write(
+            &wrapper,
+            format!(
+                "#!/bin/sh\nconfig=\"$2\"\noutput=$(sed -n 's/.*\"output_path\": \"\\(.*\\)\",/\\1/p' \"$config\")\nprintf 'psm_id\\tpcc\\tcos\\tdotprod\\tpredicted_rt\\tcalibrated_rt\\trt_diff\\tion_mobility\\n0\\t0.8\\t0.7\\t0.6\\t12.5\\t12.0\\t0.5\\t1.1\\n' > \"${{output}}.psms.tsv\"\nprintf x >> '{}'\n",
+                marker.display()
+            ),
+        )
+        .unwrap();
+        let mut permissions = wrapper.metadata().unwrap().permissions();
+        permissions.set_mode(0o755);
+        std::fs::set_permissions(&wrapper, permissions).unwrap();
+        let settings = ExternalFeatureGenerationSettings {
+            enabled: true,
+            command_path: Some(wrapper.display().to_string()),
+            temp_directory: Some(root.join("work").display().to_string()),
+            max_rank: Some(1),
+            feature_generators: Some(serde_json::json!({"basic": {}})),
+            ..ExternalFeatureGenerationSettings::default()
+        };
+        let database = IndexedDatabase {
+            peptides: vec![Peptide {
+                sequence: std::sync::Arc::from(&b"PEPTIDE"[..]),
+                ..Peptide::default()
+            }],
+            ..IndexedDatabase::default()
+        };
+        let mut features = vec![FeatureCore {
+            spec_id: "scan=1".into(),
+            psm_id: 0,
+            rank: 1,
+            peptide_idx: PeptideIx(0),
+            ..FeatureCore::default()
+        }
+        .to_df()];
+
+        let report =
+            construct_raw_cache_only(&mut features, &settings, &[], &database, "search", &root)
+                .unwrap();
+        assert_eq!(std::fs::read(&marker).unwrap(), b"x");
+        assert!(report.external_generator_invoked);
+        assert!(!report.reused_existing_exact);
+        assert!(!report.stage_calibration_performed);
+        assert!(report.downstream_stages_entered.is_empty());
+        assert_eq!(report.requested_candidate_count, 1);
+        assert_eq!(report.joined_candidate_count, 1);
+        assert!(report.manifest_path.is_file());
+        assert!(report.payload_path.is_file());
+        std::fs::remove_dir_all(root).unwrap();
     }
 }

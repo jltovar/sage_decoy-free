@@ -105,6 +105,14 @@ ordered spectrum ordinals and content hashes, normalized search configuration, c
 rank depth, candidate count, and payload hash. A macOS path and a WSL path can therefore reference
 the same pool content; reordering or changing any input still fails closed.
 
+For controlled construction without entering any statistical or annotation stage, use the
+dedicated `sage candidate-pool-only` boundary. It atomically publishes and reopens the immutable
+pool, emits a construction report, and returns. The corresponding `sage raw-cache-only` boundary
+requires and fully verifies that exact pool, generates or exactly reopens only the raw external
+prediction layer, and returns before stage calibration or fitting. See
+[`RESOURCE_CONSTRUCTION_BOUNDARIES.md`](RESOURCE_CONSTRUCTION_BOUNDARIES.md) for the traced call
+boundaries, exact commands, provenance catalog, atomicity, resumption, and no-fallback guarantees.
+
 The optimizer has four interfaces:
 
 - `window_optimizer.strategy: "landscape_adaptive"` is the recommended new-dataset mode. It uses
