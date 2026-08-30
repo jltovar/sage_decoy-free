@@ -8,7 +8,8 @@ use crate::candidate_pool::{
 };
 use crate::external_feature_cache::{ExternalAnnotationCacheRequest, ExternalAnnotationCacheUsage};
 use crate::external_features::{
-    construct_raw_cache_only, maybe_add_external_features, RawCacheOnlyConstructionResult,
+    construct_raw_cache_only, finalize_raw_cache_from_existing_output, maybe_add_external_features,
+    RawCacheOnlyConstructionResult,
 };
 use crate::provenance::sha256_file;
 use anyhow::Context;
@@ -387,6 +388,71 @@ impl Runner {
                 "no spectrum-search fallback".into(),
                 "no stage calibration or statistical fitting".into(),
                 "no optimizer, audit, winner, target-only, or TDC stage".into(),
+            ],
+        })
+    }
+
+    /// Finalize only a raw cache from an already completed and provenance-bound
+    /// generator output. Candidate-pool verification is identical to
+    /// raw-cache-only, and no external process or search fallback is reachable.
+    pub fn finalize_raw_annotation_cache_from_existing_output(
+        self,
+        candidate_pool_root: std::path::PathBuf,
+        annotation_cache_root: std::path::PathBuf,
+        required_rank_depth: usize,
+        generator_output_tsv: std::path::PathBuf,
+    ) -> anyhow::Result<RawCacheConstructionReport> {
+        anyhow::ensure!(
+            self.decoy_free_mode,
+            "raw-cache recovery requires fdr.mode=decoy_free"
+        );
+        anyhow::ensure!(
+            !self.parameters.database.prefilter,
+            "raw-cache recovery prohibits database.prefilter"
+        );
+        anyhow::ensure!(required_rank_depth > 0, "rank depth must be positive");
+        anyhow::ensure!(
+            self.parameters.external_features.max_rank == Some(required_rank_depth as u32),
+            "raw-cache recovery --rank-depth must equal frozen external_features.max_rank"
+        );
+        let request = CandidatePoolRequest {
+            root: candidate_pool_root,
+            required_rank_depth,
+            allow_reuse: true,
+            require_existing: true,
+        };
+        let (candidate_usage, candidates) = self
+            .preflight_existing_candidate_pool(&request)
+            .context("raw-cache recovery exact candidate-pool verification failed")?;
+        crate::candidate_pool::verify_usage(&candidate_usage)?;
+        let candidate_pool_manifest_sha256 = sha256_file(&candidate_usage.manifest)?;
+        let candidate_pool_payload_sha256 = sha256_file(&candidate_usage.payload)?;
+        let mut features = candidates
+            .into_iter()
+            .map(FeatureCore::to_df)
+            .collect::<Vec<_>>();
+        let raw_cache = finalize_raw_cache_from_existing_output(
+            &mut features,
+            &self.parameters.external_features,
+            &self.parameters.mzml_paths,
+            &self.database,
+            &candidate_usage.search_fingerprint,
+            &annotation_cache_root,
+            &generator_output_tsv,
+        )?;
+        Ok(RawCacheConstructionReport {
+            schema_version: 2,
+            execution_scope: "finalize_raw_cache_from_existing_output".into(),
+            status: "verified_complete".into(),
+            candidate_pool: candidate_usage,
+            candidate_pool_manifest_sha256,
+            candidate_pool_payload_sha256,
+            raw_cache,
+            downstream_stages_entered: Vec::new(),
+            stop_guarantee: vec![
+                "exact existing candidate pool and generator provenance required".into(),
+                "no spectrum-search or annotation-generation fallback".into(),
+                "no calibration, fitting, optimization, audit, target-only, or TDC stage".into(),
             ],
         })
     }

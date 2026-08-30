@@ -85,9 +85,14 @@ The raw constructor requires durable wrapper and Python identities as applicable
 MS2PIP, DeepLC, or IM2Deep generators it verifies the relevant installed package versions plus the
 wrapper package and `psm-utils`; for MS2PIP and DeepLC it also requires complete selected model-file
 content identities. Generation exports the frozen candidate population with neutral q/PEP fields,
-invokes the wrapper once, requires a one-to-one stable-ID join with finite raw features, and
-atomically publishes and reopens the raw manifest and payload. Duplicate, missing, surplus, or
-nonfinite records fail before publication.
+invokes the wrapper once, and requires a one-to-one stable-ID join. Raw-cache schema v2 records an
+explicit `sage-external-feature-missingness-v1` availability catalog. An all-NaN MS2PIP or DeepLC
+lane is represented as `prediction_unavailable`; the candidate remains present and downstream
+calibration ignores only that unavailable lane. No zero, mean, median, or other numeric imputation
+is performed. Infinity, partial-lane nonfiniteness, nonfinite native observed mobility, duplicate,
+missing, surplus, or inconsistent availability state is treated as corrupt/ambiguous output and
+fails before publication. The content fingerprint binds the missingness schema, every availability
+record, and the complete generator-output SHA-256 and size.
 
 If the exact raw cache already exists, Sage fully verifies and reuses it without invoking Python or
 the wrapper. An incomplete, corrupt, or incompatible final cache fails closed and never triggers
@@ -95,6 +100,31 @@ regeneration. The successful catalog/report records both candidate-resource hash
 payload, and candidate-ID coverage hashes; model, wrapper, Python, package, and probe provenance;
 population counts; execution flags; an empty `downstream_stages_entered` list; and the stopping
 guarantees. It performs no model/window-specific calibration.
+
+On every newly generated run, Sage writes `generator.provenance.json` beside
+`candidates.input.tsv`, `generator.config.json`, and `generator.output.psms.tsv`. It binds those
+files to the raw input identity before parsing. Successful temporary work is cleaned according to
+the configured output policy; failed work is retained for forensics and is never silently deleted.
+
+## Existing-output finalization command
+
+```bash
+sage finalize-raw-cache-from-existing-output frozen-search.json \
+  --candidate-pool-root /external/resources/candidate-pools \
+  --annotation-cache-root /external/resources/raw-annotations \
+  --generator-output-tsv /external/transient/generator.output.psms.tsv \
+  --rank-depth 50 \
+  --report /external/evidence/raw-cache-recovery.report.json
+```
+
+This scope requires the sibling candidate export, generator configuration, and generator-run
+provenance. It fully reopens the exact candidate pool, independently regenerates the expected
+candidate export and configuration without invoking an external process, compares their hashes,
+verifies the output hash and complete one-to-one stable-ID coverage, applies the explicit
+missingness contract, atomically publishes, and reopens the cache. Missing sidecars, mismatched
+pool/generator identity, corrupt numeric state, or incomplete coverage fails closed. Exact replay
+reopens the same cache and launches no external process. The command has no spectrum-search,
+annotation-generation, calibration, fitting, optimization, audit, target-only, or TDC fallback.
 
 ## Atomicity and resumption
 
@@ -107,7 +137,8 @@ atomic JSON writer and are reopened and identity-checked by the CLI before succe
 
 Safe resumption therefore means rerunning the same boundary with byte-identical scientific inputs:
 a complete exact resource is verified and reused, while any mismatch stops. There is no `--force`
-or repair path in either command.
+or force-overwrite path. Existing-output finalization is not a permissive repair bypass: it is
+available only for a complete, hash-bound generator run produced by the same contract.
 
 Directory-backed spectra add a second resumption condition: the stored input kind, directory
 schema, root-relative entry count, total bytes, and content digest must match the newly resolved

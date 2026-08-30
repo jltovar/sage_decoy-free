@@ -121,6 +121,11 @@ requires and fully verifies that exact pool, generates or exactly reopens only t
 prediction layer, and returns before stage calibration or fitting. See
 [`RESOURCE_CONSTRUCTION_BOUNDARIES.md`](RESOURCE_CONSTRUCTION_BOUNDARIES.md) for the traced call
 boundaries, exact commands, provenance catalog, atomicity, resumption, and no-fallback guarantees.
+Raw-cache schema v2 represents unavailable MS2PIP and DeepLC lanes explicitly: the candidate stays
+in the population, unavailable values remain non-evidence, and valid Sage or other external lanes
+remain usable. Sage never imputes a numeric prediction. A hash-bound preserved generator run may
+be finalized with `sage finalize-raw-cache-from-existing-output`; this recovery scope cannot launch
+the wrapper, Python, a spectrum search, or a statistical stage.
 
 The optimizer has four interfaces:
 

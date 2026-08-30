@@ -16,10 +16,12 @@ pub const EXTERNAL_ANNOTATION_CACHE_SCHEMA_VERSION: u32 = 2;
 pub const EXTERNAL_ANNOTATION_FEATURE_SCHEMA: &str = "sage-external-psm-features-v1";
 const EXTERNAL_ANNOTATION_FINGERPRINT_SCHEMA: &str =
     "sage-external-annotation-fingerprint-v2-model-content";
-pub const RAW_EXTERNAL_PREDICTION_CACHE_SCHEMA_VERSION: u32 = 1;
-pub const RAW_EXTERNAL_PREDICTION_FEATURE_SCHEMA: &str = "sage-raw-external-prediction-features-v1";
+pub const RAW_EXTERNAL_PREDICTION_CACHE_SCHEMA_VERSION: u32 = 2;
+pub const RAW_EXTERNAL_PREDICTION_FEATURE_SCHEMA: &str =
+    "sage-raw-external-prediction-features-v2-missingness";
+pub const RAW_EXTERNAL_MISSINGNESS_SCHEMA: &str = "sage-external-feature-missingness-v1";
 const RAW_EXTERNAL_PREDICTION_FINGERPRINT_SCHEMA: &str =
-    "sage-raw-external-prediction-fingerprint-v1";
+    "sage-raw-external-prediction-fingerprint-v2-missingness";
 const STAGE_EXTERNAL_CALIBRATION_FINGERPRINT_SCHEMA: &str =
     "sage-stage-external-calibration-fingerprint-v1";
 
@@ -94,6 +96,55 @@ pub struct ExternalAnnotationRecord {
     pub features: ExternalPsmFeatures,
 }
 
+#[derive(Clone, Copy, Debug, Serialize, Deserialize, PartialEq, Eq, PartialOrd, Ord)]
+#[serde(rename_all = "snake_case")]
+pub enum ExternalFeatureLane {
+    Ms2pip,
+    Deeplc,
+}
+
+#[derive(Clone, Copy, Debug, Serialize, Deserialize, PartialEq, Eq, PartialOrd, Ord)]
+#[serde(rename_all = "snake_case")]
+pub enum MissingExternalFeatureReason {
+    PredictionUnavailable,
+}
+
+#[derive(Clone, Debug, Serialize, Deserialize, PartialEq, Eq)]
+pub struct MissingExternalFeature {
+    pub lane: ExternalFeatureLane,
+    pub reason: MissingExternalFeatureReason,
+    pub fields: Vec<String>,
+}
+
+#[derive(Clone, Debug, Default, Serialize, Deserialize, PartialEq, Eq)]
+pub struct ExternalFeatureAvailability {
+    pub ms2pip_available: bool,
+    pub deeplc_available: bool,
+    pub missing: Vec<MissingExternalFeature>,
+}
+
+#[derive(Clone, Debug, Default, Serialize, Deserialize, PartialEq, Eq)]
+pub struct MissingExternalFeatureSummary {
+    pub schema: String,
+    pub affected_candidate_count: usize,
+    pub ms2pip_unavailable_count: usize,
+    pub deeplc_unavailable_count: usize,
+    pub overlapping_unavailable_count: usize,
+}
+
+#[derive(Clone, Debug, Serialize, Deserialize, PartialEq, Eq)]
+pub struct GeneratorOutputIdentity {
+    pub sha256: String,
+    pub size_bytes: u64,
+}
+
+#[derive(Clone, Debug, Serialize, Deserialize)]
+pub struct RawExternalPredictionRecord {
+    pub stable_id: String,
+    pub features: ExternalPsmFeatures,
+    pub availability: ExternalFeatureAvailability,
+}
+
 /// Portable identity of expensive external prediction outputs. Statistical
 /// scores, q-values, PEPs, selected windows, and fitted artifacts are absent by
 /// construction.
@@ -129,6 +180,9 @@ pub struct RawExternalPredictionCacheManifest {
     pub payload_sha256: String,
     pub prediction_count: usize,
     pub joined_prediction_count: usize,
+    pub content_fingerprint: String,
+    pub generator_output: GeneratorOutputIdentity,
+    pub missingness: MissingExternalFeatureSummary,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub migrated_from_schema_v2_fingerprint: Option<String>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
@@ -139,7 +193,10 @@ pub struct RawExternalPredictionCacheManifest {
 struct RawExternalPredictionPayload {
     schema_version: u32,
     raw_prediction_identity: RawExternalPredictionIdentity,
-    records: Vec<ExternalAnnotationRecord>,
+    content_fingerprint: String,
+    generator_output: GeneratorOutputIdentity,
+    missingness: MissingExternalFeatureSummary,
+    records: Vec<RawExternalPredictionRecord>,
 }
 
 #[derive(Clone, Debug, Serialize, Deserialize)]
@@ -171,6 +228,8 @@ pub struct ExternalAnnotationCacheUsage {
     pub raw_prediction_cache_fingerprint: String,
     #[serde(default)]
     pub raw_prediction_cache_schema_version: u32,
+    #[serde(default)]
+    pub raw_prediction_cache_content_fingerprint: String,
     /// Inexpensive stage-specific calibration identity. This preserves the
     /// separation between raw inference and model/window calibration.
     #[serde(default, skip_serializing_if = "Option::is_none")]
@@ -1326,23 +1385,166 @@ fn raw_cache_payload_path(directory: &Path) -> PathBuf {
     directory.join("raw_external_predictions.bin.zst")
 }
 
-fn required_prediction_fields_are_finite(features: &ExternalPsmFeatures) -> bool {
-    [
-        features.ms2rescore_ms2pip_pcc,
-        features.ms2rescore_spectral_angle,
-        features.ms2rescore_fragment_intensity_agreement,
-        features.ms2rescore_deeplc_predicted_rt,
-        features.ms2rescore_deeplc_calibrated_rt,
-        features.ms2rescore_deeplc_rt_error,
-        features.ms2rescore_deeplc_abs_rt_error,
-        features.tims2rescore_observed_ion_mobility,
-    ]
-    .into_iter()
-    .all(f32::is_finite)
+fn lane_availability(
+    lane: ExternalFeatureLane,
+    fields: &[(&str, f32)],
+) -> Result<(bool, Option<MissingExternalFeature>)> {
+    anyhow::ensure!(
+        fields.iter().all(|(_, value)| !value.is_infinite()),
+        "infinite external prediction in {:?} lane is corrupt generator output",
+        lane
+    );
+    let finite = fields.iter().filter(|(_, value)| value.is_finite()).count();
+    anyhow::ensure!(
+        finite == 0 || finite == fields.len(),
+        "partially nonfinite {:?} lane is ambiguous generator output",
+        lane
+    );
+    if finite == fields.len() {
+        Ok((true, None))
+    } else {
+        Ok((
+            false,
+            Some(MissingExternalFeature {
+                lane,
+                reason: MissingExternalFeatureReason::PredictionUnavailable,
+                fields: fields.iter().map(|(name, _)| (*name).to_string()).collect(),
+            }),
+        ))
+    }
+}
+
+pub fn availability_for_features(
+    features: &ExternalPsmFeatures,
+) -> Result<ExternalFeatureAvailability> {
+    anyhow::ensure!(
+        features.tims2rescore_observed_ion_mobility.is_finite(),
+        "nonfinite observed ion mobility is not an unavailable external prediction"
+    );
+    let (ms2pip_available, ms2pip_missing) = lane_availability(
+        ExternalFeatureLane::Ms2pip,
+        &[
+            ("ms2rescore_ms2pip_pcc", features.ms2rescore_ms2pip_pcc),
+            (
+                "ms2rescore_spectral_angle",
+                features.ms2rescore_spectral_angle,
+            ),
+            (
+                "ms2rescore_fragment_intensity_agreement",
+                features.ms2rescore_fragment_intensity_agreement,
+            ),
+        ],
+    )?;
+    let (deeplc_available, deeplc_missing) = lane_availability(
+        ExternalFeatureLane::Deeplc,
+        &[
+            (
+                "ms2rescore_deeplc_predicted_rt",
+                features.ms2rescore_deeplc_predicted_rt,
+            ),
+            (
+                "ms2rescore_deeplc_calibrated_rt",
+                features.ms2rescore_deeplc_calibrated_rt,
+            ),
+            (
+                "ms2rescore_deeplc_rt_error",
+                features.ms2rescore_deeplc_rt_error,
+            ),
+            (
+                "ms2rescore_deeplc_abs_rt_error",
+                features.ms2rescore_deeplc_abs_rt_error,
+            ),
+        ],
+    )?;
+    let missing = [ms2pip_missing, deeplc_missing]
+        .into_iter()
+        .flatten()
+        .collect();
+    Ok(ExternalFeatureAvailability {
+        ms2pip_available,
+        deeplc_available,
+        missing,
+    })
+}
+
+pub fn raw_record(
+    stable_id: String,
+    features: ExternalPsmFeatures,
+) -> Result<RawExternalPredictionRecord> {
+    let availability = availability_for_features(&features)?;
+    Ok(RawExternalPredictionRecord {
+        stable_id,
+        features,
+        availability,
+    })
+}
+
+pub fn generator_output_identity(path: &Path) -> Result<GeneratorOutputIdentity> {
+    let metadata = path
+        .metadata()
+        .with_context(|| format!("reading generator output metadata {}", path.display()))?;
+    anyhow::ensure!(metadata.is_file(), "generator output is not a regular file");
+    Ok(GeneratorOutputIdentity {
+        sha256: sha256_file(path)?,
+        size_bytes: metadata.len(),
+    })
+}
+
+fn missingness_summary(records: &[RawExternalPredictionRecord]) -> MissingExternalFeatureSummary {
+    let ms2pip_unavailable_count = records
+        .iter()
+        .filter(|record| !record.availability.ms2pip_available)
+        .count();
+    let deeplc_unavailable_count = records
+        .iter()
+        .filter(|record| !record.availability.deeplc_available)
+        .count();
+    let overlapping_unavailable_count = records
+        .iter()
+        .filter(|record| {
+            !record.availability.ms2pip_available && !record.availability.deeplc_available
+        })
+        .count();
+    MissingExternalFeatureSummary {
+        schema: RAW_EXTERNAL_MISSINGNESS_SCHEMA.into(),
+        affected_candidate_count: records
+            .iter()
+            .filter(|record| !record.availability.missing.is_empty())
+            .count(),
+        ms2pip_unavailable_count,
+        deeplc_unavailable_count,
+        overlapping_unavailable_count,
+    }
+}
+
+fn raw_content_fingerprint(
+    identity: &RawExternalPredictionIdentity,
+    output: &GeneratorOutputIdentity,
+    records: &[RawExternalPredictionRecord],
+) -> Result<String> {
+    let mut hasher = Sha256::new();
+    for part in [
+        "sage-raw-external-prediction-content-v1",
+        identity.digest.as_str(),
+        output.sha256.as_str(),
+        RAW_EXTERNAL_MISSINGNESS_SCHEMA,
+    ] {
+        hasher.update((part.len() as u64).to_le_bytes());
+        hasher.update(part.as_bytes());
+    }
+    hasher.update(output.size_bytes.to_le_bytes());
+    for record in records {
+        let availability = bincode::serialize(&record.availability)?;
+        hasher.update((record.stable_id.len() as u64).to_le_bytes());
+        hasher.update(record.stable_id.as_bytes());
+        hasher.update((availability.len() as u64).to_le_bytes());
+        hasher.update(availability);
+    }
+    Ok(format!("{:x}", hasher.finalize()))
 }
 
 fn validate_raw_records(
-    records: &[ExternalAnnotationRecord],
+    records: &[RawExternalPredictionRecord],
     identity: &RawExternalPredictionIdentity,
 ) -> Result<()> {
     anyhow::ensure!(
@@ -1360,8 +1562,8 @@ fn validate_raw_records(
             "raw external prediction cache contains an incomplete candidate"
         );
         anyhow::ensure!(
-            required_prediction_fields_are_finite(&record.features),
-            "raw external prediction cache contains nonfinite required MS2PIP/DeepLC fields for {}",
+            availability_for_features(&record.features)? == record.availability,
+            "raw external prediction availability disagrees with numeric fields for {}",
             record.stable_id
         );
     }
@@ -1380,7 +1582,7 @@ pub fn load_raw_cache(
 ) -> Result<
     Option<(
         RawExternalPredictionCacheManifest,
-        Vec<ExternalAnnotationRecord>,
+        Vec<RawExternalPredictionRecord>,
     )>,
 > {
     let manifest_path = raw_cache_manifest_path(directory);
@@ -1414,10 +1616,19 @@ pub fn load_raw_cache(
     anyhow::ensure!(
         payload.schema_version == RAW_EXTERNAL_PREDICTION_CACHE_SCHEMA_VERSION
             && payload.raw_prediction_identity == *expected
-            && payload.raw_prediction_identity == manifest.identity,
+            && payload.raw_prediction_identity == manifest.identity
+            && payload.content_fingerprint == manifest.content_fingerprint
+            && payload.generator_output == manifest.generator_output
+            && payload.missingness == manifest.missingness,
         "raw external prediction cache payload identity mismatch"
     );
     validate_raw_records(&payload.records, expected)?;
+    anyhow::ensure!(
+        missingness_summary(&payload.records) == manifest.missingness
+            && raw_content_fingerprint(expected, &manifest.generator_output, &payload.records)?
+                == manifest.content_fingerprint,
+        "raw external prediction cache missingness/content identity mismatch"
+    );
     let joined = payload
         .records
         .iter()
@@ -1431,10 +1642,11 @@ pub fn load_raw_cache(
     Ok(Some((manifest, payload.records)))
 }
 
-pub fn write_raw_cache(
+pub fn write_raw_cache_with_output(
     directory: &Path,
     identity: &RawExternalPredictionIdentity,
-    records: Vec<ExternalAnnotationRecord>,
+    records: Vec<RawExternalPredictionRecord>,
+    generator_output: GeneratorOutputIdentity,
     migrated_from: Option<&ExternalAnnotationCacheManifest>,
 ) -> Result<RawExternalPredictionCacheManifest> {
     validate_raw_records(&records, identity)?;
@@ -1442,7 +1654,8 @@ pub fn write_raw_cache(
         let (manifest, existing) = load_raw_cache(directory, identity)?
             .context("refusing to overwrite an incompatible raw external prediction cache")?;
         anyhow::ensure!(
-            bincode::serialize(&existing)? == bincode::serialize(&records)?,
+            bincode::serialize(&existing)? == bincode::serialize(&records)?
+                && manifest.generator_output == generator_output,
             "raw external predictions changed under an identical portable identity"
         );
         return Ok(manifest);
@@ -1450,9 +1663,14 @@ pub fn write_raw_cache(
     std::fs::create_dir_all(directory)?;
     let payload_path = raw_cache_payload_path(directory);
     let temporary = directory.join("raw_external_predictions.bin.zst.tmp");
+    let missingness = missingness_summary(&records);
+    let content_fingerprint = raw_content_fingerprint(identity, &generator_output, &records)?;
     let payload = RawExternalPredictionPayload {
         schema_version: RAW_EXTERNAL_PREDICTION_CACHE_SCHEMA_VERSION,
         raw_prediction_identity: identity.clone(),
+        content_fingerprint: content_fingerprint.clone(),
+        generator_output: generator_output.clone(),
+        missingness: missingness.clone(),
         records,
     };
     {
@@ -1473,6 +1691,9 @@ pub fn write_raw_cache(
         payload_sha256: sha256_file(&payload_path)?,
         prediction_count: payload.records.len(),
         joined_prediction_count: payload.records.len(),
+        content_fingerprint,
+        generator_output,
+        missingness,
         migrated_from_schema_v2_fingerprint: migrated_from
             .map(|manifest| manifest.identity.digest.clone()),
         migrated_from_schema_v2_payload_sha256: migrated_from
@@ -1485,16 +1706,18 @@ pub fn write_raw_cache(
 /// Publish a raw prediction cache as one verified directory transaction.
 /// Exact existing caches are reopened and reused; an incompatible final path
 /// fails closed and is never overwritten or regenerated in place.
-pub fn publish_raw_cache_atomic(
+pub fn publish_raw_cache_atomic_with_output(
     directory: &Path,
     identity: &RawExternalPredictionIdentity,
-    records: Vec<ExternalAnnotationRecord>,
+    records: Vec<RawExternalPredictionRecord>,
+    generator_output: GeneratorOutputIdentity,
 ) -> Result<(RawExternalPredictionCacheManifest, bool)> {
     if directory.exists() {
         let (manifest, existing) = load_raw_cache(directory, identity)?
             .context("existing final raw prediction cache is incomplete or incompatible")?;
         anyhow::ensure!(
-            bincode::serialize(&existing)? == bincode::serialize(&records)?,
+            bincode::serialize(&existing)? == bincode::serialize(&records)?
+                && manifest.generator_output == generator_output,
             "raw predictions changed under an existing portable identity"
         );
         return Ok((manifest, true));
@@ -1520,7 +1743,8 @@ pub fn publish_raw_cache_atomic(
     );
 
     let result = (|| -> Result<RawExternalPredictionCacheManifest> {
-        let written = write_raw_cache(&staging, identity, records, None)?;
+        let written =
+            write_raw_cache_with_output(&staging, identity, records, generator_output, None)?;
         let (verified, _) = load_raw_cache(&staging, identity)?
             .context("raw-cache staging verification did not find a complete cache")?;
         anyhow::ensure!(
@@ -1560,6 +1784,52 @@ pub fn publish_raw_cache_atomic(
     result.map(|manifest| (manifest, false))
 }
 
+#[cfg(test)]
+pub fn write_raw_cache(
+    directory: &Path,
+    identity: &RawExternalPredictionIdentity,
+    records: Vec<ExternalAnnotationRecord>,
+    migrated_from: Option<&ExternalAnnotationCacheManifest>,
+) -> Result<RawExternalPredictionCacheManifest> {
+    let records = records
+        .into_iter()
+        .map(|record| raw_record(record.stable_id, record.features))
+        .collect::<Result<Vec<_>>>()?;
+    write_raw_cache_with_output(
+        directory,
+        identity,
+        records,
+        GeneratorOutputIdentity {
+            sha256: migrated_from
+                .map(|manifest| manifest.payload_sha256.clone())
+                .unwrap_or_else(|| "synthetic-test-generator-output".into()),
+            size_bytes: 0,
+        },
+        migrated_from,
+    )
+}
+
+#[cfg(test)]
+pub fn publish_raw_cache_atomic(
+    directory: &Path,
+    identity: &RawExternalPredictionIdentity,
+    records: Vec<ExternalAnnotationRecord>,
+) -> Result<(RawExternalPredictionCacheManifest, bool)> {
+    let records = records
+        .into_iter()
+        .map(|record| raw_record(record.stable_id, record.features))
+        .collect::<Result<Vec<_>>>()?;
+    publish_raw_cache_atomic_with_output(
+        directory,
+        identity,
+        records,
+        GeneratorOutputIdentity {
+            sha256: "synthetic-test-generator-output".into(),
+            size_bytes: 0,
+        },
+    )
+}
+
 pub fn raw_cache_usage(
     directory: &Path,
     manifest: &RawExternalPredictionCacheManifest,
@@ -1590,6 +1860,7 @@ pub fn raw_cache_usage(
         },
         raw_prediction_cache_fingerprint: manifest.identity.digest.clone(),
         raw_prediction_cache_schema_version: manifest.schema_version,
+        raw_prediction_cache_content_fingerprint: manifest.content_fingerprint.clone(),
         stage_calibration_identity: calibration,
         migrated_from_schema_v2: manifest.migrated_from_schema_v2_fingerprint.is_some(),
     }
@@ -1619,6 +1890,7 @@ pub fn usage(
         },
         raw_prediction_cache_fingerprint: String::new(),
         raw_prediction_cache_schema_version: 0,
+        raw_prediction_cache_content_fingerprint: String::new(),
         stage_calibration_identity: None,
         migrated_from_schema_v2: false,
     }
@@ -1650,6 +1922,10 @@ pub fn verify_usage(usage: &ExternalAnnotationCacheUsage) -> Result<()> {
                 && manifest.joined_prediction_count == usage.joined_annotation_count
                 && manifest.identity.requested_max_rank == usage.requested_max_rank,
             "raw prediction cache usage record does not match its verified manifest"
+        );
+        anyhow::ensure!(
+            manifest.content_fingerprint == usage.raw_prediction_cache_content_fingerprint,
+            "raw prediction cache content/missingness fingerprint mismatch"
         );
         if let Some(calibration) = usage.stage_calibration_identity.as_ref() {
             anyhow::ensure!(
@@ -1847,6 +2123,53 @@ mod tests {
             ms2rescore_feature_joined: true,
             ..ExternalPsmFeatures::default()
         }
+    }
+
+    #[test]
+    fn missing_external_feature_contract_is_lane_explicit_and_fail_closed() {
+        let finite = complete_features();
+        let finite_availability = availability_for_features(&finite).unwrap();
+        assert!(finite_availability.ms2pip_available);
+        assert!(finite_availability.deeplc_available);
+        assert!(finite_availability.missing.is_empty());
+
+        let mut ms2pip_missing = finite;
+        ms2pip_missing.ms2rescore_ms2pip_pcc = f32::NAN;
+        ms2pip_missing.ms2rescore_spectral_angle = f32::NAN;
+        ms2pip_missing.ms2rescore_fragment_intensity_agreement = f32::NAN;
+        let availability = availability_for_features(&ms2pip_missing).unwrap();
+        assert!(!availability.ms2pip_available);
+        assert!(availability.deeplc_available);
+        assert_eq!(availability.missing[0].lane, ExternalFeatureLane::Ms2pip);
+
+        let mut deeplc_missing = finite;
+        deeplc_missing.ms2rescore_deeplc_predicted_rt = f32::NAN;
+        deeplc_missing.ms2rescore_deeplc_calibrated_rt = f32::NAN;
+        deeplc_missing.ms2rescore_deeplc_rt_error = f32::NAN;
+        deeplc_missing.ms2rescore_deeplc_abs_rt_error = f32::NAN;
+        let availability = availability_for_features(&deeplc_missing).unwrap();
+        assert!(availability.ms2pip_available);
+        assert!(!availability.deeplc_available);
+
+        let mut overlapping = ms2pip_missing;
+        overlapping.ms2rescore_deeplc_predicted_rt = f32::NAN;
+        overlapping.ms2rescore_deeplc_calibrated_rt = f32::NAN;
+        overlapping.ms2rescore_deeplc_rt_error = f32::NAN;
+        overlapping.ms2rescore_deeplc_abs_rt_error = f32::NAN;
+        let availability = availability_for_features(&overlapping).unwrap();
+        assert!(!availability.ms2pip_available);
+        assert!(!availability.deeplc_available);
+        assert_eq!(availability.missing.len(), 2);
+
+        let mut partial = finite;
+        partial.ms2rescore_ms2pip_pcc = f32::NAN;
+        assert!(availability_for_features(&partial).is_err());
+        let mut infinite = finite;
+        infinite.ms2rescore_deeplc_predicted_rt = f32::INFINITY;
+        assert!(availability_for_features(&infinite).is_err());
+        let mut native_missing = finite;
+        native_missing.tims2rescore_observed_ion_mobility = f32::NAN;
+        assert!(availability_for_features(&native_missing).is_err());
     }
 
     #[test]

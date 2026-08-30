@@ -171,6 +171,41 @@ fn main() -> anyhow::Result<()> {
                 ),
         )
         .subcommand(
+            Command::new("finalize-raw-cache-from-existing-output")
+                .about("Verify and atomically finalize a raw cache from a preserved generator output without launching external processes")
+                .arg(Arg::new("parameters").required(true).value_hint(ValueHint::FilePath))
+                .arg(
+                    Arg::new("candidate-pool-root")
+                        .required(true)
+                        .long("candidate-pool-root")
+                        .value_hint(ValueHint::DirPath),
+                )
+                .arg(
+                    Arg::new("annotation-cache-root")
+                        .required(true)
+                        .long("annotation-cache-root")
+                        .value_hint(ValueHint::DirPath),
+                )
+                .arg(
+                    Arg::new("generator-output-tsv")
+                        .required(true)
+                        .long("generator-output-tsv")
+                        .value_hint(ValueHint::FilePath),
+                )
+                .arg(
+                    Arg::new("rank-depth")
+                        .required(true)
+                        .long("rank-depth")
+                        .value_parser(value_parser!(u32).range(1..)),
+                )
+                .arg(
+                    Arg::new("report")
+                        .required(true)
+                        .long("report")
+                        .value_hint(ValueHint::FilePath),
+                ),
+        )
+        .subcommand(
             Command::new("audit-entrapment")
                 .about("Generate or inspect an entrapment FASTA without running spectral searches")
                 .arg(
@@ -386,6 +421,54 @@ fn main() -> anyhow::Result<()> {
                 && reopened.raw_cache.identity == report.raw_cache.identity
                 && reopened.raw_cache.payload_sha256 == report.raw_cache.payload_sha256,
             "raw-cache-only report failed atomic reopen verification"
+        );
+        println!("{}", serde_json::to_string_pretty(&reopened)?);
+        return Ok(());
+    }
+    if let Some(("finalize-raw-cache-from-existing-output", boundary_matches)) =
+        matches.subcommand()
+    {
+        let parameters = boundary_matches
+            .get_one::<String>("parameters")
+            .expect("required search parameters");
+        let candidate_root = boundary_matches
+            .get_one::<String>("candidate-pool-root")
+            .expect("required candidate-pool root");
+        let annotation_root = boundary_matches
+            .get_one::<String>("annotation-cache-root")
+            .expect("required annotation-cache root");
+        let generator_output = boundary_matches
+            .get_one::<String>("generator-output-tsv")
+            .expect("required generator output");
+        let rank_depth = boundary_matches
+            .get_one::<u32>("rank-depth")
+            .copied()
+            .expect("required rank depth") as usize;
+        let report_path = boundary_matches
+            .get_one::<String>("report")
+            .expect("required report path");
+        let input = Input::load(parameters)?;
+        let parameters = input.build()?;
+        anyhow::ensure!(
+            !parameters.database.prefilter,
+            "raw-cache recovery prohibits database.prefilter before Runner construction"
+        );
+        let runner = Runner::new(parameters, parallel)?;
+        let report = runner.finalize_raw_annotation_cache_from_existing_output(
+            std::path::PathBuf::from(candidate_root),
+            std::path::PathBuf::from(annotation_root),
+            rank_depth,
+            std::path::PathBuf::from(generator_output),
+        )?;
+        write_json_atomic(std::path::Path::new(report_path), &report)?;
+        let reopened: sage_cli::runner::RawCacheConstructionReport =
+            serde_json::from_slice(&std::fs::read(report_path)?)?;
+        anyhow::ensure!(
+            reopened.status == "verified_complete"
+                && reopened.raw_cache.manifest.content_fingerprint
+                    == report.raw_cache.manifest.content_fingerprint
+                && reopened.raw_cache.payload_sha256 == report.raw_cache.payload_sha256,
+            "raw-cache recovery report failed atomic reopen verification"
         );
         println!("{}", serde_json::to_string_pretty(&reopened)?);
         return Ok(());
