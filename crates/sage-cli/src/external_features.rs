@@ -8,18 +8,56 @@ use std::path::{Path, PathBuf};
 use std::process::Command;
 
 use crate::candidate_pool::stable_candidate_id;
+#[cfg(test)]
+use crate::external_feature_cache::publish_raw_cache_atomic;
 use crate::external_feature_cache::{
-    annotation_identity_with_probe_root, cache_directory, load_cache, load_raw_cache,
-    publish_raw_cache_atomic, raw_cache_directory, raw_cache_manifest_path, raw_cache_usage,
-    raw_generator_provenance, raw_prediction_identity_with_probe_root, stage_calibration_identity,
-    write_raw_cache, ExternalAnnotationCacheRequest, ExternalAnnotationCacheUsage,
+    annotation_identity_with_probe_root, cache_directory, generator_output_identity, load_cache,
+    load_raw_cache, publish_raw_cache_atomic_with_output, raw_cache_directory,
+    raw_cache_manifest_path, raw_cache_usage, raw_generator_provenance,
+    raw_prediction_identity_with_probe_root, raw_record, stage_calibration_identity,
+    write_raw_cache_with_output, ExternalAnnotationCacheRequest, ExternalAnnotationCacheUsage,
     ExternalAnnotationInput, ExternalAnnotationRecord, RawExternalPredictionCacheManifest,
-    RawExternalPredictionIdentity, RawGeneratorProvenance,
+    RawExternalPredictionIdentity, RawExternalPredictionRecord, RawGeneratorProvenance,
 };
 use crate::input::{
     ExternalFeatureEngine, ExternalFeatureFailPolicy, ExternalFeatureGenerationSettings,
     ExternalFeatureUseMode,
 };
+use crate::provenance::{sha256_file, write_json_atomic};
+
+const GENERATOR_RUN_PROVENANCE_SCHEMA: &str = "sage-raw-generator-run-v1";
+
+#[derive(Clone, Debug, serde::Serialize, serde::Deserialize, PartialEq, Eq)]
+pub struct GeneratorArtifactIdentity {
+    pub path: PathBuf,
+    pub size_bytes: u64,
+    pub sha256: String,
+}
+
+#[derive(Clone, Debug, serde::Serialize, serde::Deserialize, PartialEq, Eq)]
+pub struct GeneratorRunProvenance {
+    pub schema: String,
+    pub raw_prediction_identity: RawExternalPredictionIdentity,
+    pub candidate_input: GeneratorArtifactIdentity,
+    pub generator_config: GeneratorArtifactIdentity,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub generator_output: Option<GeneratorArtifactIdentity>,
+}
+
+fn artifact_identity(path: &Path) -> Result<GeneratorArtifactIdentity> {
+    let metadata = path
+        .metadata()
+        .with_context(|| format!("reading generator artifact {}", path.display()))?;
+    anyhow::ensure!(
+        metadata.is_file(),
+        "generator artifact is not a regular file"
+    );
+    Ok(GeneratorArtifactIdentity {
+        path: path.to_path_buf(),
+        size_bytes: metadata.len(),
+        sha256: sha256_file(path)?,
+    })
+}
 
 #[derive(Clone, Debug, Eq, PartialEq, Hash)]
 pub struct ExternalFeatureJoinKey {
@@ -260,6 +298,7 @@ pub fn construct_raw_cache_only(
         let generation = (|| -> Result<RawExternalPredictionCacheManifest> {
             let psm_path = temporary.join("candidates.input.tsv");
             let config_path = temporary.join("generator.config.json");
+            let provenance_path = temporary.join("generator.provenance.json");
             let output_root = temporary.join("generator.output");
             let output_tsv = PathBuf::from(format!("{}.psms.tsv", output_root.display()));
             export_candidate_table(
@@ -287,8 +326,18 @@ pub fn construct_raw_cache_only(
                 current == identity,
                 "raw-cache-only generator identity changed after candidate export"
             );
+            let mut run_provenance = GeneratorRunProvenance {
+                schema: GENERATOR_RUN_PROVENANCE_SCHEMA.into(),
+                raw_prediction_identity: identity.clone(),
+                candidate_input: artifact_identity(&psm_path)?,
+                generator_config: artifact_identity(&config_path)?,
+                generator_output: None,
+            };
+            write_json_atomic(&provenance_path, &run_provenance)?;
             generator_invoked = true;
             run_external_process(settings, &config_path)?;
+            run_provenance.generator_output = Some(artifact_identity(&output_tsv)?);
+            write_json_atomic(&provenance_path, &run_provenance)?;
             let parsed = parse_feature_output(&output_tsv).with_context(|| {
                 format!("parsing raw-cache-only output {}", output_tsv.display())
             })?;
@@ -305,11 +354,10 @@ pub fn construct_raw_cache_only(
             join_features(features, parsed, mzml_paths, db)?;
             let records = candidate_indices
                 .iter()
-                .map(|(index, stable_id)| ExternalAnnotationRecord {
-                    stable_id: stable_id.clone(),
-                    features: features[*index].core.external_features,
+                .map(|(index, stable_id)| {
+                    raw_record(stable_id.clone(), features[*index].core.external_features)
                 })
-                .collect::<Vec<_>>();
+                .collect::<Result<Vec<_>>>()?;
             let current = raw_prediction_identity_with_probe_root(
                 search_fingerprint,
                 settings,
@@ -322,14 +370,20 @@ pub fn construct_raw_cache_only(
                 current == identity,
                 "raw-cache-only generator identity changed during annotation"
             );
-            let (manifest, reused) = publish_raw_cache_atomic(&directory, &identity, records)?;
+            let output_identity = generator_output_identity(&output_tsv)?;
+            let (manifest, reused) = publish_raw_cache_atomic_with_output(
+                &directory,
+                &identity,
+                records,
+                output_identity,
+            )?;
             anyhow::ensure!(
                 !reused,
                 "raw-cache final directory appeared during generation; refusing ambiguous publication"
             );
             Ok(manifest)
         })();
-        if settings.output_directory.is_none() && temporary.exists() {
+        if generation.is_ok() && settings.output_directory.is_none() && temporary.exists() {
             let _ = std::fs::remove_dir_all(&temporary);
         }
         generation?
@@ -354,7 +408,7 @@ pub fn construct_raw_cache_only(
     );
 
     Ok(RawCacheOnlyConstructionResult {
-        schema_version: 1,
+        schema_version: 2,
         execution_scope: "raw_annotation_cache_only".into(),
         status: "verified_complete".into(),
         identity: identity.clone(),
@@ -378,6 +432,200 @@ pub fn construct_raw_cache_only(
             "no model/window-specific calibration".into(),
             "no Decoy-Free fitting, q-value calculation, or optimizer trial".into(),
             "no winner selection, audit, target-only, or TDC stage".into(),
+        ],
+    })
+}
+
+/// Finalize a raw cache from a previously completed generator run. This path
+/// verifies the exact candidate export, generator configuration, output bytes,
+/// and one-to-one candidate coverage and never launches an external process.
+pub fn finalize_raw_cache_from_existing_output(
+    features: &mut [DfFeature],
+    settings: &ExternalFeatureGenerationSettings,
+    mzml_paths: &[Url],
+    db: &IndexedDatabase,
+    search_fingerprint: &str,
+    cache_root: &Path,
+    output_tsv: &Path,
+) -> Result<RawCacheOnlyConstructionResult> {
+    anyhow::ensure!(
+        settings.enabled && settings.feature_only,
+        "raw-cache recovery requires feature-only external features"
+    );
+    anyhow::ensure!(
+        matches!(settings.fail_policy, ExternalFeatureFailPolicy::Error),
+        "raw-cache recovery requires fail_policy=error"
+    );
+    let requested_max_rank = settings
+        .max_rank
+        .context("raw-cache recovery requires max_rank")?;
+    let (inputs, candidate_indices) =
+        annotation_inputs(features, db, search_fingerprint, requested_max_rank);
+    anyhow::ensure!(
+        !inputs.is_empty(),
+        "raw-cache recovery candidate population is empty"
+    );
+    let identity = raw_prediction_identity_with_probe_root(
+        search_fingerprint,
+        settings,
+        &inputs,
+        requested_max_rank,
+        cache_root,
+        true,
+    )?;
+    let provenance = raw_generator_provenance(settings, cache_root, true)?;
+    anyhow::ensure!(
+        provenance.generator_settings_sha256 == identity.generator_settings_sha256,
+        "raw-cache recovery generator identity mismatch"
+    );
+    let directory = raw_cache_directory(cache_root, &identity);
+
+    let parent = output_tsv
+        .parent()
+        .context("generator output has no containing transient directory")?;
+    let psm_path = parent.join("candidates.input.tsv");
+    let config_path = parent.join("generator.config.json");
+    let provenance_path = parent.join("generator.provenance.json");
+    for path in [&psm_path, &config_path, output_tsv, &provenance_path] {
+        anyhow::ensure!(
+            path.is_file(),
+            "raw-cache recovery requires preserved artifact {}",
+            path.display()
+        );
+    }
+    let recorded: GeneratorRunProvenance =
+        serde_json::from_slice(&std::fs::read(&provenance_path)?)
+            .context("invalid generator run provenance")?;
+    anyhow::ensure!(
+        recorded.schema == GENERATOR_RUN_PROVENANCE_SCHEMA
+            && recorded.raw_prediction_identity == identity
+            && recorded.candidate_input == artifact_identity(&psm_path)?
+            && recorded.generator_config == artifact_identity(&config_path)?
+            && recorded.generator_output.as_ref() == Some(&artifact_identity(output_tsv)?),
+        "preserved generator artifacts do not match their originating provenance"
+    );
+
+    let validation = std::env::temp_dir().join(format!(
+        "sage-raw-cache-recovery-validation.{}.{}",
+        std::process::id(),
+        std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .unwrap_or_default()
+            .as_nanos()
+    ));
+    std::fs::create_dir_all(&validation)?;
+    let validation_result = (|| -> Result<()> {
+        let expected_psm = validation.join("candidates.input.tsv");
+        let expected_config = validation.join("generator.config.json");
+        export_candidate_table(
+            features,
+            &expected_psm,
+            mzml_paths,
+            db,
+            Some(requested_max_rank),
+            true,
+        )?;
+        anyhow::ensure!(
+            sha256_file(&expected_psm)? == recorded.candidate_input.sha256,
+            "preserved candidate export differs from the exact verified candidate pool"
+        );
+        let output_root = output_tsv
+            .to_string_lossy()
+            .strip_suffix(".psms.tsv")
+            .map(PathBuf::from)
+            .context("generator output must end in .psms.tsv")?;
+        write_feature_config(
+            settings,
+            &psm_path,
+            &output_root,
+            &expected_config,
+            mzml_paths,
+        )?;
+        anyhow::ensure!(
+            sha256_file(&expected_config)? == recorded.generator_config.sha256,
+            "preserved generator configuration differs from the frozen production configuration"
+        );
+        Ok(())
+    })();
+    if validation.exists() {
+        let _ = std::fs::remove_dir_all(&validation);
+    }
+    validation_result?;
+
+    let output_identity = generator_output_identity(output_tsv)?;
+    let (_manifest, reused) = if directory.exists() {
+        let (manifest, _) = load_raw_cache(&directory, &identity)?
+            .context("existing raw cache is incomplete or incompatible")?;
+        anyhow::ensure!(
+            manifest.generator_output == output_identity,
+            "existing raw cache binds a different generator output"
+        );
+        (manifest, true)
+    } else {
+        let parsed = parse_feature_output(output_tsv).with_context(|| {
+            format!(
+                "parsing preserved generator output {}",
+                output_tsv.display()
+            )
+        })?;
+        anyhow::ensure!(
+            parsed.row_count == inputs.len()
+                && parsed.by_psm_id.len() == inputs.len()
+                && parsed.duplicate_psm_ids == 0,
+            "preserved generator output is not a one-to-one candidate catalog"
+        );
+        join_features(features, parsed, mzml_paths, db)?;
+        let records = candidate_indices
+            .iter()
+            .map(|(index, stable_id)| {
+                raw_record(stable_id.clone(), features[*index].core.external_features)
+            })
+            .collect::<Result<Vec<_>>>()?;
+        let (manifest, reused) = publish_raw_cache_atomic_with_output(
+            &directory,
+            &identity,
+            records,
+            output_identity.clone(),
+        )?;
+        anyhow::ensure!(
+            !reused,
+            "raw-cache recovery encountered ambiguous concurrent publication"
+        );
+        (manifest, false)
+    };
+    let (verified, records) = load_raw_cache(&directory, &identity)?
+        .context("recovered raw cache failed immutable reopen verification")?;
+    anyhow::ensure!(
+        records.len() == inputs.len()
+            && verified.prediction_count == inputs.len()
+            && verified.joined_prediction_count == inputs.len(),
+        "recovered raw cache candidate coverage is incomplete"
+    );
+    let manifest_path = raw_cache_manifest_path(&directory);
+    let payload_path = directory.join(&verified.payload_file);
+    Ok(RawCacheOnlyConstructionResult {
+        schema_version: 2,
+        execution_scope: "finalize_raw_cache_from_existing_output".into(),
+        status: "verified_complete".into(),
+        identity: identity.clone(),
+        generator_provenance: provenance,
+        directory,
+        manifest: verified,
+        manifest_path: manifest_path.clone(),
+        manifest_sha256: sha256_file(&manifest_path)?,
+        payload_path: payload_path.clone(),
+        payload_sha256: sha256_file(&payload_path)?,
+        candidate_id_coverage_sha256: identity.raw_input_sha256.clone(),
+        requested_candidate_count: identity.requested_candidate_count,
+        joined_candidate_count: identity.requested_candidate_count,
+        reused_existing_exact: reused,
+        external_generator_invoked: false,
+        stage_calibration_performed: false,
+        downstream_stages_entered: Vec::new(),
+        stop_guarantee: vec![
+            "exact candidate pool, candidate export, generator configuration, and output hashes required".into(),
+            "no spectrum search or external annotation process".into(),
+            "no calibration, fitting, optimizer, audit, target-only, or TDC stage".into(),
         ],
     })
 }
@@ -472,7 +720,7 @@ fn add_external_features_inner(
             let directory = raw_cache_directory(&request.root, &raw_identity);
             match load_raw_cache(&directory, &raw_identity) {
                 Ok(Some((manifest, records))) => {
-                    apply_cached_annotations(features, &candidate_indices, records)?;
+                    apply_cached_raw_predictions(features, &candidate_indices, records)?;
                     log::info!(
                         "raw MS2Rescore prediction cache: reused {}/{} predictions from {} (raw_fingerprint={}, calibration_fingerprint={})",
                         manifest.joined_prediction_count,
@@ -531,10 +779,16 @@ fn add_external_features_inner(
                     load_cache(&legacy_directory, &legacy_identity)?
                 {
                     apply_cached_annotations(features, &candidate_indices, records.clone())?;
-                    let raw_manifest = write_raw_cache(
+                    let raw_records = records
+                        .into_iter()
+                        .map(|record| raw_record(record.stable_id, record.features))
+                        .collect::<Result<Vec<_>>>()?;
+                    let legacy_payload = legacy_directory.join(&legacy_manifest.payload_file);
+                    let raw_manifest = write_raw_cache_with_output(
                         &directory,
                         &raw_identity,
-                        records,
+                        raw_records,
+                        generator_output_identity(&legacy_payload)?,
                         Some(&legacy_manifest),
                     )?;
                     log::info!(
@@ -678,12 +932,15 @@ fn add_external_features_inner(
         );
         let records = candidate_indices
             .into_iter()
-            .map(|(index, stable_id)| ExternalAnnotationRecord {
-                stable_id,
-                features: features[index].core.external_features,
-            })
-            .collect();
-        let manifest = write_raw_cache(&directory, &identity, records, None)?;
+            .map(|(index, stable_id)| raw_record(stable_id, features[index].core.external_features))
+            .collect::<Result<Vec<_>>>()?;
+        let manifest = write_raw_cache_with_output(
+            &directory,
+            &identity,
+            records,
+            generator_output_identity(&output_tsv)?,
+            None,
+        )?;
         log::info!(
             "raw MS2Rescore prediction cache: wrote {}/{} joined predictions to {} (raw_fingerprint={}, calibration_fingerprint={})",
             manifest.joined_prediction_count,
@@ -769,6 +1026,32 @@ fn apply_cached_annotations(
     anyhow::ensure!(
         by_id.is_empty(),
         "MS2Rescore annotation cache contains candidates not present in the current analysis"
+    );
+    Ok(())
+}
+
+fn apply_cached_raw_predictions(
+    features: &mut [DfFeature],
+    candidate_indices: &[(usize, String)],
+    records: Vec<RawExternalPredictionRecord>,
+) -> Result<()> {
+    anyhow::ensure!(
+        records.len() == candidate_indices.len(),
+        "raw prediction cache candidate-count mismatch"
+    );
+    let mut by_id = records
+        .into_iter()
+        .map(|record| (record.stable_id, record.features))
+        .collect::<HashMap<_, _>>();
+    for (index, stable_id) in candidate_indices {
+        let prediction = by_id
+            .remove(stable_id)
+            .with_context(|| format!("raw prediction cache is missing {stable_id}"))?;
+        features[*index].core.external_features = prediction;
+    }
+    anyhow::ensure!(
+        by_id.is_empty(),
+        "raw prediction cache contains unexpected candidates"
     );
     Ok(())
 }
@@ -1036,91 +1319,7 @@ fn parse_feature_output(path: &Path) -> Result<ParsedExternalFeatureTable> {
             .and_then(|x| x.parse::<u32>().ok())
             .unwrap_or(1);
 
-        let mut f = ExternalPsmFeatures::default();
-
-        f.ms2rescore_ms2pip_pcc = get_f32(
-            &row,
-            &headers,
-            &[
-                "spec_pearson",
-                "spec_pearson_norm",
-                "Ms2pip:Correlation",
-                "ms2pip_correlation",
-                "ms2pip_corr",
-                "pcc",
-                "correlation",
-            ],
-        );
-
-        f.ms2rescore_spectral_angle = get_f32(
-            &row,
-            &headers,
-            &[
-                "cos",
-                "cos_norm",
-                "dotprod",
-                "dotprod_norm",
-                "spectral_angle",
-                "Ms2pip:SpectralAngle",
-                "ms2pip_spectral_angle",
-                "spectral_angle_similarity",
-            ],
-        );
-
-        f.ms2rescore_fragment_intensity_agreement = get_f32(
-            &row,
-            &headers,
-            &[
-                "dotprod",
-                "dotprod_norm",
-                "cos",
-                "cos_norm",
-                "spec_pearson",
-                "spec_pearson_norm",
-                "fragment_intensity_agreement",
-                "ms2pip_fragment_intensity_agreement",
-            ],
-        );
-
-        f.ms2rescore_deeplc_predicted_rt = get_f32(
-            &row,
-            &headers,
-            &[
-                "predicted_retention_time",
-                "predicted_retention_time_best",
-                "DeepLC:PredictedRetentionTime",
-                "deeplc_predicted_rt",
-                "predicted_rt",
-                "rt_pred",
-            ],
-        );
-
-        f.ms2rescore_deeplc_calibrated_rt = get_f32(
-            &row,
-            &headers,
-            &[
-                "observed_retention_time",
-                "observed_retention_time_best",
-                "DeepLC:CalibratedRetentionTime",
-                "deeplc_calibrated_rt",
-                "calibrated_rt",
-            ],
-        );
-
-        f.ms2rescore_deeplc_rt_error = get_f32(
-            &row,
-            &headers,
-            &[
-                "rt_diff",
-                "rt_diff_best",
-                "DeepLC:RetentionTimeError",
-                "deeplc_rt_error",
-                "rt_error",
-                "delta_rt",
-            ],
-        );
-
-        let rt_err = get_f32(
+        let rt_err = get_required_f32(
             &row,
             &headers,
             &[
@@ -1131,12 +1330,91 @@ fn parse_feature_output(path: &Path) -> Result<ParsedExternalFeatureTable> {
                 "abs_rt_error",
                 "abs_delta_rt",
             ],
-        );
-
-        f.ms2rescore_deeplc_abs_rt_error = if rt_err.is_finite() {
-            rt_err.abs()
-        } else {
-            f32::NAN
+        )?;
+        let mut f = ExternalPsmFeatures {
+            ms2rescore_ms2pip_pcc: get_required_f32(
+                &row,
+                &headers,
+                &[
+                    "spec_pearson",
+                    "spec_pearson_norm",
+                    "Ms2pip:Correlation",
+                    "ms2pip_correlation",
+                    "ms2pip_corr",
+                    "pcc",
+                    "correlation",
+                ],
+            )?,
+            ms2rescore_spectral_angle: get_required_f32(
+                &row,
+                &headers,
+                &[
+                    "cos",
+                    "cos_norm",
+                    "dotprod",
+                    "dotprod_norm",
+                    "spectral_angle",
+                    "Ms2pip:SpectralAngle",
+                    "ms2pip_spectral_angle",
+                    "spectral_angle_similarity",
+                ],
+            )?,
+            ms2rescore_fragment_intensity_agreement: get_required_f32(
+                &row,
+                &headers,
+                &[
+                    "dotprod",
+                    "dotprod_norm",
+                    "cos",
+                    "cos_norm",
+                    "spec_pearson",
+                    "spec_pearson_norm",
+                    "fragment_intensity_agreement",
+                    "ms2pip_fragment_intensity_agreement",
+                ],
+            )?,
+            ms2rescore_deeplc_predicted_rt: get_required_f32(
+                &row,
+                &headers,
+                &[
+                    "predicted_retention_time",
+                    "predicted_retention_time_best",
+                    "DeepLC:PredictedRetentionTime",
+                    "deeplc_predicted_rt",
+                    "predicted_rt",
+                    "rt_pred",
+                ],
+            )?,
+            ms2rescore_deeplc_calibrated_rt: get_required_f32(
+                &row,
+                &headers,
+                &[
+                    "observed_retention_time",
+                    "observed_retention_time_best",
+                    "DeepLC:CalibratedRetentionTime",
+                    "deeplc_calibrated_rt",
+                    "calibrated_rt",
+                ],
+            )?,
+            ms2rescore_deeplc_rt_error: get_required_f32(
+                &row,
+                &headers,
+                &[
+                    "rt_diff",
+                    "rt_diff_best",
+                    "DeepLC:RetentionTimeError",
+                    "deeplc_rt_error",
+                    "rt_error",
+                    "delta_rt",
+                ],
+            )?,
+            ms2rescore_deeplc_abs_rt_error: if rt_err.is_finite() {
+                rt_err.abs()
+            } else {
+                f32::NAN
+            },
+            ms2rescore_feature_joined: true,
+            ..ExternalPsmFeatures::default()
         };
 
         f.tims2rescore_im2deep_predicted_ccs = get_f32(
@@ -1198,7 +1476,7 @@ fn parse_feature_output(path: &Path) -> Result<ParsedExternalFeatureTable> {
             ],
         );
 
-        f.tims2rescore_observed_ion_mobility = get_f32(
+        f.tims2rescore_observed_ion_mobility = get_required_f32(
             &row,
             &headers,
             &[
@@ -1207,7 +1485,7 @@ fn parse_feature_output(path: &Path) -> Result<ParsedExternalFeatureTable> {
                 "ion_mobility_observed",
                 "im_observed",
             ],
-        );
+        )?;
 
         f.tims2rescore_abs_ion_mobility_error = get_f32(
             &row,
@@ -1228,8 +1506,6 @@ fn parse_feature_output(path: &Path) -> Result<ParsedExternalFeatureTable> {
                 "pct_im_error",
             ],
         );
-
-        f.ms2rescore_feature_joined = true;
 
         let parsed = ParsedExternalPsmFeatures {
             psm_id,
@@ -1998,6 +2274,28 @@ fn get_f32(row: &csv::StringRecord, headers: &csv::StringRecord, names: &[&str])
         .unwrap_or(f32::NAN)
 }
 
+fn get_required_f32(
+    row: &csv::StringRecord,
+    headers: &csv::StringRecord,
+    names: &[&str],
+) -> Result<f32> {
+    let (index, header) = names
+        .iter()
+        .find_map(|name| {
+            headers
+                .iter()
+                .position(|candidate| candidate == *name)
+                .map(|index| (index, *name))
+        })
+        .with_context(|| {
+            format!("generator output lacks required numeric field aliases {names:?}")
+        })?;
+    let raw = row.get(index).unwrap_or_default().trim();
+    anyhow::ensure!(!raw.is_empty(), "empty required numeric field {header}");
+    raw.parse::<f32>()
+        .with_context(|| format!("invalid required numeric representation in {header}: {raw:?}"))
+}
+
 #[cfg(test)]
 mod path_tests {
     use super::*;
@@ -2159,6 +2457,7 @@ mod path_tests {
             enabled: true,
             command_path: Some(wrapper.display().to_string()),
             temp_directory: Some(root.join("work").display().to_string()),
+            output_directory: Some(root.join("preserve-generator-work").display().to_string()),
             max_rank: Some(1),
             feature_generators: Some(serde_json::json!({"basic": {}})),
             ..ExternalFeatureGenerationSettings::default()
@@ -2191,6 +2490,56 @@ mod path_tests {
         assert_eq!(report.joined_candidate_count, 1);
         assert!(report.manifest_path.is_file());
         assert!(report.payload_path.is_file());
+
+        let transient = std::fs::read_dir(root.join("work"))
+            .unwrap()
+            .map(|entry| entry.unwrap().path())
+            .find(|path| {
+                path.file_name()
+                    .and_then(|name| name.to_str())
+                    .is_some_and(|name| name.starts_with("sage-raw-cache-only."))
+            })
+            .unwrap();
+        let preserved_output = transient.join("generator.output.psms.tsv");
+        assert!(preserved_output.is_file());
+        assert!(transient.join("generator.provenance.json").is_file());
+        std::fs::remove_dir_all(&report.directory).unwrap();
+
+        let mut recovery_features = vec![FeatureCore {
+            spec_id: "scan=1".into(),
+            psm_id: 0,
+            rank: 1,
+            peptide_idx: PeptideIx(0),
+            ..FeatureCore::default()
+        }
+        .to_df()];
+        let recovered = finalize_raw_cache_from_existing_output(
+            &mut recovery_features,
+            &settings,
+            &[],
+            &database,
+            "search",
+            &root,
+            &preserved_output,
+        )
+        .unwrap();
+        assert!(!recovered.external_generator_invoked);
+        assert!(!recovered.reused_existing_exact);
+        assert_eq!(std::fs::read(&marker).unwrap(), b"x");
+
+        let replay = finalize_raw_cache_from_existing_output(
+            &mut recovery_features,
+            &settings,
+            &[],
+            &database,
+            "search",
+            &root,
+            &preserved_output,
+        )
+        .unwrap();
+        assert!(replay.reused_existing_exact);
+        assert!(!replay.external_generator_invoked);
+        assert_eq!(std::fs::read(&marker).unwrap(), b"x");
         std::fs::remove_dir_all(root).unwrap();
     }
 }
