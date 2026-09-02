@@ -4166,6 +4166,10 @@ pub struct OptimizerIdentity {
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub entrapment_partition_identity: Option<String>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub entrapment_partition_scientific_content_sha256: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub entrapment_partition_artifact_sha256: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
     pub root_optimizer_provenance_sha256: Option<String>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub stage_optimizer_provenance_sha256: Option<String>,
@@ -4290,6 +4294,10 @@ pub struct AuditLevelMetrics {
 pub struct FrozenWinnerAuditEvaluation {
     pub schema_version: u32,
     pub partition_identity: String,
+    #[serde(default)]
+    pub partition_scientific_content_sha256: String,
+    #[serde(default)]
+    pub partition_artifact_sha256: String,
     pub expert: OptimizerExpert,
     pub winner_trial_id: String,
     pub winner_results_sha256: String,
@@ -5562,6 +5570,8 @@ mod tests {
             source_configuration_sha256: "config".into(),
             catalog_sha256: "catalog".into(),
             entrapment_partition_identity: None,
+            entrapment_partition_scientific_content_sha256: None,
+            entrapment_partition_artifact_sha256: None,
             root_optimizer_provenance_sha256: None,
             stage_optimizer_provenance_sha256: None,
             root_proposal_space_sha256: None,
@@ -6270,6 +6280,8 @@ mod tests {
         let mut first_identity = identity();
         first_identity.execution_mode = OptimizerExecutionMode::OptimizationOnly;
         first_identity.entrapment_partition_identity = Some("partition-a".into());
+        first_identity.entrapment_partition_scientific_content_sha256 = Some("scientific-a".into());
+        first_identity.entrapment_partition_artifact_sha256 = Some("artifact-a".into());
         let mut second_identity = first_identity.clone();
         second_identity.entrapment_partition_identity = Some("partition-b".into());
         assert_eq!(
@@ -6283,6 +6295,19 @@ mod tests {
         assert_ne!(
             optimizer_fingerprint(&first_identity, &selection).unwrap(),
             optimizer_fingerprint(&second_identity, &selection).unwrap()
+        );
+        let mut different_scientific = first_identity.clone();
+        different_scientific.entrapment_partition_scientific_content_sha256 =
+            Some("scientific-b".into());
+        assert_ne!(
+            optimizer_fingerprint(&first_identity, &selection).unwrap(),
+            optimizer_fingerprint(&different_scientific, &selection).unwrap()
+        );
+        let mut different_artifact = first_identity.clone();
+        different_artifact.entrapment_partition_artifact_sha256 = Some("artifact-b".into());
+        assert_ne!(
+            optimizer_fingerprint(&first_identity, &selection).unwrap(),
+            optimizer_fingerprint(&different_artifact, &selection).unwrap()
         );
 
         let directory = temp("partition-checkpoint-identity");
@@ -6302,6 +6327,15 @@ mod tests {
         let error = run_optimizer(
             &selection,
             &second_identity,
+            &checkpoint,
+            &mut Evaluator::default(),
+        )
+        .unwrap_err()
+        .to_string();
+        assert!(error.contains("fingerprint mismatch"));
+        let error = run_optimizer(
+            &selection,
+            &different_artifact,
             &checkpoint,
             &mut Evaluator::default(),
         )

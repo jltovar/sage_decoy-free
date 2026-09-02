@@ -12,6 +12,12 @@ use sha2::{Digest, Sha256};
 use std::cmp::Ordering;
 use std::collections::{BTreeMap, BTreeSet};
 use std::path::{Path, PathBuf};
+use std::time::{SystemTime, UNIX_EPOCH};
+
+pub const ENTRAPMENT_PARTITION_ASSIGNMENT_ALGORITHM_SCHEMA: &str =
+    "sage-entrapment-component-partition-assignment-v1";
+pub const ENTRAPMENT_PARTITION_SCIENTIFIC_CONTENT_SCHEMA_VERSION: u32 = 1;
+pub const ENTRAPMENT_PARTITION_VERIFICATION_SCHEMA_VERSION: u32 = 1;
 
 #[derive(Clone, Debug)]
 struct FastaRecord {
@@ -77,11 +83,111 @@ pub struct EntrapmentPartitionArtifact {
     pub payload_sha256: String,
 }
 
+/// Complete portable scientific content of a partition. Historical generator
+/// and current verifier implementation identities intentionally live outside
+/// this projection.
+#[derive(Clone, Debug, Serialize, Deserialize, PartialEq)]
+pub struct EntrapmentPartitionScientificContentV1 {
+    pub schema_version: u32,
+    pub partition_schema_version: u32,
+    pub assignment_algorithm_schema: String,
+    /// Current portable content-derived dataset identity. The historical
+    /// artifact's path-derived dataset and partition identities are retained
+    /// in `HistoricalEntrapmentPartitionGeneratorIdentityV1` instead.
+    pub dataset_identity: String,
+    pub target_fasta_sha256: String,
+    pub active_entrapment_fasta_sha256: String,
+    pub digestion_search_space_identity: String,
+    pub entrapment_construction_identity: String,
+    pub seed: u64,
+    pub salt: String,
+    pub requested_selection_fraction: f64,
+    pub requested_audit_fraction: f64,
+    pub realized_selection_fraction: f64,
+    pub realized_audit_fraction: f64,
+    pub component_assignments: Vec<EntrapmentComponentAssignment>,
+    pub selection_proteins: Vec<String>,
+    pub audit_proteins: Vec<String>,
+    pub selection_canonical_peptides: Vec<String>,
+    pub audit_canonical_peptides: Vec<String>,
+    pub selection_peptidoforms: Vec<String>,
+    pub audit_peptidoforms: Vec<String>,
+    pub selection_ratios: EntrapmentRatios,
+    pub audit_ratios: EntrapmentRatios,
+    pub component_overlap_count: usize,
+    pub protein_overlap_count: usize,
+    pub canonical_peptide_overlap_count: usize,
+    pub peptidoform_overlap_count: usize,
+    /// Connected components are the partition's protein-group units.
+    pub protein_group_overlap_count: usize,
+}
+
+#[derive(Clone, Debug, Serialize, Deserialize, PartialEq, Eq)]
+pub struct HistoricalEntrapmentPartitionGeneratorIdentityV1 {
+    pub schema_version: u32,
+    pub generator_schema: String,
+    pub assignment_algorithm_schema: String,
+    pub source_implementation_identity: String,
+    pub historical_dataset_identity_schema: String,
+    pub historical_dataset_identity: String,
+    pub original_partition_identity: String,
+    pub original_artifact_sha256: String,
+    pub original_payload_sha256: String,
+}
+
+#[derive(Clone, Debug, Serialize, Deserialize, PartialEq, Eq)]
+pub struct CurrentEntrapmentPartitionVerifierIdentityV1 {
+    pub schema_version: u32,
+    pub verification_algorithm_schema: String,
+    pub source_implementation_identity: String,
+    pub executable_sha256: String,
+    pub current_dataset_identity_schema: String,
+    pub current_dataset_identity: String,
+}
+
+#[derive(Clone, Debug, Serialize, Deserialize, PartialEq, Eq)]
+pub(crate) struct HistoricalDatasetIdentityAlias {
+    pub schema: String,
+    pub identity: String,
+}
+
+#[derive(Clone, Copy, Debug)]
+pub(crate) struct PartitionDatasetIdentityContext<'a> {
+    pub current: &'a str,
+    /// Compatibility aliases are derived by trusted workflow code from the
+    /// active manifest; they are not accepted as user-supplied hashes.
+    pub historical_aliases: &'a [HistoricalDatasetIdentityAlias],
+}
+
+#[derive(Clone, Debug, Serialize, Deserialize, PartialEq, Eq)]
+pub struct EntrapmentPartitionVerifiedUseV1 {
+    pub schema_version: u32,
+    pub scientific_content_sha256: String,
+    pub exact_artifact_sha256: String,
+    pub historical_generator: HistoricalEntrapmentPartitionGeneratorIdentityV1,
+    pub current_verifier: CurrentEntrapmentPartitionVerifierIdentityV1,
+    pub verified_use_sha256: String,
+    /// Machine-local audit metadata; excluded from portable identities.
+    pub artifact_path: PathBuf,
+    /// Machine-local audit metadata; excluded from portable identities.
+    pub verified_at_unix_seconds: u64,
+}
+
+#[derive(Clone, Debug, Serialize, Deserialize, PartialEq)]
+pub struct VerifiedEntrapmentPartition {
+    pub artifact: EntrapmentPartitionArtifact,
+    pub verification: EntrapmentPartitionVerifiedUseV1,
+}
+
 /// The only partition data available to model fitting and optimizer trial
 /// evaluation. Audit identities and ratios deliberately have no field here.
 #[derive(Clone, Debug, Serialize, Deserialize, PartialEq)]
 pub struct EntrapmentSelectionView {
     pub partition_identity: String,
+    #[serde(default, skip_serializing_if = "String::is_empty")]
+    pub scientific_content_sha256: String,
+    #[serde(default, skip_serializing_if = "String::is_empty")]
+    pub exact_artifact_sha256: String,
     pub selection_proteins: Vec<String>,
     pub selection_ratios: EntrapmentRatios,
 }
@@ -98,6 +204,21 @@ impl EntrapmentPartitionArtifact {
     pub fn selection_view(&self) -> EntrapmentSelectionView {
         EntrapmentSelectionView {
             partition_identity: self.partition_identity.clone(),
+            scientific_content_sha256: String::new(),
+            exact_artifact_sha256: String::new(),
+            selection_proteins: self.selection_proteins.clone(),
+            selection_ratios: self.selection_ratios.clone(),
+        }
+    }
+
+    pub fn selection_view_verified(
+        &self,
+        verification: &EntrapmentPartitionVerifiedUseV1,
+    ) -> EntrapmentSelectionView {
+        EntrapmentSelectionView {
+            partition_identity: self.partition_identity.clone(),
+            scientific_content_sha256: verification.scientific_content_sha256.clone(),
+            exact_artifact_sha256: verification.exact_artifact_sha256.clone(),
             selection_proteins: self.selection_proteins.clone(),
             selection_ratios: self.selection_ratios.clone(),
         }
@@ -1341,6 +1462,277 @@ fn artifact_partition_identity(artifact: &EntrapmentPartitionArtifact) -> Result
     Ok(format!("{:x}", hasher.finalize()))
 }
 
+fn partition_scientific_content(
+    artifact: &EntrapmentPartitionArtifact,
+    portable_dataset_identity: &str,
+) -> EntrapmentPartitionScientificContentV1 {
+    let selection_components = artifact
+        .component_assignments
+        .iter()
+        .filter(|assignment| assignment.partition == EntrapmentPartitionAssignment::Selection)
+        .map(|assignment| assignment.component_identity.as_str())
+        .collect::<BTreeSet<_>>();
+    let audit_components = artifact
+        .component_assignments
+        .iter()
+        .filter(|assignment| assignment.partition == EntrapmentPartitionAssignment::Audit)
+        .map(|assignment| assignment.component_identity.as_str())
+        .collect::<BTreeSet<_>>();
+    let selection_proteins = artifact
+        .selection_proteins
+        .iter()
+        .map(String::as_str)
+        .collect::<BTreeSet<_>>();
+    let audit_proteins = artifact
+        .audit_proteins
+        .iter()
+        .map(String::as_str)
+        .collect::<BTreeSet<_>>();
+    let selection_peptides = artifact
+        .selection_canonical_peptides
+        .iter()
+        .map(String::as_str)
+        .collect::<BTreeSet<_>>();
+    let audit_peptides = artifact
+        .audit_canonical_peptides
+        .iter()
+        .map(String::as_str)
+        .collect::<BTreeSet<_>>();
+    let selection_peptidoforms = artifact
+        .selection_peptidoforms
+        .iter()
+        .map(String::as_str)
+        .collect::<BTreeSet<_>>();
+    let audit_peptidoforms = artifact
+        .audit_peptidoforms
+        .iter()
+        .map(String::as_str)
+        .collect::<BTreeSet<_>>();
+    EntrapmentPartitionScientificContentV1 {
+        schema_version: ENTRAPMENT_PARTITION_SCIENTIFIC_CONTENT_SCHEMA_VERSION,
+        partition_schema_version: artifact.schema_version,
+        assignment_algorithm_schema: ENTRAPMENT_PARTITION_ASSIGNMENT_ALGORITHM_SCHEMA.into(),
+        dataset_identity: portable_dataset_identity.into(),
+        target_fasta_sha256: artifact.target_fasta_sha256.clone(),
+        active_entrapment_fasta_sha256: artifact.active_entrapment_fasta_sha256.clone(),
+        digestion_search_space_identity: artifact.digestion_search_space_identity.clone(),
+        entrapment_construction_identity: artifact.entrapment_construction_identity.clone(),
+        seed: artifact.seed,
+        salt: artifact.salt.clone(),
+        requested_selection_fraction: artifact.requested_selection_fraction,
+        requested_audit_fraction: artifact.requested_audit_fraction,
+        realized_selection_fraction: artifact.realized_selection_fraction,
+        realized_audit_fraction: artifact.realized_audit_fraction,
+        component_assignments: artifact.component_assignments.clone(),
+        selection_proteins: artifact.selection_proteins.clone(),
+        audit_proteins: artifact.audit_proteins.clone(),
+        selection_canonical_peptides: artifact.selection_canonical_peptides.clone(),
+        audit_canonical_peptides: artifact.audit_canonical_peptides.clone(),
+        selection_peptidoforms: artifact.selection_peptidoforms.clone(),
+        audit_peptidoforms: artifact.audit_peptidoforms.clone(),
+        selection_ratios: artifact.selection_ratios.clone(),
+        audit_ratios: artifact.audit_ratios.clone(),
+        component_overlap_count: selection_components.intersection(&audit_components).count(),
+        protein_overlap_count: selection_proteins.intersection(&audit_proteins).count(),
+        canonical_peptide_overlap_count: selection_peptides.intersection(&audit_peptides).count(),
+        peptidoform_overlap_count: selection_peptidoforms
+            .intersection(&audit_peptidoforms)
+            .count(),
+        protein_group_overlap_count: selection_components.intersection(&audit_components).count(),
+    }
+}
+
+pub fn entrapment_partition_scientific_content_sha256(
+    artifact: &EntrapmentPartitionArtifact,
+) -> Result<String> {
+    entrapment_partition_scientific_content_sha256_for_dataset(artifact, &artifact.dataset_identity)
+}
+
+fn entrapment_partition_scientific_content_sha256_for_dataset(
+    artifact: &EntrapmentPartitionArtifact,
+    portable_dataset_identity: &str,
+) -> Result<String> {
+    let mut hasher = Sha256::new();
+    hasher.update(b"sage-entrapment-partition-scientific-content-v1\0");
+    hasher.update(serde_json::to_vec(&partition_scientific_content(
+        artifact,
+        portable_dataset_identity,
+    ))?);
+    Ok(format!("{:x}", hasher.finalize()))
+}
+
+fn validate_partition_structure(artifact: &EntrapmentPartitionArtifact) -> Result<()> {
+    anyhow::ensure!(
+        artifact.schema_version == 1,
+        "unsupported entrapment partition schema"
+    );
+    anyhow::ensure!(
+        artifact.partition_identity == artifact_partition_identity(artifact)?,
+        "entrapment partition identity integrity failure"
+    );
+    anyhow::ensure!(
+        artifact.payload_sha256 == artifact_payload_sha256(artifact)?,
+        "entrapment partition payload integrity failure"
+    );
+    anyhow::ensure!(
+        artifact.source_implementation_identity.len() == 64
+            && artifact
+                .source_implementation_identity
+                .bytes()
+                .all(|byte| byte.is_ascii_hexdigit()),
+        "entrapment partition historical generator identity is invalid"
+    );
+
+    let content = partition_scientific_content(artifact, &artifact.dataset_identity);
+    anyhow::ensure!(
+        content.component_overlap_count == 0
+            && content.protein_group_overlap_count == 0
+            && content.protein_overlap_count == 0
+            && content.canonical_peptide_overlap_count == 0
+            && content.peptidoform_overlap_count == 0,
+        "entrapment partition contains cross-partition overlap"
+    );
+    let mut component_ids = BTreeSet::new();
+    let mut assigned_proteins = BTreeMap::<&str, EntrapmentPartitionAssignment>::new();
+    for assignment in &artifact.component_assignments {
+        anyhow::ensure!(
+            component_ids.insert(assignment.component_identity.as_str()),
+            "entrapment partition contains a duplicate component identity"
+        );
+        anyhow::ensure!(
+            !assignment.proteins.is_empty(),
+            "entrapment partition contains an empty component"
+        );
+        for protein in &assignment.proteins {
+            anyhow::ensure!(
+                assigned_proteins
+                    .insert(protein.as_str(), assignment.partition)
+                    .is_none(),
+                "entrapment partition assigns a protein more than once"
+            );
+        }
+    }
+    for (proteins, role) in [
+        (
+            &artifact.selection_proteins,
+            EntrapmentPartitionAssignment::Selection,
+        ),
+        (
+            &artifact.audit_proteins,
+            EntrapmentPartitionAssignment::Audit,
+        ),
+    ] {
+        anyhow::ensure!(
+            proteins.iter().collect::<BTreeSet<_>>().len() == proteins.len(),
+            "entrapment partition contains duplicate protein membership"
+        );
+        for protein in proteins {
+            anyhow::ensure!(
+                assigned_proteins.get(protein.as_str()) == Some(&role),
+                "entrapment partition component and protein membership disagree"
+            );
+        }
+    }
+    anyhow::ensure!(
+        assigned_proteins.len()
+            == artifact.selection_proteins.len() + artifact.audit_proteins.len(),
+        "entrapment partition component membership is incomplete"
+    );
+    for (members, label) in [
+        (&artifact.selection_canonical_peptides, "selection peptide"),
+        (&artifact.audit_canonical_peptides, "audit peptide"),
+        (&artifact.selection_peptidoforms, "selection peptidoform"),
+        (&artifact.audit_peptidoforms, "audit peptidoform"),
+    ] {
+        anyhow::ensure!(
+            members.iter().collect::<BTreeSet<_>>().len() == members.len(),
+            "entrapment partition contains duplicate {label} membership"
+        );
+    }
+    for (ratios, proteins, peptides, peptidoforms, label) in [
+        (
+            &artifact.selection_ratios,
+            artifact.selection_proteins.len(),
+            artifact.selection_canonical_peptides.len(),
+            artifact.selection_peptidoforms.len(),
+            "selection",
+        ),
+        (
+            &artifact.audit_ratios,
+            artifact.audit_proteins.len(),
+            artifact.audit_canonical_peptides.len(),
+            artifact.audit_peptidoforms.len(),
+            "audit",
+        ),
+    ] {
+        anyhow::ensure!(
+            ratios.entrapment_proteins == proteins
+                && ratios.entrapment_peptides == peptides
+                && ratios.entrapment_peptidoforms == peptidoforms
+                && ratios.protein_ratio.is_finite()
+                && ratios.peptide_ratio.is_finite()
+                && ratios.peptidoform_ratio.is_finite(),
+            "entrapment partition {label} ratios disagree with membership"
+        );
+    }
+    Ok(())
+}
+
+fn scientific_mismatch_paths(
+    existing: &serde_json::Value,
+    expected: &serde_json::Value,
+    path: &str,
+    output: &mut Vec<String>,
+) {
+    match (existing, expected) {
+        (serde_json::Value::Object(left), serde_json::Value::Object(right)) => {
+            let keys = left.keys().chain(right.keys()).collect::<BTreeSet<_>>();
+            for key in keys {
+                let child = format!("{path}/{}", key.replace('~', "~0").replace('/', "~1"));
+                match (left.get(key), right.get(key)) {
+                    (Some(left), Some(right)) => {
+                        scientific_mismatch_paths(left, right, &child, output)
+                    }
+                    _ => output.push(child),
+                }
+            }
+        }
+        (serde_json::Value::Array(left), serde_json::Value::Array(right)) => {
+            let length = left.len().max(right.len());
+            for index in 0..length {
+                let child = format!("{path}/{index}");
+                match (left.get(index), right.get(index)) {
+                    (Some(left), Some(right)) => {
+                        scientific_mismatch_paths(left, right, &child, output)
+                    }
+                    _ => output.push(child),
+                }
+            }
+        }
+        _ if existing != expected => output.push(path.to_owned()),
+        _ => {}
+    }
+}
+
+fn verified_use_identity(
+    scientific_content_sha256: &str,
+    exact_artifact_sha256: &str,
+    historical_generator: &HistoricalEntrapmentPartitionGeneratorIdentityV1,
+    current_verifier: &CurrentEntrapmentPartitionVerifierIdentityV1,
+) -> Result<String> {
+    let portable = serde_json::json!({
+        "schema_version": ENTRAPMENT_PARTITION_VERIFICATION_SCHEMA_VERSION,
+        "scientific_content_sha256": scientific_content_sha256,
+        "exact_artifact_sha256": exact_artifact_sha256,
+        "historical_generator": historical_generator,
+        "current_verifier": current_verifier,
+    });
+    let mut hasher = Sha256::new();
+    hasher.update(b"sage-entrapment-partition-verified-use-v1\0");
+    hasher.update(serde_json::to_vec(&portable)?);
+    Ok(format!("{:x}", hasher.finalize()))
+}
+
 pub fn entrapment_construction_identity(report: &EntrapmentDatabaseReport) -> Result<String> {
     let value = match report {
         EntrapmentDatabaseReport::NativeGenerated { generation } => serde_json::json!({
@@ -1641,6 +2033,154 @@ pub fn build_entrapment_partition(
     Ok(artifact)
 }
 
+pub(crate) fn resolve_entrapment_partition_with_provenance_and_dataset_aliases(
+    parameters: &Parameters,
+    dataset_identities: PartitionDatasetIdentityContext<'_>,
+    target_fasta: &Path,
+    active_entrapment_fasta: &Path,
+    entrapment_construction_identity: &str,
+    config: &EntrapmentValidationConfig,
+    artifact_path: &Path,
+) -> Result<VerifiedEntrapmentPartition> {
+    let expected = build_entrapment_partition(
+        parameters,
+        dataset_identities.current,
+        target_fasta,
+        active_entrapment_fasta,
+        entrapment_construction_identity,
+        config,
+    )?;
+    let existing = if artifact_path.is_file() {
+        let existing: EntrapmentPartitionArtifact =
+            serde_json::from_slice(&std::fs::read(artifact_path).with_context(|| {
+                format!(
+                    "failed to read entrapment partition {}",
+                    artifact_path.display()
+                )
+            })?)
+            .context("invalid entrapment partition artifact")?;
+        existing
+    } else {
+        anyhow::ensure!(
+            !config.require_existing_partition,
+            "required existing entrapment partition artifact is missing: {}",
+            artifact_path.display()
+        );
+        write_json_atomic(artifact_path, &expected)?;
+        expected.clone()
+    };
+
+    // Authenticate the immutable historical artifact using its own original
+    // fields before comparing it with anything reconstructed by this build.
+    validate_partition_structure(&existing)?;
+    let existing_scientific = partition_scientific_content(&existing, &expected.dataset_identity);
+    let expected_scientific = partition_scientific_content(&expected, &expected.dataset_identity);
+    let historical_dataset_identity_schema =
+        if existing.dataset_identity == expected.dataset_identity {
+            "sage-decoy-free-dataset-current-content-v1".to_owned()
+        } else {
+            dataset_identities
+                .historical_aliases
+                .iter()
+                .find(|alias| alias.identity == existing.dataset_identity)
+                .map(|alias| alias.schema.clone())
+                .with_context(|| {
+                    format!(
+                        "entrapment partition dataset identity mismatch: historical={} current={}",
+                        existing.dataset_identity, expected.dataset_identity
+                    )
+                })?
+        };
+    // Dataset identity algorithms are provenance layers, not assignment
+    // algorithms. Once the current manifest independently authenticates the
+    // historical identity through a supported alias, compare every scientific
+    // field under the current portable content-derived dataset identity.
+    if existing_scientific != expected_scientific {
+        let existing_value = serde_json::to_value(&existing_scientific)?;
+        let expected_value = serde_json::to_value(&expected_scientific)?;
+        let mut mismatches = Vec::new();
+        scientific_mismatch_paths(&existing_value, &expected_value, "", &mut mismatches);
+        anyhow::bail!(
+            "entrapment partition scientific content mismatch at: {}",
+            mismatches.join(", ")
+        );
+    }
+
+    let exact_artifact_sha256 = sha256_file(artifact_path)?;
+    let scientific_content_sha256 = entrapment_partition_scientific_content_sha256_for_dataset(
+        &existing,
+        &expected.dataset_identity,
+    )?;
+    let historical_generator = HistoricalEntrapmentPartitionGeneratorIdentityV1 {
+        schema_version: 1,
+        generator_schema: "sage-entrapment-partition-generation-v1".into(),
+        assignment_algorithm_schema: ENTRAPMENT_PARTITION_ASSIGNMENT_ALGORITHM_SCHEMA.into(),
+        source_implementation_identity: existing.source_implementation_identity.clone(),
+        historical_dataset_identity_schema,
+        historical_dataset_identity: existing.dataset_identity.clone(),
+        original_partition_identity: existing.partition_identity.clone(),
+        original_artifact_sha256: exact_artifact_sha256.clone(),
+        original_payload_sha256: existing.payload_sha256.clone(),
+    };
+    let executable =
+        std::env::current_exe().context("failed to resolve partition verifier executable")?;
+    let current_verifier = CurrentEntrapmentPartitionVerifierIdentityV1 {
+        schema_version: 1,
+        verification_algorithm_schema: "sage-entrapment-partition-verification-v1".into(),
+        source_implementation_identity: PARAMETER_OPTIMIZER_IMPLEMENTATION_SOURCE_SHA256.into(),
+        executable_sha256: sha256_file(&executable)?,
+        current_dataset_identity_schema: "sage-decoy-free-dataset-v1-input-path-content-identity"
+            .into(),
+        current_dataset_identity: expected.dataset_identity.clone(),
+    };
+    let verified_use_sha256 = verified_use_identity(
+        &scientific_content_sha256,
+        &exact_artifact_sha256,
+        &historical_generator,
+        &current_verifier,
+    )?;
+    let verified_at_unix_seconds = SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .context("system clock predates Unix epoch")?
+        .as_secs();
+    Ok(VerifiedEntrapmentPartition {
+        artifact: existing,
+        verification: EntrapmentPartitionVerifiedUseV1 {
+            schema_version: ENTRAPMENT_PARTITION_VERIFICATION_SCHEMA_VERSION,
+            scientific_content_sha256,
+            exact_artifact_sha256,
+            historical_generator,
+            current_verifier,
+            verified_use_sha256,
+            artifact_path: artifact_path.to_path_buf(),
+            verified_at_unix_seconds,
+        },
+    })
+}
+
+pub fn resolve_entrapment_partition_with_provenance(
+    parameters: &Parameters,
+    dataset_identity: &str,
+    target_fasta: &Path,
+    active_entrapment_fasta: &Path,
+    entrapment_construction_identity: &str,
+    config: &EntrapmentValidationConfig,
+    artifact_path: &Path,
+) -> Result<VerifiedEntrapmentPartition> {
+    resolve_entrapment_partition_with_provenance_and_dataset_aliases(
+        parameters,
+        PartitionDatasetIdentityContext {
+            current: dataset_identity,
+            historical_aliases: &[],
+        },
+        target_fasta,
+        active_entrapment_fasta,
+        entrapment_construction_identity,
+        config,
+        artifact_path,
+    )
+}
+
 pub fn resolve_entrapment_partition(
     parameters: &Parameters,
     dataset_identity: &str,
@@ -1650,40 +2190,16 @@ pub fn resolve_entrapment_partition(
     config: &EntrapmentValidationConfig,
     artifact_path: &Path,
 ) -> Result<EntrapmentPartitionArtifact> {
-    let expected = build_entrapment_partition(
+    Ok(resolve_entrapment_partition_with_provenance(
         parameters,
         dataset_identity,
         target_fasta,
         active_entrapment_fasta,
         entrapment_construction_identity,
         config,
-    )?;
-    if artifact_path.is_file() {
-        let existing: EntrapmentPartitionArtifact =
-            serde_json::from_slice(&std::fs::read(artifact_path).with_context(|| {
-                format!(
-                    "failed to read entrapment partition {}",
-                    artifact_path.display()
-                )
-            })?)
-            .context("invalid entrapment partition artifact")?;
-        anyhow::ensure!(
-            existing.payload_sha256 == artifact_payload_sha256(&existing)?,
-            "entrapment partition payload integrity failure"
-        );
-        anyhow::ensure!(
-            existing == expected,
-            "entrapment partition disagrees with dataset, FASTAs, digestion, construction, seed, fractions, assignments, ratios, or implementation identity"
-        );
-        return Ok(existing);
-    }
-    anyhow::ensure!(
-        !config.require_existing_partition,
-        "required existing entrapment partition artifact is missing: {}",
-        artifact_path.display()
-    );
-    write_json_atomic(artifact_path, &expected)?;
-    Ok(expected)
+        artifact_path,
+    )?
+    .artifact)
 }
 
 fn fdrbench_canonical_sequence(sequence: &str) -> String {
@@ -2799,7 +3315,7 @@ mod tests {
         )
         .unwrap_err()
         .to_string()
-        .contains("disagrees with dataset"));
+        .contains("partition identity integrity failure"));
 
         let mut require_existing = partition_config();
         require_existing.require_existing_partition = true;
@@ -2815,6 +3331,294 @@ mod tests {
         .unwrap_err()
         .to_string()
         .contains("required existing"));
+        std::fs::remove_dir_all(directory).unwrap();
+    }
+
+    fn write_self_consistent_partition(path: &Path, artifact: &mut EntrapmentPartitionArtifact) {
+        artifact.partition_identity = artifact_partition_identity(artifact).unwrap();
+        artifact.payload_sha256 = artifact_payload_sha256(artifact).unwrap();
+        write_json_atomic(path, artifact).unwrap();
+    }
+
+    #[test]
+    fn layered_partition_provenance_accepts_historical_generator_only() {
+        let directory = test_directory("partition-layered-provenance");
+        let (target, combined) = partition_fastas(&directory, false);
+        let artifact_path = directory.join("partition.json");
+        let mut historical = build_entrapment_partition(
+            &parameters(),
+            "dataset",
+            &target,
+            &combined,
+            "construction",
+            &partition_config(),
+        )
+        .unwrap();
+        historical.source_implementation_identity = "a".repeat(64);
+        historical.dataset_identity = "legacy-dataset-identity".into();
+        write_self_consistent_partition(&artifact_path, &mut historical);
+        let original_bytes = std::fs::read(&artifact_path).unwrap();
+        let original_payload = historical.payload_sha256.clone();
+
+        let error = resolve_entrapment_partition_with_provenance(
+            &parameters(),
+            "dataset",
+            &target,
+            &combined,
+            "construction",
+            &partition_config(),
+            &artifact_path,
+        )
+        .unwrap_err()
+        .to_string();
+        assert!(error.contains("dataset identity mismatch"), "{error}");
+        let aliases = [HistoricalDatasetIdentityAlias {
+            schema: "historical-directory-unaware-v1".into(),
+            identity: "legacy-dataset-identity".into(),
+        }];
+        let verified = resolve_entrapment_partition_with_provenance_and_dataset_aliases(
+            &parameters(),
+            PartitionDatasetIdentityContext {
+                current: "dataset",
+                historical_aliases: &aliases,
+            },
+            &target,
+            &combined,
+            "construction",
+            &partition_config(),
+            &artifact_path,
+        )
+        .unwrap();
+        assert_eq!(
+            verified
+                .verification
+                .historical_generator
+                .source_implementation_identity,
+            "a".repeat(64)
+        );
+        assert_eq!(
+            verified
+                .verification
+                .current_verifier
+                .source_implementation_identity,
+            PARAMETER_OPTIMIZER_IMPLEMENTATION_SOURCE_SHA256
+        );
+        assert_eq!(
+            verified
+                .verification
+                .historical_generator
+                .original_payload_sha256,
+            original_payload
+        );
+        assert_eq!(
+            verified
+                .verification
+                .historical_generator
+                .historical_dataset_identity,
+            "legacy-dataset-identity"
+        );
+        assert_eq!(
+            verified
+                .verification
+                .current_verifier
+                .current_dataset_identity,
+            "dataset"
+        );
+        assert_eq!(std::fs::read(&artifact_path).unwrap(), original_bytes);
+        assert_eq!(
+            verified.verification.scientific_content_sha256,
+            entrapment_partition_scientific_content_sha256_for_dataset(&historical, "dataset")
+                .unwrap()
+        );
+        assert_ne!(
+            verified.verification.scientific_content_sha256,
+            entrapment_partition_scientific_content_sha256(&historical).unwrap(),
+            "legacy path-derived dataset identity must not define portable scientific content"
+        );
+        let mut another_verifier = verified.verification.current_verifier.clone();
+        another_verifier.source_implementation_identity = "b".repeat(64);
+        assert_ne!(
+            verified.verification.verified_use_sha256,
+            verified_use_identity(
+                &verified.verification.scientific_content_sha256,
+                &verified.verification.exact_artifact_sha256,
+                &verified.verification.historical_generator,
+                &another_verifier,
+            )
+            .unwrap(),
+            "current verifier changes belong to verified-use provenance, not partition science"
+        );
+
+        let relocated = directory.join("relocated.json");
+        std::fs::copy(&artifact_path, &relocated).unwrap();
+        let relocated_verified = resolve_entrapment_partition_with_provenance_and_dataset_aliases(
+            &parameters(),
+            PartitionDatasetIdentityContext {
+                current: "dataset",
+                historical_aliases: &aliases,
+            },
+            &target,
+            &combined,
+            "construction",
+            &partition_config(),
+            &relocated,
+        )
+        .unwrap();
+        assert_eq!(
+            verified.verification.scientific_content_sha256,
+            relocated_verified.verification.scientific_content_sha256
+        );
+        assert_eq!(
+            verified.verification.exact_artifact_sha256,
+            relocated_verified.verification.exact_artifact_sha256
+        );
+        assert_eq!(
+            verified.verification.verified_use_sha256,
+            relocated_verified.verification.verified_use_sha256
+        );
+        assert_ne!(
+            verified.verification.artifact_path,
+            relocated_verified.verification.artifact_path
+        );
+        std::fs::remove_dir_all(directory).unwrap();
+    }
+
+    #[test]
+    fn layered_partition_provenance_rejects_every_scientific_change() {
+        let directory = test_directory("partition-layered-mismatch");
+        let (target, combined) = partition_fastas(&directory, false);
+        let baseline = build_entrapment_partition(
+            &parameters(),
+            "dataset",
+            &target,
+            &combined,
+            "construction",
+            &partition_config(),
+        )
+        .unwrap();
+
+        let verify_artifact = |name: &str, mut artifact: EntrapmentPartitionArtifact| {
+            let path = directory.join(name);
+            write_self_consistent_partition(&path, &mut artifact);
+            resolve_entrapment_partition_with_provenance(
+                &parameters(),
+                "dataset",
+                &target,
+                &combined,
+                "construction",
+                &partition_config(),
+                &path,
+            )
+            .unwrap_err()
+            .to_string()
+        };
+
+        let mut assignment = baseline.clone();
+        assignment.component_assignments[0].partition =
+            match assignment.component_assignments[0].partition {
+                EntrapmentPartitionAssignment::Selection => EntrapmentPartitionAssignment::Audit,
+                EntrapmentPartitionAssignment::Audit => EntrapmentPartitionAssignment::Selection,
+            };
+        assert!(verify_artifact("assignment.json", assignment)
+            .contains("component and protein membership disagree"));
+
+        let mut component = baseline.clone();
+        component.component_assignments[0]
+            .proteins
+            .push("Ent_extra".into());
+        assert!(verify_artifact("component.json", component)
+            .contains("component membership is incomplete"));
+
+        let mut ratio = baseline.clone();
+        ratio.selection_ratios.protein_ratio += 0.01;
+        assert!(verify_artifact("ratio.json", ratio).contains("scientific content mismatch"));
+
+        let mut overlap = baseline.clone();
+        overlap
+            .selection_proteins
+            .push(overlap.audit_proteins[0].clone());
+        assert!(verify_artifact("overlap.json", overlap).contains("cross-partition overlap"));
+
+        let mut unsupported = baseline.clone();
+        unsupported.schema_version = 2;
+        assert!(verify_artifact("unsupported.json", unsupported)
+            .contains("unsupported entrapment partition schema"));
+
+        let path = directory.join("baseline.json");
+        let mut self_consistent = baseline.clone();
+        write_self_consistent_partition(&path, &mut self_consistent);
+        for (config, expected_path) in [
+            (
+                {
+                    let mut c = partition_config();
+                    c.seed += 1;
+                    c
+                },
+                "/seed",
+            ),
+            (
+                {
+                    let mut c = partition_config();
+                    c.salt.push_str("-changed");
+                    c
+                },
+                "/salt",
+            ),
+            (
+                {
+                    let mut c = partition_config();
+                    c.selection_fraction = 0.4;
+                    c.audit_fraction = 0.6;
+                    c
+                },
+                "/requested_",
+            ),
+        ] {
+            let error = resolve_entrapment_partition_with_provenance(
+                &parameters(),
+                "dataset",
+                &target,
+                &combined,
+                "construction",
+                &config,
+                &path,
+            )
+            .unwrap_err()
+            .to_string();
+            assert!(error.contains(expected_path), "{error}");
+        }
+        let error = resolve_entrapment_partition_with_provenance(
+            &parameters(),
+            "dataset",
+            &target,
+            &combined,
+            "different-construction",
+            &partition_config(),
+            &path,
+        )
+        .unwrap_err()
+        .to_string();
+        assert!(
+            error.contains("/entrapment_construction_identity"),
+            "{error}"
+        );
+        let mut changed_parameters = parameters();
+        changed_parameters.enzyme.missed_cleavages = Some(1);
+        let error = resolve_entrapment_partition_with_provenance(
+            &changed_parameters,
+            "dataset",
+            &target,
+            &combined,
+            "construction",
+            &partition_config(),
+            &path,
+        )
+        .unwrap_err()
+        .to_string();
+        assert!(
+            error.contains("/digestion_search_space_identity"),
+            "{error}"
+        );
         std::fs::remove_dir_all(directory).unwrap();
     }
 

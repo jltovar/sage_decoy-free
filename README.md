@@ -257,6 +257,12 @@ identity, and never controls Ensemble participation. Every new dataset construct
 partition and reruns local parameter/window optimization; previously selected ISB settings are not
 portable defaults.
 
+Existing partitions use [layered provenance](PARTITION_PROVENANCE.md): their original payload and
+historical generator identity remain immutable, while the current verifier independently rebuilds
+and compares the complete scientific partition content. Optimizer checkpoints bind both that
+scientific-content hash and the exact artifact hash; an unrelated current source change does not
+masquerade as historical generation or weaken assignment validation.
+
 Create and freeze the prospective artifact before any optimizer trial with
 `sage materialize-entrapment-partition workflow.json`. This dedicated path reads only the manifest,
 digestion/search-space configuration, dataset identities, target and active +entrapment FASTAs, and

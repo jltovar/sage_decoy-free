@@ -276,7 +276,11 @@ intervals by level, power, and validation classification. Exact resume verifies 
 record. Audit results cannot change the winner, checkpoint, convergence, fallback, or voter roster;
 zero audit entrapments never imply statistical validation.
 
-The partition identity participates in analysis, optimizer, trial, and checkpoint fingerprints.
+The partition's layered scientific-content identity and exact immutable artifact hash participate
+in analysis, optimizer, trial, and checkpoint fingerprints. The schema-v1 source identity remains
+historical generator provenance; a current verifier records its own source and executable identity
+separately and must reconstruct the complete assignments, membership, ratios, and overlap state.
+See `PARTITION_PROVENANCE.md`.
 The strict spectrum-search fingerprint, immutable candidate-pool identity, and layered raw
 MS2PIP/DeepLC prediction identity remain unchanged. All experts and Ensemble use the same artifact.
 Target-only remains downstream of the frozen dataset-local winners and cannot retune any partition,
