@@ -238,12 +238,22 @@ Use `--inputs-only` first to record the exact portable dataset, FASTA, digestion
 entrapment-construction identities without assigning components or writing an artifact.
 
 When the combined FASTA was created by an earlier Sage-controlled phase, use native database mode
-with `generation_mode: require_existing`. The workflow must name the original Sage audit artifact
-and freeze both its SHA-256 and the combined FASTA SHA-256. Preflight validates the audit schema,
-generator/search inputs, measured ratios, and construction identity before reopening the partition,
-candidate pool, or raw cache. No workflow-local `entrapment.generation.json` is required or
-manufactured. The verified construction identity is portable across relocation and is bound through
-the proposal-space root into trials, checkpoints, fitted winners, and downstream winner locks.
+with `generation_mode: require_existing`. Use `lock-existing-entrapment-resource` to derive a
+schema-v1 immutable lock from the original audit manifest, audit report, frozen search configuration,
+and referenced FASTAs. The workflow names this lock and freezes both its SHA-256 and the combined
+FASTA SHA-256. Preflight validates the lock's phase-scoped scientific-input projection, measured
+ratios, generated-output identity, and construction identity before reopening the partition,
+candidate pool, or raw cache. It separately verifies that the active optimization database is the
+generated combined FASTA, rather than comparing it to the target-only construction input.
+
+The projection includes only construction-consumed digestion/search-space values and deterministic
+selection inputs. Phase-local Python/external-feature settings, temporary/output locations, FDR and
+optimizer configuration, search tolerances, isotope handling, reporting controls, and threads do
+not affect this identity. The historical whole-parameter hash remains recorded but is not a
+cross-phase compatibility predicate. No workflow-local `entrapment.generation.json` is required or
+manufactured. The verified construction and resource identities are portable across relocation and
+are bound through the proposal-space root into trials, checkpoints, fitted winners, and downstream
+winner locks.
 
 Partitioning occurs at the foreign-protein connected-component level. Sage applies its configured
 digestion and modification search space, canonicalizes I/L, links all entrapment proteins sharing

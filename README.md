@@ -89,16 +89,32 @@ sage audit-entrapment entrapment.audit.json
 ```
 
 See [`entrapment.audit.example.json`](entrapment.audit.example.json) for the audit schema.
+The complete consumption and identity audit is documented in
+[`ENTRAPMENT_RESOURCE_IDENTITY.md`](ENTRAPMENT_RESOURCE_IDENTITY.md).
 
 An optimization workflow may also consume an immutable Sage-generated resource prepared by an
-earlier controlled phase. Set `entrapment.generation_mode` to `require_existing` and provide
-`generation_artifact`, `expected_generation_artifact_sha256`, and
-`expected_combined_fasta_sha256`. Strict preflight verifies the complete audit artifact, active
-target/foreign/search inputs, measured ratios, generation settings, combined FASTA, and partition
-construction identity. It never regenerates or copies the FASTA and never falls back to local
-generation. The default `workflow_local` mode retains the existing generation behavior; the two
-modes are mutually exclusive. Absolute artifact paths are operational provenance only and are
-excluded from the portable proposal-space identity.
+earlier controlled phase. First derive a phase-scoped lock from the immutable historical evidence:
+
+```bash
+sage lock-existing-entrapment-resource entrapment.audit.manifest.json \
+  --audit-report entrapment.audit.json \
+  --output entrapment.resource.lock.json
+```
+
+Then set `entrapment.generation_mode` to `require_existing` and provide the lock as
+`generation_artifact`, plus `expected_generation_artifact_sha256` and
+`expected_combined_fasta_sha256`. The lock records the historical whole-configuration digest only
+as legacy provenance. Cross-phase compatibility instead uses a versioned projection of inputs
+actually consumed by construction: target and foreign FASTA content, resolved enzyme and peptide
+mass/length rules, modifications, source/exclusion modes, seed, protein fold, and construction
+algorithm semantics. Python and external-feature configuration, temporary/output paths, search
+scoring/FDR settings, database indexing controls, and threads are excluded.
+
+Strict preflight separately requires the active optimization database to equal the exact generated
+combined FASTA, verifies the lock payload, ratios and partition construction identity, and never
+regenerates or copies the FASTA. The default `workflow_local` mode retains local generation; the two
+modes are mutually exclusive. Absolute paths are operational provenance only and are excluded from
+portable scientific identity.
 
 ### Shared candidate pool and in-memory optimization
 

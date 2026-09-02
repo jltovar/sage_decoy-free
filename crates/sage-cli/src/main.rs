@@ -1,7 +1,7 @@
 use clap::{value_parser, Arg, Command, ValueHint};
 use rayon::ThreadPoolBuilder;
 use sage_cli::audit::execute_validation_audit;
-use sage_cli::entrapment::execute_entrapment_audit;
+use sage_cli::entrapment::{execute_entrapment_audit, lock_existing_entrapment_resource};
 use sage_cli::input::Input;
 use sage_cli::provenance::{freeze_baseline, write_json_atomic};
 use sage_cli::runner::Runner;
@@ -71,6 +71,33 @@ fn main() -> anyhow::Result<()> {
                         .long("inputs-only")
                         .action(clap::ArgAction::SetTrue)
                         .help("Print prospective partition input identities without assigning components or writing an artifact"),
+                ),
+        )
+        .subcommand(
+            Command::new("lock-existing-entrapment-resource")
+                .about("Verify a historical Sage entrapment audit and atomically derive a phase-scoped immutable resource lock")
+                .arg(
+                    Arg::new("audit-manifest")
+                        .required(true)
+                        .value_parser(clap::builder::NonEmptyStringValueParser::new())
+                        .value_hint(ValueHint::FilePath)
+                        .help("Immutable historical Sage entrapment audit manifest"),
+                )
+                .arg(
+                    Arg::new("audit-report")
+                        .required(true)
+                        .long("audit-report")
+                        .value_parser(clap::builder::NonEmptyStringValueParser::new())
+                        .value_hint(ValueHint::FilePath)
+                        .help("Immutable historical Sage entrapment audit report"),
+                )
+                .arg(
+                    Arg::new("output")
+                        .required(true)
+                        .long("output")
+                        .value_parser(clap::builder::NonEmptyStringValueParser::new())
+                        .value_hint(ValueHint::FilePath)
+                        .help("New immutable existing-entrapment resource lock"),
                 ),
         )
         .subcommand(
@@ -522,6 +549,24 @@ fn main() -> anyhow::Result<()> {
                 materialize_workflow_entrapment_partition(std::path::Path::new(manifest))?;
             println!("{}", serde_json::to_string_pretty(&artifact)?);
         }
+        return Ok(());
+    }
+    if let Some(("lock-existing-entrapment-resource", lock_matches)) = matches.subcommand() {
+        let audit_manifest = lock_matches
+            .get_one::<String>("audit-manifest")
+            .expect("required audit manifest");
+        let audit_report = lock_matches
+            .get_one::<String>("audit-report")
+            .expect("required audit report");
+        let output = lock_matches
+            .get_one::<String>("output")
+            .expect("required lock output");
+        let lock = lock_existing_entrapment_resource(
+            std::path::Path::new(audit_manifest),
+            std::path::Path::new(audit_report),
+            std::path::Path::new(output),
+        )?;
+        println!("{}", serde_json::to_string_pretty(&lock)?);
         return Ok(());
     }
     if let Some(("resolve-frozen-expert-configurations", resolver_matches)) = matches.subcommand() {
