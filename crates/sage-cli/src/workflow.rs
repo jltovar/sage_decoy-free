@@ -5,9 +5,9 @@ use crate::candidate_pool::{
 };
 use crate::entrapment::{
     build_entrapment_partition, compare_generated_to_legacy, digestion_search_space_identity,
-    entrapment_construction_identity, entrapment_generation_input_sha256,
-    generate_foreign_entrapment, inspect_frozen_entrapment, load_existing_entrapment_resource,
-    resolve_entrapment_partition, EntrapmentDatabaseMode, EntrapmentDatabaseReport,
+    entrapment_construction_identity, generate_foreign_entrapment, inspect_frozen_entrapment,
+    load_existing_entrapment_resource, resolve_entrapment_partition,
+    validate_entrapment_generation_report_inputs, EntrapmentDatabaseMode, EntrapmentDatabaseReport,
     EntrapmentFastaParityReport, EntrapmentGenerationMode, EntrapmentGenerationReport,
     EntrapmentPartitionArtifact, EntrapmentSelectionView, ExistingEntrapmentResourceReference,
     ForeignSourceMode, LegacyEntrapmentReference, SharedPeptideExclusionMode,
@@ -170,7 +170,7 @@ pub struct EntrapmentWorkflow {
     #[serde(default = "default_protein_fold")]
     pub protein_fold: usize,
     /// Whether native Sage entrapment generation occurs in this workflow or
-    /// an immutable Sage audit artifact is required and reused read-only.
+    /// an immutable phase-scoped Sage resource lock is required and reused.
     #[serde(default)]
     pub generation_mode: EntrapmentGenerationMode,
     #[serde(default)]
@@ -2707,7 +2707,8 @@ fn workflow_entrapment_partition_inputs(
                             report_path.display()
                         )
                     })?)?;
-                let expected_input_sha256 = entrapment_generation_input_sha256(
+                validate_entrapment_generation_report_inputs(
+                    &generation,
                     &parameters,
                     &manifest.target_fasta,
                     &manifest.entrapment.foreign_fastas,
@@ -2718,9 +2719,7 @@ fn workflow_entrapment_partition_inputs(
                     manifest.entrapment.selected_foreign_fasta.as_deref(),
                 )?;
                 anyhow::ensure!(
-                    generation.schema_version == 2
-                        && generation.generation_input_sha256 == expected_input_sha256
-                        && generation.output_sha256 == sha256_file(&active_entrapment_fasta)?,
+                    generation.output_sha256 == sha256_file(&active_entrapment_fasta)?,
                     "partition materialization found an entrapment generation input, schema, or FASTA hash mismatch"
                 );
                 EntrapmentDatabaseReport::NativeGenerated { generation }
@@ -3003,7 +3002,10 @@ fn strict_resource_preflight(
                         valid: true,
                         reused: true,
                         generation_allowed: false,
-                        catalog_fingerprints: vec![reference.generation_input_sha256.clone()],
+                        catalog_fingerprints: vec![
+                            reference.scientific_input_sha256.clone(),
+                            reference.resource_identity.clone(),
+                        ],
                         original_source_uris: Vec::new(),
                         current_source_uris: Vec::new(),
                         portable_identity_valid: Some(true),
@@ -3021,7 +3023,8 @@ fn strict_resource_preflight(
                             )
                         })?,
                     )?;
-                    let expected_input_sha256 = entrapment_generation_input_sha256(
+                    validate_entrapment_generation_report_inputs(
+                        &generation,
                         &parameters,
                         &manifest.target_fasta,
                         &manifest.entrapment.foreign_fastas,
@@ -3032,9 +3035,7 @@ fn strict_resource_preflight(
                         manifest.entrapment.selected_foreign_fasta.as_deref(),
                     )?;
                     anyhow::ensure!(
-                        generation.schema_version == 2
-                            && generation.generation_input_sha256 == expected_input_sha256
-                            && generation.output_sha256 == sha256_file(&entrapment_fasta)?,
+                        generation.output_sha256 == sha256_file(&entrapment_fasta)?,
                         "selection/audit preflight found an entrapment generation input, schema, or FASTA hash mismatch"
                     );
                     EntrapmentDatabaseReport::NativeGenerated { generation }
@@ -7684,16 +7685,6 @@ pub fn execute_workflow(
                     Some(reference),
                 )
             } else {
-                let expected_input_sha256 = entrapment_generation_input_sha256(
-                    &parameters,
-                    &manifest.target_fasta,
-                    &manifest.entrapment.foreign_fastas,
-                    manifest.entrapment.seed,
-                    manifest.entrapment.protein_fold,
-                    &manifest.entrapment.foreign_source_mode,
-                    &manifest.entrapment.shared_peptide_exclusion_mode,
-                    manifest.entrapment.selected_foreign_fasta.as_deref(),
-                )?;
                 let report = if plan_only && !manifest.entrapment.output_fasta.is_file() {
                     None
                 } else if manifest.entrapment.output_fasta.is_file() && manifest.resume {
@@ -7705,14 +7696,17 @@ pub fn execute_workflow(
                             )
                         })?,
                     )?;
-                    anyhow::ensure!(
-                        report.schema_version == 2,
-                        "existing entrapment report predates Phase 2 provenance; regenerate it"
-                    );
-                    anyhow::ensure!(
-                    report.generation_input_sha256 == expected_input_sha256,
-                    "existing entrapment FASTA was generated from different inputs or digestion settings"
-                );
+                    validate_entrapment_generation_report_inputs(
+                        &report,
+                        &parameters,
+                        &manifest.target_fasta,
+                        &manifest.entrapment.foreign_fastas,
+                        manifest.entrapment.seed,
+                        manifest.entrapment.protein_fold,
+                        &manifest.entrapment.foreign_source_mode,
+                        &manifest.entrapment.shared_peptide_exclusion_mode,
+                        manifest.entrapment.selected_foreign_fasta.as_deref(),
+                    )?;
                     anyhow::ensure!(
                         report.output_sha256 == sha256_file(&manifest.entrapment.output_fasta)?,
                         "existing entrapment FASTA hash does not match its generation report"

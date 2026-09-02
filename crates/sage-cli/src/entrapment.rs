@@ -152,7 +152,13 @@ pub struct ForeignCandidateReport {
 #[derive(Clone, Debug, Serialize, Deserialize)]
 pub struct EntrapmentGenerationReport {
     pub schema_version: u32,
+    /// Legacy phase-local whole-`Parameters` digest. Retained for historical
+    /// provenance only; cross-phase reuse must use `scientific_input_sha256`.
     pub generation_input_sha256: String,
+    #[serde(default)]
+    pub scientific_inputs: Option<EntrapmentGenerationScientificInputsV1>,
+    #[serde(default)]
+    pub scientific_input_sha256: Option<String>,
     #[serde(default = "default_generator_version")]
     pub generator_version: String,
     #[serde(default = "default_selection_algorithm")]
@@ -271,12 +277,84 @@ pub struct ExistingEntrapmentResourceReference {
     pub artifact_sha256: String,
     pub combined_fasta_sha256: String,
     pub construction_identity: String,
-    pub generation_input_sha256: String,
+    pub scientific_input_sha256: String,
+    pub resource_identity: String,
+    pub legacy_generation_input_sha256: String,
     pub reused: bool,
+}
+
+#[derive(Clone, Debug, Serialize, Deserialize, PartialEq, Eq)]
+pub struct CanonicalModificationV1 {
+    pub specificity: String,
+    pub mass_bits: u32,
+}
+
+#[derive(Clone, Debug, Serialize, Deserialize, PartialEq, Eq)]
+pub struct CanonicalVariableModificationV1 {
+    pub specificity: String,
+    pub mass_bits: Vec<u32>,
+}
+
+/// Canonical, resolved inputs that can change native entrapment construction.
+/// Paths, search scoring, reporting, external features, and runtime controls
+/// are deliberately absent.
+#[derive(Clone, Debug, Serialize, Deserialize, PartialEq, Eq)]
+pub struct EntrapmentGenerationScientificInputsV1 {
+    pub schema_version: u32,
+    pub generator_version: String,
+    pub selection_algorithm: String,
+    pub canonical_peptide_semantics: String,
+    pub canonical_peptidoform_semantics: String,
+    pub header_generation_semantics: String,
+    pub target_fasta_sha256: String,
+    pub foreign_fasta_sha256: Vec<String>,
+    pub selected_foreign_fasta_sha256: Option<String>,
+    pub foreign_source_mode: ForeignSourceMode,
+    pub shared_peptide_exclusion_mode: SharedPeptideExclusionMode,
+    pub seed: u64,
+    pub protein_fold: usize,
+    pub missed_cleavages: u8,
+    pub peptide_min_length: usize,
+    pub peptide_max_length: usize,
+    pub cleave_at: String,
+    pub restrict: String,
+    pub c_terminal: bool,
+    pub semi_enzymatic: bool,
+    pub peptide_min_mass_bits: u32,
+    pub peptide_max_mass_bits: u32,
+    pub static_modifications: Vec<CanonicalModificationV1>,
+    pub variable_modifications: Vec<CanonicalVariableModificationV1>,
+    pub maximum_variable_modifications: usize,
+}
+
+#[derive(Clone, Debug, Serialize, Deserialize)]
+pub struct ExistingEntrapmentResourceLock {
+    pub schema_version: u32,
+    pub scientific_inputs: EntrapmentGenerationScientificInputsV1,
+    pub scientific_input_sha256: String,
+    pub generation_implementation_identity: String,
+    pub target_fasta_sha256: String,
+    pub foreign_fasta_sha256: Vec<String>,
+    pub selected_foreign_fasta_sha256: String,
+    pub generated_combined_fasta_sha256: String,
+    pub legacy_audit_artifact_sha256: String,
+    pub legacy_audit_schema_version: u32,
+    pub legacy_generation_schema_version: u32,
+    pub legacy_generation_input_sha256: String,
+    pub historical_search_config_sha256: String,
+    pub database_report: EntrapmentDatabaseReport,
+    pub construction_identity: String,
+    pub resource_identity: String,
+    /// Operational evidence only. Excluded from portable scientific identity.
+    pub audit_artifact_path: PathBuf,
+    /// Operational evidence only. Excluded from portable scientific identity.
+    pub historical_search_config_path: PathBuf,
+    pub payload_sha256: String,
 }
 
 #[derive(Clone, Debug, Serialize, Deserialize)]
 #[serde(tag = "database_mode", rename_all = "snake_case")]
+#[allow(clippy::large_enum_variant)]
 pub enum EntrapmentDatabaseReport {
     NativeGenerated {
         generation: EntrapmentGenerationReport,
@@ -328,6 +406,262 @@ fn validate_measured_ratios(ratios: &EntrapmentRatios) -> Result<()> {
     Ok(())
 }
 
+fn sorted_static_modifications(parameters: &Parameters) -> Vec<CanonicalModificationV1> {
+    let mut modifications = parameters
+        .static_mods
+        .iter()
+        .map(|(specificity, mass)| CanonicalModificationV1 {
+            specificity: specificity.to_string(),
+            mass_bits: mass.to_bits(),
+        })
+        .collect::<Vec<_>>();
+    modifications.sort_by(|left, right| {
+        left.specificity
+            .cmp(&right.specificity)
+            .then_with(|| left.mass_bits.cmp(&right.mass_bits))
+    });
+    modifications
+}
+
+fn sorted_variable_modifications(parameters: &Parameters) -> Vec<CanonicalVariableModificationV1> {
+    let mut modifications = parameters
+        .variable_mods
+        .iter()
+        .map(|(specificity, masses)| {
+            let mut mass_bits = masses.iter().map(|mass| mass.to_bits()).collect::<Vec<_>>();
+            mass_bits.sort_unstable();
+            CanonicalVariableModificationV1 {
+                specificity: specificity.to_string(),
+                mass_bits,
+            }
+        })
+        .collect::<Vec<_>>();
+    modifications.sort_by(|left, right| {
+        left.specificity
+            .cmp(&right.specificity)
+            .then_with(|| left.mass_bits.cmp(&right.mass_bits))
+    });
+    modifications
+}
+
+#[allow(clippy::too_many_arguments)]
+pub fn entrapment_generation_scientific_inputs(
+    parameters: &Parameters,
+    target_fasta: &Path,
+    foreign_fastas: &[PathBuf],
+    seed: u64,
+    protein_fold: usize,
+    source_mode: &ForeignSourceMode,
+    exclusion_mode: &SharedPeptideExclusionMode,
+    selected_foreign_fasta: Option<&Path>,
+) -> Result<EntrapmentGenerationScientificInputsV1> {
+    anyhow::ensure!(protein_fold > 0, "protein_fold must be positive");
+    anyhow::ensure!(target_fasta.is_file(), "target FASTA does not exist");
+    anyhow::ensure!(
+        !foreign_fastas.is_empty() && foreign_fastas.iter().all(|path| path.is_file()),
+        "all foreign FASTA inputs must exist"
+    );
+    match source_mode {
+        ForeignSourceMode::Automatic => anyhow::ensure!(
+            selected_foreign_fasta.is_none(),
+            "automatic foreign-source selection must not declare a selected source"
+        ),
+        ForeignSourceMode::Explicit | ForeignSourceMode::AutomaticWithOverride => {
+            anyhow::ensure!(
+                selected_foreign_fasta.is_some_and(Path::is_file),
+                "explicit or override source selection requires an existing selected source"
+            );
+        }
+    }
+    let mut foreign_fasta_sha256 = foreign_fastas
+        .iter()
+        .map(|path| sha256_file(path))
+        .collect::<Result<Vec<_>>>()?;
+    foreign_fasta_sha256.sort();
+    foreign_fasta_sha256.dedup();
+    anyhow::ensure!(
+        foreign_fasta_sha256.len() == foreign_fastas.len(),
+        "duplicate foreign FASTA content identities are not allowed"
+    );
+    let selected_foreign_fasta_sha256 = selected_foreign_fasta.map(sha256_file).transpose()?;
+    if let Some(selected) = &selected_foreign_fasta_sha256 {
+        anyhow::ensure!(
+            foreign_fasta_sha256.binary_search(selected).is_ok(),
+            "selected foreign source is not one of the declared foreign inputs"
+        );
+    }
+    let enzyme = &parameters.enzyme;
+    Ok(EntrapmentGenerationScientificInputsV1 {
+        schema_version: 1,
+        generator_version: default_generator_version(),
+        selection_algorithm: default_selection_algorithm(),
+        canonical_peptide_semantics: "sage-entrapment-canonical-peptide-il-v1".into(),
+        canonical_peptidoform_semantics: "sage-entrapment-peptidoform-mass-bits-v1".into(),
+        header_generation_semantics: "sage-entrapment-header-ent-serial-source-v1".into(),
+        target_fasta_sha256: sha256_file(target_fasta)?,
+        foreign_fasta_sha256,
+        selected_foreign_fasta_sha256,
+        foreign_source_mode: source_mode.clone(),
+        shared_peptide_exclusion_mode: exclusion_mode.clone(),
+        seed,
+        protein_fold,
+        missed_cleavages: enzyme.missed_cleavages.unwrap_or(1),
+        peptide_min_length: enzyme.min_len.unwrap_or(5),
+        peptide_max_length: enzyme.max_len.unwrap_or(50),
+        cleave_at: enzyme.cleave_at.clone().unwrap_or_else(|| "KR".into()),
+        restrict: enzyme.restrict.clone().unwrap_or_default(),
+        c_terminal: enzyme.c_terminal.unwrap_or(true),
+        semi_enzymatic: enzyme.semi_enzymatic.unwrap_or(false),
+        peptide_min_mass_bits: parameters.peptide_min_mass.to_bits(),
+        peptide_max_mass_bits: parameters.peptide_max_mass.to_bits(),
+        static_modifications: sorted_static_modifications(parameters),
+        variable_modifications: sorted_variable_modifications(parameters),
+        maximum_variable_modifications: parameters.max_variable_mods,
+    })
+}
+
+pub fn entrapment_generation_scientific_input_sha256(
+    inputs: &EntrapmentGenerationScientificInputsV1,
+) -> Result<String> {
+    anyhow::ensure!(
+        inputs.schema_version == 1,
+        "unsupported scientific-input schema"
+    );
+    let mut hasher = Sha256::new();
+    hasher.update(b"sage-entrapment-generation-scientific-inputs-v1\0");
+    hasher.update(serde_json::to_vec(inputs)?);
+    Ok(format!("{:x}", hasher.finalize()))
+}
+
+fn resource_lock_payload_sha256(lock: &ExistingEntrapmentResourceLock) -> Result<String> {
+    let mut payload = lock.clone();
+    payload.payload_sha256.clear();
+    let mut hasher = Sha256::new();
+    hasher.update(b"sage-existing-entrapment-resource-lock-payload-v1\0");
+    hasher.update(serde_json::to_vec(&payload)?);
+    Ok(format!("{:x}", hasher.finalize()))
+}
+
+fn entrapment_resource_identity(
+    scientific_input_sha256: &str,
+    generated_combined_fasta_sha256: &str,
+    construction_identity: &str,
+    measured: &EntrapmentRatios,
+) -> Result<String> {
+    let mut hasher = Sha256::new();
+    hasher.update(b"sage-existing-entrapment-scientific-resource-v1\0");
+    hasher.update(scientific_input_sha256.as_bytes());
+    hasher.update(generated_combined_fasta_sha256.as_bytes());
+    hasher.update(construction_identity.as_bytes());
+    hasher.update(serde_json::to_vec(measured)?);
+    Ok(format!("{:x}", hasher.finalize()))
+}
+
+fn validate_existing_entrapment_resource_lock(lock: &ExistingEntrapmentResourceLock) -> Result<()> {
+    anyhow::ensure!(
+        lock.schema_version == 1,
+        "unsupported existing entrapment resource-lock schema"
+    );
+    anyhow::ensure!(
+        resource_lock_payload_sha256(lock)? == lock.payload_sha256,
+        "existing entrapment resource-lock payload hash mismatch"
+    );
+    anyhow::ensure!(
+        entrapment_generation_scientific_input_sha256(&lock.scientific_inputs)?
+            == lock.scientific_input_sha256,
+        "existing entrapment resource-lock scientific-input hash mismatch"
+    );
+    anyhow::ensure!(
+        lock.generation_implementation_identity == generation_implementation_identity()
+            && lock.scientific_inputs.generator_version == default_generator_version()
+            && lock.scientific_inputs.selection_algorithm == default_selection_algorithm(),
+        "unsupported existing entrapment resource-lock construction implementation"
+    );
+    anyhow::ensure!(
+        lock.target_fasta_sha256 == lock.scientific_inputs.target_fasta_sha256
+            && lock.foreign_fasta_sha256 == lock.scientific_inputs.foreign_fasta_sha256,
+        "existing entrapment resource-lock input identities are inconsistent"
+    );
+    let generation = match &lock.database_report {
+        EntrapmentDatabaseReport::NativeGenerated { generation } => generation,
+        EntrapmentDatabaseReport::FrozenLegacy { .. } => {
+            anyhow::bail!("existing entrapment resource lock is not native-generated")
+        }
+    };
+    anyhow::ensure!(
+        generation.target_sha256 == lock.target_fasta_sha256
+            && generation.selected_foreign_sha256 == lock.selected_foreign_fasta_sha256
+            && generation.output_sha256 == lock.generated_combined_fasta_sha256
+            && generation.generation_input_sha256 == lock.legacy_generation_input_sha256,
+        "existing entrapment resource-lock generation identities are inconsistent"
+    );
+    validate_measured_ratios(&generation.measured)?;
+    anyhow::ensure!(
+        entrapment_construction_identity(&lock.database_report)? == lock.construction_identity,
+        "existing entrapment resource-lock construction identity mismatch"
+    );
+    anyhow::ensure!(
+        entrapment_resource_identity(
+            &lock.scientific_input_sha256,
+            &lock.generated_combined_fasta_sha256,
+            &lock.construction_identity,
+            &generation.measured,
+        )? == lock.resource_identity,
+        "existing entrapment resource-lock scientific resource identity mismatch"
+    );
+    Ok(())
+}
+
+fn json_difference_paths(
+    recorded: &serde_json::Value,
+    expected: &serde_json::Value,
+    path: &str,
+    differences: &mut Vec<String>,
+) {
+    match (recorded, expected) {
+        (serde_json::Value::Object(left), serde_json::Value::Object(right)) => {
+            let keys = left
+                .keys()
+                .chain(right.keys())
+                .cloned()
+                .collect::<BTreeSet<_>>();
+            for key in keys {
+                let child = format!("{path}/{}", key.replace('~', "~0").replace('/', "~1"));
+                match (left.get(&key), right.get(&key)) {
+                    (Some(left), Some(right)) => {
+                        json_difference_paths(left, right, &child, differences)
+                    }
+                    _ => differences.push(child),
+                }
+            }
+        }
+        (serde_json::Value::Array(left), serde_json::Value::Array(right)) => {
+            if left.len() != right.len() {
+                differences.push(format!("{path}/length"));
+            }
+            for (index, (left, right)) in left.iter().zip(right).enumerate() {
+                json_difference_paths(left, right, &format!("{path}/{index}"), differences);
+            }
+        }
+        _ if recorded != expected => differences.push(path.to_owned()),
+        _ => {}
+    }
+}
+
+fn scientific_input_difference_paths(
+    recorded: &EntrapmentGenerationScientificInputsV1,
+    expected: &EntrapmentGenerationScientificInputsV1,
+) -> Result<Vec<String>> {
+    let mut differences = Vec::new();
+    json_difference_paths(
+        &serde_json::to_value(recorded)?,
+        &serde_json::to_value(expected)?,
+        "",
+        &mut differences,
+    );
+    Ok(differences)
+}
+
 #[allow(clippy::too_many_arguments)]
 pub fn load_existing_entrapment_resource(
     artifact_path: &Path,
@@ -355,20 +689,16 @@ pub fn load_existing_entrapment_resource(
         artifact_sha256 == expected_artifact_sha256,
         "existing entrapment artifact content hash mismatch"
     );
-    let audit: EntrapmentAuditReport = serde_json::from_slice(&std::fs::read(artifact_path)?)
-        .context("invalid existing Sage entrapment audit artifact")?;
-    anyhow::ensure!(
-        audit.schema_version == 1,
-        "unsupported existing entrapment audit schema"
-    );
-    let generation = match audit.database {
+    let lock: ExistingEntrapmentResourceLock =
+        serde_json::from_slice(&std::fs::read(artifact_path)?)
+            .context("invalid existing Sage entrapment resource lock")?;
+    validate_existing_entrapment_resource_lock(&lock)?;
+    let generation = match &lock.database_report {
         EntrapmentDatabaseReport::NativeGenerated { generation } => generation,
-        EntrapmentDatabaseReport::FrozenLegacy { .. } => {
-            anyhow::bail!("existing entrapment artifact is not Sage native-generated")
-        }
+        EntrapmentDatabaseReport::FrozenLegacy { .. } => unreachable!(),
     };
     anyhow::ensure!(
-        generation.schema_version == 2
+        (generation.schema_version == 2 || generation.schema_version == 3)
             && generation.generator_version == default_generator_version()
             && generation.selection_algorithm == default_selection_algorithm(),
         "unsupported existing entrapment generation schema or implementation"
@@ -376,15 +706,21 @@ pub fn load_existing_entrapment_resource(
     let target_sha256 = sha256_file(target_fasta)?;
     let combined_sha256 = sha256_file(active_entrapment_fasta)?;
     anyhow::ensure!(
-        target_sha256 == generation.target_sha256,
+        target_sha256 == lock.target_fasta_sha256,
         "existing entrapment target FASTA mismatch"
     );
     anyhow::ensure!(
         combined_sha256 == expected_combined_fasta_sha256
-            && generation.output_sha256 == expected_combined_fasta_sha256,
+            && lock.generated_combined_fasta_sha256 == expected_combined_fasta_sha256,
         "existing entrapment combined FASTA mismatch"
     );
-    let expected_input_sha256 = entrapment_generation_input_sha256(
+    let active_database = Path::new(&parameters.fasta);
+    anyhow::ensure!(
+        active_database.is_file()
+            && sha256_file(active_database)? == lock.generated_combined_fasta_sha256,
+        "active optimization database is not the generated combined entrapment FASTA"
+    );
+    let expected_scientific_inputs = entrapment_generation_scientific_inputs(
         parameters,
         target_fasta,
         foreign_fastas,
@@ -394,13 +730,15 @@ pub fn load_existing_entrapment_resource(
         exclusion_mode,
         selected_foreign_fasta,
     )?;
+    let expected_scientific_input_sha256 =
+        entrapment_generation_scientific_input_sha256(&expected_scientific_inputs)?;
+    let scientific_differences =
+        scientific_input_difference_paths(&lock.scientific_inputs, &expected_scientific_inputs)?;
     anyhow::ensure!(
-        generation.generation_input_sha256 == expected_input_sha256
-            && generation.seed == seed
-            && generation.protein_fold == protein_fold
-            && &generation.foreign_source_mode == source_mode
-            && &generation.shared_peptide_exclusion_mode == exclusion_mode,
-        "existing entrapment generation settings or search/digestion identity mismatch"
+        scientific_differences.is_empty()
+            && lock.scientific_input_sha256 == expected_scientific_input_sha256,
+        "existing entrapment phase-scoped scientific-input mismatch; differing components: {}",
+        scientific_differences.join(", ")
     );
     if let Some(selected) = selected_foreign_fasta {
         anyhow::ensure!(
@@ -409,18 +747,15 @@ pub fn load_existing_entrapment_resource(
         );
     }
     validate_measured_ratios(&generation.measured)?;
-    let report = EntrapmentDatabaseReport::NativeGenerated { generation };
+    let report = lock.database_report.clone();
     let reference = ExistingEntrapmentResourceReference {
-        schema_version: 1,
+        schema_version: lock.schema_version,
         artifact_sha256,
         combined_fasta_sha256: combined_sha256,
-        construction_identity: entrapment_construction_identity(&report)?,
-        generation_input_sha256: match &report {
-            EntrapmentDatabaseReport::NativeGenerated { generation } => {
-                generation.generation_input_sha256.clone()
-            }
-            EntrapmentDatabaseReport::FrozenLegacy { .. } => unreachable!(),
-        },
+        construction_identity: lock.construction_identity,
+        scientific_input_sha256: lock.scientific_input_sha256,
+        resource_identity: lock.resource_identity,
+        legacy_generation_input_sha256: lock.legacy_generation_input_sha256,
         reused: true,
     };
     Ok((report, reference))
@@ -566,6 +901,184 @@ pub fn execute_entrapment_audit(manifest_path: &Path) -> Result<EntrapmentAuditR
         &report,
     )?;
     Ok(report)
+}
+
+fn generation_implementation_identity() -> String {
+    let mut hasher = Sha256::new();
+    hasher.update(b"sage-entrapment-generation-implementation-v1\0");
+    hasher.update(default_generator_version().as_bytes());
+    hasher.update([0]);
+    hasher.update(default_selection_algorithm().as_bytes());
+    hasher.update([0]);
+    hasher.update(b"scientific-input-schema-v1");
+    format!("{:x}", hasher.finalize())
+}
+
+/// Derive an immutable, phase-scoped resource lock from a historical Sage
+/// audit. This verifies but never regenerates the combined FASTA.
+pub fn lock_existing_entrapment_resource(
+    audit_manifest_path: &Path,
+    audit_report_path: &Path,
+    output: &Path,
+) -> Result<ExistingEntrapmentResourceLock> {
+    anyhow::ensure!(
+        !output.exists(),
+        "existing entrapment resource-lock output already exists"
+    );
+    let manifest: EntrapmentAuditManifest = serde_json::from_slice(
+        &std::fs::read(audit_manifest_path)
+            .with_context(|| format!("failed to read {}", audit_manifest_path.display()))?,
+    )
+    .context("invalid historical entrapment audit manifest")?;
+    anyhow::ensure!(
+        manifest.schema_version == 1
+            && manifest.database_mode == EntrapmentDatabaseMode::NativeGenerated,
+        "resource locking requires a supported native-generated audit manifest"
+    );
+    anyhow::ensure!(
+        manifest.search_config.is_file()
+            && manifest.target_fasta.is_file()
+            && manifest.output_fasta.is_file()
+            && manifest.foreign_fastas.iter().all(|path| path.is_file()),
+        "historical entrapment manifest references a missing input or output"
+    );
+    let audit_bytes = std::fs::read(audit_report_path)
+        .with_context(|| format!("failed to read {}", audit_report_path.display()))?;
+    let audit: EntrapmentAuditReport = serde_json::from_slice(&audit_bytes)
+        .context("invalid historical entrapment audit report")?;
+    anyhow::ensure!(
+        audit.schema_version == 1,
+        "unsupported historical audit schema"
+    );
+    let generation = match &audit.database {
+        EntrapmentDatabaseReport::NativeGenerated { generation } => generation,
+        EntrapmentDatabaseReport::FrozenLegacy { .. } => {
+            anyhow::bail!("historical audit is not Sage native-generated")
+        }
+    };
+    anyhow::ensure!(
+        generation.schema_version == 2 || generation.schema_version == 3,
+        "unsupported historical entrapment generation schema"
+    );
+    anyhow::ensure!(
+        generation.generator_version == default_generator_version()
+            && generation.selection_algorithm == default_selection_algorithm(),
+        "unsupported historical entrapment generation implementation"
+    );
+    let input = Input::load(manifest.search_config.to_string_lossy().as_ref())?;
+    let parameters = input.database.make_parameters();
+    let legacy_input_sha256 = entrapment_generation_input_sha256(
+        &parameters,
+        &manifest.target_fasta,
+        &manifest.foreign_fastas,
+        manifest.seed,
+        manifest.protein_fold,
+        &manifest.foreign_source_mode,
+        &manifest.shared_peptide_exclusion_mode,
+        manifest.selected_foreign_fasta.as_deref(),
+    )?;
+    anyhow::ensure!(
+        generation.generation_input_sha256 == legacy_input_sha256,
+        "historical audit's legacy full-input hash does not match its frozen manifest and search configuration"
+    );
+    let scientific_inputs = entrapment_generation_scientific_inputs(
+        &parameters,
+        &manifest.target_fasta,
+        &manifest.foreign_fastas,
+        manifest.seed,
+        manifest.protein_fold,
+        &manifest.foreign_source_mode,
+        &manifest.shared_peptide_exclusion_mode,
+        manifest.selected_foreign_fasta.as_deref(),
+    )?;
+    let scientific_input_sha256 =
+        entrapment_generation_scientific_input_sha256(&scientific_inputs)?;
+    let target_fasta_sha256 = sha256_file(&manifest.target_fasta)?;
+    let generated_combined_fasta_sha256 = sha256_file(&manifest.output_fasta)?;
+    anyhow::ensure!(
+        generation.target_sha256 == target_fasta_sha256
+            && generation.output_sha256 == generated_combined_fasta_sha256
+            && generation.seed == manifest.seed
+            && generation.protein_fold == manifest.protein_fold
+            && generation.foreign_source_mode == manifest.foreign_source_mode
+            && generation.shared_peptide_exclusion_mode == manifest.shared_peptide_exclusion_mode,
+        "historical audit generation fields do not match its frozen manifest or FASTA content"
+    );
+    let selected_path = manifest
+        .selected_foreign_fasta
+        .as_deref()
+        .unwrap_or(&generation.selected_foreign_fasta);
+    let selected_foreign_fasta_sha256 = sha256_file(selected_path)?;
+    anyhow::ensure!(
+        selected_foreign_fasta_sha256 == generation.selected_foreign_sha256
+            && scientific_inputs
+                .foreign_fasta_sha256
+                .binary_search(&selected_foreign_fasta_sha256)
+                .is_ok(),
+        "historical audit selected foreign-source identity mismatch"
+    );
+    let mut recorded_candidate_hashes = generation
+        .candidates
+        .iter()
+        .map(|candidate| candidate.sha256.clone())
+        .collect::<Vec<_>>();
+    recorded_candidate_hashes.sort();
+    recorded_candidate_hashes.dedup();
+    let expected_candidate_hashes = if manifest.foreign_source_mode == ForeignSourceMode::Explicit {
+        vec![selected_foreign_fasta_sha256.clone()]
+    } else {
+        scientific_inputs.foreign_fasta_sha256.clone()
+    };
+    anyhow::ensure!(
+        recorded_candidate_hashes == expected_candidate_hashes,
+        "historical audit candidate source identity mismatch"
+    );
+    let frozen =
+        inspect_frozen_entrapment(&parameters, &manifest.target_fasta, &manifest.output_fasta)?;
+    validate_measured_ratios(&generation.measured)?;
+    anyhow::ensure!(
+        frozen.measured == generation.measured,
+        "historical audit counts or measured ratios do not match the generated FASTA"
+    );
+    let construction_identity = entrapment_construction_identity(&audit.database)?;
+    let resource_identity = entrapment_resource_identity(
+        &scientific_input_sha256,
+        &generated_combined_fasta_sha256,
+        &construction_identity,
+        &generation.measured,
+    )?;
+    let mut lock = ExistingEntrapmentResourceLock {
+        schema_version: 1,
+        scientific_inputs: scientific_inputs.clone(),
+        scientific_input_sha256,
+        generation_implementation_identity: generation_implementation_identity(),
+        target_fasta_sha256,
+        foreign_fasta_sha256: scientific_inputs.foreign_fasta_sha256.clone(),
+        selected_foreign_fasta_sha256,
+        generated_combined_fasta_sha256,
+        legacy_audit_artifact_sha256: sha256_file(audit_report_path)?,
+        legacy_audit_schema_version: audit.schema_version,
+        legacy_generation_schema_version: generation.schema_version,
+        legacy_generation_input_sha256: generation.generation_input_sha256.clone(),
+        historical_search_config_sha256: sha256_file(&manifest.search_config)?,
+        database_report: audit.database,
+        construction_identity,
+        resource_identity,
+        audit_artifact_path: audit_report_path.to_path_buf(),
+        historical_search_config_path: manifest.search_config,
+        payload_sha256: String::new(),
+    };
+    lock.payload_sha256 = resource_lock_payload_sha256(&lock)?;
+    validate_existing_entrapment_resource_lock(&lock)?;
+    write_json_atomic(output, &lock)?;
+    let reopened: ExistingEntrapmentResourceLock = serde_json::from_slice(&std::fs::read(output)?)?;
+    validate_existing_entrapment_resource_lock(&reopened)?;
+    anyhow::ensure!(
+        reopened.payload_sha256 == lock.payload_sha256
+            && reopened.resource_identity == lock.resource_identity,
+        "existing entrapment resource lock failed atomic reopen verification"
+    );
+    Ok(reopened)
 }
 
 fn parse_fasta(path: &Path) -> Result<Vec<FastaRecord>> {
@@ -1552,6 +2065,71 @@ pub fn entrapment_generation_input_sha256(
     Ok(format!("{:x}", input_hasher.finalize()))
 }
 
+#[allow(clippy::too_many_arguments)]
+pub fn validate_entrapment_generation_report_inputs(
+    report: &EntrapmentGenerationReport,
+    parameters: &Parameters,
+    target_fasta: &Path,
+    foreign_fastas: &[PathBuf],
+    seed: u64,
+    protein_fold: usize,
+    source_mode: &ForeignSourceMode,
+    exclusion_mode: &SharedPeptideExclusionMode,
+    selected_foreign_fasta: Option<&Path>,
+) -> Result<()> {
+    anyhow::ensure!(
+        report.generator_version == default_generator_version()
+            && report.selection_algorithm == default_selection_algorithm(),
+        "unsupported entrapment generation implementation"
+    );
+    match report.schema_version {
+        2 => {
+            let expected = entrapment_generation_input_sha256(
+                parameters,
+                target_fasta,
+                foreign_fastas,
+                seed,
+                protein_fold,
+                source_mode,
+                exclusion_mode,
+                selected_foreign_fasta,
+            )?;
+            anyhow::ensure!(
+                report.generation_input_sha256 == expected,
+                "legacy entrapment generation full-input identity mismatch"
+            );
+        }
+        3 => {
+            let expected = entrapment_generation_scientific_inputs(
+                parameters,
+                target_fasta,
+                foreign_fastas,
+                seed,
+                protein_fold,
+                source_mode,
+                exclusion_mode,
+                selected_foreign_fasta,
+            )?;
+            let expected_sha256 = entrapment_generation_scientific_input_sha256(&expected)?;
+            anyhow::ensure!(
+                report.scientific_inputs.as_ref() == Some(&expected)
+                    && report.scientific_input_sha256.as_deref() == Some(expected_sha256.as_str()),
+                "entrapment generation phase-scoped scientific-input identity mismatch"
+            );
+        }
+        _ => anyhow::bail!("unsupported entrapment generation report schema"),
+    }
+    anyhow::ensure!(
+        report.target_sha256 == sha256_file(target_fasta)?
+            && report.seed == seed
+            && report.protein_fold == protein_fold
+            && &report.foreign_source_mode == source_mode
+            && &report.shared_peptide_exclusion_mode == exclusion_mode,
+        "entrapment generation report settings mismatch"
+    );
+    Ok(())
+}
+
 pub fn generate_foreign_entrapment(
     parameters: &Parameters,
     target_fasta: &Path,
@@ -1593,6 +2171,18 @@ pub fn generate_foreign_entrapment(
         &exclusion_mode,
         selected_foreign_fasta,
     )?;
+    let scientific_inputs = entrapment_generation_scientific_inputs(
+        parameters,
+        target_fasta,
+        foreign_fastas,
+        seed,
+        protein_fold,
+        &source_mode,
+        &exclusion_mode,
+        selected_foreign_fasta,
+    )?;
+    let scientific_input_sha256 =
+        entrapment_generation_scientific_input_sha256(&scientific_inputs)?;
     let exclusion_parameters = shared_exclusion_parameters(parameters, &exclusion_mode);
     let exclusion_target = shared_exclusion_records(&target, &exclusion_mode);
     let (target_peptides, _) = peptide_keys(&exclusion_parameters, &exclusion_target);
@@ -1742,8 +2332,10 @@ pub fn generate_foreign_entrapment(
         && selected_foreign_sha256 != automatic.sha256;
 
     Ok(EntrapmentGenerationReport {
-        schema_version: 2,
+        schema_version: 3,
         generation_input_sha256,
+        scientific_inputs: Some(scientific_inputs),
+        scientific_input_sha256: Some(scientific_input_sha256),
         generator_version: default_generator_version(),
         selection_algorithm: default_selection_algorithm(),
         target_fasta: target_fasta.to_path_buf(),
@@ -1915,6 +2507,7 @@ mod tests {
     use super::*;
     use sage_core::database::{EnzymeBuilder, Parameters};
     use sage_core::ion_series::Kind;
+    use sage_core::modification::ModificationSpecificity;
     use std::collections::HashMap;
     use std::time::{SystemTime, UNIX_EPOCH};
 
@@ -2439,6 +3032,187 @@ mod tests {
         std::fs::remove_dir_all(directory).unwrap();
     }
 
+    fn scientific_identity(
+        parameters: &Parameters,
+        target: &Path,
+        foreign: &Path,
+        seed: u64,
+        protein_fold: usize,
+        exclusion: SharedPeptideExclusionMode,
+    ) -> String {
+        let inputs = entrapment_generation_scientific_inputs(
+            parameters,
+            target,
+            &[foreign.to_path_buf()],
+            seed,
+            protein_fold,
+            &ForeignSourceMode::Explicit,
+            &exclusion,
+            Some(foreign),
+        )
+        .unwrap();
+        entrapment_generation_scientific_input_sha256(&inputs).unwrap()
+    }
+
+    #[test]
+    fn phase_scoped_identity_tracks_consumed_inputs_only() {
+        let directory = test_directory("scientific-identity");
+        let target = directory.join("target.fasta");
+        let foreign = directory.join("foreign.fasta");
+        std::fs::write(&target, b">target\nAAAKCCCCK\n").unwrap();
+        std::fs::write(&foreign, b">foreign\nDDDKEEEEK\n").unwrap();
+        let base = parameters();
+        let identity = scientific_identity(
+            &base,
+            &target,
+            &foreign,
+            42,
+            1,
+            SharedPeptideExclusionMode::SageSearchSpace,
+        );
+
+        let mut operational = base.clone();
+        operational.fasta = "/another/phase/combined.fasta".into();
+        operational.bucket_size = 32768;
+        operational.ion_kinds = vec![Kind::A, Kind::C];
+        operational.min_ion_index = 7;
+        operational.decoy_tag = "different_".into();
+        operational.generate_decoys = true;
+        operational.prefilter = true;
+        operational.prefilter_chunk_size = 999;
+        operational.prefilter_low_memory = false;
+        assert_eq!(
+            identity,
+            scientific_identity(
+                &operational,
+                &target,
+                &foreign,
+                42,
+                1,
+                SharedPeptideExclusionMode::SageSearchSpace,
+            )
+        );
+
+        let mut relevant_variants = Vec::new();
+        let mut changed = base.clone();
+        changed.enzyme.missed_cleavages = Some(1);
+        relevant_variants.push(changed);
+        let mut changed = base.clone();
+        changed.enzyme.min_len = Some(4);
+        relevant_variants.push(changed);
+        let mut changed = base.clone();
+        changed.enzyme.max_len = Some(49);
+        relevant_variants.push(changed);
+        let mut changed = base.clone();
+        changed.enzyme.cleave_at = Some("K".into());
+        relevant_variants.push(changed);
+        let mut changed = base.clone();
+        changed.enzyme.restrict = Some("".into());
+        relevant_variants.push(changed);
+        let mut changed = base.clone();
+        changed.enzyme.c_terminal = Some(false);
+        relevant_variants.push(changed);
+        let mut changed = base.clone();
+        changed.enzyme.semi_enzymatic = Some(true);
+        relevant_variants.push(changed);
+        let mut changed = base.clone();
+        changed.peptide_min_mass = 1.0;
+        relevant_variants.push(changed);
+        let mut changed = base.clone();
+        changed.peptide_max_mass = 9999.0;
+        relevant_variants.push(changed);
+        let mut changed = base.clone();
+        changed
+            .static_mods
+            .insert(ModificationSpecificity::Residue(b'C'), 57.0);
+        relevant_variants.push(changed);
+        let mut changed = base.clone();
+        changed
+            .variable_mods
+            .insert(ModificationSpecificity::Residue(b'M'), vec![16.0]);
+        relevant_variants.push(changed);
+        let mut changed = base.clone();
+        changed.max_variable_mods = 3;
+        relevant_variants.push(changed);
+        for changed in relevant_variants {
+            assert_ne!(
+                identity,
+                scientific_identity(
+                    &changed,
+                    &target,
+                    &foreign,
+                    42,
+                    1,
+                    SharedPeptideExclusionMode::SageSearchSpace,
+                )
+            );
+        }
+        assert_ne!(
+            identity,
+            scientific_identity(
+                &base,
+                &target,
+                &foreign,
+                43,
+                1,
+                SharedPeptideExclusionMode::SageSearchSpace,
+            )
+        );
+        assert_ne!(
+            identity,
+            scientific_identity(
+                &base,
+                &target,
+                &foreign,
+                42,
+                2,
+                SharedPeptideExclusionMode::SageSearchSpace,
+            )
+        );
+        assert_ne!(
+            identity,
+            scientific_identity(
+                &base,
+                &target,
+                &foreign,
+                42,
+                1,
+                SharedPeptideExclusionMode::Fdrbench004Compatibility,
+            )
+        );
+
+        let moved = directory.join("moved");
+        std::fs::create_dir(&moved).unwrap();
+        let moved_target = moved.join("renamed-target.fasta");
+        let moved_foreign = moved.join("renamed-foreign.fasta");
+        std::fs::copy(&target, &moved_target).unwrap();
+        std::fs::copy(&foreign, &moved_foreign).unwrap();
+        assert_eq!(
+            identity,
+            scientific_identity(
+                &base,
+                &moved_target,
+                &moved_foreign,
+                42,
+                1,
+                SharedPeptideExclusionMode::SageSearchSpace,
+            )
+        );
+        std::fs::write(&moved_foreign, b">foreign\nDDDKEEEER\n").unwrap();
+        assert_ne!(
+            identity,
+            scientific_identity(
+                &base,
+                &moved_target,
+                &moved_foreign,
+                42,
+                1,
+                SharedPeptideExclusionMode::SageSearchSpace,
+            )
+        );
+        std::fs::remove_dir_all(directory).unwrap();
+    }
+
     fn existing_resource_fixture(
         name: &str,
     ) -> (PathBuf, PathBuf, PathBuf, PathBuf, PathBuf, String, String) {
@@ -2446,15 +3220,20 @@ mod tests {
         let target = directory.join("target.fasta");
         let foreign = directory.join("foreign.fasta");
         let combined = directory.join("combined.fasta");
-        let artifact = directory.join("entrapment.audit.json");
+        let audit_artifact = directory.join("entrapment.audit.json");
+        let audit_manifest = directory.join("entrapment.audit.manifest.json");
+        let search_config = directory.join("generation.search.json");
+        let artifact = directory.join("entrapment.resource.lock.json");
         std::fs::write(&target, b">Target_A\nAAAKCCCCK\n>Target_B\nGGGKLLLLK\n").unwrap();
         std::fs::write(
             &foreign,
             b">Foreign_A\nDDDKEEEEK\n>Foreign_B\nNNNNKQQQQK\n>Foreign_C\nSSSSKTTTTK\n",
         )
         .unwrap();
+        let mut generation_parameters = parameters();
+        generation_parameters.fasta = target.to_string_lossy().into_owned();
         let generation = generate_foreign_entrapment(
-            &parameters(),
+            &generation_parameters,
             &target,
             std::slice::from_ref(&foreign),
             &combined,
@@ -2466,7 +3245,7 @@ mod tests {
         )
         .unwrap();
         write_json_atomic(
-            &artifact,
+            &audit_artifact,
             &EntrapmentAuditReport {
                 schema_version: 1,
                 database: EntrapmentDatabaseReport::NativeGenerated { generation },
@@ -2474,6 +3253,61 @@ mod tests {
             },
         )
         .unwrap();
+        write_json_atomic(
+            &search_config,
+            &serde_json::json!({
+                "database": {
+                    "bucket_size": 8192,
+                    "enzyme": {
+                        "missed_cleavages": 0,
+                        "min_len": 3,
+                        "max_len": 50,
+                        "cleave_at": "KR",
+                        "restrict": "P",
+                        "c_terminal": true,
+                        "semi_enzymatic": false
+                    },
+                    "peptide_min_mass": 0.0,
+                    "peptide_max_mass": 10000.0,
+                    "ion_kinds": ["b", "y"],
+                    "min_ion_index": 2,
+                    "static_mods": {},
+                    "variable_mods": {},
+                    "max_variable_mods": 2,
+                    "decoy_tag": "rev_",
+                    "generate_decoys": false,
+                    "fasta": target,
+                    "prefilter_chunk_size": 0,
+                    "prefilter": false,
+                    "prefilter_low_memory": true
+                },
+                "precursor_tol": {"ppm": [-20.0, 20.0]},
+                "fragment_tol": {"ppm": [-20.0, 20.0]},
+                "mzml_paths": []
+            }),
+        )
+        .unwrap();
+        write_json_atomic(
+            &audit_manifest,
+            &EntrapmentAuditManifest {
+                schema_version: 1,
+                search_config,
+                target_fasta: target.clone(),
+                output_directory: directory.clone(),
+                database_mode: EntrapmentDatabaseMode::NativeGenerated,
+                foreign_fastas: vec![foreign.clone()],
+                output_fasta: combined.clone(),
+                frozen_legacy_fasta: None,
+                foreign_source_mode: ForeignSourceMode::Explicit,
+                shared_peptide_exclusion_mode: SharedPeptideExclusionMode::SageSearchSpace,
+                selected_foreign_fasta: Some(foreign.clone()),
+                legacy_parity_reference: None,
+                seed: 42,
+                protein_fold: 1,
+            },
+        )
+        .unwrap();
+        lock_existing_entrapment_resource(&audit_manifest, &audit_artifact, &artifact).unwrap();
         let artifact_sha = sha256_file(&artifact).unwrap();
         let combined_sha = sha256_file(&combined).unwrap();
         (
@@ -2491,11 +3325,13 @@ mod tests {
     fn existing_sage_entrapment_resource_is_verified_and_relocation_invariant() {
         let (directory, target, foreign, combined, artifact, artifact_sha, combined_sha) =
             existing_resource_fixture("existing-valid");
+        let mut active_parameters = parameters();
+        active_parameters.fasta = combined.to_string_lossy().into_owned();
         let (report, reference) = load_existing_entrapment_resource(
             &artifact,
             &artifact_sha,
             &combined_sha,
-            &parameters(),
+            &active_parameters,
             &target,
             std::slice::from_ref(&foreign),
             &combined,
@@ -2517,11 +3353,13 @@ mod tests {
         let relocated_fasta = relocated.join("combined.fasta");
         std::fs::copy(&artifact, &relocated_artifact).unwrap();
         std::fs::copy(&combined, &relocated_fasta).unwrap();
+        let mut relocated_parameters = parameters();
+        relocated_parameters.fasta = relocated_fasta.to_string_lossy().into_owned();
         let (_, relocated_reference) = load_existing_entrapment_resource(
             &relocated_artifact,
             &artifact_sha,
             &combined_sha,
-            &parameters(),
+            &relocated_parameters,
             &target,
             std::slice::from_ref(&foreign),
             &relocated_fasta,
@@ -2544,11 +3382,13 @@ mod tests {
         let (directory, target, foreign, combined, artifact, artifact_sha, combined_sha) =
             existing_resource_fixture("existing-mismatch");
         let attempt = |artifact_hash: &str, combined_hash: &str, seed: u64| {
+            let mut active_parameters = parameters();
+            active_parameters.fasta = combined.to_string_lossy().into_owned();
             load_existing_entrapment_resource(
                 &artifact,
                 artifact_hash,
                 combined_hash,
-                &parameters(),
+                &active_parameters,
                 &target,
                 std::slice::from_ref(&foreign),
                 &combined,
@@ -2561,8 +3401,67 @@ mod tests {
         };
         assert!(attempt(&"0".repeat(64), &combined_sha, 42).is_err());
         assert!(attempt(&artifact_sha, &"1".repeat(64), 42).is_err());
-        assert!(attempt(&artifact_sha, &combined_sha, 43).is_err());
-        let mut audit: EntrapmentAuditReport =
+        assert!(attempt(&artifact_sha, &combined_sha, 43)
+            .unwrap_err()
+            .to_string()
+            .contains("/seed"));
+        let other_target = directory.join("other-target.fasta");
+        std::fs::write(&other_target, b">Target_A\nAAAKCCCCR\n").unwrap();
+        let mut active_parameters = parameters();
+        active_parameters.fasta = combined.to_string_lossy().into_owned();
+        assert!(load_existing_entrapment_resource(
+            &artifact,
+            &artifact_sha,
+            &combined_sha,
+            &active_parameters,
+            &other_target,
+            std::slice::from_ref(&foreign),
+            &combined,
+            42,
+            1,
+            &ForeignSourceMode::Explicit,
+            &SharedPeptideExclusionMode::SageSearchSpace,
+            Some(&foreign),
+        )
+        .is_err());
+        let other_foreign = directory.join("other-foreign.fasta");
+        std::fs::write(&other_foreign, b">Foreign_A\nDDDKEEEER\n").unwrap();
+        assert!(load_existing_entrapment_resource(
+            &artifact,
+            &artifact_sha,
+            &combined_sha,
+            &active_parameters,
+            &target,
+            std::slice::from_ref(&other_foreign),
+            &combined,
+            42,
+            1,
+            &ForeignSourceMode::Explicit,
+            &SharedPeptideExclusionMode::SageSearchSpace,
+            Some(&other_foreign),
+        )
+        .is_err());
+        let other_combined = directory.join("other-combined.fasta");
+        std::fs::write(&other_combined, b">Target_A\nAAAKCCCCK\n").unwrap();
+        let other_combined_sha = sha256_file(&other_combined).unwrap();
+        let mut other_database = parameters();
+        other_database.fasta = other_combined.to_string_lossy().into_owned();
+        assert!(load_existing_entrapment_resource(
+            &artifact,
+            &artifact_sha,
+            &other_combined_sha,
+            &other_database,
+            &target,
+            std::slice::from_ref(&foreign),
+            &other_combined,
+            42,
+            1,
+            &ForeignSourceMode::Explicit,
+            &SharedPeptideExclusionMode::SageSearchSpace,
+            Some(&foreign),
+        )
+        .is_err());
+        let mut audit: ExistingEntrapmentResourceLock =
             serde_json::from_slice(&std::fs::read(&artifact).unwrap()).unwrap();
         audit.schema_version = 99;
         write_json_atomic(&artifact, &audit).unwrap();
