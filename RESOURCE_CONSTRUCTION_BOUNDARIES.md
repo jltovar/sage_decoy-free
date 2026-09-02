@@ -85,7 +85,7 @@ The raw constructor requires durable wrapper and Python identities as applicable
 MS2PIP, DeepLC, or IM2Deep generators it verifies the relevant installed package versions plus the
 wrapper package and `psm-utils`; for MS2PIP and DeepLC it also requires complete selected model-file
 content identities. Generation exports the frozen candidate population with neutral q/PEP fields,
-invokes the wrapper once, and requires a one-to-one stable-ID join. Raw-cache schema v2 records an
+invokes the wrapper once, and requires a one-to-one stable-ID join. Raw feature schema v2 records an
 explicit `sage-external-feature-missingness-v1` availability catalog. The TSV parser classifies the
 raw text for every member of MS2PIP and DeepLC independently before numeric conversion. The
 production wrapper's all-empty representation for a complete lane becomes the existing all-NaN
@@ -96,7 +96,11 @@ required field, nonfinite native observed mobility, duplicate, missing, surplus,
 availability state is treated as corrupt/ambiguous output and fails before publication. Missingness
 in one recognized lane never disables valid evidence in another lane. The content fingerprint binds
 the missingness schema, every availability record, and the complete generator-output SHA-256 and
-size.
+size. Durable raw-cache schema v3 additionally binds two distinct provenance layers: the frozen
+external generator execution (pool/export/configuration/output, wrapper, Python/packages, and
+models) and the current Rust finalizer/parser (source, interpretation schemas, provenance schema,
+and cache serialization schema). Parser-only changes can change the durable cache identity without
+invalidating unchanged generator output.
 
 If the exact raw cache already exists, Sage fully verifies and reuses it without invoking Python or
 the wrapper. An incomplete, corrupt, or incompatible final cache fails closed and never triggers
@@ -109,6 +113,8 @@ On every newly generated run, Sage writes `generator.provenance.json` beside
 `candidates.input.tsv`, `generator.config.json`, and `generator.output.psms.tsv`. It binds those
 files to the raw input identity before parsing. Successful temporary work is cleaned according to
 the configured output policy; failed work is retained for forensics and is never silently deleted.
+New sidecars use generator provenance v2 and include expanded component identities so a mismatch
+report can name every differing wrapper, interpreter/environment/package, or model component.
 
 ## Existing-output finalization command
 
@@ -117,6 +123,7 @@ sage finalize-raw-cache-from-existing-output frozen-search.json \
   --candidate-pool-root /external/resources/candidate-pools \
   --annotation-cache-root /external/resources/raw-annotations \
   --generator-output-tsv /external/transient/generator.output.psms.tsv \
+  --legacy-generator-source-root /exact/historical/repository \
   --rank-depth 50 \
   --report /external/evidence/raw-cache-recovery.report.json
 ```
@@ -129,6 +136,12 @@ missingness contract, atomically publishes, and reopens the cache. Missing sidec
 pool/generator identity, corrupt numeric state, or incomplete coverage fails closed. Exact replay
 reopens the same cache and launches no external process. The command has no spectrum-search,
 annotation-generation, calibration, fitting, optimization, audit, target-only, or TDC fallback.
+`--legacy-generator-source-root` is required only for a v1 generator sidecar. Sage hashes the exact
+historical `external_feature_cache.rs` and `external_features.rs` bytes with the historical domain
+contract, reconstructs the old conflated aggregate, and then records that verified generator
+identity separately from the current finalizer. Unsupported schemas and all simultaneous component
+mismatches are reported structurally; current parser source is never substituted for historical
+generator source.
 
 ## Atomicity and resumption
 

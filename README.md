@@ -121,13 +121,17 @@ requires and fully verifies that exact pool, generates or exactly reopens only t
 prediction layer, and returns before stage calibration or fitting. See
 [`RESOURCE_CONSTRUCTION_BOUNDARIES.md`](RESOURCE_CONSTRUCTION_BOUNDARIES.md) for the traced call
 boundaries, exact commands, provenance catalog, atomicity, resumption, and no-fallback guarantees.
-Raw-cache schema v2 represents unavailable MS2PIP and DeepLC lanes explicitly: the candidate stays
+Raw-cache payload feature schema v2 represents unavailable MS2PIP and DeepLC lanes explicitly: the candidate stays
 in the population, unavailable values remain non-evidence, and valid Sage or other external lanes
 remain usable. At the TSV boundary, Sage examines every raw field in each recognized lane before
 numeric parsing: the production wrapper's all-empty lane is mapped to the existing durable
 `prediction_unavailable` state, while a partially empty lane, malformed nonempty value, NaN, or
 infinity fails closed. Empty required fields outside a recognized complete lane also fail closed.
-Sage never imputes a numeric prediction. A hash-bound preserved generator run may
+Sage never imputes a numeric prediction. Durable raw-cache schema v3 separates the frozen
+generator-execution identity from the current Rust parser/finalizer identity and binds both in the
+published cache. A parser correction can therefore interpret an unchanged, fully verified
+generator output without masquerading as the historical generator or weakening any wrapper,
+environment, model, configuration, export, output, or candidate-population check. A hash-bound preserved generator run may
 be finalized with `sage finalize-raw-cache-from-existing-output`; this recovery scope cannot launch
 the wrapper, Python, a spectrum search, or a statistical stage.
 
@@ -230,6 +234,14 @@ excludes the Decoy-Free model, null window, preliminary q/PEP stream, target-onl
 Ensemble roster. Sage derives each model/window-specific external empirical profile from this raw
 layer. Consequently a dataset ordinarily needs one raw +entrapment cache and one raw target-only
 cache, even when many models or windows are evaluated.
+
+The frozen generator-execution layer is reconstructible from the generator sidecar and exact
+candidate export, configuration, and output bytes; it excludes current Rust parser source. The
+separate finalizer layer records current Rust source, parser and missing-lane schemas, provenance
+schema, and cache serialization schema. The durable cache fingerprint binds both layers. New
+generator runs write expanded provenance schema v2. Recovery of historical v1 provenance requires
+the exact historical repository source bytes so Sage can reconstruct and verify the old aggregate;
+an asserted legacy digest alone is never accepted.
 
 When DeepLC is enabled, layered caching requires an explicit positive `calibration_set_size`.
 This makes its dataset-level calibration selection deterministic from the native candidate score

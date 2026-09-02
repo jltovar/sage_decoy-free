@@ -16,12 +16,21 @@ pub const EXTERNAL_ANNOTATION_CACHE_SCHEMA_VERSION: u32 = 2;
 pub const EXTERNAL_ANNOTATION_FEATURE_SCHEMA: &str = "sage-external-psm-features-v1";
 const EXTERNAL_ANNOTATION_FINGERPRINT_SCHEMA: &str =
     "sage-external-annotation-fingerprint-v2-model-content";
-pub const RAW_EXTERNAL_PREDICTION_CACHE_SCHEMA_VERSION: u32 = 2;
+pub const RAW_EXTERNAL_PREDICTION_CACHE_SCHEMA_VERSION: u32 = 3;
 pub const RAW_EXTERNAL_PREDICTION_FEATURE_SCHEMA: &str =
     "sage-raw-external-prediction-features-v2-missingness";
 pub const RAW_EXTERNAL_MISSINGNESS_SCHEMA: &str = "sage-external-feature-missingness-v1";
 const RAW_EXTERNAL_PREDICTION_FINGERPRINT_SCHEMA: &str =
-    "sage-raw-external-prediction-fingerprint-v2-missingness";
+    "sage-raw-external-prediction-fingerprint-v3-layered-provenance";
+pub const RAW_GENERATOR_EXECUTION_SETTINGS_SCHEMA: &str =
+    "sage-raw-generator-execution-settings-v1";
+pub const RAW_CACHE_FINALIZER_IDENTITY_SCHEMA: &str = "sage-raw-cache-finalizer-identity-v1";
+pub const RAW_CACHE_PARSER_SCHEMA: &str = "sage-raw-tsv-parser-v2-whole-lane-empty";
+pub const RAW_GENERATOR_RUN_PROVENANCE_SCHEMA_V1: &str = "sage-raw-generator-run-v1";
+pub const RAW_GENERATOR_RUN_PROVENANCE_SCHEMA_V2: &str =
+    "sage-raw-generator-run-v2-layered-provenance";
+pub const VERIFIED_RAW_GENERATOR_EXECUTION_SCHEMA: &str =
+    "sage-verified-raw-generator-execution-v1";
 const STAGE_EXTERNAL_CALIBRATION_FINGERPRINT_SCHEMA: &str =
     "sage-stage-external-calibration-fingerprint-v1";
 
@@ -138,6 +147,49 @@ pub struct GeneratorOutputIdentity {
     pub size_bytes: u64,
 }
 
+#[derive(Clone, Debug, Serialize, Deserialize, PartialEq, Eq)]
+pub struct RawCacheFinalizerIdentity {
+    pub schema_version: u32,
+    pub digest: String,
+    pub sage_version: String,
+    pub rust_source_sha256: String,
+    pub parser_schema: String,
+    pub missingness_schema: String,
+    pub generator_provenance_schema: String,
+    pub cache_schema_version: u32,
+}
+
+#[derive(Clone, Debug, Serialize, Deserialize, PartialEq, Eq)]
+pub struct VerifiedRawGeneratorExecution {
+    pub schema_version: u32,
+    pub digest: String,
+    pub recorded_provenance_schema: String,
+    pub generator_execution_settings_sha256: String,
+    pub generator_components: RawGeneratorProvenance,
+    pub candidate_export: GeneratorOutputIdentity,
+    pub generator_configuration: GeneratorOutputIdentity,
+    pub generator_output: GeneratorOutputIdentity,
+    pub provenance_sha256: String,
+    #[serde(default)]
+    pub legacy_raw_prediction_fingerprint: Option<String>,
+    #[serde(default)]
+    pub legacy_generator_settings_sha256: Option<String>,
+    #[serde(default)]
+    pub legacy_rust_source_sha256: Option<String>,
+}
+
+#[derive(Clone, Debug)]
+pub struct VerifiedRawGeneratorExecutionArtifacts {
+    pub recorded_provenance_schema: String,
+    pub candidate_export: GeneratorOutputIdentity,
+    pub generator_configuration: GeneratorOutputIdentity,
+    pub generator_output: GeneratorOutputIdentity,
+    pub provenance_sha256: String,
+    pub legacy_raw_prediction_fingerprint: Option<String>,
+    pub legacy_generator_settings_sha256: Option<String>,
+    pub legacy_rust_source_sha256: Option<String>,
+}
+
 #[derive(Clone, Debug, Serialize, Deserialize)]
 pub struct RawExternalPredictionRecord {
     pub stable_id: String,
@@ -153,7 +205,8 @@ pub struct RawExternalPredictionIdentity {
     pub schema_version: u32,
     pub digest: String,
     pub search_fingerprint: String,
-    pub generator_settings_sha256: String,
+    pub generator_execution_settings_sha256: String,
+    pub finalizer: RawCacheFinalizerIdentity,
     pub raw_input_sha256: String,
     pub stable_candidate_id_schema: String,
     pub feature_schema: String,
@@ -182,6 +235,7 @@ pub struct RawExternalPredictionCacheManifest {
     pub joined_prediction_count: usize,
     pub content_fingerprint: String,
     pub generator_output: GeneratorOutputIdentity,
+    pub generator_execution: VerifiedRawGeneratorExecution,
     pub missingness: MissingExternalFeatureSummary,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub migrated_from_schema_v2_fingerprint: Option<String>,
@@ -195,6 +249,7 @@ struct RawExternalPredictionPayload {
     raw_prediction_identity: RawExternalPredictionIdentity,
     content_fingerprint: String,
     generator_output: GeneratorOutputIdentity,
+    generator_execution: VerifiedRawGeneratorExecution,
     missingness: MissingExternalFeatureSummary,
     records: Vec<RawExternalPredictionRecord>,
 }
@@ -262,7 +317,30 @@ struct GeneratorSettingsIdentity<'a> {
 }
 
 #[derive(Serialize)]
-struct RawGeneratorSettingsIdentity<'a> {
+struct RawGeneratorExecutionSettingsIdentity<'a> {
+    schema: &'static str,
+    engine: &'a crate::input::ExternalFeatureEngine,
+    command: Option<PortableSourceIdentity>,
+    python: Option<PortableSourceIdentity>,
+    python_environment: Option<String>,
+    spectrum_file_mapping: BTreeMap<String, PortableSourceIdentity>,
+    feature_only: bool,
+    max_rank: Option<u32>,
+    feature_generators: Option<serde_json::Value>,
+    processes: Option<usize>,
+    ms2pip_model: Option<&'a str>,
+    ms2pip_ms2_tolerance_bits: Option<u64>,
+    deeplc_retrain: Option<bool>,
+    deeplc_n_epochs: Option<usize>,
+    deeplc_calibration_set_size: Option<usize>,
+    modification_mapping: Option<serde_json::Value>,
+    fixed_modifications: Option<serde_json::Value>,
+    model_components: &'a [ModelComponentIdentity],
+    raw_candidate_export_contract: &'static str,
+}
+
+#[derive(Serialize)]
+struct LegacyRawGeneratorSettingsIdentity<'a> {
     schema: &'static str,
     sage_version: &'a str,
     engine: &'a crate::input::ExternalFeatureEngine,
@@ -283,7 +361,7 @@ struct RawGeneratorSettingsIdentity<'a> {
     fixed_modifications: Option<serde_json::Value>,
     model_components: &'a [ModelComponentIdentity],
     raw_candidate_export_contract: &'static str,
-    rust_source_sha256: &'static str,
+    rust_source_sha256: &'a str,
 }
 
 #[derive(Clone, Debug, Serialize)]
@@ -459,21 +537,21 @@ struct OperationalFileIdentity {
     sha256: String,
 }
 
-#[derive(Clone, Debug, Serialize, Deserialize)]
+#[derive(Clone, Debug, Serialize, Deserialize, PartialEq, Eq)]
 pub struct RawGeneratorSourceIdentity {
     pub source: String,
     pub kind: String,
     pub sha256: String,
 }
 
-#[derive(Clone, Debug, Serialize, Deserialize)]
+#[derive(Clone, Debug, Serialize, Deserialize, PartialEq, Eq)]
 pub struct RawGeneratorFileIdentity {
     pub path: PathBuf,
     pub size_bytes: u64,
     pub sha256: String,
 }
 
-#[derive(Clone, Debug, Serialize, Deserialize)]
+#[derive(Clone, Debug, Serialize, Deserialize, PartialEq, Eq)]
 pub struct RawGeneratorProvenance {
     pub schema_version: u32,
     pub generator_settings_sha256: String,
@@ -748,9 +826,8 @@ fn raw_generator_identity(
             ))
         })
         .collect::<Result<BTreeMap<_, _>>>()?;
-    let value = RawGeneratorSettingsIdentity {
-        schema: RAW_EXTERNAL_PREDICTION_FINGERPRINT_SCHEMA,
-        sage_version: env!("CARGO_PKG_VERSION"),
+    let value = RawGeneratorExecutionSettingsIdentity {
+        schema: RAW_GENERATOR_EXECUTION_SETTINGS_SCHEMA,
         engine: &settings.engine,
         command,
         python,
@@ -772,12 +849,134 @@ fn raw_generator_identity(
         fixed_modifications: settings.fixed_modifications.as_ref().map(canonical_json),
         model_components: &probe.model_components,
         raw_candidate_export_contract: "sage-external-raw-candidate-export-v1-neutral-statistics",
-        rust_source_sha256: env!("SAGE_EXTERNAL_CACHE_SOURCE_SHA256"),
     };
     Ok((
         sha256_bytes(&serde_json::to_vec(&value)?),
         probe.model_components,
     ))
+}
+
+/// Reconstruct the legacy schema-v2 composite identity from complete source
+/// bytes. This is used only to verify historical provenance that incorrectly
+/// mixed Rust parser/finalizer source with immutable generator settings.
+pub fn legacy_raw_generator_settings_sha256_with_existing_probe_root(
+    settings: &ExternalFeatureGenerationSettings,
+    probe_root: &Path,
+    rust_source_sha256: &str,
+) -> Result<String> {
+    validate_model_independent_generator_contract(settings)?;
+    anyhow::ensure!(
+        rust_source_sha256.len() == 64
+            && rust_source_sha256
+                .bytes()
+                .all(|byte| byte.is_ascii_hexdigit()),
+        "legacy Rust source identity must be a 64-character SHA-256"
+    );
+    let probe = resolve_generator_probe(settings, Some(probe_root), true)?;
+    let command = settings
+        .command_path
+        .as_deref()
+        .map(source_identity)
+        .transpose()?
+        .map(PortableSourceIdentity::from);
+    let python = settings
+        .python_executable
+        .as_deref()
+        .map(source_identity)
+        .transpose()?
+        .map(PortableSourceIdentity::from);
+    let spectrum_file_mapping = settings
+        .spectrum_file_mapping
+        .iter()
+        .map(|(name, source)| {
+            Ok((
+                name.clone(),
+                PortableSourceIdentity::from(source_identity(source)?),
+            ))
+        })
+        .collect::<Result<BTreeMap<_, _>>>()?;
+    let value = LegacyRawGeneratorSettingsIdentity {
+        schema: "sage-raw-external-prediction-fingerprint-v2-missingness",
+        sage_version: env!("CARGO_PKG_VERSION"),
+        engine: &settings.engine,
+        command,
+        python,
+        python_environment: probe.python_environment,
+        spectrum_file_mapping,
+        feature_only: settings.feature_only,
+        max_rank: settings.max_rank,
+        feature_generators: settings
+            .feature_generators
+            .as_ref()
+            .map(portable_feature_generators),
+        processes: settings.processes,
+        ms2pip_model: settings.ms2pip_model.as_deref(),
+        ms2pip_ms2_tolerance_bits: settings.ms2pip_ms2_tolerance.map(f64::to_bits),
+        deeplc_retrain: settings.deeplc_retrain,
+        deeplc_n_epochs: settings.deeplc_n_epochs,
+        deeplc_calibration_set_size: settings.deeplc_calibration_set_size,
+        modification_mapping: settings.modification_mapping.as_ref().map(canonical_json),
+        fixed_modifications: settings.fixed_modifications.as_ref().map(canonical_json),
+        model_components: &probe.model_components,
+        raw_candidate_export_contract: "sage-external-raw-candidate-export-v1-neutral-statistics",
+        rust_source_sha256,
+    };
+    Ok(sha256_bytes(&serde_json::to_vec(&value)?))
+}
+
+/// Hash the exact two-source contract used by historical raw-cache builds.
+/// Callers provide source bytes, not an unverified aggregate digest.
+pub fn legacy_external_cache_source_sha256(repository_root: &Path) -> Result<String> {
+    let sources = [
+        "crates/sage-cli/src/external_feature_cache.rs",
+        "crates/sage-cli/src/external_features.rs",
+    ];
+    let mut hasher = Sha256::new();
+    hasher.update(b"sage-layered-external-cache-source-v1\0");
+    for repository_path in sources {
+        let legacy_path = repository_path
+            .strip_prefix("crates/sage-cli/")
+            .expect("fixed source prefix");
+        let path = repository_root.join(repository_path);
+        anyhow::ensure!(
+            path.is_file(),
+            "legacy source file is missing: {}",
+            path.display()
+        );
+        hasher.update(legacy_path.as_bytes());
+        hasher.update(b"\0");
+        hasher.update(std::fs::read(&path)?);
+        hasher.update(b"\0");
+    }
+    Ok(format!("{:x}", hasher.finalize()))
+}
+
+/// Recompute the historical schema-v2 aggregate after every contributing
+/// component has been verified independently.
+pub fn legacy_raw_prediction_fingerprint(
+    search_fingerprint: &str,
+    generator_settings_sha256: &str,
+    raw_input_sha256: &str,
+    stable_candidate_id_schema: &str,
+    feature_schema: &str,
+    requested_max_rank: u32,
+    requested_candidate_count: usize,
+) -> String {
+    let mut hasher = Sha256::new();
+    for part in [
+        "sage-raw-external-prediction-fingerprint-v2-missingness",
+        search_fingerprint,
+        generator_settings_sha256,
+        raw_input_sha256,
+        stable_candidate_id_schema,
+        feature_schema,
+    ] {
+        hasher.update(part.as_bytes());
+        hasher.update(b"\0");
+    }
+    hasher.update(requested_max_rank.to_le_bytes());
+    hasher.update((requested_candidate_count as u64).to_le_bytes());
+    format!("{:x}", hasher.finalize())
 }
 
 /// Resolve the complete durable provenance consumed by raw-cache-only
@@ -843,6 +1042,10 @@ pub fn raw_generator_provenance(
         probe_path,
         probe_sha256,
     })
+}
+
+pub fn raw_generator_provenance_sha256(provenance: &RawGeneratorProvenance) -> Result<String> {
+    Ok(sha256_bytes(&serde_json::to_vec(provenance)?))
 }
 
 fn validate_model_independent_generator_contract(
@@ -1060,6 +1263,32 @@ pub fn raw_prediction_identity_with_probe_root(
     )
 }
 
+pub fn current_raw_cache_finalizer_identity() -> RawCacheFinalizerIdentity {
+    let mut hasher = Sha256::new();
+    for part in [
+        RAW_CACHE_FINALIZER_IDENTITY_SCHEMA,
+        env!("CARGO_PKG_VERSION"),
+        env!("SAGE_EXTERNAL_CACHE_SOURCE_SHA256"),
+        RAW_CACHE_PARSER_SCHEMA,
+        RAW_EXTERNAL_MISSINGNESS_SCHEMA,
+        RAW_GENERATOR_RUN_PROVENANCE_SCHEMA_V2,
+    ] {
+        hasher.update((part.len() as u64).to_le_bytes());
+        hasher.update(part.as_bytes());
+    }
+    hasher.update(RAW_EXTERNAL_PREDICTION_CACHE_SCHEMA_VERSION.to_le_bytes());
+    RawCacheFinalizerIdentity {
+        schema_version: 1,
+        digest: format!("{:x}", hasher.finalize()),
+        sage_version: env!("CARGO_PKG_VERSION").into(),
+        rust_source_sha256: env!("SAGE_EXTERNAL_CACHE_SOURCE_SHA256").into(),
+        parser_schema: RAW_CACHE_PARSER_SCHEMA.into(),
+        missingness_schema: RAW_EXTERNAL_MISSINGNESS_SCHEMA.into(),
+        generator_provenance_schema: RAW_GENERATOR_RUN_PROVENANCE_SCHEMA_V2.into(),
+        cache_schema_version: RAW_EXTERNAL_PREDICTION_CACHE_SCHEMA_VERSION,
+    }
+}
+
 pub fn raw_prediction_identity_from_candidate_ids_with_probe_root(
     search_fingerprint: &str,
     settings: &ExternalFeatureGenerationSettings,
@@ -1088,17 +1317,19 @@ fn build_raw_prediction_identity<'a>(
     probe_root: &Path,
     require_existing_probe: bool,
 ) -> Result<RawExternalPredictionIdentity> {
-    let (generator_settings_sha256, model_components) =
+    let (generator_execution_settings_sha256, model_components) =
         raw_generator_identity(settings, Some(probe_root), require_existing_probe)?;
     let raw_input_sha256 = raw_candidate_id_sha256(candidate_ids)?;
+    let finalizer = current_raw_cache_finalizer_identity();
     let mut hasher = Sha256::new();
     for part in [
         RAW_EXTERNAL_PREDICTION_FINGERPRINT_SCHEMA,
         search_fingerprint,
-        generator_settings_sha256.as_str(),
+        generator_execution_settings_sha256.as_str(),
         raw_input_sha256.as_str(),
         CANDIDATE_ID_SCHEMA,
         RAW_EXTERNAL_PREDICTION_FEATURE_SCHEMA,
+        finalizer.digest.as_str(),
     ] {
         hasher.update(part.as_bytes());
         hasher.update(b"\0");
@@ -1109,7 +1340,8 @@ fn build_raw_prediction_identity<'a>(
         schema_version: RAW_EXTERNAL_PREDICTION_CACHE_SCHEMA_VERSION,
         digest: format!("{:x}", hasher.finalize()),
         search_fingerprint: search_fingerprint.into(),
-        generator_settings_sha256,
+        generator_execution_settings_sha256,
+        finalizer,
         raw_input_sha256,
         stable_candidate_id_schema: CANDIDATE_ID_SCHEMA.into(),
         feature_schema: RAW_EXTERNAL_PREDICTION_FEATURE_SCHEMA.into(),
@@ -1490,6 +1722,88 @@ pub fn generator_output_identity(path: &Path) -> Result<GeneratorOutputIdentity>
     })
 }
 
+pub fn verified_raw_generator_execution(
+    identity: &RawExternalPredictionIdentity,
+    generator_components: RawGeneratorProvenance,
+    artifacts: VerifiedRawGeneratorExecutionArtifacts,
+) -> Result<VerifiedRawGeneratorExecution> {
+    let VerifiedRawGeneratorExecutionArtifacts {
+        recorded_provenance_schema,
+        candidate_export,
+        generator_configuration,
+        generator_output,
+        provenance_sha256,
+        legacy_raw_prediction_fingerprint,
+        legacy_generator_settings_sha256,
+        legacy_rust_source_sha256,
+    } = artifacts;
+    anyhow::ensure!(
+        generator_components.generator_settings_sha256
+            == identity.generator_execution_settings_sha256,
+        "expanded generator components disagree with generator execution settings identity"
+    );
+    anyhow::ensure!(
+        provenance_sha256.len() == 64
+            && provenance_sha256
+                .bytes()
+                .all(|byte| byte.is_ascii_hexdigit()),
+        "generator provenance identity must be a SHA-256"
+    );
+    let mut hasher = Sha256::new();
+    for part in [
+        VERIFIED_RAW_GENERATOR_EXECUTION_SCHEMA,
+        identity.search_fingerprint.as_str(),
+        identity.generator_execution_settings_sha256.as_str(),
+        identity.raw_input_sha256.as_str(),
+        identity.stable_candidate_id_schema.as_str(),
+        recorded_provenance_schema.as_str(),
+        provenance_sha256.as_str(),
+    ] {
+        hasher.update((part.len() as u64).to_le_bytes());
+        hasher.update(part.as_bytes());
+    }
+    for artifact in [
+        &candidate_export,
+        &generator_configuration,
+        &generator_output,
+    ] {
+        hasher.update((artifact.sha256.len() as u64).to_le_bytes());
+        hasher.update(artifact.sha256.as_bytes());
+        hasher.update(artifact.size_bytes.to_le_bytes());
+    }
+    let component_bytes = serde_json::to_vec(&generator_components)?;
+    hasher.update((component_bytes.len() as u64).to_le_bytes());
+    hasher.update(component_bytes);
+    for optional in [
+        legacy_raw_prediction_fingerprint.as_deref(),
+        legacy_generator_settings_sha256.as_deref(),
+        legacy_rust_source_sha256.as_deref(),
+    ] {
+        match optional {
+            Some(value) => {
+                hasher.update([1]);
+                hasher.update((value.len() as u64).to_le_bytes());
+                hasher.update(value.as_bytes());
+            }
+            None => hasher.update([0]),
+        }
+    }
+    Ok(VerifiedRawGeneratorExecution {
+        schema_version: 1,
+        digest: format!("{:x}", hasher.finalize()),
+        recorded_provenance_schema,
+        generator_execution_settings_sha256: identity.generator_execution_settings_sha256.clone(),
+        generator_components,
+        candidate_export,
+        generator_configuration,
+        generator_output,
+        provenance_sha256,
+        legacy_raw_prediction_fingerprint,
+        legacy_generator_settings_sha256,
+        legacy_rust_source_sha256,
+    })
+}
+
 fn missingness_summary(records: &[RawExternalPredictionRecord]) -> MissingExternalFeatureSummary {
     let ms2pip_unavailable_count = records
         .iter()
@@ -1519,20 +1833,26 @@ fn missingness_summary(records: &[RawExternalPredictionRecord]) -> MissingExtern
 
 fn raw_content_fingerprint(
     identity: &RawExternalPredictionIdentity,
-    output: &GeneratorOutputIdentity,
+    generator_execution: &VerifiedRawGeneratorExecution,
     records: &[RawExternalPredictionRecord],
 ) -> Result<String> {
     let mut hasher = Sha256::new();
     for part in [
-        "sage-raw-external-prediction-content-v1",
+        "sage-raw-external-prediction-content-v2-layered-provenance",
         identity.digest.as_str(),
-        output.sha256.as_str(),
+        generator_execution.digest.as_str(),
+        generator_execution.generator_output.sha256.as_str(),
         RAW_EXTERNAL_MISSINGNESS_SCHEMA,
     ] {
         hasher.update((part.len() as u64).to_le_bytes());
         hasher.update(part.as_bytes());
     }
-    hasher.update(output.size_bytes.to_le_bytes());
+    hasher.update(
+        generator_execution
+            .generator_output
+            .size_bytes
+            .to_le_bytes(),
+    );
     for record in records {
         let availability = bincode::serialize(&record.availability)?;
         hasher.update((record.stable_id.len() as u64).to_le_bytes());
@@ -1619,13 +1939,14 @@ pub fn load_raw_cache(
             && payload.raw_prediction_identity == manifest.identity
             && payload.content_fingerprint == manifest.content_fingerprint
             && payload.generator_output == manifest.generator_output
+            && payload.generator_execution == manifest.generator_execution
             && payload.missingness == manifest.missingness,
         "raw external prediction cache payload identity mismatch"
     );
     validate_raw_records(&payload.records, expected)?;
     anyhow::ensure!(
         missingness_summary(&payload.records) == manifest.missingness
-            && raw_content_fingerprint(expected, &manifest.generator_output, &payload.records)?
+            && raw_content_fingerprint(expected, &manifest.generator_execution, &payload.records)?
                 == manifest.content_fingerprint,
         "raw external prediction cache missingness/content identity mismatch"
     );
@@ -1646,16 +1967,22 @@ pub fn write_raw_cache_with_output(
     directory: &Path,
     identity: &RawExternalPredictionIdentity,
     records: Vec<RawExternalPredictionRecord>,
-    generator_output: GeneratorOutputIdentity,
+    generator_execution: VerifiedRawGeneratorExecution,
     migrated_from: Option<&ExternalAnnotationCacheManifest>,
 ) -> Result<RawExternalPredictionCacheManifest> {
+    let generator_output = generator_execution.generator_output.clone();
+    anyhow::ensure!(
+        generator_execution.generator_execution_settings_sha256
+            == identity.generator_execution_settings_sha256,
+        "verified generator execution disagrees with layered raw-cache identity"
+    );
     validate_raw_records(&records, identity)?;
     if directory.exists() {
         let (manifest, existing) = load_raw_cache(directory, identity)?
             .context("refusing to overwrite an incompatible raw external prediction cache")?;
         anyhow::ensure!(
             bincode::serialize(&existing)? == bincode::serialize(&records)?
-                && manifest.generator_output == generator_output,
+                && manifest.generator_execution == generator_execution,
             "raw external predictions changed under an identical portable identity"
         );
         return Ok(manifest);
@@ -1664,12 +1991,13 @@ pub fn write_raw_cache_with_output(
     let payload_path = raw_cache_payload_path(directory);
     let temporary = directory.join("raw_external_predictions.bin.zst.tmp");
     let missingness = missingness_summary(&records);
-    let content_fingerprint = raw_content_fingerprint(identity, &generator_output, &records)?;
+    let content_fingerprint = raw_content_fingerprint(identity, &generator_execution, &records)?;
     let payload = RawExternalPredictionPayload {
         schema_version: RAW_EXTERNAL_PREDICTION_CACHE_SCHEMA_VERSION,
         raw_prediction_identity: identity.clone(),
         content_fingerprint: content_fingerprint.clone(),
         generator_output: generator_output.clone(),
+        generator_execution: generator_execution.clone(),
         missingness: missingness.clone(),
         records,
     };
@@ -1693,6 +2021,7 @@ pub fn write_raw_cache_with_output(
         joined_prediction_count: payload.records.len(),
         content_fingerprint,
         generator_output,
+        generator_execution,
         missingness,
         migrated_from_schema_v2_fingerprint: migrated_from
             .map(|manifest| manifest.identity.digest.clone()),
@@ -1710,14 +2039,14 @@ pub fn publish_raw_cache_atomic_with_output(
     directory: &Path,
     identity: &RawExternalPredictionIdentity,
     records: Vec<RawExternalPredictionRecord>,
-    generator_output: GeneratorOutputIdentity,
+    generator_execution: VerifiedRawGeneratorExecution,
 ) -> Result<(RawExternalPredictionCacheManifest, bool)> {
     if directory.exists() {
         let (manifest, existing) = load_raw_cache(directory, identity)?
             .context("existing final raw prediction cache is incomplete or incompatible")?;
         anyhow::ensure!(
             bincode::serialize(&existing)? == bincode::serialize(&records)?
-                && manifest.generator_output == generator_output,
+                && manifest.generator_execution == generator_execution,
             "raw predictions changed under an existing portable identity"
         );
         return Ok((manifest, true));
@@ -1744,7 +2073,7 @@ pub fn publish_raw_cache_atomic_with_output(
 
     let result = (|| -> Result<RawExternalPredictionCacheManifest> {
         let written =
-            write_raw_cache_with_output(&staging, identity, records, generator_output, None)?;
+            write_raw_cache_with_output(&staging, identity, records, generator_execution, None)?;
         let (verified, _) = load_raw_cache(&staging, identity)?
             .context("raw-cache staging verification did not find a complete cache")?;
         anyhow::ensure!(
@@ -1795,16 +2124,43 @@ pub fn write_raw_cache(
         .into_iter()
         .map(|record| raw_record(record.stable_id, record.features))
         .collect::<Result<Vec<_>>>()?;
+    let output = GeneratorOutputIdentity {
+        sha256: migrated_from
+            .map(|manifest| manifest.payload_sha256.clone())
+            .unwrap_or_else(|| format!("{:064x}", 1)),
+        size_bytes: 0,
+    };
+    let generator_components = RawGeneratorProvenance {
+        schema_version: 1,
+        generator_settings_sha256: identity.generator_execution_settings_sha256.clone(),
+        command: None,
+        python: None,
+        python_environment: None,
+        package_metadata: Vec::new(),
+        model_components: identity.model_components.clone(),
+        model_files: Vec::new(),
+        probe_path: None,
+        probe_sha256: None,
+    };
+    let generator_execution = verified_raw_generator_execution(
+        identity,
+        generator_components,
+        VerifiedRawGeneratorExecutionArtifacts {
+            recorded_provenance_schema: "sage-synthetic-test-generator-run-v1".into(),
+            candidate_export: output.clone(),
+            generator_configuration: output.clone(),
+            generator_output: output,
+            provenance_sha256: format!("{:064x}", 2),
+            legacy_raw_prediction_fingerprint: None,
+            legacy_generator_settings_sha256: None,
+            legacy_rust_source_sha256: None,
+        },
+    )?;
     write_raw_cache_with_output(
         directory,
         identity,
         records,
-        GeneratorOutputIdentity {
-            sha256: migrated_from
-                .map(|manifest| manifest.payload_sha256.clone())
-                .unwrap_or_else(|| "synthetic-test-generator-output".into()),
-            size_bytes: 0,
-        },
+        generator_execution,
         migrated_from,
     )
 }
@@ -1819,15 +2175,37 @@ pub fn publish_raw_cache_atomic(
         .into_iter()
         .map(|record| raw_record(record.stable_id, record.features))
         .collect::<Result<Vec<_>>>()?;
-    publish_raw_cache_atomic_with_output(
-        directory,
+    let output = GeneratorOutputIdentity {
+        sha256: format!("{:064x}", 1),
+        size_bytes: 0,
+    };
+    let generator_components = RawGeneratorProvenance {
+        schema_version: 1,
+        generator_settings_sha256: identity.generator_execution_settings_sha256.clone(),
+        command: None,
+        python: None,
+        python_environment: None,
+        package_metadata: Vec::new(),
+        model_components: identity.model_components.clone(),
+        model_files: Vec::new(),
+        probe_path: None,
+        probe_sha256: None,
+    };
+    let generator_execution = verified_raw_generator_execution(
         identity,
-        records,
-        GeneratorOutputIdentity {
-            sha256: "synthetic-test-generator-output".into(),
-            size_bytes: 0,
+        generator_components,
+        VerifiedRawGeneratorExecutionArtifacts {
+            recorded_provenance_schema: "sage-synthetic-test-generator-run-v1".into(),
+            candidate_export: output.clone(),
+            generator_configuration: output.clone(),
+            generator_output: output,
+            provenance_sha256: format!("{:064x}", 2),
+            legacy_raw_prediction_fingerprint: None,
+            legacy_generator_settings_sha256: None,
+            legacy_rust_source_sha256: None,
         },
-    )
+    )?;
+    publish_raw_cache_atomic_with_output(directory, identity, records, generator_execution)
 }
 
 pub fn raw_cache_usage(

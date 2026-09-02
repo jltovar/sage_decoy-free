@@ -193,6 +193,12 @@ fn main() -> anyhow::Result<()> {
                         .value_hint(ValueHint::FilePath),
                 )
                 .arg(
+                    Arg::new("legacy-generator-source-root")
+                        .long("legacy-generator-source-root")
+                        .value_hint(ValueHint::DirPath)
+                        .help("Exact historical repository source root required to verify legacy v1 generator provenance"),
+                )
+                .arg(
                     Arg::new("rank-depth")
                         .required(true)
                         .long("rank-depth")
@@ -440,6 +446,9 @@ fn main() -> anyhow::Result<()> {
         let generator_output = boundary_matches
             .get_one::<String>("generator-output-tsv")
             .expect("required generator output");
+        let legacy_generator_source_root = boundary_matches
+            .get_one::<String>("legacy-generator-source-root")
+            .map(std::path::PathBuf::from);
         let rank_depth = boundary_matches
             .get_one::<u32>("rank-depth")
             .copied()
@@ -459,6 +468,7 @@ fn main() -> anyhow::Result<()> {
             std::path::PathBuf::from(annotation_root),
             rank_depth,
             std::path::PathBuf::from(generator_output),
+            legacy_generator_source_root,
         )?;
         write_json_atomic(std::path::Path::new(report_path), &report)?;
         let reopened: sage_cli::runner::RawCacheConstructionReport =
