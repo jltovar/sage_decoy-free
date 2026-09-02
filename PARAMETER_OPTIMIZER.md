@@ -237,6 +237,14 @@ hash, change `require_existing_partition` to `true`, and then run strict workflo
 Use `--inputs-only` first to record the exact portable dataset, FASTA, digestion, and
 entrapment-construction identities without assigning components or writing an artifact.
 
+When the combined FASTA was created by an earlier Sage-controlled phase, use native database mode
+with `generation_mode: require_existing`. The workflow must name the original Sage audit artifact
+and freeze both its SHA-256 and the combined FASTA SHA-256. Preflight validates the audit schema,
+generator/search inputs, measured ratios, and construction identity before reopening the partition,
+candidate pool, or raw cache. No workflow-local `entrapment.generation.json` is required or
+manufactured. The verified construction identity is portable across relocation and is bound through
+the proposal-space root into trials, checkpoints, fitted winners, and downstream winner locks.
+
 Partitioning occurs at the foreign-protein connected-component level. Sage applies its configured
 digestion and modification search space, canonicalizes I/L, links all entrapment proteins sharing
 any searchable peptide, and assigns the whole content-identified component by a cryptographic hash
