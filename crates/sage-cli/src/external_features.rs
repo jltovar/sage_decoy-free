@@ -11,21 +11,25 @@ use crate::candidate_pool::stable_candidate_id;
 #[cfg(test)]
 use crate::external_feature_cache::publish_raw_cache_atomic;
 use crate::external_feature_cache::{
-    annotation_identity_with_probe_root, cache_directory, generator_output_identity, load_cache,
-    load_raw_cache, publish_raw_cache_atomic_with_output, raw_cache_directory,
-    raw_cache_manifest_path, raw_cache_usage, raw_generator_provenance,
+    annotation_identity_with_probe_root, cache_directory, generator_output_identity,
+    legacy_external_cache_source_sha256,
+    legacy_raw_generator_settings_sha256_with_existing_probe_root,
+    legacy_raw_prediction_fingerprint, load_cache, load_raw_cache,
+    publish_raw_cache_atomic_with_output, raw_cache_directory, raw_cache_manifest_path,
+    raw_cache_usage, raw_generator_provenance, raw_generator_provenance_sha256,
     raw_prediction_identity_with_probe_root, raw_record, stage_calibration_identity,
-    write_raw_cache_with_output, ExternalAnnotationCacheRequest, ExternalAnnotationCacheUsage,
-    ExternalAnnotationInput, ExternalAnnotationRecord, RawExternalPredictionCacheManifest,
-    RawExternalPredictionIdentity, RawExternalPredictionRecord, RawGeneratorProvenance,
+    verified_raw_generator_execution, write_raw_cache_with_output, ExternalAnnotationCacheRequest,
+    ExternalAnnotationCacheUsage, ExternalAnnotationInput, ExternalAnnotationRecord,
+    GeneratorOutputIdentity, RawExternalPredictionCacheManifest, RawExternalPredictionIdentity,
+    RawExternalPredictionRecord, RawGeneratorProvenance, VerifiedRawGeneratorExecutionArtifacts,
+    RAW_EXTERNAL_PREDICTION_FEATURE_SCHEMA, RAW_GENERATOR_RUN_PROVENANCE_SCHEMA_V1,
+    RAW_GENERATOR_RUN_PROVENANCE_SCHEMA_V2,
 };
 use crate::input::{
     ExternalFeatureEngine, ExternalFeatureFailPolicy, ExternalFeatureGenerationSettings,
     ExternalFeatureUseMode,
 };
 use crate::provenance::{sha256_file, write_json_atomic};
-
-const GENERATOR_RUN_PROVENANCE_SCHEMA: &str = "sage-raw-generator-run-v1";
 
 #[derive(Clone, Debug, serde::Serialize, serde::Deserialize, PartialEq, Eq)]
 pub struct GeneratorArtifactIdentity {
@@ -37,11 +41,61 @@ pub struct GeneratorArtifactIdentity {
 #[derive(Clone, Debug, serde::Serialize, serde::Deserialize, PartialEq, Eq)]
 pub struct GeneratorRunProvenance {
     pub schema: String,
-    pub raw_prediction_identity: RawExternalPredictionIdentity,
+    pub raw_prediction_identity: RecordedRawPredictionIdentity,
     pub candidate_input: GeneratorArtifactIdentity,
     pub generator_config: GeneratorArtifactIdentity,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub generator_output: Option<GeneratorArtifactIdentity>,
+    /// Expanded immutable generator components. Historical v1 sidecars omit
+    /// this field; v2 sidecars make every wrapper/environment/model component
+    /// independently auditable.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub generator_components: Option<RawGeneratorProvenance>,
+}
+
+#[derive(Clone, Debug, serde::Serialize, serde::Deserialize, PartialEq, Eq)]
+pub struct LegacyRawPredictionIdentity {
+    pub schema_version: u32,
+    pub digest: String,
+    pub search_fingerprint: String,
+    pub generator_settings_sha256: String,
+    pub raw_input_sha256: String,
+    pub stable_candidate_id_schema: String,
+    pub feature_schema: String,
+    pub requested_candidate_count: usize,
+    pub requested_max_rank: u32,
+    pub model_components: Vec<crate::external_feature_cache::ModelComponentIdentity>,
+}
+
+#[derive(Clone, Debug, serde::Serialize, serde::Deserialize, PartialEq, Eq)]
+#[serde(untagged)]
+pub enum RecordedRawPredictionIdentity {
+    Layered(RawExternalPredictionIdentity),
+    Legacy(LegacyRawPredictionIdentity),
+}
+
+#[derive(Clone, Debug, serde::Serialize, serde::Deserialize, PartialEq, Eq)]
+pub struct ProvenanceComponentMismatch {
+    pub component: String,
+    pub recorded: String,
+    pub recomputed: String,
+}
+
+fn mismatch(
+    mismatches: &mut Vec<ProvenanceComponentMismatch>,
+    component: impl Into<String>,
+    recorded: impl ToString,
+    recomputed: impl ToString,
+) {
+    let recorded = recorded.to_string();
+    let recomputed = recomputed.to_string();
+    if recorded != recomputed {
+        mismatches.push(ProvenanceComponentMismatch {
+            component: component.into(),
+            recorded,
+            recomputed,
+        });
+    }
 }
 
 fn artifact_identity(path: &Path) -> Result<GeneratorArtifactIdentity> {
@@ -57,6 +111,165 @@ fn artifact_identity(path: &Path) -> Result<GeneratorArtifactIdentity> {
         size_bytes: metadata.len(),
         sha256: sha256_file(path)?,
     })
+}
+
+fn artifact_content_identity(artifact: &GeneratorArtifactIdentity) -> GeneratorOutputIdentity {
+    GeneratorOutputIdentity {
+        sha256: artifact.sha256.clone(),
+        size_bytes: artifact.size_bytes,
+    }
+}
+
+fn compare_artifact(
+    label: &str,
+    recorded: &GeneratorArtifactIdentity,
+    actual: &GeneratorArtifactIdentity,
+    mismatches: &mut Vec<ProvenanceComponentMismatch>,
+) {
+    mismatch(
+        mismatches,
+        format!("{label}.path"),
+        recorded.path.display(),
+        actual.path.display(),
+    );
+    mismatch(
+        mismatches,
+        format!("{label}.size_bytes"),
+        recorded.size_bytes,
+        actual.size_bytes,
+    );
+    mismatch(
+        mismatches,
+        format!("{label}.sha256"),
+        &recorded.sha256,
+        &actual.sha256,
+    );
+}
+
+fn compare_generator_components(
+    recorded: &RawGeneratorProvenance,
+    recomputed: &RawGeneratorProvenance,
+    mismatches: &mut Vec<ProvenanceComponentMismatch>,
+) -> Result<()> {
+    mismatch(
+        mismatches,
+        "generator_components.schema_version",
+        recorded.schema_version,
+        recomputed.schema_version,
+    );
+    mismatch(
+        mismatches,
+        "generator_components.settings_sha256",
+        &recorded.generator_settings_sha256,
+        &recomputed.generator_settings_sha256,
+    );
+    for (name, left, right) in [
+        ("wrapper", &recorded.command, &recomputed.command),
+        ("python", &recorded.python, &recomputed.python),
+    ] {
+        mismatch(
+            mismatches,
+            format!("generator_components.{name}"),
+            serde_json::to_string(left)?,
+            serde_json::to_string(right)?,
+        );
+    }
+    mismatch(
+        mismatches,
+        "generator_components.python_environment",
+        recorded.python_environment.as_deref().unwrap_or("<none>"),
+        recomputed.python_environment.as_deref().unwrap_or("<none>"),
+    );
+    for (name, left, right) in [
+        (
+            "package_metadata",
+            serde_json::to_string(&recorded.package_metadata)?,
+            serde_json::to_string(&recomputed.package_metadata)?,
+        ),
+        (
+            "model_components",
+            serde_json::to_string(&recorded.model_components)?,
+            serde_json::to_string(&recomputed.model_components)?,
+        ),
+        (
+            "model_files",
+            serde_json::to_string(&recorded.model_files)?,
+            serde_json::to_string(&recomputed.model_files)?,
+        ),
+    ] {
+        mismatch(
+            mismatches,
+            format!("generator_components.{name}"),
+            left,
+            right,
+        );
+    }
+    Ok(())
+}
+
+fn compare_layered_identity(
+    recorded: &RawExternalPredictionIdentity,
+    recomputed: &RawExternalPredictionIdentity,
+    mismatches: &mut Vec<ProvenanceComponentMismatch>,
+) -> Result<()> {
+    for (component, left, right) in [
+        (
+            "candidate_pool.search_fingerprint",
+            recorded.search_fingerprint.as_str(),
+            recomputed.search_fingerprint.as_str(),
+        ),
+        (
+            "generator.settings_sha256",
+            recorded.generator_execution_settings_sha256.as_str(),
+            recomputed.generator_execution_settings_sha256.as_str(),
+        ),
+        (
+            "candidate_export.population_sha256",
+            recorded.raw_input_sha256.as_str(),
+            recomputed.raw_input_sha256.as_str(),
+        ),
+        (
+            "candidate.stable_id_schema",
+            recorded.stable_candidate_id_schema.as_str(),
+            recomputed.stable_candidate_id_schema.as_str(),
+        ),
+        (
+            "generator.feature_schema",
+            recorded.feature_schema.as_str(),
+            recomputed.feature_schema.as_str(),
+        ),
+    ] {
+        mismatch(mismatches, component, left, right);
+    }
+    mismatch(
+        mismatches,
+        "candidate.count",
+        recorded.requested_candidate_count,
+        recomputed.requested_candidate_count,
+    );
+    mismatch(
+        mismatches,
+        "candidate.rank_depth",
+        recorded.requested_max_rank,
+        recomputed.requested_max_rank,
+    );
+    mismatch(
+        mismatches,
+        "generator.model_components",
+        serde_json::to_string(&recorded.model_components)?,
+        serde_json::to_string(&recomputed.model_components)?,
+    );
+    Ok(())
+}
+
+fn fail_on_provenance_mismatches(mismatches: Vec<ProvenanceComponentMismatch>) -> Result<()> {
+    if mismatches.is_empty() {
+        return Ok(());
+    }
+    anyhow::bail!(
+        "preserved generator provenance mismatch: {}",
+        serde_json::to_string(&mismatches)?
+    )
 }
 
 #[derive(Clone, Debug, Eq, PartialEq, Hash)]
@@ -104,6 +317,12 @@ pub struct RawCacheOnlyConstructionResult {
     pub stage_calibration_performed: bool,
     pub downstream_stages_entered: Vec<String>,
     pub stop_guarantee: Vec<String>,
+}
+
+pub struct ExistingRawCacheFinalizationRequest<'a> {
+    pub cache_root: &'a Path,
+    pub output_tsv: &'a Path,
+    pub legacy_generator_source_root: Option<&'a Path>,
 }
 
 /// Generate or exactly reopen only the model-independent raw external
@@ -180,7 +399,7 @@ pub fn construct_raw_cache_only(
     )?;
     let provenance = raw_generator_provenance(settings, cache_root, true)?;
     anyhow::ensure!(
-        provenance.generator_settings_sha256 == identity.generator_settings_sha256,
+        provenance.generator_settings_sha256 == identity.generator_execution_settings_sha256,
         "raw-cache-only generator provenance disagrees with the raw identity"
     );
     anyhow::ensure!(
@@ -327,11 +546,12 @@ pub fn construct_raw_cache_only(
                 "raw-cache-only generator identity changed after candidate export"
             );
             let mut run_provenance = GeneratorRunProvenance {
-                schema: GENERATOR_RUN_PROVENANCE_SCHEMA.into(),
-                raw_prediction_identity: identity.clone(),
+                schema: RAW_GENERATOR_RUN_PROVENANCE_SCHEMA_V2.into(),
+                raw_prediction_identity: RecordedRawPredictionIdentity::Layered(identity.clone()),
                 candidate_input: artifact_identity(&psm_path)?,
                 generator_config: artifact_identity(&config_path)?,
                 generator_output: None,
+                generator_components: Some(provenance.clone()),
             };
             write_json_atomic(&provenance_path, &run_provenance)?;
             generator_invoked = true;
@@ -371,11 +591,27 @@ pub fn construct_raw_cache_only(
                 "raw-cache-only generator identity changed during annotation"
             );
             let output_identity = generator_output_identity(&output_tsv)?;
+            let generator_execution = verified_raw_generator_execution(
+                &identity,
+                provenance.clone(),
+                VerifiedRawGeneratorExecutionArtifacts {
+                    recorded_provenance_schema: run_provenance.schema.clone(),
+                    candidate_export: artifact_content_identity(&run_provenance.candidate_input),
+                    generator_configuration: artifact_content_identity(
+                        &run_provenance.generator_config,
+                    ),
+                    generator_output: output_identity,
+                    provenance_sha256: sha256_file(&provenance_path)?,
+                    legacy_raw_prediction_fingerprint: None,
+                    legacy_generator_settings_sha256: None,
+                    legacy_rust_source_sha256: None,
+                },
+            )?;
             let (manifest, reused) = publish_raw_cache_atomic_with_output(
                 &directory,
                 &identity,
                 records,
-                output_identity,
+                generator_execution,
             )?;
             anyhow::ensure!(
                 !reused,
@@ -445,9 +681,13 @@ pub fn finalize_raw_cache_from_existing_output(
     mzml_paths: &[Url],
     db: &IndexedDatabase,
     search_fingerprint: &str,
-    cache_root: &Path,
-    output_tsv: &Path,
+    request: ExistingRawCacheFinalizationRequest<'_>,
 ) -> Result<RawCacheOnlyConstructionResult> {
+    let ExistingRawCacheFinalizationRequest {
+        cache_root,
+        output_tsv,
+        legacy_generator_source_root,
+    } = request;
     anyhow::ensure!(
         settings.enabled && settings.feature_only,
         "raw-cache recovery requires feature-only external features"
@@ -475,7 +715,7 @@ pub fn finalize_raw_cache_from_existing_output(
     )?;
     let provenance = raw_generator_provenance(settings, cache_root, true)?;
     anyhow::ensure!(
-        provenance.generator_settings_sha256 == identity.generator_settings_sha256,
+        provenance.generator_settings_sha256 == identity.generator_execution_settings_sha256,
         "raw-cache recovery generator identity mismatch"
     );
     let directory = raw_cache_directory(cache_root, &identity);
@@ -496,14 +736,194 @@ pub fn finalize_raw_cache_from_existing_output(
     let recorded: GeneratorRunProvenance =
         serde_json::from_slice(&std::fs::read(&provenance_path)?)
             .context("invalid generator run provenance")?;
-    anyhow::ensure!(
-        recorded.schema == GENERATOR_RUN_PROVENANCE_SCHEMA
-            && recorded.raw_prediction_identity == identity
-            && recorded.candidate_input == artifact_identity(&psm_path)?
-            && recorded.generator_config == artifact_identity(&config_path)?
-            && recorded.generator_output.as_ref() == Some(&artifact_identity(output_tsv)?),
-        "preserved generator artifacts do not match their originating provenance"
+    let actual_candidate_input = artifact_identity(&psm_path)?;
+    let actual_generator_config = artifact_identity(&config_path)?;
+    let actual_generator_output = artifact_identity(output_tsv)?;
+    let provenance_sha256 = sha256_file(&provenance_path)?;
+    let mut mismatches = Vec::new();
+    compare_artifact(
+        "candidate_export",
+        &recorded.candidate_input,
+        &actual_candidate_input,
+        &mut mismatches,
     );
+    compare_artifact(
+        "generator_configuration",
+        &recorded.generator_config,
+        &actual_generator_config,
+        &mut mismatches,
+    );
+    match recorded.generator_output.as_ref() {
+        Some(expected) => compare_artifact(
+            "generator_output",
+            expected,
+            &actual_generator_output,
+            &mut mismatches,
+        ),
+        None => mismatch(
+            &mut mismatches,
+            "generator_output",
+            "<missing>",
+            serde_json::to_string(&actual_generator_output)?,
+        ),
+    }
+
+    let (legacy_fingerprint, legacy_settings, legacy_source) = match recorded.schema.as_str() {
+        RAW_GENERATOR_RUN_PROVENANCE_SCHEMA_V1 => {
+            let legacy = match &recorded.raw_prediction_identity {
+                RecordedRawPredictionIdentity::Legacy(legacy) => legacy,
+                RecordedRawPredictionIdentity::Layered(_layered) => {
+                    mismatch(
+                        &mut mismatches,
+                        "raw_prediction_identity.kind",
+                        "layered",
+                        "legacy",
+                    );
+                    fail_on_provenance_mismatches(mismatches)?;
+                    unreachable!()
+                }
+            };
+            let source_root = legacy_generator_source_root.context(
+                "legacy generator provenance requires --legacy-generator-source-root containing the exact historical source bytes",
+            )?;
+            let source_sha256 = legacy_external_cache_source_sha256(source_root)?;
+            let settings_sha256 = legacy_raw_generator_settings_sha256_with_existing_probe_root(
+                settings,
+                cache_root,
+                &source_sha256,
+            )?;
+            mismatch(
+                &mut mismatches,
+                "identity.schema_version",
+                legacy.schema_version,
+                2,
+            );
+            mismatch(
+                &mut mismatches,
+                "candidate_pool.search_fingerprint",
+                &legacy.search_fingerprint,
+                &identity.search_fingerprint,
+            );
+            mismatch(
+                &mut mismatches,
+                "generator.settings_sha256",
+                &legacy.generator_settings_sha256,
+                &settings_sha256,
+            );
+            mismatch(
+                &mut mismatches,
+                "candidate_export.population_sha256",
+                &legacy.raw_input_sha256,
+                &identity.raw_input_sha256,
+            );
+            mismatch(
+                &mut mismatches,
+                "candidate.stable_id_schema",
+                &legacy.stable_candidate_id_schema,
+                &identity.stable_candidate_id_schema,
+            );
+            mismatch(
+                &mut mismatches,
+                "generator.feature_schema",
+                &legacy.feature_schema,
+                RAW_EXTERNAL_PREDICTION_FEATURE_SCHEMA,
+            );
+            mismatch(
+                &mut mismatches,
+                "candidate.count",
+                legacy.requested_candidate_count,
+                identity.requested_candidate_count,
+            );
+            mismatch(
+                &mut mismatches,
+                "candidate.rank_depth",
+                legacy.requested_max_rank,
+                identity.requested_max_rank,
+            );
+            mismatch(
+                &mut mismatches,
+                "generator.model_components",
+                serde_json::to_string(&legacy.model_components)?,
+                serde_json::to_string(&identity.model_components)?,
+            );
+            let recomputed_fingerprint = legacy_raw_prediction_fingerprint(
+                &legacy.search_fingerprint,
+                &settings_sha256,
+                &legacy.raw_input_sha256,
+                &legacy.stable_candidate_id_schema,
+                &legacy.feature_schema,
+                legacy.requested_max_rank,
+                legacy.requested_candidate_count,
+            );
+            mismatch(
+                &mut mismatches,
+                "identity.aggregate_digest",
+                &legacy.digest,
+                &recomputed_fingerprint,
+            );
+            (
+                Some(legacy.digest.clone()),
+                Some(settings_sha256),
+                Some(source_sha256),
+            )
+        }
+        RAW_GENERATOR_RUN_PROVENANCE_SCHEMA_V2 => {
+            let layered = match &recorded.raw_prediction_identity {
+                RecordedRawPredictionIdentity::Layered(layered) => layered,
+                RecordedRawPredictionIdentity::Legacy(_) => {
+                    mismatch(
+                        &mut mismatches,
+                        "raw_prediction_identity.kind",
+                        "legacy",
+                        "layered",
+                    );
+                    fail_on_provenance_mismatches(mismatches)?;
+                    unreachable!()
+                }
+            };
+            compare_layered_identity(layered, &identity, &mut mismatches)?;
+            match recorded.generator_components.as_ref() {
+                Some(components) => {
+                    compare_generator_components(components, &provenance, &mut mismatches)?
+                }
+                None => mismatch(
+                    &mut mismatches,
+                    "generator_components",
+                    "<missing>",
+                    "required for v2 provenance",
+                ),
+            }
+            (None, None, None)
+        }
+        unsupported => {
+            mismatch(
+                &mut mismatches,
+                "provenance.schema",
+                unsupported,
+                format!(
+                    "{} or {}",
+                    RAW_GENERATOR_RUN_PROVENANCE_SCHEMA_V1, RAW_GENERATOR_RUN_PROVENANCE_SCHEMA_V2
+                ),
+            );
+            fail_on_provenance_mismatches(mismatches)?;
+            unreachable!()
+        }
+    };
+    fail_on_provenance_mismatches(mismatches)?;
+    let generator_execution = verified_raw_generator_execution(
+        &identity,
+        provenance.clone(),
+        VerifiedRawGeneratorExecutionArtifacts {
+            recorded_provenance_schema: recorded.schema.clone(),
+            candidate_export: artifact_content_identity(&actual_candidate_input),
+            generator_configuration: artifact_content_identity(&actual_generator_config),
+            generator_output: artifact_content_identity(&actual_generator_output),
+            provenance_sha256,
+            legacy_raw_prediction_fingerprint: legacy_fingerprint,
+            legacy_generator_settings_sha256: legacy_settings,
+            legacy_rust_source_sha256: legacy_source,
+        },
+    )?;
 
     let validation = std::env::temp_dir().join(format!(
         "sage-raw-cache-recovery-validation.{}.{}",
@@ -557,8 +977,9 @@ pub fn finalize_raw_cache_from_existing_output(
         let (manifest, _) = load_raw_cache(&directory, &identity)?
             .context("existing raw cache is incomplete or incompatible")?;
         anyhow::ensure!(
-            manifest.generator_output == output_identity,
-            "existing raw cache binds a different generator output"
+            manifest.generator_output == output_identity
+                && manifest.generator_execution == generator_execution,
+            "existing raw cache binds a different verified generator execution"
         );
         (manifest, true)
     } else {
@@ -585,7 +1006,7 @@ pub fn finalize_raw_cache_from_existing_output(
             &directory,
             &identity,
             records,
-            output_identity.clone(),
+            generator_execution,
         )?;
         anyhow::ensure!(
             !reused,
@@ -784,11 +1205,28 @@ fn add_external_features_inner(
                         .map(|record| raw_record(record.stable_id, record.features))
                         .collect::<Result<Vec<_>>>()?;
                     let legacy_payload = legacy_directory.join(&legacy_manifest.payload_file);
+                    let output_identity = generator_output_identity(&legacy_payload)?;
+                    let generator_provenance =
+                        raw_generator_provenance(settings, &request.root, true)?;
+                    let generator_execution = verified_raw_generator_execution(
+                        &raw_identity,
+                        generator_provenance,
+                        VerifiedRawGeneratorExecutionArtifacts {
+                            recorded_provenance_schema: "sage-schema-v2-cache-migration-v1".into(),
+                            candidate_export: output_identity.clone(),
+                            generator_configuration: output_identity.clone(),
+                            generator_output: output_identity,
+                            provenance_sha256: legacy_manifest.payload_sha256.clone(),
+                            legacy_raw_prediction_fingerprint: None,
+                            legacy_generator_settings_sha256: None,
+                            legacy_rust_source_sha256: None,
+                        },
+                    )?;
                     let raw_manifest = write_raw_cache_with_output(
                         &directory,
                         &raw_identity,
                         raw_records,
-                        generator_output_identity(&legacy_payload)?,
+                        generator_execution,
                         Some(&legacy_manifest),
                     )?;
                     log::info!(
@@ -934,13 +1372,33 @@ fn add_external_features_inner(
             .into_iter()
             .map(|(index, stable_id)| raw_record(stable_id, features[index].core.external_features))
             .collect::<Result<Vec<_>>>()?;
-        let manifest = write_raw_cache_with_output(
-            &directory,
-            &identity,
-            records,
-            generator_output_identity(&output_tsv)?,
-            None,
+        let generator_provenance = raw_generator_provenance(
+            settings,
+            &cache_request
+                .expect("prepared cache has a cache request")
+                .root,
+            true,
         )?;
+        let candidate_input = generator_output_identity(&psm_path)?;
+        let generator_config = generator_output_identity(&config_path)?;
+        let generator_output = generator_output_identity(&output_tsv)?;
+        let generator_provenance_sha256 = raw_generator_provenance_sha256(&generator_provenance)?;
+        let generator_execution = verified_raw_generator_execution(
+            &identity,
+            generator_provenance,
+            VerifiedRawGeneratorExecutionArtifacts {
+                recorded_provenance_schema: RAW_GENERATOR_RUN_PROVENANCE_SCHEMA_V2.into(),
+                candidate_export: candidate_input,
+                generator_configuration: generator_config,
+                generator_output,
+                provenance_sha256: generator_provenance_sha256,
+                legacy_raw_prediction_fingerprint: None,
+                legacy_generator_settings_sha256: None,
+                legacy_rust_source_sha256: None,
+            },
+        )?;
+        let manifest =
+            write_raw_cache_with_output(&directory, &identity, records, generator_execution, None)?;
         log::info!(
             "raw MS2Rescore prediction cache: wrote {}/{} joined predictions to {} (raw_fingerprint={}, calibration_fingerprint={})",
             manifest.joined_prediction_count,
@@ -2401,6 +2859,134 @@ mod path_tests {
     }
 
     #[test]
+    fn structured_provenance_diagnostics_report_all_differences() {
+        let finalizer = crate::external_feature_cache::current_raw_cache_finalizer_identity();
+        let baseline = RawExternalPredictionIdentity {
+            schema_version: 3,
+            digest: "digest".into(),
+            search_fingerprint: "pool-a".into(),
+            generator_execution_settings_sha256: "settings-a".into(),
+            finalizer,
+            raw_input_sha256: "population-a".into(),
+            stable_candidate_id_schema: "candidate-schema-a".into(),
+            feature_schema: "feature-schema-a".into(),
+            requested_candidate_count: 2,
+            requested_max_rank: 50,
+            model_components: Vec::new(),
+        };
+        let mut changed = baseline.clone();
+        changed.search_fingerprint = "pool-b".into();
+        changed.generator_execution_settings_sha256 = "settings-b".into();
+        changed.raw_input_sha256 = "population-b".into();
+        changed.stable_candidate_id_schema = "candidate-schema-b".into();
+        changed.feature_schema = "feature-schema-b".into();
+        changed.requested_candidate_count = 3;
+        changed.requested_max_rank = 49;
+        changed
+            .model_components
+            .push(crate::external_feature_cache::ModelComponentIdentity {
+                generator: "ms2pip".into(),
+                logical_model_name: "changed".into(),
+                relative_filename: "changed.model".into(),
+                size_bytes: 1,
+                sha256: "model-b".into(),
+            });
+        let mut mismatches = Vec::new();
+        compare_layered_identity(&baseline, &changed, &mut mismatches).unwrap();
+        let names = mismatches
+            .iter()
+            .map(|item| item.component.as_str())
+            .collect::<std::collections::HashSet<_>>();
+        for expected in [
+            "candidate_pool.search_fingerprint",
+            "generator.settings_sha256",
+            "candidate_export.population_sha256",
+            "candidate.stable_id_schema",
+            "generator.feature_schema",
+            "candidate.count",
+            "candidate.rank_depth",
+            "generator.model_components",
+        ] {
+            assert!(names.contains(expected), "missing diagnostic {expected}");
+        }
+
+        let artifact_a = GeneratorArtifactIdentity {
+            path: "a".into(),
+            size_bytes: 1,
+            sha256: "sha-a".into(),
+        };
+        let artifact_b = GeneratorArtifactIdentity {
+            path: "b".into(),
+            size_bytes: 2,
+            sha256: "sha-b".into(),
+        };
+        let mut artifact_mismatches = Vec::new();
+        compare_artifact(
+            "generator_output",
+            &artifact_a,
+            &artifact_b,
+            &mut artifact_mismatches,
+        );
+        assert_eq!(artifact_mismatches.len(), 3);
+
+        let component_a = RawGeneratorProvenance {
+            schema_version: 1,
+            generator_settings_sha256: "settings-a".into(),
+            command: None,
+            python: None,
+            python_environment: None,
+            package_metadata: Vec::new(),
+            model_components: Vec::new(),
+            model_files: Vec::new(),
+            probe_path: None,
+            probe_sha256: None,
+        };
+        let mut component_b = component_a.clone();
+        component_b.schema_version = 2;
+        component_b.generator_settings_sha256 = "settings-b".into();
+        component_b.command = Some(crate::external_feature_cache::RawGeneratorSourceIdentity {
+            source: "wrapper".into(),
+            kind: "file".into(),
+            sha256: "wrapper-b".into(),
+        });
+        component_b.python = Some(crate::external_feature_cache::RawGeneratorSourceIdentity {
+            source: "python".into(),
+            kind: "file".into(),
+            sha256: "python-b".into(),
+        });
+        component_b.python_environment = Some("environment-b".into());
+        component_b.package_metadata.push(
+            crate::external_feature_cache::RawGeneratorFileIdentity {
+                path: "package".into(),
+                size_bytes: 1,
+                sha256: "package-b".into(),
+            },
+        );
+        component_b
+            .model_files
+            .push(crate::external_feature_cache::RawGeneratorFileIdentity {
+                path: "model".into(),
+                size_bytes: 1,
+                sha256: "model-b".into(),
+            });
+        let mut component_mismatches = Vec::new();
+        compare_generator_components(&component_a, &component_b, &mut component_mismatches)
+            .unwrap();
+        let rendered = serde_json::to_string(&component_mismatches).unwrap();
+        for expected in [
+            "schema_version",
+            "settings_sha256",
+            "wrapper",
+            "python",
+            "python_environment",
+            "package_metadata",
+            "model_files",
+        ] {
+            assert!(rendered.contains(expected), "missing diagnostic {expected}");
+        }
+    }
+
+    #[test]
     fn production_tsv_whole_lane_missingness_is_classified_before_numeric_parsing() {
         let finite =
             parsed_features(["0.8", "0.7", "0.6"], ["12.5", "12.0", "0.5"], "1.1").unwrap();
@@ -2708,7 +3294,60 @@ mod path_tests {
             .unwrap();
         let preserved_output = transient.join("generator.output.psms.tsv");
         assert!(preserved_output.is_file());
-        assert!(transient.join("generator.provenance.json").is_file());
+        let provenance_path = transient.join("generator.provenance.json");
+        assert!(provenance_path.is_file());
+
+        // Recast this production-shaped preserved run as historical v1
+        // provenance. Exact historical source bytes are required to reconstruct
+        // its old conflated aggregate; the current finalizer remains separate.
+        let legacy_source_root = root.join("legacy-source");
+        for relative in [
+            "crates/sage-cli/src/external_feature_cache.rs",
+            "crates/sage-cli/src/external_features.rs",
+        ] {
+            let path = legacy_source_root.join(relative);
+            std::fs::create_dir_all(path.parent().unwrap()).unwrap();
+            std::fs::write(&path, format!("historical source fixture: {relative}\n")).unwrap();
+        }
+        let legacy_source_sha256 =
+            legacy_external_cache_source_sha256(&legacy_source_root).unwrap();
+        let legacy_settings_sha256 = legacy_raw_generator_settings_sha256_with_existing_probe_root(
+            &settings,
+            &root,
+            &legacy_source_sha256,
+        )
+        .unwrap();
+        let mut run: GeneratorRunProvenance =
+            serde_json::from_slice(&std::fs::read(&provenance_path).unwrap()).unwrap();
+        let layered = match &run.raw_prediction_identity {
+            RecordedRawPredictionIdentity::Layered(layered) => layered.clone(),
+            RecordedRawPredictionIdentity::Legacy(_) => panic!("new run must use v2 provenance"),
+        };
+        let legacy_digest = legacy_raw_prediction_fingerprint(
+            &layered.search_fingerprint,
+            &legacy_settings_sha256,
+            &layered.raw_input_sha256,
+            &layered.stable_candidate_id_schema,
+            &layered.feature_schema,
+            layered.requested_max_rank,
+            layered.requested_candidate_count,
+        );
+        run.schema = RAW_GENERATOR_RUN_PROVENANCE_SCHEMA_V1.into();
+        run.raw_prediction_identity =
+            RecordedRawPredictionIdentity::Legacy(LegacyRawPredictionIdentity {
+                schema_version: 2,
+                digest: legacy_digest.clone(),
+                search_fingerprint: layered.search_fingerprint,
+                generator_settings_sha256: legacy_settings_sha256.clone(),
+                raw_input_sha256: layered.raw_input_sha256,
+                stable_candidate_id_schema: layered.stable_candidate_id_schema,
+                feature_schema: layered.feature_schema,
+                requested_candidate_count: layered.requested_candidate_count,
+                requested_max_rank: layered.requested_max_rank,
+                model_components: layered.model_components,
+            });
+        run.generator_components = None;
+        write_json_atomic(&provenance_path, &run).unwrap();
         std::fs::remove_dir_all(&report.directory).unwrap();
 
         let mut recovery_features = vec![FeatureCore {
@@ -2719,14 +3358,50 @@ mod path_tests {
             ..FeatureCore::default()
         }
         .to_df()];
+        let altered_source_root = root.join("altered-legacy-source");
+        for relative in [
+            "crates/sage-cli/src/external_feature_cache.rs",
+            "crates/sage-cli/src/external_features.rs",
+        ] {
+            let source = legacy_source_root.join(relative);
+            let target = altered_source_root.join(relative);
+            std::fs::create_dir_all(target.parent().unwrap()).unwrap();
+            std::fs::copy(source, &target).unwrap();
+        }
+        std::fs::write(
+            altered_source_root.join("crates/sage-cli/src/external_features.rs"),
+            "different historical source bytes\n",
+        )
+        .unwrap();
+        let rejected = finalize_raw_cache_from_existing_output(
+            &mut recovery_features,
+            &settings,
+            &[],
+            &database,
+            "search",
+            ExistingRawCacheFinalizationRequest {
+                cache_root: &root,
+                output_tsv: &preserved_output,
+                legacy_generator_source_root: Some(&altered_source_root),
+            },
+        )
+        .unwrap_err();
+        let rejected = format!("{rejected:#}");
+        assert!(rejected.contains("generator.settings_sha256"));
+        assert!(!report.directory.exists());
+        assert_eq!(std::fs::read(&marker).unwrap(), b"x");
+
         let recovered = finalize_raw_cache_from_existing_output(
             &mut recovery_features,
             &settings,
             &[],
             &database,
             "search",
-            &root,
-            &preserved_output,
+            ExistingRawCacheFinalizationRequest {
+                cache_root: &root,
+                output_tsv: &preserved_output,
+                legacy_generator_source_root: Some(&legacy_source_root),
+            },
         )
         .unwrap();
         assert!(!recovered.external_generator_invoked);
@@ -2734,6 +3409,26 @@ mod path_tests {
         assert_eq!(std::fs::read(&marker).unwrap(), b"x");
         assert_eq!(recovered.manifest.missingness.ms2pip_unavailable_count, 1);
         assert_eq!(recovered.manifest.missingness.deeplc_unavailable_count, 0);
+        assert_eq!(
+            recovered
+                .manifest
+                .generator_execution
+                .legacy_raw_prediction_fingerprint
+                .as_deref(),
+            Some(legacy_digest.as_str())
+        );
+        assert_eq!(
+            recovered
+                .manifest
+                .generator_execution
+                .legacy_rust_source_sha256
+                .as_deref(),
+            Some(legacy_source_sha256.as_str())
+        );
+        assert_eq!(
+            recovered.manifest.identity.finalizer,
+            crate::external_feature_cache::current_raw_cache_finalizer_identity()
+        );
         let recovered_manifest_bytes = std::fs::read(&recovered.manifest_path).unwrap();
         let recovered_payload_bytes = std::fs::read(&recovered.payload_path).unwrap();
         let (_, recovered_records) = load_raw_cache(&recovered.directory, &recovered.identity)
@@ -2754,8 +3449,11 @@ mod path_tests {
             &[],
             &database,
             "search",
-            &root,
-            &preserved_output,
+            ExistingRawCacheFinalizationRequest {
+                cache_root: &root,
+                output_tsv: &preserved_output,
+                legacy_generator_source_root: Some(&legacy_source_root),
+            },
         )
         .unwrap();
         assert!(replay.reused_existing_exact);

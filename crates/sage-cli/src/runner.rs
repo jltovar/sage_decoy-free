@@ -9,7 +9,7 @@ use crate::candidate_pool::{
 use crate::external_feature_cache::{ExternalAnnotationCacheRequest, ExternalAnnotationCacheUsage};
 use crate::external_features::{
     construct_raw_cache_only, finalize_raw_cache_from_existing_output, maybe_add_external_features,
-    RawCacheOnlyConstructionResult,
+    ExistingRawCacheFinalizationRequest, RawCacheOnlyConstructionResult,
 };
 use crate::provenance::sha256_file;
 use anyhow::Context;
@@ -401,6 +401,7 @@ impl Runner {
         annotation_cache_root: std::path::PathBuf,
         required_rank_depth: usize,
         generator_output_tsv: std::path::PathBuf,
+        legacy_generator_source_root: Option<std::path::PathBuf>,
     ) -> anyhow::Result<RawCacheConstructionReport> {
         anyhow::ensure!(
             self.decoy_free_mode,
@@ -437,8 +438,11 @@ impl Runner {
             &self.parameters.mzml_paths,
             &self.database,
             &candidate_usage.search_fingerprint,
-            &annotation_cache_root,
-            &generator_output_tsv,
+            ExistingRawCacheFinalizationRequest {
+                cache_root: &annotation_cache_root,
+                output_tsv: &generator_output_tsv,
+                legacy_generator_source_root: legacy_generator_source_root.as_deref(),
+            },
         )?;
         Ok(RawCacheConstructionReport {
             schema_version: 2,
