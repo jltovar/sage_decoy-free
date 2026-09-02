@@ -6,11 +6,13 @@ use crate::candidate_pool::{
 use crate::entrapment::{
     build_entrapment_partition, compare_generated_to_legacy, digestion_search_space_identity,
     entrapment_construction_identity, generate_foreign_entrapment, inspect_frozen_entrapment,
-    load_existing_entrapment_resource, resolve_entrapment_partition,
+    load_existing_entrapment_resource,
+    resolve_entrapment_partition_with_provenance_and_dataset_aliases,
     validate_entrapment_generation_report_inputs, EntrapmentDatabaseMode, EntrapmentDatabaseReport,
     EntrapmentFastaParityReport, EntrapmentGenerationMode, EntrapmentGenerationReport,
-    EntrapmentPartitionArtifact, EntrapmentSelectionView, ExistingEntrapmentResourceReference,
-    ForeignSourceMode, LegacyEntrapmentReference, SharedPeptideExclusionMode,
+    EntrapmentPartitionArtifact, EntrapmentPartitionVerifiedUseV1, EntrapmentSelectionView,
+    ExistingEntrapmentResourceReference, ForeignSourceMode, HistoricalDatasetIdentityAlias,
+    LegacyEntrapmentReference, PartitionDatasetIdentityContext, SharedPeptideExclusionMode,
 };
 use crate::external_feature_cache::{
     preflight_existing_cache_root, raw_generator_settings_sha256_with_existing_probe_root,
@@ -1727,6 +1729,10 @@ pub struct StageRecord {
     pub parameter_overrides: BTreeMap<String, ParameterValue>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub entrapment_partition_identity: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub entrapment_partition_scientific_content_sha256: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub entrapment_partition_artifact_sha256: Option<String>,
     /// Portable complete effective configuration consumed by this stage. New
     /// Ensemble locks require this field for every expert; legacy checkpoints
     /// remain readable but cannot be promoted into a target-only refit lock.
@@ -1759,6 +1765,8 @@ pub struct WorkflowState {
     pub entrapment_fasta_parity: Option<EntrapmentFastaParityReport>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub entrapment_partition: Option<EntrapmentPartitionArtifact>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub entrapment_partition_verification: Option<EntrapmentPartitionVerifiedUseV1>,
     pub baseline: Option<BaselineManifest>,
     pub stages: Vec<StageRecord>,
     #[serde(default)]
@@ -2559,6 +2567,44 @@ fn compute_dataset_identity(manifest: &WorkflowManifest) -> Result<DatasetIdenti
     })
 }
 
+/// Reconstruct the dataset fingerprint used before directory-backed spectral
+/// inputs acquired a content identity. Directory strings were historically
+/// treated as unresolved sources and path-hashed. This alias is used only to
+/// authenticate an immutable historical partition; portable current and
+/// downstream identities always use `compute_dataset_identity`.
+fn historical_directory_unaware_dataset_identity(
+    manifest: &WorkflowManifest,
+) -> Result<HistoricalDatasetIdentityAlias> {
+    let target_fasta_sha256 = content_sha256(&manifest.target_fasta)?;
+    let mut spectra_sha256 = manifest
+        .spectra
+        .iter()
+        .map(|source| {
+            let path = Path::new(source);
+            if path.is_file() {
+                content_sha256(path)
+            } else {
+                let mut hasher = Sha256::new();
+                hasher.update(b"unresolved-spectrum-source:");
+                hasher.update(source.as_bytes());
+                Ok(format!("{:x}", hasher.finalize()))
+            }
+        })
+        .collect::<Result<Vec<_>>>()?;
+    spectra_sha256.sort();
+    let mut hasher = Sha256::new();
+    hasher.update(b"sage-decoy-free-dataset-v1\0");
+    hasher.update(target_fasta_sha256.as_bytes());
+    for digest in &spectra_sha256 {
+        hasher.update(b"\0");
+        hasher.update(digest.as_bytes());
+    }
+    Ok(HistoricalDatasetIdentityAlias {
+        schema: "sage-decoy-free-dataset-v1-directory-as-unresolved-source-string".into(),
+        identity: format!("{:x}", hasher.finalize()),
+    })
+}
+
 fn expert_identity(model: &ModelFit) -> ExpertIdentity {
     ExpertIdentity::from(model)
 }
@@ -2799,14 +2845,21 @@ pub fn materialize_workflow_entrapment_partition(
         .context("selection_audit requires entrapment.partition_artifact")?;
     let (parameters, dataset, active_entrapment_fasta, construction_identity) =
         workflow_entrapment_partition_inputs(&manifest)?;
-    resolve_entrapment_partition(
-        &parameters,
-        &dataset.fingerprint,
-        &manifest.target_fasta,
-        &active_entrapment_fasta,
-        &construction_identity,
-        &config.entrapment_validation,
-        artifact_path,
+    let aliases = [historical_directory_unaware_dataset_identity(&manifest)?];
+    Ok(
+        resolve_entrapment_partition_with_provenance_and_dataset_aliases(
+            &parameters,
+            PartitionDatasetIdentityContext {
+                current: &dataset.fingerprint,
+                historical_aliases: &aliases,
+            },
+            &manifest.target_fasta,
+            &active_entrapment_fasta,
+            &construction_identity,
+            &config.entrapment_validation,
+            artifact_path,
+        )?
+        .artifact,
     )
 }
 
@@ -3063,22 +3116,29 @@ fn strict_resource_preflight(
             &construction_identity,
             &config.entrapment_validation,
         )?;
-        let (partition, reused, status, manifest_sha256) = if partition_path.is_file() {
+        let (partition, verification, reused, status, manifest_sha256) = if partition_path.is_file()
+        {
             let mut require_existing = config.entrapment_validation.clone();
             require_existing.require_existing_partition = true;
-            let partition = resolve_entrapment_partition(
+            let aliases = [historical_directory_unaware_dataset_identity(manifest)?];
+            let verified = resolve_entrapment_partition_with_provenance_and_dataset_aliases(
                 &parameters,
-                &expected.dataset_identity,
+                PartitionDatasetIdentityContext {
+                    current: &expected.dataset_identity,
+                    historical_aliases: &aliases,
+                },
                 &manifest.target_fasta,
                 &entrapment_fasta,
                 &construction_identity,
                 &require_existing,
                 partition_path,
             )?;
+            let partition = verified.artifact;
             (
                 partition,
+                Some(verified.verification),
                 true,
-                "validated_exact",
+                "validated_layered_provenance",
                 sha256_file(partition_path)?,
             )
         } else {
@@ -3087,7 +3147,7 @@ fn strict_resource_preflight(
                 "required existing entrapment partition artifact is missing: {}",
                 partition_path.display()
             );
-            (expected, false, "validated_derivable", String::new())
+            (expected, None, false, "validated_derivable", String::new())
         };
         reports.push(ResourcePreflightReport {
             resource_type: "entrapment_partition".into(),
@@ -3095,10 +3155,18 @@ fn strict_resource_preflight(
             stage: None,
             status: status.into(),
             requested_path: partition_path.clone(),
-            expected_fingerprint: partition.partition_identity.clone(),
-            actual_fingerprint: reused
-                .then(|| partition.partition_identity.clone())
-                .unwrap_or_default(),
+            expected_fingerprint: verification
+                .as_ref()
+                .map(|verified| verified.scientific_content_sha256.clone())
+                .unwrap_or_else(|| partition.partition_identity.clone()),
+            actual_fingerprint: if reused {
+                verification
+                    .as_ref()
+                    .map(|verified| verified.scientific_content_sha256.clone())
+                    .unwrap_or_else(|| partition.partition_identity.clone())
+            } else {
+                String::new()
+            },
             schema_version: partition.schema_version,
             candidate_or_annotation_count: partition.selection_proteins.len()
                 + partition.audit_proteins.len(),
@@ -3108,7 +3176,23 @@ fn strict_resource_preflight(
             valid: true,
             reused,
             generation_allowed: !config.entrapment_validation.require_existing_partition,
-            catalog_fingerprints: Vec::new(),
+            catalog_fingerprints: verification
+                .as_ref()
+                .map(|verified| {
+                    vec![
+                        format!("artifact:{}", verified.exact_artifact_sha256),
+                        format!(
+                            "historical_generator:{}",
+                            verified.historical_generator.source_implementation_identity
+                        ),
+                        format!(
+                            "current_verifier:{}",
+                            verified.current_verifier.source_implementation_identity
+                        ),
+                        format!("verified_use:{}", verified.verified_use_sha256),
+                    ]
+                })
+                .unwrap_or_default(),
             original_source_uris: Vec::new(),
             current_source_uris: Vec::new(),
             portable_identity_valid: Some(true),
@@ -5956,6 +6040,10 @@ fn run_search_stage(
         parameter_overrides: parameter_overrides.cloned().unwrap_or_default(),
         entrapment_partition_identity: entrapment_selection
             .map(|partition| partition.partition_identity.clone()),
+        entrapment_partition_scientific_content_sha256: entrapment_selection
+            .map(|partition| partition.scientific_content_sha256.clone()),
+        entrapment_partition_artifact_sha256: entrapment_selection
+            .map(|partition| partition.exact_artifact_sha256.clone()),
         resolved_production_configuration: Some(resolved_production_configuration),
         ensemble_expert_configuration_sha256,
         ensemble_expert_artifact_sha256,
@@ -6512,6 +6600,14 @@ impl TrialEvaluator for WorkflowTrialEvaluator<'_> {
                 serde_json::json!(partition.partition_identity),
             );
             diagnostics.insert(
+                "entrapment_partition_scientific_content_sha256".into(),
+                serde_json::json!(partition.scientific_content_sha256),
+            );
+            diagnostics.insert(
+                "entrapment_partition_artifact_sha256".into(),
+                serde_json::json!(partition.exact_artifact_sha256),
+            );
+            diagnostics.insert(
                 "entrapment_metrics_population".into(),
                 serde_json::json!("selection_only"),
             );
@@ -6615,8 +6711,15 @@ fn optimizer_identity_from_preflight(
         raw.valid && raw.reused && !raw.generation_allowed,
         "optimizer raw annotation cache is not strict immutable reuse"
     );
+    if let Some(partition) = entrapment_selection {
+        anyhow::ensure!(
+            partition.scientific_content_sha256.len() == 64
+                && partition.exact_artifact_sha256.len() == 64,
+            "selection/audit optimization requires layered partition scientific-content and exact-artifact identities"
+        );
+    }
     Ok(OptimizerIdentity {
-        schema_version: 1,
+        schema_version: 2,
         execution_mode: manifest
             .parameter_optimizer
             .as_ref()
@@ -6634,6 +6737,10 @@ fn optimizer_identity_from_preflight(
         catalog_sha256: parameter_catalog_fingerprint()?,
         entrapment_partition_identity: entrapment_selection
             .map(|partition| partition.partition_identity.clone()),
+        entrapment_partition_scientific_content_sha256: entrapment_selection
+            .map(|partition| partition.scientific_content_sha256.clone()),
+        entrapment_partition_artifact_sha256: entrapment_selection
+            .map(|partition| partition.exact_artifact_sha256.clone()),
         root_optimizer_provenance_sha256: None,
         stage_optimizer_provenance_sha256: None,
         root_proposal_space_sha256: manifest
@@ -7322,6 +7429,8 @@ fn frozen_audit_payload_sha256(audit: &FrozenWinnerAuditEvaluation) -> Result<St
 fn evaluate_frozen_optimizer_winner_once(
     manifest: &WorkflowManifest,
     partition: &EntrapmentPartitionArtifact,
+    partition_scientific_content_sha256: &str,
+    partition_artifact_sha256: &str,
     result: &OptimizerRunResult,
 ) -> Result<FrozenWinnerAuditEvaluation> {
     let expert = result
@@ -7350,6 +7459,8 @@ fn evaluate_frozen_optimizer_winner_once(
         );
         anyhow::ensure!(
             audit.partition_identity == partition.partition_identity
+                && audit.partition_scientific_content_sha256 == partition_scientific_content_sha256
+                && audit.partition_artifact_sha256 == partition_artifact_sha256
                 && audit.expert == expert
                 && audit.winner_trial_id == winner.request.trial_id
                 && audit.winner_results_sha256 == winner_results_sha256,
@@ -7440,8 +7551,10 @@ fn evaluate_frozen_optimizer_winner_once(
         StatisticalValidationStatus::EmpiricallyEvaluable
     };
     let mut audit = FrozenWinnerAuditEvaluation {
-        schema_version: 1,
+        schema_version: 2,
         partition_identity: partition.partition_identity.clone(),
+        partition_scientific_content_sha256: partition_scientific_content_sha256.into(),
+        partition_artifact_sha256: partition_artifact_sha256.into(),
         expert,
         winner_trial_id: winner.request.trial_id.clone(),
         winner_results_sha256,
@@ -7606,12 +7719,13 @@ pub fn execute_workflow(
     if plan_only && strict_preflight_enabled {
         let planned_models = planned_model_reports(&manifest);
         return Ok(WorkflowState {
-            schema_version: 2,
+            schema_version: 3,
             manifest_hash,
             dataset,
             entrapment: None,
             entrapment_fasta_parity: None,
             entrapment_partition: None,
+            entrapment_partition_verification: None,
             baseline: None,
             stages: Vec::new(),
             candidate_pools: Vec::new(),
@@ -7765,10 +7879,13 @@ pub fn execute_workflow(
         }
         _ => None,
     };
-    let entrapment_partition = match manifest.parameter_optimizer.as_ref().filter(|config| {
-        config.enabled
-            && config.entrapment_validation.mode == EntrapmentValidationMode::SelectionAudit
-    }) {
+    let (entrapment_partition, entrapment_partition_verification) = match manifest
+        .parameter_optimizer
+        .as_ref()
+        .filter(|config| {
+            config.enabled
+                && config.entrapment_validation.mode == EntrapmentValidationMode::SelectionAudit
+        }) {
         Some(config) => {
             let report = entrapment
                 .as_ref()
@@ -7778,15 +7895,20 @@ pub fn execute_workflow(
                 .partition_artifact
                 .as_ref()
                 .context("validated selection/audit partition path is missing")?;
-            let partition = resolve_entrapment_partition(
+            let aliases = [historical_directory_unaware_dataset_identity(&manifest)?];
+            let verified = resolve_entrapment_partition_with_provenance_and_dataset_aliases(
                 &parameters,
-                &dataset.fingerprint,
+                PartitionDatasetIdentityContext {
+                    current: &dataset.fingerprint,
+                    historical_aliases: &aliases,
+                },
                 &manifest.target_fasta,
                 &active_entrapment_fasta,
                 &entrapment_construction_identity(report)?,
                 &config.entrapment_validation,
                 path,
             )?;
+            let partition = verified.artifact;
             write_json_atomic(
                 &manifest
                     .output_root
@@ -7794,21 +7916,27 @@ pub fn execute_workflow(
                 &serde_json::json!({
                     "schema_version": partition.schema_version,
                     "partition_identity": partition.partition_identity,
+                    "scientific_content_sha256": &verified.verification.scientific_content_sha256,
+                    "exact_artifact_sha256": &verified.verification.exact_artifact_sha256,
+                    "historical_generator": &verified.verification.historical_generator,
+                    "current_verifier": &verified.verification.current_verifier,
+                    "verified_use_sha256": &verified.verification.verified_use_sha256,
                     "payload_sha256": partition.payload_sha256,
                     "selection_ratios": partition.selection_ratios,
                     "audit_ratios": partition.audit_ratios,
                 }),
             )?;
-            Some(partition)
+            (Some(partition), Some(verified.verification))
         }
-        None => None,
+        None => (None, None),
     };
     // The optimizer-facing view deliberately contains no audit accession or
     // audit ratio. The complete artifact stays at workflow scope until every
     // winner has been frozen.
     let entrapment_selection = entrapment_partition
         .as_ref()
-        .map(EntrapmentPartitionArtifact::selection_view);
+        .zip(entrapment_partition_verification.as_ref())
+        .map(|(partition, verification)| partition.selection_view_verified(verification));
     if let Some(report) = entrapment.as_ref() {
         let measured = entrapment_partition
             .as_ref()
@@ -8484,6 +8612,8 @@ pub fn execute_workflow(
                     ensemble_interaction_calibration: None,
                     parameter_overrides: parameter_overrides.clone().unwrap_or_default(),
                     entrapment_partition_identity: None,
+                    entrapment_partition_scientific_content_sha256: None,
+                    entrapment_partition_artifact_sha256: None,
                     resolved_production_configuration: None,
                     ensemble_expert_configuration_sha256: BTreeMap::new(),
                     ensemble_expert_artifact_sha256: BTreeMap::new(),
@@ -8648,6 +8778,9 @@ pub fn execute_workflow(
         .filter(|config| config.optimization_only())
     {
         if let Some(partition) = entrapment_partition.as_ref() {
+            let verification = entrapment_partition_verification
+                .as_ref()
+                .context("selection/audit partition verification provenance is missing")?;
             // This loop is intentionally after every expert and the final
             // Ensemble optimizer has frozen its winner. Audit labels and
             // metrics therefore cannot influence any subsequent proposal,
@@ -8673,13 +8806,33 @@ pub fn execute_workflow(
                                 && trial
                                     .evaluation
                                     .compact_diagnostics
+                                    .get("entrapment_partition_scientific_content_sha256")
+                                    .is_some_and(|value| {
+                                        value.as_str()
+                                            == Some(verification.scientific_content_sha256.as_str())
+                                    })
+                                && trial
+                                    .evaluation
+                                    .compact_diagnostics
+                                    .get("entrapment_partition_artifact_sha256")
+                                    .is_some_and(|value| {
+                                        value.as_str()
+                                            == Some(verification.exact_artifact_sha256.as_str())
+                                    })
+                                && trial
+                                    .evaluation
+                                    .compact_diagnostics
                                     .get("audit_metrics_present")
                                     .is_none_or(|value| value == &serde_json::json!(false))
                         }),
                     "optimizer trial/checkpoint provenance is missing the shared selection-only partition contract"
                 );
                 result.frozen_audit = Some(evaluate_frozen_optimizer_winner_once(
-                    &manifest, partition, result,
+                    &manifest,
+                    partition,
+                    &verification.scientific_content_sha256,
+                    &verification.exact_artifact_sha256,
+                    result,
                 )?);
                 let expert = result
                     .requested_parameter_space
@@ -8729,12 +8882,13 @@ pub fn execute_workflow(
         let scope_reason =
             "optimization_only completed; post-selection and target-only stages were not run by execution scope";
         let state = WorkflowState {
-            schema_version: 2,
+            schema_version: 3,
             manifest_hash,
             dataset,
             entrapment,
             entrapment_fasta_parity,
             entrapment_partition,
+            entrapment_partition_verification,
             baseline,
             stages: Vec::new(),
             candidate_pools: Vec::new(),
@@ -9141,12 +9295,13 @@ pub fn execute_workflow(
         )
     });
     let state = WorkflowState {
-        schema_version: 2,
+        schema_version: 3,
         manifest_hash,
         dataset,
         entrapment,
         entrapment_fasta_parity,
         entrapment_partition,
+        entrapment_partition_verification,
         baseline,
         stages,
         candidate_pools,
@@ -10150,6 +10305,11 @@ mod tests {
             source_configuration_sha256: "config".into(),
             catalog_sha256: "catalog".into(),
             entrapment_partition_identity: Some(partition.partition_identity.clone()),
+            entrapment_partition_scientific_content_sha256: Some(
+                crate::entrapment::entrapment_partition_scientific_content_sha256(&partition)
+                    .unwrap(),
+            ),
+            entrapment_partition_artifact_sha256: Some("artifact".into()),
             root_optimizer_provenance_sha256: None,
             stage_optimizer_provenance_sha256: None,
             root_proposal_space_sha256: None,
@@ -10176,10 +10336,36 @@ mod tests {
              t1\t1\t1\tTarget_A\tTARGETPEP\t0.001\t0.001\t0.001\ttrue\ttrue\n",
         )
         .unwrap();
-        let first = evaluate_frozen_optimizer_winner_once(&manifest, &partition, &result).unwrap();
+        let first = evaluate_frozen_optimizer_winner_once(
+            &manifest,
+            &partition,
+            identity
+                .entrapment_partition_scientific_content_sha256
+                .as_deref()
+                .unwrap(),
+            identity
+                .entrapment_partition_artifact_sha256
+                .as_deref()
+                .unwrap(),
+            &result,
+        )
+        .unwrap();
         let audit_path = optimizer_root.join("winner.entrapment_audit.json");
         let first_bytes = std::fs::read(&audit_path).unwrap();
-        let second = evaluate_frozen_optimizer_winner_once(&manifest, &partition, &result).unwrap();
+        let second = evaluate_frozen_optimizer_winner_once(
+            &manifest,
+            &partition,
+            identity
+                .entrapment_partition_scientific_content_sha256
+                .as_deref()
+                .unwrap(),
+            identity
+                .entrapment_partition_artifact_sha256
+                .as_deref()
+                .unwrap(),
+            &result,
+        )
+        .unwrap();
         assert_eq!(first, second);
         assert_eq!(first_bytes, std::fs::read(&audit_path).unwrap());
         assert!(first.evaluated_after_winner_freeze);
@@ -10671,6 +10857,39 @@ mod tests {
     }
 
     #[test]
+    fn historical_directory_dataset_alias_is_auditable_but_not_portable() {
+        let directory = test_directory("historical-directory-dataset-alias");
+        let first = directory.join("first/synthetic.d");
+        let second = directory.join("second/synthetic.d");
+        for root in [&first, &second] {
+            std::fs::create_dir_all(root.join("nested")).unwrap();
+            std::fs::write(root.join("analysis.tdf"), b"vendor-data").unwrap();
+            std::fs::write(root.join("nested/index.bin"), b"index").unwrap();
+        }
+
+        let mut first_manifest = minimal_manifest(&directory, ValidationDatasetRole::Development);
+        first_manifest.spectra = vec![first.display().to_string()];
+        let mut second_manifest = first_manifest.clone();
+        second_manifest.spectra = vec![second.display().to_string()];
+
+        let first_current = compute_dataset_identity(&first_manifest).unwrap();
+        let second_current = compute_dataset_identity(&second_manifest).unwrap();
+        let first_historical =
+            historical_directory_unaware_dataset_identity(&first_manifest).unwrap();
+        let second_historical =
+            historical_directory_unaware_dataset_identity(&second_manifest).unwrap();
+
+        assert_eq!(first_current.fingerprint, second_current.fingerprint);
+        assert_ne!(first_historical.identity, second_historical.identity);
+        assert_ne!(first_current.fingerprint, first_historical.identity);
+        assert_eq!(
+            first_historical.schema,
+            "sage-decoy-free-dataset-v1-directory-as-unresolved-source-string"
+        );
+        std::fs::remove_dir_all(directory).unwrap();
+    }
+
+    #[test]
     fn holdout_runs_its_own_declared_optimizer() {
         let directory = test_directory("holdout-local-optimizer");
         let mut manifest = minimal_manifest(&directory, ValidationDatasetRole::Holdout);
@@ -11157,6 +11376,8 @@ mod tests {
             ensemble_interaction_calibration: None,
             parameter_overrides: BTreeMap::new(),
             entrapment_partition_identity: None,
+            entrapment_partition_scientific_content_sha256: None,
+            entrapment_partition_artifact_sha256: None,
             resolved_production_configuration: None,
             ensemble_expert_configuration_sha256: BTreeMap::new(),
             ensemble_expert_artifact_sha256: BTreeMap::new(),
@@ -13529,6 +13750,8 @@ mod tests {
             source_configuration_sha256: "config".into(),
             catalog_sha256: "catalog".into(),
             entrapment_partition_identity: None,
+            entrapment_partition_scientific_content_sha256: None,
+            entrapment_partition_artifact_sha256: None,
             root_optimizer_provenance_sha256: Some(
                 ensemble_projection.root_optimizer_provenance_sha256.clone(),
             ),
