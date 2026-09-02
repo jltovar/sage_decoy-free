@@ -1319,95 +1319,98 @@ fn parse_feature_output(path: &Path) -> Result<ParsedExternalFeatureTable> {
             .and_then(|x| x.parse::<u32>().ok())
             .unwrap_or(1);
 
-        let rt_err = get_required_f32(
+        let ms2pip = get_required_feature_lane(
             &row,
             &headers,
+            "MS2PIP",
             &[
-                "rt_diff",
-                "rt_diff_best",
-                "DeepLC:AbsRetentionTimeError",
-                "deeplc_abs_rt_error",
-                "abs_rt_error",
-                "abs_delta_rt",
+                (
+                    "spec_pearson",
+                    &[
+                        "spec_pearson",
+                        "spec_pearson_norm",
+                        "Ms2pip:Correlation",
+                        "ms2pip_correlation",
+                        "ms2pip_corr",
+                        "pcc",
+                        "correlation",
+                    ],
+                ),
+                (
+                    "cos",
+                    &[
+                        "cos",
+                        "cos_norm",
+                        "dotprod",
+                        "dotprod_norm",
+                        "spectral_angle",
+                        "Ms2pip:SpectralAngle",
+                        "ms2pip_spectral_angle",
+                        "spectral_angle_similarity",
+                    ],
+                ),
+                (
+                    "dotprod",
+                    &[
+                        "dotprod",
+                        "dotprod_norm",
+                        "cos",
+                        "cos_norm",
+                        "spec_pearson",
+                        "spec_pearson_norm",
+                        "fragment_intensity_agreement",
+                        "ms2pip_fragment_intensity_agreement",
+                    ],
+                ),
             ],
         )?;
-        let mut f = ExternalPsmFeatures {
-            ms2rescore_ms2pip_pcc: get_required_f32(
-                &row,
-                &headers,
-                &[
-                    "spec_pearson",
-                    "spec_pearson_norm",
-                    "Ms2pip:Correlation",
-                    "ms2pip_correlation",
-                    "ms2pip_corr",
-                    "pcc",
-                    "correlation",
-                ],
-            )?,
-            ms2rescore_spectral_angle: get_required_f32(
-                &row,
-                &headers,
-                &[
-                    "cos",
-                    "cos_norm",
-                    "dotprod",
-                    "dotprod_norm",
-                    "spectral_angle",
-                    "Ms2pip:SpectralAngle",
-                    "ms2pip_spectral_angle",
-                    "spectral_angle_similarity",
-                ],
-            )?,
-            ms2rescore_fragment_intensity_agreement: get_required_f32(
-                &row,
-                &headers,
-                &[
-                    "dotprod",
-                    "dotprod_norm",
-                    "cos",
-                    "cos_norm",
-                    "spec_pearson",
-                    "spec_pearson_norm",
-                    "fragment_intensity_agreement",
-                    "ms2pip_fragment_intensity_agreement",
-                ],
-            )?,
-            ms2rescore_deeplc_predicted_rt: get_required_f32(
-                &row,
-                &headers,
-                &[
+        let deeplc = get_required_feature_lane(
+            &row,
+            &headers,
+            "DeepLC",
+            &[
+                (
                     "predicted_retention_time",
-                    "predicted_retention_time_best",
-                    "DeepLC:PredictedRetentionTime",
-                    "deeplc_predicted_rt",
-                    "predicted_rt",
-                    "rt_pred",
-                ],
-            )?,
-            ms2rescore_deeplc_calibrated_rt: get_required_f32(
-                &row,
-                &headers,
-                &[
+                    &[
+                        "predicted_retention_time",
+                        "predicted_retention_time_best",
+                        "DeepLC:PredictedRetentionTime",
+                        "deeplc_predicted_rt",
+                        "predicted_rt",
+                        "rt_pred",
+                    ],
+                ),
+                (
                     "observed_retention_time",
-                    "observed_retention_time_best",
-                    "DeepLC:CalibratedRetentionTime",
-                    "deeplc_calibrated_rt",
-                    "calibrated_rt",
-                ],
-            )?,
-            ms2rescore_deeplc_rt_error: get_required_f32(
-                &row,
-                &headers,
-                &[
+                    &[
+                        "observed_retention_time",
+                        "observed_retention_time_best",
+                        "DeepLC:CalibratedRetentionTime",
+                        "deeplc_calibrated_rt",
+                        "calibrated_rt",
+                    ],
+                ),
+                (
                     "rt_diff",
-                    "rt_diff_best",
-                    "DeepLC:RetentionTimeError",
-                    "deeplc_rt_error",
-                    "rt_error",
-                    "delta_rt",
-                ],
-            )?,
+                    &[
+                        "rt_diff",
+                        "rt_diff_best",
+                        "DeepLC:RetentionTimeError",
+                        "deeplc_rt_error",
+                        "rt_error",
+                        "delta_rt",
+                    ],
+                ),
+            ],
+        )?;
+        let rt_err = deeplc[2];
+        let mut f = ExternalPsmFeatures {
+            ms2rescore_ms2pip_pcc: ms2pip[0],
+            ms2rescore_spectral_angle: ms2pip[1],
+            ms2rescore_fragment_intensity_agreement: ms2pip[2],
+            ms2rescore_deeplc_predicted_rt: deeplc[0],
+            ms2rescore_deeplc_calibrated_rt: deeplc[1],
+            ms2rescore_deeplc_rt_error: rt_err,
             ms2rescore_deeplc_abs_rt_error: if rt_err.is_finite() {
                 rt_err.abs()
             } else {
@@ -2292,13 +2295,213 @@ fn get_required_f32(
         })?;
     let raw = row.get(index).unwrap_or_default().trim();
     anyhow::ensure!(!raw.is_empty(), "empty required numeric field {header}");
-    raw.parse::<f32>()
-        .with_context(|| format!("invalid required numeric representation in {header}: {raw:?}"))
+    let value = raw
+        .parse::<f32>()
+        .with_context(|| format!("invalid required numeric representation in {header}: {raw:?}"))?;
+    anyhow::ensure!(
+        value.is_finite(),
+        "nonfinite required numeric field {header}: {raw:?}"
+    );
+    Ok(value)
+}
+
+fn get_required_raw<'a>(
+    row: &'a csv::StringRecord,
+    headers: &csv::StringRecord,
+    names: &[&str],
+) -> Result<&'a str> {
+    let index = names
+        .iter()
+        .find_map(|name| headers.iter().position(|candidate| candidate == *name))
+        .with_context(|| {
+            format!("generator output lacks required numeric field aliases {names:?}")
+        })?;
+    Ok(row.get(index).unwrap_or_default().trim())
+}
+
+/// Classify a prediction lane from its raw TSV spelling before interpreting
+/// any member as a number. The production wrapper serializes an unavailable
+/// prediction as an empty field. A whole empty lane is therefore represented
+/// by NaNs for the existing durable `prediction_unavailable` contract, while
+/// partial emptiness and every non-finite or malformed nonempty value remain
+/// fail-closed errors.
+fn get_required_feature_lane(
+    row: &csv::StringRecord,
+    headers: &csv::StringRecord,
+    lane: &str,
+    fields: &[(&str, &[&str])],
+) -> Result<Vec<f32>> {
+    let raw = fields
+        .iter()
+        .map(|(name, aliases)| Ok((*name, get_required_raw(row, headers, aliases)?)))
+        .collect::<Result<Vec<_>>>()?;
+    let empty = raw.iter().filter(|(_, value)| value.is_empty()).count();
+    if empty == raw.len() {
+        return Ok(vec![f32::NAN; raw.len()]);
+    }
+    anyhow::ensure!(
+        empty == 0,
+        "partially empty {lane} lane is ambiguous generator output"
+    );
+    raw.into_iter()
+        .map(|(field, value)| {
+            let parsed = value.parse::<f32>().with_context(|| {
+                format!("invalid numeric representation in {lane} field {field}: {value:?}")
+            })?;
+            anyhow::ensure!(
+                parsed.is_finite(),
+                "nonfinite numeric representation in {lane} field {field}: {value:?}"
+            );
+            Ok(parsed)
+        })
+        .collect()
 }
 
 #[cfg(test)]
 mod path_tests {
     use super::*;
+
+    const PRODUCTION_OUTPUT_HEADER: &str = "psm_id\tspectrum_id\traw_file\tpeptidoform\tcharge\trank\tspec_pearson\tcos\tdotprod\tpredicted_retention_time\tobserved_retention_time\trt_diff\tion_mobility\n";
+
+    fn production_output_row(
+        psm_id: &str,
+        ms2pip: [&str; 3],
+        deeplc: [&str; 3],
+        ion_mobility: &str,
+    ) -> String {
+        format!(
+            "{psm_id}\tscan={psm_id}\trun.d\tPEPTIDE\t2\t1\t{}\t{}\t{}\t{}\t{}\t{}\t{ion_mobility}\n",
+            ms2pip[0], ms2pip[1], ms2pip[2], deeplc[0], deeplc[1], deeplc[2]
+        )
+    }
+
+    fn parse_production_output(rows: &str) -> Result<ParsedExternalFeatureTable> {
+        let path = std::env::temp_dir().join(format!(
+            "sage-production-shaped-external-output-{}-{}.tsv",
+            std::process::id(),
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .unwrap_or_default()
+                .as_nanos()
+        ));
+        std::fs::write(&path, format!("{PRODUCTION_OUTPUT_HEADER}{rows}"))?;
+        let result = parse_feature_output(&path);
+        let _ = std::fs::remove_file(path);
+        result
+    }
+
+    fn parsed_features(
+        ms2pip: [&str; 3],
+        deeplc: [&str; 3],
+        ion_mobility: &str,
+    ) -> Result<ExternalPsmFeatures> {
+        let parsed =
+            parse_production_output(&production_output_row("0", ms2pip, deeplc, ion_mobility))?;
+        Ok(parsed.by_psm_id.get(&0).unwrap().features)
+    }
+
+    #[test]
+    fn production_tsv_whole_lane_missingness_is_classified_before_numeric_parsing() {
+        let finite =
+            parsed_features(["0.8", "0.7", "0.6"], ["12.5", "12.0", "0.5"], "1.1").unwrap();
+        let finite_availability =
+            crate::external_feature_cache::availability_for_features(&finite).unwrap();
+        assert!(finite_availability.ms2pip_available);
+        assert!(finite_availability.deeplc_available);
+
+        let ms2pip_missing = parsed_features(["", "", ""], ["12.5", "12.0", "0.5"], "1.1").unwrap();
+        let ms2pip_availability =
+            crate::external_feature_cache::availability_for_features(&ms2pip_missing).unwrap();
+        assert!(!ms2pip_availability.ms2pip_available);
+        assert!(ms2pip_availability.deeplc_available);
+        assert_eq!(
+            ms2pip_availability.missing[0].reason,
+            crate::external_feature_cache::MissingExternalFeatureReason::PredictionUnavailable
+        );
+        assert!(ms2pip_missing.ms2rescore_ms2pip_pcc.is_nan());
+        assert!(ms2pip_missing.ms2rescore_spectral_angle.is_nan());
+        assert!(ms2pip_missing
+            .ms2rescore_fragment_intensity_agreement
+            .is_nan());
+        assert!(ms2pip_missing.ms2rescore_deeplc_predicted_rt.is_finite());
+
+        let deeplc_missing = parsed_features(["0.8", "0.7", "0.6"], ["", "", ""], "1.1").unwrap();
+        let deeplc_availability =
+            crate::external_feature_cache::availability_for_features(&deeplc_missing).unwrap();
+        assert!(deeplc_availability.ms2pip_available);
+        assert!(!deeplc_availability.deeplc_available);
+        assert!(deeplc_missing.ms2rescore_deeplc_predicted_rt.is_nan());
+        assert!(deeplc_missing.ms2rescore_deeplc_calibrated_rt.is_nan());
+        assert!(deeplc_missing.ms2rescore_deeplc_rt_error.is_nan());
+        assert!(deeplc_missing.ms2rescore_deeplc_abs_rt_error.is_nan());
+
+        let both_missing = parsed_features(["", "", ""], ["", "", ""], "1.1").unwrap();
+        let both_availability =
+            crate::external_feature_cache::availability_for_features(&both_missing).unwrap();
+        assert!(!both_availability.ms2pip_available);
+        assert!(!both_availability.deeplc_available);
+        assert_eq!(both_availability.missing.len(), 2);
+    }
+
+    #[test]
+    fn production_tsv_partial_empty_lanes_fail_closed() {
+        for fields in [["", "0.7", "0.6"], ["", "", "0.6"]] {
+            let error = parsed_features(fields, ["12.5", "12.0", "0.5"], "1.1")
+                .unwrap_err()
+                .to_string();
+            assert!(error.contains("partially empty MS2PIP lane"));
+        }
+        for fields in [["", "12.0", "0.5"], ["", "", "0.5"]] {
+            let error = parsed_features(["0.8", "0.7", "0.6"], fields, "1.1")
+                .unwrap_err()
+                .to_string();
+            assert!(error.contains("partially empty DeepLC lane"));
+        }
+    }
+
+    #[test]
+    fn production_tsv_malformed_and_nonfinite_lane_values_fail_closed() {
+        for value in ["not-a-number", "NaN", "inf", "+inf", "-inf"] {
+            let error = parsed_features([value, "0.7", "0.6"], ["12.5", "12.0", "0.5"], "1.1")
+                .unwrap_err()
+                .to_string();
+            assert!(
+                error.contains("invalid numeric representation")
+                    || error.contains("nonfinite numeric representation")
+            );
+        }
+        let error = parsed_features(["0.8", "0.7", "0.6"], ["12.5", "12.0", "0.5"], "")
+            .unwrap_err()
+            .to_string();
+        assert!(error.contains("empty required numeric field ion_mobility"));
+    }
+
+    #[test]
+    fn production_tsv_candidate_catalog_counts_duplicates_missing_and_exact_coverage() {
+        let row_zero =
+            production_output_row("0", ["0.8", "0.7", "0.6"], ["12.5", "12.0", "0.5"], "1.1");
+        let row_one =
+            production_output_row("1", ["0.8", "0.7", "0.6"], ["12.5", "12.0", "0.5"], "1.1");
+        let exact = parse_production_output(&format!("{row_zero}{row_one}")).unwrap();
+        assert_eq!(exact.row_count, 2);
+        assert_eq!(exact.by_psm_id.len(), 2);
+        assert_eq!(exact.duplicate_psm_ids, 0);
+
+        let duplicate = parse_production_output(&format!("{row_zero}{row_zero}")).unwrap();
+        assert_eq!(duplicate.row_count, 2);
+        assert_eq!(duplicate.by_psm_id.len(), 1);
+        assert_eq!(duplicate.duplicate_psm_ids, 1);
+
+        let missing_id = parse_production_output(&production_output_row(
+            "",
+            ["0.8", "0.7", "0.6"],
+            ["12.5", "12.0", "0.5"],
+            "1.1",
+        ))
+        .unwrap();
+        assert_eq!(missing_id.row_count, 1);
+        assert!(missing_id.by_psm_id.is_empty());
+    }
 
     fn complete_external_features() -> ExternalPsmFeatures {
         ExternalPsmFeatures {
@@ -2445,7 +2648,7 @@ mod path_tests {
         std::fs::write(
             &wrapper,
             format!(
-                "#!/bin/sh\nconfig=\"$2\"\noutput=$(sed -n 's/.*\"output_path\": \"\\(.*\\)\",/\\1/p' \"$config\")\nprintf 'psm_id\\tpcc\\tcos\\tdotprod\\tpredicted_rt\\tcalibrated_rt\\trt_diff\\tion_mobility\\n0\\t0.8\\t0.7\\t0.6\\t12.5\\t12.0\\t0.5\\t1.1\\n' > \"${{output}}.psms.tsv\"\nprintf x >> '{}'\n",
+                "#!/bin/sh\nconfig=\"$2\"\noutput=$(sed -n 's/.*\"output_path\": \"\\(.*\\)\",/\\1/p' \"$config\")\nprintf 'psm_id\\tspec_pearson\\tcos\\tdotprod\\tpredicted_retention_time\\tobserved_retention_time\\trt_diff\\tion_mobility\\n0\\t\\t\\t\\t12.5\\t12.0\\t0.5\\t1.1\\n' > \"${{output}}.psms.tsv\"\nprintf x >> '{}'\n",
                 marker.display()
             ),
         )
@@ -2490,6 +2693,9 @@ mod path_tests {
         assert_eq!(report.joined_candidate_count, 1);
         assert!(report.manifest_path.is_file());
         assert!(report.payload_path.is_file());
+        assert_eq!(report.manifest.missingness.affected_candidate_count, 1);
+        assert_eq!(report.manifest.missingness.ms2pip_unavailable_count, 1);
+        assert_eq!(report.manifest.missingness.deeplc_unavailable_count, 0);
 
         let transient = std::fs::read_dir(root.join("work"))
             .unwrap()
@@ -2526,6 +2732,21 @@ mod path_tests {
         assert!(!recovered.external_generator_invoked);
         assert!(!recovered.reused_existing_exact);
         assert_eq!(std::fs::read(&marker).unwrap(), b"x");
+        assert_eq!(recovered.manifest.missingness.ms2pip_unavailable_count, 1);
+        assert_eq!(recovered.manifest.missingness.deeplc_unavailable_count, 0);
+        let recovered_manifest_bytes = std::fs::read(&recovered.manifest_path).unwrap();
+        let recovered_payload_bytes = std::fs::read(&recovered.payload_path).unwrap();
+        let (_, recovered_records) = load_raw_cache(&recovered.directory, &recovered.identity)
+            .unwrap()
+            .unwrap();
+        assert_eq!(recovered_records.len(), 1);
+        assert!(!recovered_records[0].availability.ms2pip_available);
+        assert!(recovered_records[0].availability.deeplc_available);
+        assert!(recovered_records[0].features.ms2rescore_ms2pip_pcc.is_nan());
+        assert!(recovered_records[0]
+            .features
+            .ms2rescore_deeplc_predicted_rt
+            .is_finite());
 
         let replay = finalize_raw_cache_from_existing_output(
             &mut recovery_features,
@@ -2540,6 +2761,14 @@ mod path_tests {
         assert!(replay.reused_existing_exact);
         assert!(!replay.external_generator_invoked);
         assert_eq!(std::fs::read(&marker).unwrap(), b"x");
+        assert_eq!(
+            std::fs::read(&replay.manifest_path).unwrap(),
+            recovered_manifest_bytes
+        );
+        assert_eq!(
+            std::fs::read(&replay.payload_path).unwrap(),
+            recovered_payload_bytes
+        );
         std::fs::remove_dir_all(root).unwrap();
     }
 }
