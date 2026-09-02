@@ -7,7 +7,7 @@ use sage_cli::provenance::{freeze_baseline, write_json_atomic};
 use sage_cli::runner::Runner;
 use sage_cli::workflow::{
     execute_workflow, materialize_workflow_entrapment_partition,
-    resolve_frozen_expert_configurations,
+    resolve_frozen_expert_configurations, resolve_optimizer_proposal_space,
 };
 
 fn main() -> anyhow::Result<()> {
@@ -71,6 +71,27 @@ fn main() -> anyhow::Result<()> {
                         .long("inputs-only")
                         .action(clap::ArgAction::SetTrue)
                         .help("Print prospective partition input identities without assigning components or writing an artifact"),
+                ),
+        )
+        .subcommand(
+            Command::new("resolve-optimizer-proposal-space")
+                .about(
+                    "Resolve and freeze an unresolved optimizer proposal space without data access or winner selection",
+                )
+                .arg(
+                    Arg::new("manifest")
+                        .required(true)
+                        .value_parser(clap::builder::NonEmptyStringValueParser::new())
+                        .value_hint(ValueHint::FilePath)
+                        .help("Path to a prospective optimization workflow manifest"),
+                )
+                .arg(
+                    Arg::new("output")
+                        .required(true)
+                        .long("output")
+                        .value_parser(clap::builder::NonEmptyStringValueParser::new())
+                        .value_hint(ValueHint::FilePath)
+                        .help("New immutable canonical proposal-space artifact"),
                 ),
         )
         .subcommand(
@@ -511,6 +532,20 @@ fn main() -> anyhow::Result<()> {
             .get_one::<String>("output")
             .expect("required resolution output");
         let artifact = resolve_frozen_expert_configurations(
+            std::path::Path::new(manifest),
+            std::path::Path::new(output),
+        )?;
+        println!("{}", serde_json::to_string_pretty(&artifact)?);
+        return Ok(());
+    }
+    if let Some(("resolve-optimizer-proposal-space", resolver_matches)) = matches.subcommand() {
+        let manifest = resolver_matches
+            .get_one::<String>("manifest")
+            .expect("required workflow manifest");
+        let output = resolver_matches
+            .get_one::<String>("output")
+            .expect("required resolution output");
+        let artifact = resolve_optimizer_proposal_space(
             std::path::Path::new(manifest),
             std::path::Path::new(output),
         )?;

@@ -12,7 +12,7 @@ use sha2::{Digest, Sha256};
 use std::collections::{BTreeMap, BTreeSet};
 use std::path::Path;
 
-pub const PARAMETER_OPTIMIZER_SCHEMA_VERSION: u32 = 4;
+pub const PARAMETER_OPTIMIZER_SCHEMA_VERSION: u32 = 5;
 pub const PARAMETER_CATALOG_SCHEMA_VERSION: u32 = 2;
 pub const PARAMETER_OPTIMIZER_IMPLEMENTATION_SOURCE_SHA256: &str =
     env!("SAGE_PARAMETER_OPTIMIZER_SOURCE_SHA256");
@@ -2919,6 +2919,14 @@ pub struct ParameterOptimizerConfig {
     /// candidate, spectrum, annotation, or optimizer-trial access.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub frozen_expert_configuration_artifact: Option<std::path::PathBuf>,
+    /// Immutable inputs-only resolution of the complete unresolved optimizer
+    /// proposal space. This is root provenance, never a frozen-winner
+    /// substitute.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub proposal_space_artifact: Option<std::path::PathBuf>,
+    /// Prospectively frozen digest from `resolve-optimizer-proposal-space`.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub expected_proposal_space_sha256: Option<String>,
     #[serde(default)]
     pub require_expected_expert_configurations: bool,
     #[serde(default)]
@@ -2995,6 +3003,7 @@ fn optimizer_config_provenance_sha256(
 ) -> Result<String> {
     let mut portable = config.clone();
     portable.frozen_expert_configuration_artifact = None;
+    portable.proposal_space_artifact = None;
     let mut hasher = Sha256::new();
     hasher.update(domain);
     hasher.update(serde_json::to_vec(&portable)?);
@@ -3174,6 +3183,24 @@ impl ParameterOptimizerConfig {
             anyhow::ensure!(
                 self.optimization_only(),
                 "selection/audit entrapment validation requires execution_mode=optimization_only so audit occurs only after every winner is frozen"
+            );
+        }
+        if self.proposal_space_artifact.is_some() || self.expected_proposal_space_sha256.is_some() {
+            anyhow::ensure!(
+                self.schema_version >= 5,
+                "optimizer proposal-space provenance requires parameter_optimizer schema_version 5"
+            );
+            anyhow::ensure!(
+                self.expected_proposal_space_sha256
+                    .as_ref()
+                    .is_some_and(|hash| {
+                        hash.len() == 64 && hash.bytes().all(|byte| byte.is_ascii_hexdigit())
+                    }),
+                "expected proposal-space hash must be 64 hexadecimal characters"
+            );
+            anyhow::ensure!(
+                self.proposal_space_artifact.is_some(),
+                "expected proposal-space provenance requires an immutable artifact"
             );
         }
         anyhow::ensure!(
@@ -4064,6 +4091,10 @@ pub struct TrialRequest {
     pub parameters: BTreeMap<String, ParameterValue>,
     pub use_external_features: bool,
     pub target_only_outcomes_allowed: bool,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub root_proposal_space_sha256: Option<String>,
+    #[serde(default)]
+    pub proposal_membership_sha256: String,
 }
 
 #[derive(Clone, Debug, Serialize, Deserialize)]
@@ -4099,6 +4130,8 @@ pub enum OptimizerOutcome {
 pub struct OptimizerCheckpointPayload {
     pub schema_version: u32,
     pub optimizer_fingerprint: String,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub root_proposal_space_sha256: Option<String>,
     pub completed_trials: BTreeMap<String, TrialRecord>,
     pub accepted_transitions: Vec<AcceptedTransition>,
     pub current_parameters: BTreeMap<String, ParameterValue>,
@@ -4136,6 +4169,8 @@ pub struct OptimizerIdentity {
     pub root_optimizer_provenance_sha256: Option<String>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub stage_optimizer_provenance_sha256: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub root_proposal_space_sha256: Option<String>,
 }
 
 pub fn optimizer_fingerprint(
@@ -4144,6 +4179,7 @@ pub fn optimizer_fingerprint(
 ) -> Result<String> {
     let mut portable = config.clone();
     portable.frozen_expert_configuration_artifact = None;
+    portable.proposal_space_artifact = None;
     let mut hasher = Sha256::new();
     hasher.update(b"sage-decoy-free-parameter-optimizer-v1\0");
     hasher.update(serde_json::to_vec(identity)?);
@@ -4200,6 +4236,8 @@ pub trait TrialEvaluator {
 pub struct OptimizerRunResult {
     pub schema_version: u32,
     pub optimizer_fingerprint: String,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub root_proposal_space_sha256: Option<String>,
     /// Stable scientific result identity. Operational resume annotations are
     /// deliberately excluded so exact checkpoint replay has the same hash.
     pub scientific_result_sha256: String,
@@ -4275,9 +4313,23 @@ pub fn run_optimizer<E: TrialEvaluator>(
     evaluator: &mut E,
 ) -> Result<OptimizerRunResult> {
     config.validate()?;
+    if config.schema_version >= 5 {
+        anyhow::ensure!(
+            config.expected_proposal_space_sha256.is_some(),
+            "schema-v5 optimizer execution requires a frozen root proposal-space identity"
+        );
+        anyhow::ensure!(
+            identity.root_proposal_space_sha256 == config.expected_proposal_space_sha256,
+            "optimizer identity does not bind the frozen root proposal space"
+        );
+    }
     let fingerprint = optimizer_fingerprint(identity, config)?;
     let mut payload = if config.resume && checkpoint_path.is_file() {
         let mut payload = load_checkpoint(checkpoint_path, &fingerprint)?;
+        anyhow::ensure!(
+            payload.root_proposal_space_sha256 == identity.root_proposal_space_sha256,
+            "optimizer checkpoint root proposal-space identity mismatch"
+        );
         payload
             .resume_history
             .push(format!("resume-{}", payload.resume_history.len() + 1));
@@ -4286,6 +4338,7 @@ pub fn run_optimizer<E: TrialEvaluator>(
         OptimizerCheckpointPayload {
             schema_version: PARAMETER_OPTIMIZER_SCHEMA_VERSION,
             optimizer_fingerprint: fingerprint.clone(),
+            root_proposal_space_sha256: identity.root_proposal_space_sha256.clone(),
             completed_trials: BTreeMap::new(),
             accepted_transitions: Vec::new(),
             current_parameters: resolve_baseline(config),
@@ -4971,6 +5024,64 @@ fn trial_id(
     Ok(format!("{:x}", hasher.finalize()))
 }
 
+fn proposal_membership_sha256(
+    root_proposal_space_sha256: Option<&str>,
+    block: &OptimizerBlock,
+    pass: usize,
+    ordinal: usize,
+    values: &BTreeMap<String, ParameterValue>,
+) -> Result<String> {
+    let mut hasher = Sha256::new();
+    hasher.update(b"sage-optimizer-proposal-membership-v1\0");
+    hasher.update(
+        root_proposal_space_sha256
+            .unwrap_or("legacy-unresolved")
+            .as_bytes(),
+    );
+    hasher.update(block.id.as_bytes());
+    hasher.update(pass.to_le_bytes());
+    hasher.update(ordinal.to_le_bytes());
+    hasher.update(serde_json::to_vec(values)?);
+    Ok(format!("{:x}", hasher.finalize()))
+}
+
+fn validate_proposal_membership(
+    config: &ParameterOptimizerConfig,
+    block: &OptimizerBlock,
+    values: &BTreeMap<String, ParameterValue>,
+) -> Result<()> {
+    let baseline = resolve_baseline_for_block(config, block);
+    let parameter_set = block_parameter_set_key(block);
+    for declared in config.blocks.iter().filter(|candidate| {
+        candidate.enabled && block_parameter_set_key(candidate) == parameter_set
+    }) {
+        for (name, fixed) in &declared.fixed {
+            anyhow::ensure!(
+                values
+                    .get(name)
+                    .is_none_or(|actual| actual.canonical_key() == fixed.canonical_key()),
+                "trial parameter {name} violates a frozen proposal-space override"
+            );
+        }
+        for (name, candidates) in &declared.space {
+            let Some(actual) = values.get(name) else {
+                continue;
+            };
+            let allowed = sorted_values(candidates)
+                .iter()
+                .any(|candidate| candidate.canonical_key() == actual.canonical_key())
+                || baseline
+                    .get(name)
+                    .is_some_and(|candidate| candidate.canonical_key() == actual.canonical_key());
+            anyhow::ensure!(
+                allowed,
+                "trial parameter {name} is outside the frozen proposal space"
+            );
+        }
+    }
+    Ok(())
+}
+
 fn evaluate_or_resume<E: TrialEvaluator>(
     config: &ParameterOptimizerConfig,
     block: &OptimizerBlock,
@@ -4981,6 +5092,14 @@ fn evaluate_or_resume<E: TrialEvaluator>(
     payload: &mut OptimizerCheckpointPayload,
     evaluator: &mut E,
 ) -> Result<TrialRecord> {
+    validate_proposal_membership(config, block, &values)?;
+    let membership = proposal_membership_sha256(
+        payload.root_proposal_space_sha256.as_deref(),
+        block,
+        pass,
+        ordinal,
+        &values,
+    )?;
     let id = trial_id(
         &payload.optimizer_fingerprint,
         block,
@@ -4989,6 +5108,11 @@ fn evaluate_or_resume<E: TrialEvaluator>(
         &values,
     )?;
     if let Some(existing) = payload.completed_trials.get(&id) {
+        anyhow::ensure!(
+            existing.request.root_proposal_space_sha256 == payload.root_proposal_space_sha256
+                && existing.request.proposal_membership_sha256 == membership,
+            "checkpoint trial proposal-space membership mismatch"
+        );
         let mut reused = existing.clone();
         reused.reused_from_checkpoint = true;
         payload.completed_trials.insert(id, reused.clone());
@@ -5004,6 +5128,8 @@ fn evaluate_or_resume<E: TrialEvaluator>(
         parameters: values,
         use_external_features: block.use_external_features,
         target_only_outcomes_allowed: false,
+        root_proposal_space_sha256: payload.root_proposal_space_sha256.clone(),
+        proposal_membership_sha256: membership,
     };
     anyhow::ensure!(
         config.target_only_outcomes_excluded && !request.target_only_outcomes_allowed,
@@ -5315,6 +5441,7 @@ fn finish_result<E: TrialEvaluator>(
     Ok(OptimizerRunResult {
         schema_version: PARAMETER_OPTIMIZER_SCHEMA_VERSION,
         optimizer_fingerprint: fingerprint,
+        root_proposal_space_sha256: payload.root_proposal_space_sha256,
         scientific_result_sha256,
         parameter_binding_coverage: parameter_production_bindings(),
         classification: config.classification,
@@ -5365,6 +5492,8 @@ mod tests {
             selected_experts: vec![OptimizerExpert::Moments, OptimizerExpert::Mle],
             expected_expert_configuration_sha256: BTreeMap::new(),
             frozen_expert_configuration_artifact: None,
+            proposal_space_artifact: None,
+            expected_proposal_space_sha256: None,
             require_expected_expert_configurations: false,
             compiled_defaults: BTreeMap::from([
                 (
@@ -5435,12 +5564,13 @@ mod tests {
             entrapment_partition_identity: None,
             root_optimizer_provenance_sha256: None,
             stage_optimizer_provenance_sha256: None,
+            root_proposal_space_sha256: None,
         }
     }
 
     fn seven_expert_root_config() -> ParameterOptimizerConfig {
         let mut cfg = config();
-        cfg.schema_version = PARAMETER_OPTIMIZER_SCHEMA_VERSION;
+        cfg.schema_version = 4;
         cfg.selected_experts = vec![
             OptimizerExpert::Moments,
             OptimizerExpert::Mle,
@@ -6067,7 +6197,7 @@ mod tests {
 
         let normal = config();
         let mut only = normal.clone();
-        only.schema_version = PARAMETER_OPTIMIZER_SCHEMA_VERSION;
+        only.schema_version = 4;
         only.execution_mode = OptimizerExecutionMode::OptimizationOnly;
         let mut only_identity = identity();
         only_identity.execution_mode = OptimizerExecutionMode::OptimizationOnly;
@@ -6106,7 +6236,7 @@ mod tests {
         );
 
         let mut selection = config();
-        selection.schema_version = PARAMETER_OPTIMIZER_SCHEMA_VERSION;
+        selection.schema_version = 4;
         selection.execution_mode = OptimizerExecutionMode::OptimizationOnly;
         selection.entrapment_validation = EntrapmentValidationConfig {
             mode: EntrapmentValidationMode::SelectionAudit,
@@ -6184,7 +6314,7 @@ mod tests {
     #[test]
     fn hidden_audit_labels_cannot_change_trial_ranking_or_winner() {
         let mut cfg = config();
-        cfg.schema_version = PARAMETER_OPTIMIZER_SCHEMA_VERSION;
+        cfg.schema_version = 4;
         cfg.execution_mode = OptimizerExecutionMode::OptimizationOnly;
         cfg.entrapment_validation = EntrapmentValidationConfig {
             mode: EntrapmentValidationMode::SelectionAudit,
@@ -6234,7 +6364,7 @@ mod tests {
     #[test]
     fn optimization_only_accepts_ensemble_and_more_than_sixteen_trials() {
         let mut cfg = config();
-        cfg.schema_version = PARAMETER_OPTIMIZER_SCHEMA_VERSION;
+        cfg.schema_version = 4;
         cfg.execution_mode = OptimizerExecutionMode::OptimizationOnly;
         cfg.maximum_trial_budget = 32;
         cfg.selected_experts = vec![OptimizerExpert::Moments, OptimizerExpert::Ensemble];
@@ -6438,7 +6568,7 @@ mod tests {
     #[test]
     fn optimization_only_represents_all_experts_without_admission_gates() {
         let mut cfg = config();
-        cfg.schema_version = PARAMETER_OPTIMIZER_SCHEMA_VERSION;
+        cfg.schema_version = 4;
         cfg.execution_mode = OptimizerExecutionMode::OptimizationOnly;
         cfg.maximum_trial_budget = 64;
         cfg.selected_experts = vec![
@@ -7696,6 +7826,77 @@ mod tests {
         );
         let serialized = serde_json::to_string(&identity()).unwrap();
         assert!(!serialized.contains(std::env::temp_dir().to_string_lossy().as_ref()));
+    }
+
+    #[test]
+    fn schema_five_trials_and_resume_bind_root_proposal_space_membership() {
+        let directory = temp("proposal-space-trial-membership");
+        std::fs::create_dir_all(&directory).unwrap();
+        let mut cfg = config();
+        cfg.schema_version = PARAMETER_OPTIMIZER_SCHEMA_VERSION;
+        cfg.proposal_space_artifact = Some(directory.join("proposal-space.json"));
+        cfg.expected_proposal_space_sha256 = Some("a".repeat(64));
+        let mut optimizer_identity = identity();
+        optimizer_identity.root_proposal_space_sha256 = Some("a".repeat(64));
+        let checkpoint = directory.join("checkpoint.json");
+        let first = run_optimizer(
+            &cfg,
+            &optimizer_identity,
+            &checkpoint,
+            &mut Evaluator::default(),
+        )
+        .unwrap();
+        assert_eq!(first.root_proposal_space_sha256, Some("a".repeat(64)));
+        assert!(first.trials.iter().all(|trial| {
+            trial.request.root_proposal_space_sha256 == Some("a".repeat(64))
+                && trial.request.proposal_membership_sha256.len() == 64
+        }));
+        assert!(first.winner_trial_id.as_ref().is_some_and(|winner| {
+            first
+                .trials
+                .iter()
+                .find(|trial| &trial.request.trial_id == winner)
+                .is_some_and(|trial| {
+                    trial.request.root_proposal_space_sha256 == Some("a".repeat(64))
+                })
+        }));
+
+        let replay = run_optimizer(
+            &cfg,
+            &optimizer_identity,
+            &checkpoint,
+            &mut Evaluator::default(),
+        )
+        .unwrap();
+        assert!(replay
+            .trials
+            .iter()
+            .all(|trial| trial.reused_from_checkpoint));
+
+        let block = &cfg.blocks[0];
+        let outside = BTreeMap::from([(
+            "moments_purification_factor".into(),
+            ParameterValue::Float(0.7),
+        )]);
+        assert!(validate_proposal_membership(&cfg, block, &outside)
+            .unwrap_err()
+            .to_string()
+            .contains("outside the frozen proposal space"));
+
+        let mut changed_cfg = cfg.clone();
+        changed_cfg.expected_proposal_space_sha256 = Some("b".repeat(64));
+        let mut changed_identity = optimizer_identity;
+        changed_identity.root_proposal_space_sha256 = Some("b".repeat(64));
+        assert!(run_optimizer(
+            &changed_cfg,
+            &changed_identity,
+            &checkpoint,
+            &mut Evaluator::default(),
+        )
+        .unwrap_err()
+        .to_string()
+        .contains("fingerprint mismatch"));
+        std::fs::remove_dir_all(directory).unwrap();
     }
 
     #[test]
