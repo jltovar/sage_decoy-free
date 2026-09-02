@@ -194,6 +194,21 @@ single frozen proposal fails if it explicitly declares a dormant override. Compl
 configurations may still store canonical defaults for auxiliary evidence; those defaults are
 distinct from active optimizer proposal overrides. Runtime dependency validation remains enabled
 as an independent fail-closed check.
+Schema-v5 optimizer roots freeze their unresolved search space with
+`sage resolve-optimizer-proposal-space WORKFLOW.json --output PROPOSAL_SPACE.json`. This command
+canonicalizes staged-coordinate and exhaustive blocks, multivalued and conditional domains,
+expert-local adaptive-window policies, block order, seed, objective, constraints, and the final
+Ensemble block without selecting a parameter value or window. It writes and reopens an atomic
+artifact before any spectrum, FASTA, partition-content, candidate-pool, raw-cache, fit, or trial
+access. The executable manifest names that artifact with `proposal_space_artifact` and binds its
+digest with `expected_proposal_space_sha256`.
+
+The proposal-space artifact is root provenance, not a winner. Runtime trial/checkpoint records
+bind root membership and the realized window visit sequence; materialized winners additionally
+bind the exact resolved scientific configuration, selected window, fitted artifact, and winning
+trial. Target-only and comparison workflows continue to require the strict frozen-expert/winner
+resolver. `resolve-frozen-expert-configurations` therefore still rejects multivalued blocks and
+adaptive windows instead of choosing prospective defaults.
 Schema-v2 optimizer manifests can additionally set `execution_mode: optimization_only` for a full
 development run that materializes all individual and final Ensemble +entrapment winners and then
 returns successfully without resolving or executing any target-only resource or stage. Omitting

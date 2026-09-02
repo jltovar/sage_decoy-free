@@ -70,6 +70,40 @@ never become voter-admission rules.
 
 ## Search strategies
 
+### Proposal-space and winner lifecycle
+
+An unresolved optimization root and a frozen production winner are different provenance objects.
+Before optimization, run:
+
+```text
+sage resolve-optimizer-proposal-space WORKFLOW.json --output PROPOSAL_SPACE.json
+```
+
+The schema-v1 proposal artifact accepts the production `staged_coordinate` and
+`exhaustive_grid` strategies, multivalued/conditional domains, independent expert window
+policies, the intrinsic MSFDR1-SMIX 1-1 window, and the final Ensemble block. It canonicalizes
+expert ownership, scopes, domains, fixed overrides, block order, dependencies, adaptive bounds
+and stopping rules, seed, objective, empirical constraints, execution scope, and selection/audit
+protocol. It records declared, canonical, dependency-pruned, production-evaluable, duplicate,
+and invalid proposal counts plus every prune/rejection reason. For adaptive windows it binds the
+algorithm and complete policy but explicitly leaves the observed visit order and selected window
+unknown until training.
+
+The resolver loads only the workflow and search-configuration documents, publishes atomically,
+and reopens the bytes for validation. It never opens spectra, FASTA or partition content,
+candidate pools, raw caches, checkpoints, fitted artifacts, target-only resources, or TDC data.
+Schema-v5 execution manifests set `proposal_space_artifact` and
+`expected_proposal_space_sha256`; strict preflight recomputes and compares the artifact before
+dataset identity or optimizer-trial access.
+
+Every realized trial binds the root proposal-space digest, stage projection, complete effective
+configuration, and realized window. Checkpoint resume rejects a different root. A winner adds its
+selected trial and fitted-artifact identities, and a proposal artifact can never satisfy a
+target-only or comparison workflow's frozen-winner requirement. The separate
+`resolve-frozen-expert-configurations` command remains deliberately strict: it accepts only
+single-valued exhaustive blocks with fixed windows and is used after selection or for already
+frozen workflows.
+
 `exhaustive_grid` sorts parameter names and canonical JSON values, evaluates every valid declared
 combination, and refuses a grid larger than its block or workflow trial budget. It is called a
 bounded optimum only for a single completely evaluated declared block. Multiple exhaustive blocks

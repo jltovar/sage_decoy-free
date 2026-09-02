@@ -23,11 +23,12 @@ use crate::parameter_optimizer::{
     apply_fdr_overrides, parameter_catalog_fingerprint, preflight_optimizer_dependencies,
     resolve_unique_frozen_block_parameters, run_optimizer, AuditLevelMetrics,
     EmpiricalCalibrationPower, EntrapmentValidationMode, FrozenWinnerAuditEvaluation,
-    OptimizerBlock, OptimizerDependencyPreflightReport, OptimizerExecutionMode, OptimizerExpert,
-    OptimizerIdentity, OptimizerOutcome, OptimizerRunResult, OptimizerStageKind,
-    OptimizerWindowSearch, ParameterOptimizerConfig, ParameterOptimizerStageProjection,
-    ParameterValue, StatisticalDefaultEligibility, StatisticalValidationStatus, TrialEvaluation,
-    TrialEvaluator, TrialMetrics, TrialRecord, TrialRequest, TrialStatus,
+    OptimizerBlock, OptimizerBlockDependencyPreflight, OptimizerDependencyPreflightReport,
+    OptimizerExecutionMode, OptimizerExpert, OptimizerIdentity, OptimizerOutcome,
+    OptimizerRunResult, OptimizerStageKind, OptimizerWindowSearch, ParameterOptimizerConfig,
+    ParameterOptimizerStageProjection, ParameterValue, StatisticalDefaultEligibility,
+    StatisticalValidationStatus, TrialEvaluation, TrialEvaluator, TrialMetrics, TrialRecord,
+    TrialRequest, TrialStatus,
 };
 use crate::provenance::{freeze_baseline, sha256_file, write_json_atomic, BaselineManifest};
 use crate::runner::Runner;
@@ -315,9 +316,352 @@ pub struct FrozenExpertConfigurationEntry {
     pub stage_projection_provenance_sha256: String,
 }
 
+/// Inputs-only canonical identity of an unresolved optimizer root. Unlike a
+/// frozen-expert artifact, this binds domains and policies without selecting
+/// parameter values, windows, fitted state, or winners.
+#[derive(Clone, Debug, Serialize, Deserialize)]
+pub struct OptimizerProposalSpaceResolution {
+    pub schema_version: u32,
+    pub optimizer_schema_version: u32,
+    pub implementation_source_sha256: String,
+    pub parameter_catalog_sha256: String,
+    pub workflow_definition_sha256: String,
+    pub search_configuration_sha256: String,
+    pub ordered_expert_roster: Vec<ExpertIdentity>,
+    pub canonical_optimizer: ParameterOptimizerConfig,
+    pub blocks: Vec<OptimizerProposalBlockResolution>,
+    pub window_policies: Vec<OptimizerWindowPolicyResolution>,
+    pub dependency_preflight: OptimizerDependencyPreflightReport,
+    pub proposal_space_sha256: String,
+    pub payload_sha256: String,
+}
+
+#[derive(Clone, Debug, Serialize, Deserialize)]
+pub struct OptimizerProposalBlockResolution {
+    pub block_id: String,
+    pub expert: Option<OptimizerExpert>,
+    pub definition_sha256: String,
+    pub canonical_proposal_set_sha256: String,
+    pub dependency: OptimizerBlockDependencyPreflight,
+}
+
+#[derive(Clone, Debug, Serialize, Deserialize)]
+pub struct OptimizerWindowPolicyResolution {
+    pub expert: ExpertIdentity,
+    pub policy: serde_json::Value,
+    pub policy_sha256: String,
+    pub selected_window_known_prospectively: bool,
+}
+
+fn domain_sha256(domain: &[u8], value: &impl Serialize) -> Result<String> {
+    let mut hasher = Sha256::new();
+    hasher.update(domain);
+    hasher.update(serde_json::to_vec(value)?);
+    Ok(format!("{:x}", hasher.finalize()))
+}
+
+fn normalized_proposal_space_optimizer(
+    config: &ParameterOptimizerConfig,
+) -> Result<ParameterOptimizerConfig> {
+    let mut normalized = config.clone();
+    anyhow::ensure!(
+        normalized.expected_expert_configuration_sha256.is_empty()
+            && normalized.frozen_expert_configuration_artifact.is_none()
+            && !normalized.require_expected_expert_configurations,
+        "pre-optimization proposal-space resolution cannot contain frozen winner identities"
+    );
+    normalized.proposal_space_artifact = None;
+    normalized.expected_proposal_space_sha256 = None;
+    // Schema v5 adds only this lifecycle binding. Canonicalize otherwise-valid
+    // legacy roots to the current proposal schema so an immutable v4
+    // preregistration and its mechanically amended v5 execution manifest
+    // resolve to one scientific proposal-space identity.
+    normalized.schema_version = crate::parameter_optimizer::PARAMETER_OPTIMIZER_SCHEMA_VERSION;
+    normalized.selected_experts.sort_by_key(|expert| {
+        let identity = ExpertIdentity::from(*expert);
+        (identity == ExpertIdentity::Ensemble, identity)
+    });
+    normalized.validate()?;
+    Ok(normalized)
+}
+
+fn normalized_proposal_space_manifest(manifest: &WorkflowManifest) -> Result<WorkflowManifest> {
+    let mut normalized = manifest.clone();
+    let config = normalized
+        .parameter_optimizer
+        .as_ref()
+        .filter(|config| config.enabled)
+        .context("proposal-space resolution requires an enabled parameter_optimizer")?;
+    normalized.parameter_optimizer = Some(normalized_proposal_space_optimizer(config)?);
+    Ok(normalized)
+}
+
+fn proposal_space_payload(artifact: &OptimizerProposalSpaceResolution) -> serde_json::Value {
+    serde_json::json!({
+        "schema_version": artifact.schema_version,
+        "optimizer_schema_version": artifact.optimizer_schema_version,
+        "implementation_source_sha256": artifact.implementation_source_sha256,
+        "parameter_catalog_sha256": artifact.parameter_catalog_sha256,
+        "workflow_definition_sha256": artifact.workflow_definition_sha256,
+        "search_configuration_sha256": artifact.search_configuration_sha256,
+        "ordered_expert_roster": artifact.ordered_expert_roster,
+        "canonical_optimizer": artifact.canonical_optimizer,
+        "blocks": artifact.blocks,
+        "window_policies": artifact.window_policies,
+        "dependency_preflight": artifact.dependency_preflight,
+    })
+}
+
+fn proposal_space_identity(artifact: &OptimizerProposalSpaceResolution) -> Result<String> {
+    domain_sha256(
+        b"sage-optimizer-proposal-space-v1\0",
+        &proposal_space_payload(artifact),
+    )
+}
+
+fn proposal_space_payload_sha256(artifact: &OptimizerProposalSpaceResolution) -> Result<String> {
+    domain_sha256(
+        b"sage-optimizer-proposal-space-artifact-v1\0",
+        &serde_json::json!({
+            "payload": proposal_space_payload(artifact),
+            "proposal_space_sha256": artifact.proposal_space_sha256,
+        }),
+    )
+}
+
+fn resolve_optimizer_proposal_space_from_manifest(
+    manifest: &WorkflowManifest,
+) -> Result<OptimizerProposalSpaceResolution> {
+    let normalized_manifest = normalized_proposal_space_manifest(manifest)?;
+    let config = normalized_manifest
+        .parameter_optimizer
+        .as_ref()
+        .context("normalized proposal-space optimizer disappeared")?;
+    let dependency_preflight = preflight_optimizer_dependencies(config)?;
+    let selected = config
+        .selected_experts
+        .iter()
+        .copied()
+        .filter(|expert| *expert != OptimizerExpert::Ensemble)
+        .map(ExpertIdentity::from)
+        .collect::<BTreeSet<_>>();
+    let ordered_expert_roster = ExpertIdentity::INDIVIDUALS
+        .into_iter()
+        .filter(|expert| selected.contains(expert))
+        .collect::<Vec<_>>();
+    anyhow::ensure!(
+        ordered_expert_roster.len() == selected.len() && !ordered_expert_roster.is_empty(),
+        "proposal-space expert roster is incomplete or noncanonical"
+    );
+    let blocks = config
+        .block_order
+        .iter()
+        .map(|block_id| {
+            let block = config
+                .blocks
+                .iter()
+                .find(|block| block.enabled && &block.id == block_id)
+                .context("proposal-space block disappeared")?;
+            let dependency = dependency_preflight
+                .blocks
+                .iter()
+                .find(|report| &report.block_id == block_id)
+                .cloned()
+                .context("proposal-space dependency report disappeared")?;
+            Ok(OptimizerProposalBlockResolution {
+                block_id: block_id.clone(),
+                expert: block.expert,
+                definition_sha256: domain_sha256(
+                    b"sage-optimizer-proposal-block-definition-v1\0",
+                    block,
+                )?,
+                canonical_proposal_set_sha256: domain_sha256(
+                    b"sage-optimizer-canonical-proposal-set-v1\0",
+                    &serde_json::json!({
+                        "compiled_defaults": config.compiled_defaults,
+                        "workflow_defaults": config.workflow_defaults,
+                        "fixed_baseline_values": config.fixed_baseline_values,
+                        "block": block,
+                        "dependency": dependency,
+                    }),
+                )?,
+                dependency,
+            })
+        })
+        .collect::<Result<Vec<_>>>()?;
+    let window_policies = ordered_expert_roster
+        .iter()
+        .map(|expert| {
+            let model = normalized_manifest
+                .models
+                .iter()
+                .find(|model| model.enabled && expert_identity(&model.model) == *expert)
+                .with_context(|| format!("proposal-space model {expert} is missing"))?;
+            let block_policies = config
+                .blocks
+                .iter()
+                .filter(|block| {
+                    block.enabled
+                        && block.expert.map(ExpertIdentity::from) == Some(*expert)
+                        && block.window_search.is_some()
+                })
+                .map(|block| {
+                    serde_json::json!({
+                        "block_id": block.id,
+                        "window_search": block.window_search,
+                    })
+                })
+                .collect::<Vec<_>>();
+            let policy = if *expert == ExpertIdentity::Msfdr1Smix {
+                anyhow::ensure!(
+                    model.window_optimizer.is_none() && block_policies.is_empty(),
+                    "MSFDR1-SMIX proposal space must remain intrinsically fixed at 1-1"
+                );
+                serde_json::json!({"strategy": "fixed_intrinsic", "min_rank": 1, "max_rank": 1})
+            } else {
+                anyhow::ensure!(
+                    model.window_optimizer.is_some() || model.window.is_some(),
+                    "proposal-space expert {expert} has no declared window policy"
+                );
+                serde_json::json!({
+                    "model_window": model.window,
+                    "model_window_optimizer": model.window_optimizer,
+                    "optimizer_block_window_policies": block_policies,
+                    "seed": config.seed,
+                    "maximum_optimization_passes": config.maximum_optimization_passes,
+                    "tie_breaking": config.objective,
+                    "realized_visit_sequence": "unknown_until_training",
+                })
+            };
+            Ok(OptimizerWindowPolicyResolution {
+                expert: *expert,
+                policy_sha256: domain_sha256(b"sage-optimizer-window-policy-space-v1\0", &policy)?,
+                policy,
+                selected_window_known_prospectively: *expert == ExpertIdentity::Msfdr1Smix,
+            })
+        })
+        .collect::<Result<Vec<_>>>()?;
+    let mut artifact = OptimizerProposalSpaceResolution {
+        schema_version: 1,
+        optimizer_schema_version: config.schema_version,
+        implementation_source_sha256:
+            crate::parameter_optimizer::PARAMETER_OPTIMIZER_IMPLEMENTATION_SOURCE_SHA256.into(),
+        parameter_catalog_sha256: parameter_catalog_fingerprint()?,
+        workflow_definition_sha256: domain_sha256(
+            b"sage-optimizer-proposal-workflow-definition-v1\0",
+            &normalized_manifest,
+        )?,
+        search_configuration_sha256: sha256_file(&normalized_manifest.search_config)?,
+        ordered_expert_roster,
+        canonical_optimizer: config.clone(),
+        blocks,
+        window_policies,
+        dependency_preflight,
+        proposal_space_sha256: String::new(),
+        payload_sha256: String::new(),
+    };
+    artifact.proposal_space_sha256 = proposal_space_identity(&artifact)?;
+    artifact.payload_sha256 = proposal_space_payload_sha256(&artifact)?;
+    validate_optimizer_proposal_space_resolution(&artifact)?;
+    Ok(artifact)
+}
+
+fn validate_optimizer_proposal_space_resolution(
+    artifact: &OptimizerProposalSpaceResolution,
+) -> Result<()> {
+    anyhow::ensure!(
+        artifact.schema_version == 1,
+        "unsupported optimizer proposal-space schema"
+    );
+    anyhow::ensure!(
+        artifact.implementation_source_sha256
+            == crate::parameter_optimizer::PARAMETER_OPTIMIZER_IMPLEMENTATION_SOURCE_SHA256,
+        "optimizer proposal-space implementation identity differs from this binary"
+    );
+    anyhow::ensure!(
+        artifact.parameter_catalog_sha256 == parameter_catalog_fingerprint()?,
+        "optimizer proposal-space parameter catalog differs from this binary"
+    );
+    artifact.canonical_optimizer.validate()?;
+    anyhow::ensure!(
+        artifact.proposal_space_sha256 == proposal_space_identity(artifact)?,
+        "optimizer proposal-space identity does not match its canonical payload"
+    );
+    anyhow::ensure!(
+        artifact.payload_sha256 == proposal_space_payload_sha256(artifact)?,
+        "optimizer proposal-space artifact payload hash mismatch"
+    );
+    anyhow::ensure!(
+        artifact.blocks.len() == artifact.canonical_optimizer.block_order.len()
+            && artifact.window_policies.len() == artifact.ordered_expert_roster.len()
+            && artifact
+                .dependency_preflight
+                .all_blocks_have_valid_candidates,
+        "optimizer proposal-space artifact is incomplete"
+    );
+    Ok(())
+}
+
+fn write_optimizer_proposal_space_atomic(
+    path: &Path,
+    artifact: &OptimizerProposalSpaceResolution,
+) -> Result<()> {
+    validate_optimizer_proposal_space_resolution(artifact)?;
+    anyhow::ensure!(
+        !path.exists(),
+        "optimizer proposal-space artifact already exists: {}",
+        path.display()
+    );
+    let parent = path.parent().unwrap_or_else(|| Path::new("."));
+    std::fs::create_dir_all(parent)?;
+    let name = path
+        .file_name()
+        .and_then(|name| name.to_str())
+        .unwrap_or("proposal-space.json");
+    let temporary = parent.join(format!(".{name}.proposal-space.{}.tmp", std::process::id()));
+    let mut file = std::fs::OpenOptions::new()
+        .write(true)
+        .create_new(true)
+        .open(&temporary)?;
+    let bytes = serde_json::to_vec_pretty(artifact)?;
+    file.write_all(&bytes)?;
+    file.sync_all()?;
+    drop(file);
+    let provisional: OptimizerProposalSpaceResolution =
+        serde_json::from_slice(&std::fs::read(&temporary)?)?;
+    validate_optimizer_proposal_space_resolution(&provisional)?;
+    std::fs::hard_link(&temporary, path)?;
+    std::fs::File::open(parent)?.sync_all()?;
+    let durable = std::fs::read(path)?;
+    let reopened: OptimizerProposalSpaceResolution = serde_json::from_slice(&durable)?;
+    anyhow::ensure!(
+        durable == bytes,
+        "durable optimizer proposal-space bytes changed"
+    );
+    validate_optimizer_proposal_space_resolution(&reopened)?;
+    std::fs::remove_file(&temporary)?;
+    std::fs::File::open(parent)?.sync_all()?;
+    Ok(())
+}
+
+pub fn resolve_optimizer_proposal_space(
+    manifest_path: &Path,
+    output_path: &Path,
+) -> Result<OptimizerProposalSpaceResolution> {
+    let manifest = WorkflowManifest::load_before_resource_access(manifest_path)?;
+    let artifact = resolve_optimizer_proposal_space_from_manifest(&manifest)?;
+    write_optimizer_proposal_space_atomic(output_path, &artifact)?;
+    let reopened: OptimizerProposalSpaceResolution =
+        serde_json::from_slice(&std::fs::read(output_path)?)?;
+    validate_optimizer_proposal_space_resolution(&reopened)?;
+    Ok(reopened)
+}
+
 #[derive(Clone, Debug, Serialize, Deserialize)]
 pub struct EnsembleWinnerMaterialization {
     pub schema_version: u32,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub root_proposal_space_sha256: Option<String>,
     pub selected_trial_id: String,
     pub selected_trial_result_sha256: String,
     pub selected_fitted_artifact_sha256: String,
@@ -3795,6 +4139,43 @@ fn prepare_frozen_expert_configuration_preflight(
     Ok(Some(actual))
 }
 
+fn prepare_optimizer_proposal_space_preflight(
+    manifest: &WorkflowManifest,
+) -> Result<Option<OptimizerProposalSpaceResolution>> {
+    let Some(config) = manifest
+        .parameter_optimizer
+        .as_ref()
+        .filter(|config| config.enabled && config.schema_version >= 5)
+    else {
+        return Ok(None);
+    };
+    let expected = config
+        .expected_proposal_space_sha256
+        .as_ref()
+        .context("schema-v5 optimization requires expected_proposal_space_sha256")?;
+    let path = config
+        .proposal_space_artifact
+        .as_ref()
+        .context("schema-v5 optimization requires proposal_space_artifact")?;
+    let frozen: OptimizerProposalSpaceResolution =
+        serde_json::from_slice(&std::fs::read(path).with_context(|| {
+            format!(
+                "failed to read optimizer proposal-space artifact {}",
+                path.display()
+            )
+        })?)?;
+    validate_optimizer_proposal_space_resolution(&frozen)?;
+    let actual = resolve_optimizer_proposal_space_from_manifest(manifest)?;
+    anyhow::ensure!(
+        frozen.proposal_space_sha256 == *expected
+            && actual.proposal_space_sha256 == *expected
+            && frozen.payload_sha256 == actual.payload_sha256
+            && proposal_space_payload(&frozen) == proposal_space_payload(&actual),
+        "frozen optimizer proposal-space artifact does not match current production resolution"
+    );
+    Ok(Some(actual))
+}
+
 fn validate_stage_expected_expert_configuration(
     config: Option<&ParameterOptimizerConfig>,
     model: &ModelFit,
@@ -6112,6 +6493,10 @@ fn optimizer_identity_from_preflight(
             .map(|partition| partition.partition_identity.clone()),
         root_optimizer_provenance_sha256: None,
         stage_optimizer_provenance_sha256: None,
+        root_proposal_space_sha256: manifest
+            .parameter_optimizer
+            .as_ref()
+            .and_then(|config| config.expected_proposal_space_sha256.clone()),
     })
 }
 
@@ -6195,12 +6580,15 @@ fn validate_optimizer_ensemble_winner_lock(
         .as_ref()
         .context("schema-v10 optimizer winner lock has no transactional winner identity")?;
     anyhow::ensure!(
-        materialization.schema_version == 1
+        (materialization.schema_version == 1 || materialization.schema_version == 2)
             && materialization.selected_trial_id == winner.request.trial_id
             && result.winner_trial_id.as_deref() == Some(winner.request.trial_id.as_str())
             && materialization.optimizer_fingerprint == result.optimizer_fingerprint
             && materialization.optimizer_scientific_result_sha256
-                == result.scientific_result_sha256,
+                == result.scientific_result_sha256
+            && materialization.root_proposal_space_sha256 == result.root_proposal_space_sha256
+            && winner.request.root_proposal_space_sha256 == result.root_proposal_space_sha256
+            && (result.root_proposal_space_sha256.is_none() || materialization.schema_version == 2),
         "optimizer winner lock identifies another selected trial or optimizer result"
     );
     let results_hash = sha256_file(&stage.results)?;
@@ -6576,7 +6964,12 @@ fn materialize_optimizer_ensemble_winner_lock(
         selected_configuration.resolved_configuration_sha256.clone();
     lock.final_ensemble_configuration = selected_configuration;
     lock.winner_materialization = Some(EnsembleWinnerMaterialization {
-        schema_version: 1,
+        schema_version: if result.root_proposal_space_sha256.is_some() {
+            2
+        } else {
+            1
+        },
+        root_proposal_space_sha256: result.root_proposal_space_sha256.clone(),
         selected_trial_id: winner.request.trial_id.clone(),
         selected_trial_result_sha256: sha256_file(&stage.results)?,
         selected_fitted_artifact_sha256: sha256_file(&fitted_artifacts_path)?,
@@ -7039,6 +7432,10 @@ pub fn execute_workflow(
 ) -> Result<WorkflowState> {
     let mut manifest = WorkflowManifest::load_before_resource_access(manifest_path)?;
     let manifest_hash = sha256_file(manifest_path)?;
+    // Schema-v5 optimization roots bind the complete unresolved proposal
+    // space before any dataset, partition, pool, cache, fit, or checkpoint
+    // access. This artifact is deliberately not a frozen-winner substitute.
+    prepare_optimizer_proposal_space_preflight(&manifest)?;
     // Resolve and compare the complete frozen expert roster before computing
     // dataset identities or touching spectra, candidate pools, annotations,
     // fitted artifacts, or optimizer checkpoints. Runtime stage validation
@@ -8714,7 +9111,7 @@ mod tests {
     #[test]
     fn required_expected_expert_configuration_map_fails_closed() {
         let mut config = test_optimizer_config();
-        config.schema_version = crate::parameter_optimizer::PARAMETER_OPTIMIZER_SCHEMA_VERSION;
+        config.schema_version = 4;
         config.selected_experts = vec![OptimizerExpert::Moments, OptimizerExpert::Ensemble];
         config.require_expected_expert_configurations = true;
         assert!(config
@@ -8767,6 +9164,8 @@ mod tests {
             selected_experts: vec![OptimizerExpert::Moments],
             expected_expert_configuration_sha256: BTreeMap::new(),
             frozen_expert_configuration_artifact: None,
+            proposal_space_artifact: None,
+            expected_proposal_space_sha256: None,
             require_expected_expert_configurations: false,
             compiled_defaults: BTreeMap::new(),
             workflow_defaults: BTreeMap::new(),
@@ -8890,7 +9289,7 @@ mod tests {
             ),
         ];
         let mut optimizer = test_optimizer_config();
-        optimizer.schema_version = crate::parameter_optimizer::PARAMETER_OPTIMIZER_SCHEMA_VERSION;
+        optimizer.schema_version = 4;
         optimizer.execution_mode = OptimizerExecutionMode::OptimizationOnly;
         optimizer.maximum_trial_budget = 16;
         optimizer.selected_experts = definitions
@@ -8948,6 +9347,248 @@ mod tests {
             .collect();
         manifest.parameter_optimizer = Some(optimizer);
         manifest
+    }
+
+    fn adaptive_seven_expert_proposal_manifest(directory: &Path) -> WorkflowManifest {
+        let mut manifest = frozen_seven_expert_manifest(directory);
+        let optimizer = manifest.parameter_optimizer.as_mut().unwrap();
+        optimizer.schema_version = crate::parameter_optimizer::PARAMETER_OPTIMIZER_SCHEMA_VERSION;
+        optimizer.maximum_trial_budget = 1_000;
+        optimizer.maximum_optimization_passes = 2;
+        optimizer.proposal_space_artifact = None;
+        optimizer.expected_proposal_space_sha256 = None;
+        for block in &mut optimizer.blocks {
+            block.strategy = crate::parameter_optimizer::OptimizerStrategy::StagedCoordinate;
+            block.max_trials = Some(100);
+            block.max_passes = Some(2);
+            for values in block.space.values_mut() {
+                let additional = match values.first().unwrap() {
+                    ParameterValue::Float(value) => ParameterValue::Float(value + 0.01),
+                    ParameterValue::Integer(value) => ParameterValue::Integer(value + 1),
+                    other => other.clone(),
+                };
+                values.push(additional);
+            }
+            if block.expert != Some(OptimizerExpert::Msfdr1Smix)
+                && block.expert != Some(OptimizerExpert::Ensemble)
+            {
+                block.window_search = Some(OptimizerWindowSearch {
+                    strategy: "landscape_adaptive".into(),
+                    min_rank_range: [2, 10],
+                    max_rank_range: [2, 25],
+                });
+            }
+        }
+        for model in &mut manifest.models {
+            if model.model == ModelFit::Ensemble || model.model == ModelFit::Msfdr1Smix {
+                model.window = None;
+                model.window_optimizer = None;
+            } else {
+                model.window = None;
+                model.window_optimizer = Some(WindowOptimizerWorkflow {
+                    strategy: NullWindowSearchStrategy::LandscapeAdaptive,
+                    min_rank_range: [2, 10],
+                    max_rank_range: [2, 25],
+                    adaptive: AdaptiveNullWindowSearchOptions::default(),
+                });
+            }
+        }
+        manifest
+    }
+
+    #[test]
+    fn proposal_space_resolves_seven_experts_without_selecting_winners_or_data() {
+        let directory = test_directory("optimizer-proposal-space-seven-experts");
+        let mut manifest = adaptive_seven_expert_proposal_manifest(&directory);
+        manifest.spectra = vec!["/must-not-be-opened/spectrum.d".into()];
+        manifest.candidate_pool_root = Some(PathBuf::from("/must-not-be-opened/pool"));
+        manifest.annotation_cache_root = Some(PathBuf::from("/must-not-be-opened/raw-cache"));
+
+        let first = resolve_optimizer_proposal_space_from_manifest(&manifest).unwrap();
+        let second = resolve_optimizer_proposal_space_from_manifest(&manifest).unwrap();
+        assert_eq!(first.proposal_space_sha256, second.proposal_space_sha256);
+        assert_eq!(first.payload_sha256, second.payload_sha256);
+        let mut legacy_preregistration = manifest.clone();
+        legacy_preregistration
+            .parameter_optimizer
+            .as_mut()
+            .unwrap()
+            .schema_version = 4;
+        assert_eq!(
+            first.proposal_space_sha256,
+            resolve_optimizer_proposal_space_from_manifest(&legacy_preregistration)
+                .unwrap()
+                .proposal_space_sha256,
+            "the operational schema-v5 amendment must not change a schema-v4 scientific space"
+        );
+        assert_eq!(first.optimizer_schema_version, 5);
+        assert_eq!(first.ordered_expert_roster, ExpertIdentity::INDIVIDUALS);
+        assert_eq!(first.window_policies.len(), 7);
+        assert!(first
+            .window_policies
+            .iter()
+            .filter(|policy| policy.selected_window_known_prospectively)
+            .all(|policy| policy.expert == ExpertIdentity::Msfdr1Smix));
+        assert!(first.window_policies.iter().any(|policy| {
+            policy.expert == ExpertIdentity::Msfdr1Smix
+                && policy.policy["min_rank"] == 1
+                && policy.policy["max_rank"] == 1
+        }));
+        assert!(first.blocks.iter().all(|block| {
+            block.dependency.production_evaluable_proposals > 0
+                && !block.definition_sha256.is_empty()
+                && !block.canonical_proposal_set_sha256.is_empty()
+        }));
+        assert!(first
+            .canonical_optimizer
+            .expected_expert_configuration_sha256
+            .is_empty());
+        assert!(manifest
+            .models
+            .iter()
+            .filter(|model| model.model != ModelFit::Ensemble)
+            .all(|model| model.window.is_none()));
+        assert!(!manifest.output_root.exists());
+        assert!(!Path::new("/must-not-be-opened/spectrum.d").exists());
+
+        let output = directory.join("proposal-space.json");
+        write_optimizer_proposal_space_atomic(&output, &first).unwrap();
+        let reopened: OptimizerProposalSpaceResolution =
+            serde_json::from_slice(&std::fs::read(&output).unwrap()).unwrap();
+        validate_optimizer_proposal_space_resolution(&reopened).unwrap();
+        assert_eq!(reopened.payload_sha256, first.payload_sha256);
+        assert!(write_optimizer_proposal_space_atomic(&output, &first)
+            .unwrap_err()
+            .to_string()
+            .contains("already exists"));
+
+        let frozen_error = resolve_frozen_expert_configurations_from_manifest(&manifest)
+            .unwrap_err()
+            .to_string();
+        assert!(
+            frozen_error.contains("fixed model-local window")
+                || frozen_error.contains("exhaustive_grid blocks")
+                || frozen_error.contains("must not declare candidate windows"),
+            "unexpected frozen-resolver error: {frozen_error}"
+        );
+        std::fs::remove_dir_all(directory).unwrap();
+    }
+
+    #[test]
+    fn proposal_space_identity_binds_domains_order_policy_and_constraints() {
+        let directory = test_directory("optimizer-proposal-space-identity");
+        let manifest = adaptive_seven_expert_proposal_manifest(&directory);
+        let baseline = resolve_optimizer_proposal_space_from_manifest(&manifest).unwrap();
+        let resolve = |candidate: &WorkflowManifest| {
+            resolve_optimizer_proposal_space_from_manifest(candidate)
+                .unwrap()
+                .proposal_space_sha256
+        };
+
+        let mut changed = manifest.clone();
+        changed.parameter_optimizer.as_mut().unwrap().blocks[0]
+            .space
+            .values_mut()
+            .next()
+            .unwrap()
+            .push(ParameterValue::Float(0.3));
+        assert_ne!(baseline.proposal_space_sha256, resolve(&changed));
+
+        let mut changed = manifest.clone();
+        changed
+            .parameter_optimizer
+            .as_mut()
+            .unwrap()
+            .block_order
+            .swap(0, 1);
+        assert_ne!(baseline.proposal_space_sha256, resolve(&changed));
+
+        let mut changed = manifest.clone();
+        changed.parameter_optimizer.as_mut().unwrap().seed += 1;
+        assert_ne!(baseline.proposal_space_sha256, resolve(&changed));
+
+        let mut changed = manifest.clone();
+        changed
+            .parameter_optimizer
+            .as_mut()
+            .unwrap()
+            .objective
+            .swap(0, 1);
+        assert_ne!(baseline.proposal_space_sha256, resolve(&changed));
+
+        let mut changed = manifest.clone();
+        changed
+            .parameter_optimizer
+            .as_mut()
+            .unwrap()
+            .empirical_entrapment_constraints
+            .push(crate::parameter_optimizer::EmpiricalEntrapmentConstraint {
+                level: "psm".into(),
+                maximum_adjusted_fdp: 0.05,
+                minimum_entrapment_observations_for_power: 10,
+            });
+        assert_ne!(baseline.proposal_space_sha256, resolve(&changed));
+
+        let mut changed = manifest.clone();
+        changed
+            .models
+            .iter_mut()
+            .find(|model| model.model == ModelFit::Moments)
+            .unwrap()
+            .window_optimizer
+            .as_mut()
+            .unwrap()
+            .adaptive
+            .hill_max_steps += 1;
+        assert_ne!(baseline.proposal_space_sha256, resolve(&changed));
+
+        let mut dependency_changed = baseline.clone();
+        dependency_changed.dependency_preflight.blocks[0]
+            .issues
+            .push(crate::parameter_optimizer::OptimizerDependencyIssue {
+                pass: 1,
+                proposal_ordinal: 7,
+                disposition: "dependency_pruned".into(),
+                affected_fields: vec!["synthetic_dependency".into()],
+                reason: "changed dependency rule".into(),
+            });
+        assert_ne!(
+            baseline.proposal_space_sha256,
+            proposal_space_identity(&dependency_changed).unwrap()
+        );
+
+        let canonical = serde_json::to_value(&manifest).unwrap();
+        let aliased_text = serde_json::to_string(&canonical)
+            .unwrap()
+            .replace("\"msfdr\"", "\"msfdr_seeded\"");
+        let aliased: WorkflowManifest = serde_json::from_str(&aliased_text).unwrap();
+        assert_eq!(baseline.proposal_space_sha256, resolve(&aliased));
+        std::fs::remove_dir_all(directory).unwrap();
+    }
+
+    #[test]
+    fn schema_five_preflight_requires_exact_proposal_artifact_not_winner_substitute() {
+        let directory = test_directory("optimizer-proposal-space-preflight");
+        let mut manifest = adaptive_seven_expert_proposal_manifest(&directory);
+        let artifact = resolve_optimizer_proposal_space_from_manifest(&manifest).unwrap();
+        let artifact_path = directory.join("proposal-space.json");
+        write_optimizer_proposal_space_atomic(&artifact_path, &artifact).unwrap();
+        let optimizer = manifest.parameter_optimizer.as_mut().unwrap();
+        optimizer.proposal_space_artifact = Some(artifact_path.clone());
+        optimizer.expected_proposal_space_sha256 = Some(artifact.proposal_space_sha256.clone());
+        let prepared = prepare_optimizer_proposal_space_preflight(&manifest)
+            .unwrap()
+            .unwrap();
+        assert_eq!(prepared.payload_sha256, artifact.payload_sha256);
+
+        let mut changed = manifest.clone();
+        changed.parameter_optimizer.as_mut().unwrap().seed += 1;
+        assert!(prepare_optimizer_proposal_space_preflight(&changed)
+            .unwrap_err()
+            .to_string()
+            .contains("does not match"));
+        assert!(resolve_frozen_expert_configurations_from_manifest(&manifest).is_err());
+        std::fs::remove_dir_all(directory).unwrap();
     }
 
     #[test]
@@ -9277,7 +9918,7 @@ mod tests {
         )
         .unwrap();
         let mut config = test_optimizer_config();
-        config.schema_version = crate::parameter_optimizer::PARAMETER_OPTIMIZER_SCHEMA_VERSION;
+        config.schema_version = 4;
         config.execution_mode = OptimizerExecutionMode::OptimizationOnly;
         config.maximum_trial_budget = 2;
         config.entrapment_validation = crate::parameter_optimizer::EntrapmentValidationConfig {
@@ -9319,6 +9960,7 @@ mod tests {
             entrapment_partition_identity: Some(partition.partition_identity.clone()),
             root_optimizer_provenance_sha256: None,
             stage_optimizer_provenance_sha256: None,
+            root_proposal_space_sha256: None,
         };
         let optimizer_root = manifest
             .output_root
@@ -9401,7 +10043,7 @@ mod tests {
         manifest.require_existing_candidate_pool = true;
         manifest.require_existing_annotation_cache = true;
         let mut optimizer = test_optimizer_config();
-        optimizer.schema_version = crate::parameter_optimizer::PARAMETER_OPTIMIZER_SCHEMA_VERSION;
+        optimizer.schema_version = 4;
         optimizer.execution_mode = OptimizerExecutionMode::OptimizationOnly;
         optimizer.entrapment_validation = crate::parameter_optimizer::EntrapmentValidationConfig {
             mode: EntrapmentValidationMode::SelectionAudit,
@@ -10124,7 +10766,7 @@ mod tests {
         .unwrap();
         manifest.target_only_annotation_cache_root = Some(poison_target_root.clone());
         let mut optimizer = test_optimizer_config();
-        optimizer.schema_version = crate::parameter_optimizer::PARAMETER_OPTIMIZER_SCHEMA_VERSION;
+        optimizer.schema_version = 4;
         optimizer.execution_mode = OptimizerExecutionMode::OptimizationOnly;
         manifest.parameter_optimizer = Some(optimizer);
         write_json_atomic(&manifest_path, &manifest).unwrap();
@@ -11706,6 +12348,8 @@ mod tests {
                 parameters: BTreeMap::new(),
                 use_external_features: false,
                 target_only_outcomes_allowed: false,
+                root_proposal_space_sha256: Some("a".repeat(64)),
+                proposal_membership_sha256: "b".repeat(64),
             },
             evaluation: TrialEvaluation {
                 status: TrialStatus::Feasible,
@@ -11735,6 +12379,7 @@ mod tests {
         let optimizer_result = OptimizerRunResult {
             schema_version: crate::parameter_optimizer::PARAMETER_OPTIMIZER_SCHEMA_VERSION,
             optimizer_fingerprint: "optimizer-fingerprint".into(),
+            root_proposal_space_sha256: Some("a".repeat(64)),
             scientific_result_sha256: "scientific-result".into(),
             parameter_binding_coverage: Vec::new(),
             classification: crate::parameter_optimizer::OptimizationClassification::DevelopmentOnly,
@@ -11814,6 +12459,22 @@ mod tests {
                 .unwrap()
                 .selected_trial_id,
             "trial-b"
+        );
+        assert_eq!(
+            selected_lock
+                .winner_materialization
+                .as_ref()
+                .unwrap()
+                .schema_version,
+            2
+        );
+        assert_eq!(
+            selected_lock
+                .winner_materialization
+                .as_ref()
+                .unwrap()
+                .root_proposal_space_sha256,
+            Some("a".repeat(64))
         );
         let first_bytes = std::fs::read(directory.join("ensemble.lock.json")).unwrap();
         let mut invalid_lock = selected_lock.clone();
@@ -12676,6 +13337,7 @@ mod tests {
                     .stage_optimizer_provenance_sha256
                     .clone(),
             ),
+            root_proposal_space_sha256: None,
         };
         let mut evaluator = NonbaselineEnsembleProjectionEvaluator::default();
         let first = run_optimizer(
@@ -12738,6 +13400,7 @@ mod tests {
             .collect::<BTreeMap<_, _>>();
         let materialization = EnsembleWinnerMaterialization {
             schema_version: 1,
+            root_proposal_space_sha256: None,
             selected_trial_id: "nonbaseline-winner".into(),
             selected_trial_result_sha256: "1".repeat(64),
             selected_fitted_artifact_sha256: "2".repeat(64),
