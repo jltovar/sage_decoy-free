@@ -123,7 +123,11 @@ prediction layer, and returns before stage calibration or fitting. See
 boundaries, exact commands, provenance catalog, atomicity, resumption, and no-fallback guarantees.
 Raw-cache schema v2 represents unavailable MS2PIP and DeepLC lanes explicitly: the candidate stays
 in the population, unavailable values remain non-evidence, and valid Sage or other external lanes
-remain usable. Sage never imputes a numeric prediction. A hash-bound preserved generator run may
+remain usable. At the TSV boundary, Sage examines every raw field in each recognized lane before
+numeric parsing: the production wrapper's all-empty lane is mapped to the existing durable
+`prediction_unavailable` state, while a partially empty lane, malformed nonempty value, NaN, or
+infinity fails closed. Empty required fields outside a recognized complete lane also fail closed.
+Sage never imputes a numeric prediction. A hash-bound preserved generator run may
 be finalized with `sage finalize-raw-cache-from-existing-output`; this recovery scope cannot launch
 the wrapper, Python, a spectrum search, or a statistical stage.
 

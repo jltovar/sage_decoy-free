@@ -86,13 +86,17 @@ MS2PIP, DeepLC, or IM2Deep generators it verifies the relevant installed package
 wrapper package and `psm-utils`; for MS2PIP and DeepLC it also requires complete selected model-file
 content identities. Generation exports the frozen candidate population with neutral q/PEP fields,
 invokes the wrapper once, and requires a one-to-one stable-ID join. Raw-cache schema v2 records an
-explicit `sage-external-feature-missingness-v1` availability catalog. An all-NaN MS2PIP or DeepLC
-lane is represented as `prediction_unavailable`; the candidate remains present and downstream
+explicit `sage-external-feature-missingness-v1` availability catalog. The TSV parser classifies the
+raw text for every member of MS2PIP and DeepLC independently before numeric conversion. The
+production wrapper's all-empty representation for a complete lane becomes the existing all-NaN
+durable lane and is recorded as `prediction_unavailable`; the candidate remains present and downstream
 calibration ignores only that unavailable lane. No zero, mean, median, or other numeric imputation
-is performed. Infinity, partial-lane nonfiniteness, nonfinite native observed mobility, duplicate,
-missing, surplus, or inconsistent availability state is treated as corrupt/ambiguous output and
-fails before publication. The content fingerprint binds the missingness schema, every availability
-record, and the complete generator-output SHA-256 and size.
+is performed. A partially empty lane, malformed nonempty value, NaN, infinity, empty unrelated
+required field, nonfinite native observed mobility, duplicate, missing, surplus, or inconsistent
+availability state is treated as corrupt/ambiguous output and fails before publication. Missingness
+in one recognized lane never disables valid evidence in another lane. The content fingerprint binds
+the missingness schema, every availability record, and the complete generator-output SHA-256 and
+size.
 
 If the exact raw cache already exists, Sage fully verifies and reuses it without invoking Python or
 the wrapper. An incomplete, corrupt, or incompatible final cache fails closed and never triggers
