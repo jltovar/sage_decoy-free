@@ -6,9 +6,10 @@ use crate::candidate_pool::{
 use crate::entrapment::{
     build_entrapment_partition, compare_generated_to_legacy, digestion_search_space_identity,
     entrapment_construction_identity, entrapment_generation_input_sha256,
-    generate_foreign_entrapment, inspect_frozen_entrapment, resolve_entrapment_partition,
-    EntrapmentDatabaseMode, EntrapmentDatabaseReport, EntrapmentFastaParityReport,
-    EntrapmentGenerationReport, EntrapmentPartitionArtifact, EntrapmentSelectionView,
+    generate_foreign_entrapment, inspect_frozen_entrapment, load_existing_entrapment_resource,
+    resolve_entrapment_partition, EntrapmentDatabaseMode, EntrapmentDatabaseReport,
+    EntrapmentFastaParityReport, EntrapmentGenerationMode, EntrapmentGenerationReport,
+    EntrapmentPartitionArtifact, EntrapmentSelectionView, ExistingEntrapmentResourceReference,
     ForeignSourceMode, LegacyEntrapmentReference, SharedPeptideExclusionMode,
 };
 use crate::external_feature_cache::{
@@ -168,6 +169,16 @@ pub struct EntrapmentWorkflow {
     pub seed: u64,
     #[serde(default = "default_protein_fold")]
     pub protein_fold: usize,
+    /// Whether native Sage entrapment generation occurs in this workflow or
+    /// an immutable Sage audit artifact is required and reused read-only.
+    #[serde(default)]
+    pub generation_mode: EntrapmentGenerationMode,
+    #[serde(default)]
+    pub generation_artifact: Option<PathBuf>,
+    #[serde(default)]
+    pub expected_generation_artifact_sha256: Option<String>,
+    #[serde(default)]
+    pub expected_combined_fasta_sha256: Option<String>,
     /// Immutable dataset-local selection/audit label partition. Required only
     /// when parameter_optimizer.entrapment_validation.mode is selection_audit.
     #[serde(default)]
@@ -387,6 +398,10 @@ fn normalized_proposal_space_optimizer(
 
 fn normalized_proposal_space_manifest(manifest: &WorkflowManifest) -> Result<WorkflowManifest> {
     let mut normalized = manifest.clone();
+    if normalized.entrapment.generation_mode == EntrapmentGenerationMode::RequireExisting {
+        normalized.entrapment.generation_artifact =
+            Some(PathBuf::from("<content-addressed-entrapment-resource>"));
+    }
     let config = normalized
         .parameter_optimizer
         .as_ref()
@@ -2206,6 +2221,47 @@ impl WorkflowManifest {
                     self.entrapment.frozen_legacy_fasta.is_none(),
                     "native generation must not declare frozen_legacy_fasta"
                 );
+                match self.entrapment.generation_mode {
+                    EntrapmentGenerationMode::WorkflowLocal => anyhow::ensure!(
+                        self.entrapment.generation_artifact.is_none()
+                            && self.entrapment.expected_generation_artifact_sha256.is_none()
+                            && self.entrapment.expected_combined_fasta_sha256.is_none(),
+                        "workflow-local entrapment generation must not declare an existing-resource artifact or hashes"
+                    ),
+                    EntrapmentGenerationMode::RequireExisting => {
+                        let artifact = self
+                            .entrapment
+                            .generation_artifact
+                            .as_ref()
+                            .context("require_existing entrapment mode requires generation_artifact")?;
+                        if validate_resource_paths {
+                            anyhow::ensure!(
+                                artifact.is_file(),
+                                "required existing entrapment artifact does not exist"
+                            );
+                            anyhow::ensure!(
+                                self.entrapment.output_fasta.is_file(),
+                                "required existing combined entrapment FASTA does not exist"
+                            );
+                        }
+                        for (name, value) in [
+                            (
+                                "expected_generation_artifact_sha256",
+                                self.entrapment.expected_generation_artifact_sha256.as_ref(),
+                            ),
+                            (
+                                "expected_combined_fasta_sha256",
+                                self.entrapment.expected_combined_fasta_sha256.as_ref(),
+                            ),
+                        ] {
+                            anyhow::ensure!(
+                                value.is_some_and(|hash| hash.len() == 64
+                                    && hash.bytes().all(|byte| byte.is_ascii_hexdigit())),
+                                "{name} must be 64 hexadecimal characters"
+                            );
+                        }
+                    }
+                }
                 match self.entrapment.foreign_source_mode {
                     ForeignSourceMode::Automatic => anyhow::ensure!(
                         self.entrapment.selected_foreign_fasta.is_none(),
@@ -2250,6 +2306,13 @@ impl WorkflowManifest {
                 }
             }
             EntrapmentDatabaseMode::FrozenLegacy => {
+                anyhow::ensure!(
+                    self.entrapment.generation_mode == EntrapmentGenerationMode::WorkflowLocal
+                        && self.entrapment.generation_artifact.is_none()
+                        && self.entrapment.expected_generation_artifact_sha256.is_none()
+                        && self.entrapment.expected_combined_fasta_sha256.is_none(),
+                    "frozen_legacy and existing native-generation resource modes are mutually exclusive"
+                );
                 let frozen = self
                     .entrapment
                     .frozen_legacy_fasta
@@ -2565,6 +2628,46 @@ fn strict_preflight_fasta(manifest: &WorkflowManifest) -> Result<PathBuf> {
     }
 }
 
+fn verified_existing_entrapment_report(
+    manifest: &WorkflowManifest,
+    parameters: &sage_core::database::Parameters,
+) -> Result<(
+    EntrapmentDatabaseReport,
+    ExistingEntrapmentResourceReference,
+)> {
+    anyhow::ensure!(
+        manifest.entrapment.database_mode == EntrapmentDatabaseMode::NativeGenerated
+            && manifest.entrapment.generation_mode == EntrapmentGenerationMode::RequireExisting,
+        "existing entrapment resource resolver requires native_generated + require_existing"
+    );
+    load_existing_entrapment_resource(
+        manifest
+            .entrapment
+            .generation_artifact
+            .as_deref()
+            .context("required existing entrapment artifact is missing")?,
+        manifest
+            .entrapment
+            .expected_generation_artifact_sha256
+            .as_deref()
+            .context("required existing entrapment artifact hash is missing")?,
+        manifest
+            .entrapment
+            .expected_combined_fasta_sha256
+            .as_deref()
+            .context("required existing combined FASTA hash is missing")?,
+        parameters,
+        &manifest.target_fasta,
+        &manifest.entrapment.foreign_fastas,
+        &manifest.entrapment.output_fasta,
+        manifest.entrapment.seed,
+        manifest.entrapment.protein_fold,
+        &manifest.entrapment.foreign_source_mode,
+        &manifest.entrapment.shared_peptide_exclusion_mode,
+        manifest.entrapment.selected_foreign_fasta.as_deref(),
+    )
+}
+
 #[derive(Clone, Debug, Serialize, Deserialize, PartialEq)]
 pub struct EntrapmentPartitionInputReport {
     pub schema_version: u32,
@@ -2593,31 +2696,35 @@ fn workflow_entrapment_partition_inputs(
     let parameters = input.database.make_parameters();
     let database_report = match manifest.entrapment.database_mode {
         EntrapmentDatabaseMode::NativeGenerated => {
-            let report_path = manifest.output_root.join("entrapment.generation.json");
-            let generation: EntrapmentGenerationReport =
-                serde_json::from_slice(&std::fs::read(&report_path).with_context(|| {
-                    format!(
-                        "partition materialization requires existing {}",
-                        report_path.display()
-                    )
-                })?)?;
-            let expected_input_sha256 = entrapment_generation_input_sha256(
-                &parameters,
-                &manifest.target_fasta,
-                &manifest.entrapment.foreign_fastas,
-                manifest.entrapment.seed,
-                manifest.entrapment.protein_fold,
-                &manifest.entrapment.foreign_source_mode,
-                &manifest.entrapment.shared_peptide_exclusion_mode,
-                manifest.entrapment.selected_foreign_fasta.as_deref(),
-            )?;
-            anyhow::ensure!(
-                generation.schema_version == 2
-                    && generation.generation_input_sha256 == expected_input_sha256
-                    && generation.output_sha256 == sha256_file(&active_entrapment_fasta)?,
-                "partition materialization found an entrapment generation input, schema, or FASTA hash mismatch"
-            );
-            EntrapmentDatabaseReport::NativeGenerated { generation }
+            if manifest.entrapment.generation_mode == EntrapmentGenerationMode::RequireExisting {
+                verified_existing_entrapment_report(manifest, &parameters)?.0
+            } else {
+                let report_path = manifest.output_root.join("entrapment.generation.json");
+                let generation: EntrapmentGenerationReport =
+                    serde_json::from_slice(&std::fs::read(&report_path).with_context(|| {
+                        format!(
+                            "partition materialization requires existing {}",
+                            report_path.display()
+                        )
+                    })?)?;
+                let expected_input_sha256 = entrapment_generation_input_sha256(
+                    &parameters,
+                    &manifest.target_fasta,
+                    &manifest.entrapment.foreign_fastas,
+                    manifest.entrapment.seed,
+                    manifest.entrapment.protein_fold,
+                    &manifest.entrapment.foreign_source_mode,
+                    &manifest.entrapment.shared_peptide_exclusion_mode,
+                    manifest.entrapment.selected_foreign_fasta.as_deref(),
+                )?;
+                anyhow::ensure!(
+                    generation.schema_version == 2
+                        && generation.generation_input_sha256 == expected_input_sha256
+                        && generation.output_sha256 == sha256_file(&active_entrapment_fasta)?,
+                    "partition materialization found an entrapment generation input, schema, or FASTA hash mismatch"
+                );
+                EntrapmentDatabaseReport::NativeGenerated { generation }
+            }
         }
         EntrapmentDatabaseMode::FrozenLegacy => EntrapmentDatabaseReport::FrozenLegacy {
             frozen: inspect_frozen_entrapment(
@@ -2872,31 +2979,66 @@ fn strict_resource_preflight(
         let parameters = input.database.make_parameters();
         let database_report = match manifest.entrapment.database_mode {
             EntrapmentDatabaseMode::NativeGenerated => {
-                let report_path = manifest.output_root.join("entrapment.generation.json");
-                let generation: EntrapmentGenerationReport =
-                    serde_json::from_slice(&std::fs::read(&report_path).with_context(|| {
-                        format!(
-                            "selection/audit preflight requires existing {}",
-                            report_path.display()
-                        )
-                    })?)?;
-                let expected_input_sha256 = entrapment_generation_input_sha256(
-                    &parameters,
-                    &manifest.target_fasta,
-                    &manifest.entrapment.foreign_fastas,
-                    manifest.entrapment.seed,
-                    manifest.entrapment.protein_fold,
-                    &manifest.entrapment.foreign_source_mode,
-                    &manifest.entrapment.shared_peptide_exclusion_mode,
-                    manifest.entrapment.selected_foreign_fasta.as_deref(),
-                )?;
-                anyhow::ensure!(
-                    generation.schema_version == 2
-                        && generation.generation_input_sha256 == expected_input_sha256
-                        && generation.output_sha256 == sha256_file(&entrapment_fasta)?,
-                    "selection/audit preflight found an entrapment generation input, schema, or FASTA hash mismatch"
-                );
-                EntrapmentDatabaseReport::NativeGenerated { generation }
+                if manifest.entrapment.generation_mode == EntrapmentGenerationMode::RequireExisting
+                {
+                    let (report, reference) =
+                        verified_existing_entrapment_report(manifest, &parameters)?;
+                    reports.push(ResourcePreflightReport {
+                        resource_type: "existing_entrapment_resource".into(),
+                        search_space: "+entrapment".into(),
+                        stage: None,
+                        status: "validated_exact_reuse".into(),
+                        requested_path: manifest
+                            .entrapment
+                            .generation_artifact
+                            .clone()
+                            .context("validated existing artifact disappeared")?,
+                        expected_fingerprint: reference.construction_identity.clone(),
+                        actual_fingerprint: reference.construction_identity.clone(),
+                        schema_version: reference.schema_version,
+                        candidate_or_annotation_count: report.measured().entrapment_proteins,
+                        retained_rank_depth: None,
+                        manifest_sha256: reference.artifact_sha256.clone(),
+                        payload_sha256: reference.combined_fasta_sha256.clone(),
+                        valid: true,
+                        reused: true,
+                        generation_allowed: false,
+                        catalog_fingerprints: vec![reference.generation_input_sha256.clone()],
+                        original_source_uris: Vec::new(),
+                        current_source_uris: Vec::new(),
+                        portable_identity_valid: Some(true),
+                        relocation_detected: None,
+                        failure_reason: None,
+                    });
+                    report
+                } else {
+                    let report_path = manifest.output_root.join("entrapment.generation.json");
+                    let generation: EntrapmentGenerationReport = serde_json::from_slice(
+                        &std::fs::read(&report_path).with_context(|| {
+                            format!(
+                                "selection/audit preflight requires existing {}",
+                                report_path.display()
+                            )
+                        })?,
+                    )?;
+                    let expected_input_sha256 = entrapment_generation_input_sha256(
+                        &parameters,
+                        &manifest.target_fasta,
+                        &manifest.entrapment.foreign_fastas,
+                        manifest.entrapment.seed,
+                        manifest.entrapment.protein_fold,
+                        &manifest.entrapment.foreign_source_mode,
+                        &manifest.entrapment.shared_peptide_exclusion_mode,
+                        manifest.entrapment.selected_foreign_fasta.as_deref(),
+                    )?;
+                    anyhow::ensure!(
+                        generation.schema_version == 2
+                            && generation.generation_input_sha256 == expected_input_sha256
+                            && generation.output_sha256 == sha256_file(&entrapment_fasta)?,
+                        "selection/audit preflight found an entrapment generation input, schema, or FASTA hash mismatch"
+                    );
+                    EntrapmentDatabaseReport::NativeGenerated { generation }
+                }
             }
             EntrapmentDatabaseMode::FrozenLegacy => EntrapmentDatabaseReport::FrozenLegacy {
                 frozen: inspect_frozen_entrapment(
@@ -7528,61 +7670,76 @@ pub fn execute_workflow(
     let parameter_input = Input::load(manifest.search_config.to_string_lossy().as_ref())?;
     let parameters = parameter_input.database.make_parameters();
     let entrapment_report_path = manifest.output_root.join("entrapment.generation.json");
-    let (active_entrapment_fasta, entrapment) = match manifest.entrapment.database_mode {
+    let (active_entrapment_fasta, entrapment, existing_entrapment_reference) = match manifest
+        .entrapment
+        .database_mode
+    {
         EntrapmentDatabaseMode::NativeGenerated => {
-            let expected_input_sha256 = entrapment_generation_input_sha256(
-                &parameters,
-                &manifest.target_fasta,
-                &manifest.entrapment.foreign_fastas,
-                manifest.entrapment.seed,
-                manifest.entrapment.protein_fold,
-                &manifest.entrapment.foreign_source_mode,
-                &manifest.entrapment.shared_peptide_exclusion_mode,
-                manifest.entrapment.selected_foreign_fasta.as_deref(),
-            )?;
-            let report = if plan_only && !manifest.entrapment.output_fasta.is_file() {
-                None
-            } else if manifest.entrapment.output_fasta.is_file() && manifest.resume {
-                let report: EntrapmentGenerationReport = serde_json::from_slice(
-                    &std::fs::read(&entrapment_report_path).with_context(|| {
-                        format!(
-                            "resume requested but {} is missing",
-                            entrapment_report_path.display()
-                        )
-                    })?,
-                )?;
-                anyhow::ensure!(
-                    report.schema_version == 2,
-                    "existing entrapment report predates Phase 2 provenance; regenerate it"
-                );
-                anyhow::ensure!(
-                    report.generation_input_sha256 == expected_input_sha256,
-                    "existing entrapment FASTA was generated from different inputs or digestion settings"
-                );
-                anyhow::ensure!(
-                    report.output_sha256 == sha256_file(&manifest.entrapment.output_fasta)?,
-                    "existing entrapment FASTA hash does not match its generation report"
-                );
-                Some(report)
+            if manifest.entrapment.generation_mode == EntrapmentGenerationMode::RequireExisting {
+                let (report, reference) =
+                    verified_existing_entrapment_report(&manifest, &parameters)?;
+                (
+                    manifest.entrapment.output_fasta.clone(),
+                    Some(report),
+                    Some(reference),
+                )
             } else {
-                let report = generate_foreign_entrapment(
+                let expected_input_sha256 = entrapment_generation_input_sha256(
                     &parameters,
                     &manifest.target_fasta,
                     &manifest.entrapment.foreign_fastas,
-                    &manifest.entrapment.output_fasta,
                     manifest.entrapment.seed,
                     manifest.entrapment.protein_fold,
-                    manifest.entrapment.foreign_source_mode.clone(),
-                    manifest.entrapment.shared_peptide_exclusion_mode.clone(),
+                    &manifest.entrapment.foreign_source_mode,
+                    &manifest.entrapment.shared_peptide_exclusion_mode,
                     manifest.entrapment.selected_foreign_fasta.as_deref(),
                 )?;
-                write_json_atomic(&entrapment_report_path, &report)?;
-                Some(report)
-            };
-            (
-                manifest.entrapment.output_fasta.clone(),
-                report.map(|generation| EntrapmentDatabaseReport::NativeGenerated { generation }),
-            )
+                let report = if plan_only && !manifest.entrapment.output_fasta.is_file() {
+                    None
+                } else if manifest.entrapment.output_fasta.is_file() && manifest.resume {
+                    let report: EntrapmentGenerationReport = serde_json::from_slice(
+                        &std::fs::read(&entrapment_report_path).with_context(|| {
+                            format!(
+                                "resume requested but {} is missing",
+                                entrapment_report_path.display()
+                            )
+                        })?,
+                    )?;
+                    anyhow::ensure!(
+                        report.schema_version == 2,
+                        "existing entrapment report predates Phase 2 provenance; regenerate it"
+                    );
+                    anyhow::ensure!(
+                    report.generation_input_sha256 == expected_input_sha256,
+                    "existing entrapment FASTA was generated from different inputs or digestion settings"
+                );
+                    anyhow::ensure!(
+                        report.output_sha256 == sha256_file(&manifest.entrapment.output_fasta)?,
+                        "existing entrapment FASTA hash does not match its generation report"
+                    );
+                    Some(report)
+                } else {
+                    let report = generate_foreign_entrapment(
+                        &parameters,
+                        &manifest.target_fasta,
+                        &manifest.entrapment.foreign_fastas,
+                        &manifest.entrapment.output_fasta,
+                        manifest.entrapment.seed,
+                        manifest.entrapment.protein_fold,
+                        manifest.entrapment.foreign_source_mode.clone(),
+                        manifest.entrapment.shared_peptide_exclusion_mode.clone(),
+                        manifest.entrapment.selected_foreign_fasta.as_deref(),
+                    )?;
+                    write_json_atomic(&entrapment_report_path, &report)?;
+                    Some(report)
+                };
+                (
+                    manifest.entrapment.output_fasta.clone(),
+                    report
+                        .map(|generation| EntrapmentDatabaseReport::NativeGenerated { generation }),
+                    None,
+                )
+            }
         }
         EntrapmentDatabaseMode::FrozenLegacy => {
             let path = manifest
@@ -7598,6 +7755,7 @@ pub fn execute_workflow(
             (
                 path.clone(),
                 Some(EntrapmentDatabaseReport::FrozenLegacy { frozen }),
+                None,
             )
         }
     };
@@ -7667,7 +7825,16 @@ pub fn execute_workflow(
             peptide: measured.peptide_ratio,
             protein: measured.protein_ratio,
         };
-        write_json_atomic(&manifest.output_root.join("entrapment.input.json"), report)?;
+        if let Some(reference) = existing_entrapment_reference.as_ref() {
+            write_json_atomic(
+                &manifest
+                    .output_root
+                    .join("entrapment.resource.reference.json"),
+                reference,
+            )?;
+        } else {
+            write_json_atomic(&manifest.output_root.join("entrapment.input.json"), report)?;
+        }
         write_json_atomic(
             &manifest.output_root.join("workflow.manifest.resolved.json"),
             &manifest,
@@ -9475,6 +9642,37 @@ mod tests {
     }
 
     #[test]
+    fn existing_entrapment_resource_path_is_operational_not_proposal_identity() {
+        let directory = test_directory("optimizer-proposal-existing-entrapment");
+        let mut first = adaptive_seven_expert_proposal_manifest(&directory);
+        first.entrapment.generation_mode = EntrapmentGenerationMode::RequireExisting;
+        first.entrapment.generation_artifact = Some(PathBuf::from("/machine-a/audit.json"));
+        first.entrapment.expected_generation_artifact_sha256 = Some("a".repeat(64));
+        first.entrapment.expected_combined_fasta_sha256 = Some("b".repeat(64));
+        let mut relocated = first.clone();
+        relocated.entrapment.generation_artifact = Some(PathBuf::from("D:\\machine-b\\audit.json"));
+        assert_eq!(
+            resolve_optimizer_proposal_space_from_manifest(&first)
+                .unwrap()
+                .proposal_space_sha256,
+            resolve_optimizer_proposal_space_from_manifest(&relocated)
+                .unwrap()
+                .proposal_space_sha256
+        );
+        let mut changed = first;
+        changed.entrapment.expected_generation_artifact_sha256 = Some("c".repeat(64));
+        assert_ne!(
+            resolve_optimizer_proposal_space_from_manifest(&changed)
+                .unwrap()
+                .proposal_space_sha256,
+            resolve_optimizer_proposal_space_from_manifest(&relocated)
+                .unwrap()
+                .proposal_space_sha256
+        );
+        std::fs::remove_dir_all(directory).unwrap();
+    }
+
+    #[test]
     fn proposal_space_identity_binds_domains_order_policy_and_constraints() {
         let directory = test_directory("optimizer-proposal-space-identity");
         let manifest = adaptive_seven_expert_proposal_manifest(&directory);
@@ -10376,6 +10574,10 @@ mod tests {
                 legacy_parity_reference: None,
                 seed: 1,
                 protein_fold: 1,
+                generation_mode: EntrapmentGenerationMode::WorkflowLocal,
+                generation_artifact: None,
+                expected_generation_artifact_sha256: None,
+                expected_combined_fasta_sha256: None,
                 partition_artifact: None,
             },
             models: vec![ModelWorkflow {
@@ -12082,6 +12284,10 @@ mod tests {
                 legacy_parity_reference: None,
                 seed: 0,
                 protein_fold: 1,
+                generation_mode: EntrapmentGenerationMode::WorkflowLocal,
+                generation_artifact: None,
+                expected_generation_artifact_sha256: None,
+                expected_combined_fasta_sha256: None,
                 partition_artifact: None,
             },
             models: vec![

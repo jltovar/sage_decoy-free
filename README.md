@@ -90,6 +90,16 @@ sage audit-entrapment entrapment.audit.json
 
 See [`entrapment.audit.example.json`](entrapment.audit.example.json) for the audit schema.
 
+An optimization workflow may also consume an immutable Sage-generated resource prepared by an
+earlier controlled phase. Set `entrapment.generation_mode` to `require_existing` and provide
+`generation_artifact`, `expected_generation_artifact_sha256`, and
+`expected_combined_fasta_sha256`. Strict preflight verifies the complete audit artifact, active
+target/foreign/search inputs, measured ratios, generation settings, combined FASTA, and partition
+construction identity. It never regenerates or copies the FASTA and never falls back to local
+generation. The default `workflow_local` mode retains the existing generation behavior; the two
+modes are mutually exclusive. Absolute artifact paths are operational provenance only and are
+excluded from the portable proposal-space identity.
+
 ### Shared candidate pool and in-memory optimization
 
 `sage workflow` performs one native spectrum search per strict search fingerprint. Compatible

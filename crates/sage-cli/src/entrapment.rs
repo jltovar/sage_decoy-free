@@ -257,6 +257,24 @@ pub enum EntrapmentDatabaseMode {
     FrozenLegacy,
 }
 
+#[derive(Clone, Debug, Default, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(rename_all = "snake_case")]
+pub enum EntrapmentGenerationMode {
+    #[default]
+    WorkflowLocal,
+    RequireExisting,
+}
+
+#[derive(Clone, Debug, Serialize, Deserialize, PartialEq, Eq)]
+pub struct ExistingEntrapmentResourceReference {
+    pub schema_version: u32,
+    pub artifact_sha256: String,
+    pub combined_fasta_sha256: String,
+    pub construction_identity: String,
+    pub generation_input_sha256: String,
+    pub reused: bool,
+}
+
 #[derive(Clone, Debug, Serialize, Deserialize)]
 #[serde(tag = "database_mode", rename_all = "snake_case")]
 pub enum EntrapmentDatabaseReport {
@@ -275,6 +293,137 @@ impl EntrapmentDatabaseReport {
             Self::FrozenLegacy { frozen } => &frozen.measured,
         }
     }
+}
+
+fn validate_measured_ratios(ratios: &EntrapmentRatios) -> Result<()> {
+    anyhow::ensure!(
+        ratios.target_proteins > 0
+            && ratios.entrapment_proteins > 0
+            && ratios.target_peptides > 0
+            && ratios.entrapment_peptides > 0
+            && ratios.target_peptidoforms > 0
+            && ratios.entrapment_peptidoforms > 0,
+        "existing entrapment resource contains an empty measured population"
+    );
+    let expected = [
+        ratios.entrapment_proteins as f64 / ratios.target_proteins as f64,
+        ratios.entrapment_peptides as f64 / ratios.target_peptides as f64,
+        ratios.entrapment_peptidoforms as f64 / ratios.target_peptidoforms as f64,
+    ];
+    let recorded = [
+        ratios.protein_ratio,
+        ratios.peptide_ratio,
+        ratios.peptidoform_ratio,
+    ];
+    anyhow::ensure!(
+        recorded
+            .iter()
+            .all(|value| value.is_finite() && *value > 0.0)
+            && recorded
+                .iter()
+                .zip(expected)
+                .all(|(recorded, expected)| (*recorded - expected).abs() <= 1e-12),
+        "existing entrapment resource contains inconsistent measured ratios"
+    );
+    Ok(())
+}
+
+#[allow(clippy::too_many_arguments)]
+pub fn load_existing_entrapment_resource(
+    artifact_path: &Path,
+    expected_artifact_sha256: &str,
+    expected_combined_fasta_sha256: &str,
+    parameters: &Parameters,
+    target_fasta: &Path,
+    foreign_fastas: &[PathBuf],
+    active_entrapment_fasta: &Path,
+    seed: u64,
+    protein_fold: usize,
+    source_mode: &ForeignSourceMode,
+    exclusion_mode: &SharedPeptideExclusionMode,
+    selected_foreign_fasta: Option<&Path>,
+) -> Result<(
+    EntrapmentDatabaseReport,
+    ExistingEntrapmentResourceReference,
+)> {
+    anyhow::ensure!(
+        artifact_path.is_file(),
+        "required existing entrapment artifact does not exist"
+    );
+    let artifact_sha256 = sha256_file(artifact_path)?;
+    anyhow::ensure!(
+        artifact_sha256 == expected_artifact_sha256,
+        "existing entrapment artifact content hash mismatch"
+    );
+    let audit: EntrapmentAuditReport = serde_json::from_slice(&std::fs::read(artifact_path)?)
+        .context("invalid existing Sage entrapment audit artifact")?;
+    anyhow::ensure!(
+        audit.schema_version == 1,
+        "unsupported existing entrapment audit schema"
+    );
+    let generation = match audit.database {
+        EntrapmentDatabaseReport::NativeGenerated { generation } => generation,
+        EntrapmentDatabaseReport::FrozenLegacy { .. } => {
+            anyhow::bail!("existing entrapment artifact is not Sage native-generated")
+        }
+    };
+    anyhow::ensure!(
+        generation.schema_version == 2
+            && generation.generator_version == default_generator_version()
+            && generation.selection_algorithm == default_selection_algorithm(),
+        "unsupported existing entrapment generation schema or implementation"
+    );
+    let target_sha256 = sha256_file(target_fasta)?;
+    let combined_sha256 = sha256_file(active_entrapment_fasta)?;
+    anyhow::ensure!(
+        target_sha256 == generation.target_sha256,
+        "existing entrapment target FASTA mismatch"
+    );
+    anyhow::ensure!(
+        combined_sha256 == expected_combined_fasta_sha256
+            && generation.output_sha256 == expected_combined_fasta_sha256,
+        "existing entrapment combined FASTA mismatch"
+    );
+    let expected_input_sha256 = entrapment_generation_input_sha256(
+        parameters,
+        target_fasta,
+        foreign_fastas,
+        seed,
+        protein_fold,
+        source_mode,
+        exclusion_mode,
+        selected_foreign_fasta,
+    )?;
+    anyhow::ensure!(
+        generation.generation_input_sha256 == expected_input_sha256
+            && generation.seed == seed
+            && generation.protein_fold == protein_fold
+            && &generation.foreign_source_mode == source_mode
+            && &generation.shared_peptide_exclusion_mode == exclusion_mode,
+        "existing entrapment generation settings or search/digestion identity mismatch"
+    );
+    if let Some(selected) = selected_foreign_fasta {
+        anyhow::ensure!(
+            sha256_file(selected)? == generation.selected_foreign_sha256,
+            "existing entrapment selected foreign-source mismatch"
+        );
+    }
+    validate_measured_ratios(&generation.measured)?;
+    let report = EntrapmentDatabaseReport::NativeGenerated { generation };
+    let reference = ExistingEntrapmentResourceReference {
+        schema_version: 1,
+        artifact_sha256,
+        combined_fasta_sha256: combined_sha256,
+        construction_identity: entrapment_construction_identity(&report)?,
+        generation_input_sha256: match &report {
+            EntrapmentDatabaseReport::NativeGenerated { generation } => {
+                generation.generation_input_sha256.clone()
+            }
+            EntrapmentDatabaseReport::FrozenLegacy { .. } => unreachable!(),
+        },
+        reused: true,
+    };
+    Ok((report, reference))
 }
 
 #[derive(Clone, Debug, Serialize, Deserialize)]
@@ -2287,6 +2436,138 @@ mod tests {
         assert!(!parity.exact_fasta_match);
         assert!(!parity.exact_header_order_match);
         assert_eq!(parity.ratios.peptide_ratio_delta, 0.0);
+        std::fs::remove_dir_all(directory).unwrap();
+    }
+
+    fn existing_resource_fixture(
+        name: &str,
+    ) -> (PathBuf, PathBuf, PathBuf, PathBuf, PathBuf, String, String) {
+        let directory = test_directory(name);
+        let target = directory.join("target.fasta");
+        let foreign = directory.join("foreign.fasta");
+        let combined = directory.join("combined.fasta");
+        let artifact = directory.join("entrapment.audit.json");
+        std::fs::write(&target, b">Target_A\nAAAKCCCCK\n>Target_B\nGGGKLLLLK\n").unwrap();
+        std::fs::write(
+            &foreign,
+            b">Foreign_A\nDDDKEEEEK\n>Foreign_B\nNNNNKQQQQK\n>Foreign_C\nSSSSKTTTTK\n",
+        )
+        .unwrap();
+        let generation = generate_foreign_entrapment(
+            &parameters(),
+            &target,
+            std::slice::from_ref(&foreign),
+            &combined,
+            42,
+            1,
+            ForeignSourceMode::Explicit,
+            SharedPeptideExclusionMode::SageSearchSpace,
+            Some(&foreign),
+        )
+        .unwrap();
+        write_json_atomic(
+            &artifact,
+            &EntrapmentAuditReport {
+                schema_version: 1,
+                database: EntrapmentDatabaseReport::NativeGenerated { generation },
+                fasta_parity: None,
+            },
+        )
+        .unwrap();
+        let artifact_sha = sha256_file(&artifact).unwrap();
+        let combined_sha = sha256_file(&combined).unwrap();
+        (
+            directory,
+            target,
+            foreign,
+            combined,
+            artifact,
+            artifact_sha,
+            combined_sha,
+        )
+    }
+
+    #[test]
+    fn existing_sage_entrapment_resource_is_verified_and_relocation_invariant() {
+        let (directory, target, foreign, combined, artifact, artifact_sha, combined_sha) =
+            existing_resource_fixture("existing-valid");
+        let (report, reference) = load_existing_entrapment_resource(
+            &artifact,
+            &artifact_sha,
+            &combined_sha,
+            &parameters(),
+            &target,
+            std::slice::from_ref(&foreign),
+            &combined,
+            42,
+            1,
+            &ForeignSourceMode::Explicit,
+            &SharedPeptideExclusionMode::SageSearchSpace,
+            Some(&foreign),
+        )
+        .unwrap();
+        assert!(reference.reused);
+        assert_eq!(
+            reference.construction_identity,
+            entrapment_construction_identity(&report).unwrap()
+        );
+        let relocated = directory.join("relocated");
+        std::fs::create_dir(&relocated).unwrap();
+        let relocated_artifact = relocated.join("audit.json");
+        let relocated_fasta = relocated.join("combined.fasta");
+        std::fs::copy(&artifact, &relocated_artifact).unwrap();
+        std::fs::copy(&combined, &relocated_fasta).unwrap();
+        let (_, relocated_reference) = load_existing_entrapment_resource(
+            &relocated_artifact,
+            &artifact_sha,
+            &combined_sha,
+            &parameters(),
+            &target,
+            std::slice::from_ref(&foreign),
+            &relocated_fasta,
+            42,
+            1,
+            &ForeignSourceMode::Explicit,
+            &SharedPeptideExclusionMode::SageSearchSpace,
+            Some(&foreign),
+        )
+        .unwrap();
+        assert_eq!(
+            reference.construction_identity,
+            relocated_reference.construction_identity
+        );
+        std::fs::remove_dir_all(directory).unwrap();
+    }
+
+    #[test]
+    fn existing_sage_entrapment_resource_mismatches_fail_closed() {
+        let (directory, target, foreign, combined, artifact, artifact_sha, combined_sha) =
+            existing_resource_fixture("existing-mismatch");
+        let attempt = |artifact_hash: &str, combined_hash: &str, seed: u64| {
+            load_existing_entrapment_resource(
+                &artifact,
+                artifact_hash,
+                combined_hash,
+                &parameters(),
+                &target,
+                std::slice::from_ref(&foreign),
+                &combined,
+                seed,
+                1,
+                &ForeignSourceMode::Explicit,
+                &SharedPeptideExclusionMode::SageSearchSpace,
+                Some(&foreign),
+            )
+        };
+        assert!(attempt(&"0".repeat(64), &combined_sha, 42).is_err());
+        assert!(attempt(&artifact_sha, &"1".repeat(64), 42).is_err());
+        assert!(attempt(&artifact_sha, &combined_sha, 43).is_err());
+        let mut audit: EntrapmentAuditReport =
+            serde_json::from_slice(&std::fs::read(&artifact).unwrap()).unwrap();
+        audit.schema_version = 99;
+        write_json_atomic(&artifact, &audit).unwrap();
+        let changed_sha = sha256_file(&artifact).unwrap();
+        assert!(attempt(&changed_sha, &combined_sha, 42).is_err());
         std::fs::remove_dir_all(directory).unwrap();
     }
 }
