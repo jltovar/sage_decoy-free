@@ -14200,6 +14200,61 @@ mod tests {
     }
 
     #[test]
+    fn level4_null_window_runtime_guard_requires_hierarchical_reporting() {
+        use crate::input::{
+            FdrMode, FdrOptions, HierarchicalInferenceConfig, HierarchicalInferenceMode,
+            NullWindowOptimizerOptions,
+        };
+        let optimizer = |validation_scope| NullWindowOptimizerOptions {
+            candidates: Vec::new(),
+            strategy: NullWindowSearchStrategy::Explicit,
+            bounds: None,
+            adaptive: AdaptiveNullWindowSearchOptions::default(),
+            validation_scope,
+            fdr_threshold: 0.01,
+            psm_entrapment_ratio: 1.0,
+            peptide_entrapment_ratio: 1.0,
+            protein_entrapment_ratio: 1.0,
+            maximum_entrapment_fdp: 0.01,
+            minimum_entrapment_count_for_stable_estimate: 3,
+            selection_entrapment_proteins: None,
+            verbose_diagnostics: false,
+        };
+
+        let mut settings = FdrSettings::from(FdrOptions {
+            mode: Some(FdrMode::DecoyFree),
+            model_fit: Some(ModelFit::Moments),
+            ..Default::default()
+        });
+        settings.null_window_optimizer = Some(optimizer(NullWindowValidationScope::Level4));
+        let error = optimize_null_window(&[], &settings, &IndexedDatabase::default()).unwrap_err();
+        assert!(error.contains("requires hierarchical_reporting"), "{error}");
+
+        let mut strict = FdrSettings::from(FdrOptions {
+            mode: Some(FdrMode::DecoyFree),
+            model_fit: Some(ModelFit::Moments),
+            hierarchical_inference: Some(HierarchicalInferenceConfig {
+                enabled: true,
+                mode: HierarchicalInferenceMode::ProteinAnchored,
+                entrapment_validation: true,
+            }),
+            ..Default::default()
+        });
+        assert_eq!(
+            strict.hierarchical_reporting,
+            HierarchicalReportingMode::Strict
+        );
+        assert!(strict.hierarchical_entrapment_validation);
+        strict.null_window_optimizer = Some(optimizer(NullWindowValidationScope::Level4));
+        let error = optimize_null_window(&[], &strict, &IndexedDatabase::default()).unwrap_err();
+        assert!(!error.contains("hierarchical_reporting"), "{error}");
+
+        settings.null_window_optimizer = Some(optimizer(NullWindowValidationScope::RawQ));
+        let error = optimize_null_window(&[], &settings, &IndexedDatabase::default()).unwrap_err();
+        assert!(!error.contains("hierarchical_reporting"), "{error}");
+    }
+
+    #[test]
     fn exhaustive_window_bounds_generate_the_complete_ordered_universe() {
         let bounds = NullWindowSearchBounds {
             min_rank_min: 2,

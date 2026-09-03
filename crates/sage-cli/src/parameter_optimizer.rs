@@ -4231,6 +4231,16 @@ pub fn load_checkpoint(
 
 pub trait TrialEvaluator {
     fn evaluate(&mut self, request: &TrialRequest) -> Result<TrialEvaluation>;
+    /// Resolve compact scientific configuration evidence for a proposal that
+    /// terminates before production evaluation (for example, dependency
+    /// pruning). Production evaluators override this; synthetic evaluators may
+    /// retain the empty default.
+    fn terminal_configuration_diagnostics(
+        &mut self,
+        _request: &TrialRequest,
+    ) -> Result<BTreeMap<String, serde_json::Value>> {
+        Ok(BTreeMap::new())
+    }
     fn materialize_winner(&mut self, _record: &TrialRecord) -> Result<Option<serde_json::Value>> {
         Ok(None)
     }
@@ -5152,19 +5162,8 @@ fn evaluate_or_resume<E: TrialEvaluator>(
         .and_then(|()| validate_active_dependencies(&request.parameters, active_parameters))
     {
         Ok(()) => evaluator.evaluate(&request)?,
-        Err(error) => TrialEvaluation {
-            status: TrialStatus::TechnicalFailure,
-            technical_reason: Some(format!(
-                "parameter_dependency_invalid_before_production: {error:#}"
-            )),
-            empirical_reason: None,
-            metrics: None,
-            development_selection_eligible: false,
-            empirical_point_estimate_within_limit: None,
-            empirical_calibration_power: EmpiricalCalibrationPower::NotAssessed,
-            statistical_validation_status: StatisticalValidationStatus::NotEvaluated,
-            statistical_default_eligibility: StatisticalDefaultEligibility::NotEvaluated,
-            compact_diagnostics: BTreeMap::from([
+        Err(error) => {
+            let mut compact_diagnostics = BTreeMap::from([
                 (
                     "production_evaluation_started".into(),
                     serde_json::json!(false),
@@ -5172,8 +5171,23 @@ fn evaluate_or_resume<E: TrialEvaluator>(
                 ("fallback_used".into(), serde_json::json!(false)),
                 ("model_substitution".into(), serde_json::json!(false)),
                 ("target_only_outcomes_used".into(), serde_json::json!(false)),
-            ]),
-        },
+            ]);
+            compact_diagnostics.extend(evaluator.terminal_configuration_diagnostics(&request)?);
+            TrialEvaluation {
+                status: TrialStatus::TechnicalFailure,
+                technical_reason: Some(format!(
+                    "parameter_dependency_invalid_before_production: {error:#}"
+                )),
+                empirical_reason: None,
+                metrics: None,
+                development_selection_eligible: false,
+                empirical_point_estimate_within_limit: None,
+                empirical_calibration_power: EmpiricalCalibrationPower::NotAssessed,
+                statistical_validation_status: StatisticalValidationStatus::NotEvaluated,
+                statistical_default_eligibility: StatisticalDefaultEligibility::NotEvaluated,
+                compact_diagnostics,
+            }
+        }
     };
     apply_empirical_constraints(config, &mut evaluation);
     let record = TrialRecord {
@@ -6132,6 +6146,22 @@ mod tests {
         calls: Vec<String>,
     }
     impl TrialEvaluator for Evaluator {
+        fn terminal_configuration_diagnostics(
+            &mut self,
+            request: &TrialRequest,
+        ) -> Result<BTreeMap<String, serde_json::Value>> {
+            Ok(BTreeMap::from([
+                (
+                    "resolved_scientific_configuration_sha256".into(),
+                    serde_json::json!(format!("synthetic-{}", request.trial_id)),
+                ),
+                (
+                    "resolved_effective_fdr_settings".into(),
+                    serde_json::json!({"synthetic": true}),
+                ),
+            ]))
+        }
+
         fn evaluate(&mut self, request: &TrialRequest) -> Result<TrialEvaluation> {
             assert!(!request.target_only_outcomes_allowed);
             self.calls.push(request.trial_id.clone());
@@ -7350,6 +7380,19 @@ mod tests {
                 .compact_diagnostics
                 .get("production_evaluation_started"),
             Some(&serde_json::json!(false))
+        );
+        assert!(invalid
+            .evaluation
+            .compact_diagnostics
+            .get("resolved_scientific_configuration_sha256")
+            .and_then(serde_json::Value::as_str)
+            .is_some_and(|value| value.starts_with("synthetic-")));
+        assert_eq!(
+            invalid
+                .evaluation
+                .compact_diagnostics
+                .get("resolved_effective_fdr_settings"),
+            Some(&serde_json::json!({"synthetic": true}))
         );
         assert!(result.winner_trial_id.is_some());
     }
