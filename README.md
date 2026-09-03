@@ -1177,6 +1177,14 @@ decoy_free_peptide_supported_psm
 
 These flags are reporting-only.  They mean that a rank-1 target PSM/peptide supports an accepted protein under the configured hierarchical mode.  They are not independent PSM-level or peptide-level FDR claims.
 
+For parameter optimization, a Level-4 null-window validation scope is compatible only with this
+strict protein-anchored mode and `entrapment_validation: true`. Sage checks that fixed combination
+during proposal-space/workflow validation, before scientific resources or trials are opened, and
+checks it again in the runtime null-window evaluator. `raw_q` remains a distinct supported
+diagnostic validation scope and does not silently enable hierarchy. Level 4 calculates the PSM,
+peptide, and protein q-value layers independently, then writes the two protein-support flags while
+retaining entrapment hypotheses and leaving the underlying q-value fields unchanged.
+
 ---
 
 ## Statistical rationale in ultra-low-input data

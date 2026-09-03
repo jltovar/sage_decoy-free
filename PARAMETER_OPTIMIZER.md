@@ -146,6 +146,16 @@ same declared development objective. Every expert retains its selected dataset-l
 artifact. Both optimized and explicitly fixed windows are serialized in winner provenance. There
 is no combined Ensemble window.
 
+`validation.null_window_validation_scope: "level4"` requires a fixed effective
+`hierarchical_inference` configuration with `enabled: true`, `mode: "protein_anchored"`, and
+`entrapment_validation: true`. Workflow and proposal-space validation resolve this compatibility
+from the search configuration before entrapment, partition, candidate-pool, raw-cache, checkpoint,
+trial, or fit access; the null-window runtime repeats the check as defense in depth. An intentional
+`raw_q` validation scope may keep hierarchy disabled. This compatibility rule does not make
+hierarchical settings optimizer dimensions or change dependency pruning for otherwise compatible
+parameter proposals. Terminal production trials retain their resolved scientific-configuration
+hash and effective settings in compact optimizer evidence before nonwinner payload cleanup.
+
 ## Objective and validity
 
 The objective is an explicit ordered list. The provisional low-input default is Level-4 proteins,

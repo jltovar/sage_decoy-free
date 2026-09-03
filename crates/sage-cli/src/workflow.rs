@@ -1513,6 +1513,47 @@ fn resolved_fdr_options(search_config: &Path) -> Result<FdrOptions> {
     .context("invalid fdr settings in search configuration")
 }
 
+/// Validate the fixed reporting layer required by a Level-4 null-window
+/// objective before any scientific resource is opened. The runtime guard in
+/// `sage_core::decoy_free_fdr` remains authoritative defense in depth.
+fn validate_optimizer_reporting_compatibility(manifest: &WorkflowManifest) -> Result<()> {
+    let Some(optimizer) = manifest
+        .parameter_optimizer
+        .as_ref()
+        .filter(|optimizer| optimizer.enabled)
+    else {
+        return Ok(());
+    };
+    if manifest.validation.null_window_validation_scope != NullWindowValidationScope::Level4 {
+        return Ok(());
+    }
+
+    let has_null_window_optimization = manifest.models.iter().any(|model| {
+        model.enabled && (!model.candidate_windows.is_empty() || model.window_optimizer.is_some())
+    }) || optimizer
+        .blocks
+        .iter()
+        .any(|block| block.enabled && block.window_search.is_some());
+    if !has_null_window_optimization {
+        return Ok(());
+    }
+
+    let options = resolved_fdr_options(&manifest.search_config).with_context(|| {
+        format!(
+            "Level-4 optimizer compatibility requires a readable search configuration: {}",
+            manifest.search_config.display()
+        )
+    })?;
+    let settings = FdrSettings::from(options);
+    anyhow::ensure!(
+        settings.hierarchical_reporting
+            == sage_core::input::HierarchicalReportingMode::Strict
+            && settings.hierarchical_entrapment_validation,
+        "null-window validation_scope=level4 requires fixed hierarchical_inference enabled=true, mode=protein_anchored, and entrapment_validation=true"
+    );
+    Ok(())
+}
+
 fn resolved_external_profile_calibration(
     search_config: &Path,
 ) -> Result<sage_core::input::ExternalProfileCalibration> {
@@ -2141,6 +2182,10 @@ impl WorkflowManifest {
             .filter(|optimizer| optimizer.enabled)
         {
             optimizer.validate()?;
+            // This reads configuration only. It deliberately precedes every
+            // entrapment, partition, candidate-pool, raw-cache, checkpoint,
+            // trial, and fit access performed by workflow execution.
+            validate_optimizer_reporting_compatibility(self)?;
             anyhow::ensure!(
                 self.require_existing_candidate_pool
                     && self.require_existing_annotation_cache
@@ -6291,6 +6336,73 @@ struct InfrastructureSmokeEvaluator<'a> {
     raw_annotation_cache_identity: &'a str,
 }
 
+fn resolved_configuration_diagnostics(
+    configuration: &ResolvedExpertConfiguration,
+    model: &ModelWorkflow,
+    validation_scope: NullWindowValidationScope,
+) -> Result<BTreeMap<String, serde_json::Value>> {
+    anyhow::ensure!(
+        configuration.resolved_configuration_sha256 == resolved_configuration_hash(configuration)?,
+        "optimizer trial resolved configuration hash does not match its payload"
+    );
+    anyhow::ensure!(
+        configuration.declared_effective_options_sha256
+            == declared_effective_options_hash(&configuration.effective_fdr_options)?,
+        "optimizer trial effective-option hash does not match its payload"
+    );
+    let settings = FdrSettings::from(configuration.effective_fdr_options.clone());
+    anyhow::ensure!(
+        serde_json::to_value(&settings)? == configuration.resolved_fdr_settings,
+        "optimizer trial resolved settings do not match their option carrier"
+    );
+    Ok(BTreeMap::from([
+        (
+            "resolved_scientific_configuration_sha256".into(),
+            serde_json::json!(configuration.resolved_configuration_sha256),
+        ),
+        (
+            "resolved_effective_fdr_options".into(),
+            serde_json::to_value(&configuration.effective_fdr_options)?,
+        ),
+        (
+            "resolved_effective_fdr_settings".into(),
+            configuration.resolved_fdr_settings.clone(),
+        ),
+        (
+            "effective_null_window_validation_scope".into(),
+            serde_json::to_value(validation_scope)?,
+        ),
+        (
+            "effective_hierarchical_reporting".into(),
+            serde_json::to_value(settings.hierarchical_reporting)?,
+        ),
+        (
+            "effective_hierarchical_entrapment_validation".into(),
+            serde_json::json!(settings.hierarchical_entrapment_validation),
+        ),
+        (
+            "resolved_model_window_policy".into(),
+            serde_json::json!({
+                "window": &model.window,
+                "candidate_windows": &model.candidate_windows,
+                "window_optimizer": &model.window_optimizer,
+            }),
+        ),
+    ]))
+}
+
+fn resolved_trial_configuration_diagnostics(
+    stage: &StageRecord,
+    model: &ModelWorkflow,
+    validation_scope: NullWindowValidationScope,
+) -> Result<BTreeMap<String, serde_json::Value>> {
+    let configuration = stage
+        .resolved_production_configuration
+        .as_ref()
+        .context("optimizer trial stage has no resolved production configuration")?;
+    resolved_configuration_diagnostics(configuration, model, validation_scope)
+}
+
 impl TrialEvaluator for InfrastructureSmokeEvaluator<'_> {
     fn evaluate(&mut self, request: &TrialRequest) -> Result<TrialEvaluation> {
         anyhow::ensure!(
@@ -6381,9 +6493,53 @@ impl WorkflowTrialEvaluator<'_> {
         }
         Ok(model)
     }
+
+    fn preserved_trial_configuration_diagnostics(
+        &self,
+        output: &Path,
+        model: &ModelWorkflow,
+    ) -> Result<BTreeMap<String, serde_json::Value>> {
+        let checkpoint = output.join("workflow.stage.json");
+        if !checkpoint.is_file() {
+            return Ok(BTreeMap::from([(
+                "resolved_scientific_configuration_status".into(),
+                serde_json::json!("not_materialized_before_failure"),
+            )]));
+        }
+        let stage: StageRecord = serde_json::from_slice(&std::fs::read(&checkpoint)?)?;
+        resolved_trial_configuration_diagnostics(
+            &stage,
+            model,
+            self.manifest.validation.null_window_validation_scope,
+        )
+    }
 }
 
 impl TrialEvaluator for WorkflowTrialEvaluator<'_> {
+    fn terminal_configuration_diagnostics(
+        &mut self,
+        request: &TrialRequest,
+    ) -> Result<BTreeMap<String, serde_json::Value>> {
+        let model = self.model_for(request)?;
+        let mut options = resolved_fdr_options(&self.manifest.search_config)?;
+        options.mode = Some(FdrMode::DecoyFree);
+        options.model_fit = Some(model.model.clone());
+        options.selection_entrapment_proteins = self.entrapment_selection.map(|partition| {
+            let mut proteins = partition.selection_proteins.clone();
+            proteins.sort();
+            proteins
+        });
+        options.nokoi_application_dataset_fingerprint = Some(self.dataset.fingerprint.clone());
+        apply_fdr_overrides(&mut options, &request.parameters)?;
+        apply_window(&mut options, &model.model, &model.window);
+        let configuration = build_resolved_expert_configuration(&model.model, options)?;
+        resolved_configuration_diagnostics(
+            &configuration,
+            &model,
+            self.manifest.validation.null_window_validation_scope,
+        )
+    }
+
     fn evaluate(&mut self, request: &TrialRequest) -> Result<TrialEvaluation> {
         anyhow::ensure!(
             !request.target_only_outcomes_allowed,
@@ -6412,6 +6568,12 @@ impl TrialEvaluator for WorkflowTrialEvaluator<'_> {
         ) {
             Ok(stage) => stage,
             Err(error) => {
+                let mut compact_diagnostics = BTreeMap::from([
+                    ("fallback_used".into(), serde_json::json!(false)),
+                    ("model_substitution".into(), serde_json::json!(false)),
+                ]);
+                compact_diagnostics
+                    .extend(self.preserved_trial_configuration_diagnostics(&output, &model)?);
                 return Ok(TrialEvaluation {
                     status: TrialStatus::TechnicalFailure,
                     technical_reason: Some(format!("{error:#}")),
@@ -6425,14 +6587,25 @@ impl TrialEvaluator for WorkflowTrialEvaluator<'_> {
                         crate::parameter_optimizer::StatisticalValidationStatus::NotEvaluated,
                     statistical_default_eligibility:
                         crate::parameter_optimizer::StatisticalDefaultEligibility::NotEvaluated,
-                    compact_diagnostics: BTreeMap::from([
-                        ("fallback_used".into(), serde_json::json!(false)),
-                        ("model_substitution".into(), serde_json::json!(false)),
-                    ]),
+                    compact_diagnostics,
                 });
             }
         };
         if stage.fallback_used {
+            let mut compact_diagnostics = BTreeMap::from([
+                ("fallback_used".into(), serde_json::json!(true)),
+                ("model_substitution".into(), serde_json::json!(false)),
+                (
+                    "resolved_production_parameters".into(),
+                    serde_json::to_value(&request.parameters)?,
+                ),
+                ("target_only_outcomes_used".into(), serde_json::json!(false)),
+            ]);
+            compact_diagnostics.extend(resolved_trial_configuration_diagnostics(
+                &stage,
+                &model,
+                self.manifest.validation.null_window_validation_scope,
+            )?);
             return Ok(TrialEvaluation {
                 status: TrialStatus::TechnicalFailure,
                 technical_reason: Some(
@@ -6451,19 +6624,25 @@ impl TrialEvaluator for WorkflowTrialEvaluator<'_> {
                     crate::parameter_optimizer::StatisticalValidationStatus::NotEvaluated,
                 statistical_default_eligibility:
                     crate::parameter_optimizer::StatisticalDefaultEligibility::NotEvaluated,
-                compact_diagnostics: BTreeMap::from([
-                    ("fallback_used".into(), serde_json::json!(true)),
-                    ("model_substitution".into(), serde_json::json!(false)),
-                    (
-                        "resolved_production_parameters".into(),
-                        serde_json::to_value(&request.parameters)?,
-                    ),
-                    ("target_only_outcomes_used".into(), serde_json::json!(false)),
-                ]),
+                compact_diagnostics,
             });
         }
         let fitted_artifacts = output.join("fitted_model_artifacts.json");
         if !fitted_artifacts.is_file() {
+            let mut compact_diagnostics = BTreeMap::from([
+                ("fallback_used".into(), serde_json::json!(false)),
+                ("model_substitution".into(), serde_json::json!(false)),
+                (
+                    "resolved_production_parameters".into(),
+                    serde_json::to_value(&request.parameters)?,
+                ),
+                ("target_only_outcomes_used".into(), serde_json::json!(false)),
+            ]);
+            compact_diagnostics.extend(resolved_trial_configuration_diagnostics(
+                &stage,
+                &model,
+                self.manifest.validation.null_window_validation_scope,
+            )?);
             return Ok(TrialEvaluation {
                 status: TrialStatus::TechnicalFailure,
                 technical_reason: Some(
@@ -6480,15 +6659,7 @@ impl TrialEvaluator for WorkflowTrialEvaluator<'_> {
                     crate::parameter_optimizer::StatisticalValidationStatus::NotEvaluated,
                 statistical_default_eligibility:
                     crate::parameter_optimizer::StatisticalDefaultEligibility::NotEvaluated,
-                compact_diagnostics: BTreeMap::from([
-                    ("fallback_used".into(), serde_json::json!(false)),
-                    ("model_substitution".into(), serde_json::json!(false)),
-                    (
-                        "resolved_production_parameters".into(),
-                        serde_json::to_value(&request.parameters)?,
-                    ),
-                    ("target_only_outcomes_used".into(), serde_json::json!(false)),
-                ]),
+                compact_diagnostics,
             });
         }
         let validation_run = ValidationRun {
@@ -6594,6 +6765,11 @@ impl TrialEvaluator for WorkflowTrialEvaluator<'_> {
             ),
             ("target_only_outcomes_used".into(), serde_json::json!(false)),
         ]);
+        diagnostics.extend(resolved_trial_configuration_diagnostics(
+            &stage,
+            &model,
+            self.manifest.validation.null_window_validation_scope,
+        )?);
         if let Some(partition) = self.entrapment_selection {
             diagnostics.insert(
                 "entrapment_partition_identity".into(),
@@ -10391,6 +10567,7 @@ mod tests {
     fn workflow_optimizer_requires_strict_reuse_and_exact_json_roster() {
         let directory = test_directory("workflow-parameter-optimizer-contract");
         let mut manifest = minimal_manifest(&directory, ValidationDatasetRole::Development);
+        manifest.validation.null_window_validation_scope = NullWindowValidationScope::RawQ;
         manifest.parameter_optimizer = Some(test_optimizer_config());
         assert!(manifest
             .validate()
@@ -10418,6 +10595,7 @@ mod tests {
     fn workflow_entrapment_partition_contract_is_explicit_and_fail_closed() {
         let directory = test_directory("workflow-entrapment-partition-contract");
         let mut manifest = minimal_manifest(&directory, ValidationDatasetRole::Development);
+        manifest.validation.null_window_validation_scope = NullWindowValidationScope::RawQ;
         manifest.require_existing_candidate_pool = true;
         manifest.require_existing_annotation_cache = true;
         let mut optimizer = test_optimizer_config();
@@ -10474,6 +10652,7 @@ mod tests {
     fn partition_materialization_is_prospective_and_does_not_enter_workflow_execution() {
         let directory = test_directory("partition-materialization-only");
         let mut manifest = minimal_manifest(&directory, ValidationDatasetRole::Development);
+        manifest.validation.null_window_validation_scope = NullWindowValidationScope::RawQ;
         manifest.search_config = Path::new(env!("CARGO_MANIFEST_DIR"))
             .join("../..")
             .join("tests/config.json");
@@ -10806,6 +10985,169 @@ mod tests {
             target_only_calibration_policy: TargetOnlyCalibrationPolicy::RefitWithLockedWindow,
             parameter_optimizer: None,
         }
+    }
+
+    fn write_hierarchical_search_config(
+        path: &Path,
+        enabled: bool,
+        mode: &str,
+        entrapment_validation: bool,
+    ) {
+        std::fs::write(
+            path,
+            serde_json::to_vec_pretty(&serde_json::json!({
+                "fdr": {
+                    "mode": "decoy_free",
+                    "final_evidence_space": "p_value",
+                    "hierarchical_inference": {
+                        "enabled": enabled,
+                        "mode": mode,
+                        "entrapment_validation": entrapment_validation
+                    }
+                }
+            }))
+            .unwrap(),
+        )
+        .unwrap();
+    }
+
+    #[test]
+    fn level4_optimizer_compatibility_fails_before_scientific_resource_access() {
+        let directory = test_directory("level4-optimizer-early-compatibility");
+        let mut manifest = minimal_manifest(&directory, ValidationDatasetRole::Development);
+        manifest.parameter_optimizer = Some(test_optimizer_config());
+        manifest.require_existing_candidate_pool = true;
+        manifest.require_existing_annotation_cache = true;
+        manifest.target_fasta = directory.join("must-not-open-target.fasta");
+        manifest.spectra = vec![directory
+            .join("must-not-open-spectrum.d")
+            .display()
+            .to_string()];
+        manifest.candidate_pool_root = Some(directory.join("must-not-open-candidate-pool"));
+        manifest.annotation_cache_root = Some(directory.join("must-not-open-raw-cache"));
+        manifest.output_root = directory.join("must-not-create-output");
+
+        let error = manifest
+            .validate_before_resource_access()
+            .unwrap_err()
+            .to_string();
+        assert!(error.contains("validation_scope=level4"), "{error}");
+        assert!(!manifest.output_root.exists());
+
+        let manifest_path = directory.join("workflow.json");
+        write_json_atomic(&manifest_path, &manifest).unwrap();
+        let proposal_path = directory.join("must-not-create-proposal.json");
+        let error = resolve_optimizer_proposal_space(&manifest_path, &proposal_path)
+            .unwrap_err()
+            .to_string();
+        assert!(error.contains("validation_scope=level4"), "{error}");
+        assert!(!proposal_path.exists());
+        assert!(!manifest.output_root.exists());
+        std::fs::remove_dir_all(directory).unwrap();
+    }
+
+    #[test]
+    fn level4_optimizer_accepts_fixed_protein_anchored_entrapment_reporting() {
+        let directory = test_directory("level4-optimizer-strict-hierarchy");
+        let mut manifest = minimal_manifest(&directory, ValidationDatasetRole::Development);
+        manifest.parameter_optimizer = Some(test_optimizer_config());
+        manifest.require_existing_candidate_pool = true;
+        manifest.require_existing_annotation_cache = true;
+        write_hierarchical_search_config(&manifest.search_config, true, "protein_anchored", true);
+
+        manifest.validate_before_resource_access().unwrap();
+        let options = resolved_fdr_options(&manifest.search_config).unwrap();
+        let settings = FdrSettings::from(options);
+        assert_eq!(
+            settings.hierarchical_reporting,
+            sage_core::input::HierarchicalReportingMode::Strict
+        );
+        assert!(settings.hierarchical_entrapment_validation);
+
+        // The fixed reporting layer does not alter proposal/dependency
+        // accounting for unrelated mixed model parameters.
+        let dependency =
+            preflight_optimizer_dependencies(manifest.parameter_optimizer.as_ref().unwrap())
+                .unwrap();
+        assert!(dependency.production_evaluable_proposals > 0);
+        assert!(dependency.all_blocks_have_valid_candidates);
+        std::fs::remove_dir_all(directory).unwrap();
+    }
+
+    #[test]
+    fn level4_requires_entrapment_reporting_but_raw_q_keeps_hierarchy_optional() {
+        let directory = test_directory("level4-versus-raw-q-hierarchy");
+        let mut manifest = minimal_manifest(&directory, ValidationDatasetRole::Development);
+        manifest.parameter_optimizer = Some(test_optimizer_config());
+        manifest.require_existing_candidate_pool = true;
+        manifest.require_existing_annotation_cache = true;
+        write_hierarchical_search_config(&manifest.search_config, true, "protein_anchored", false);
+        let error = manifest
+            .validate_before_resource_access()
+            .unwrap_err()
+            .to_string();
+        assert!(error.contains("entrapment_validation=true"), "{error}");
+
+        write_hierarchical_search_config(&manifest.search_config, false, "off", false);
+        manifest.validation.null_window_validation_scope = NullWindowValidationScope::RawQ;
+        manifest.validate_before_resource_access().unwrap();
+        std::fs::remove_dir_all(directory).unwrap();
+    }
+
+    #[test]
+    fn terminal_trial_diagnostics_retain_resolved_level4_configuration() {
+        let directory = test_directory("terminal-trial-resolved-configuration");
+        let manifest = minimal_manifest(&directory, ValidationDatasetRole::Development);
+        write_hierarchical_search_config(&manifest.search_config, true, "protein_anchored", true);
+        let options = resolved_fdr_options(&manifest.search_config).unwrap();
+        let configuration =
+            build_resolved_expert_configuration(&ModelFit::Moments, options).unwrap();
+        let stage: StageRecord = serde_json::from_value(serde_json::json!({
+            "schema_version": 5,
+            "stage": "parameter_optimizer_trial",
+            "model": "moments",
+            "input_hash": "trial-analysis",
+            "status": "running",
+            "results": directory.join("results.sage.tsv"),
+            "config_snapshot": directory.join("workflow.search.resolved.json"),
+            "external_features_enabled": true,
+            "calibration_mode": "fit_current_search_space",
+            "resolved_production_configuration": configuration
+        }))
+        .unwrap();
+        let diagnostics = resolved_trial_configuration_diagnostics(
+            &stage,
+            &manifest.models[0],
+            NullWindowValidationScope::Level4,
+        )
+        .unwrap();
+        assert_eq!(
+            diagnostics["effective_null_window_validation_scope"],
+            serde_json::json!("level4")
+        );
+        assert_eq!(
+            diagnostics["effective_hierarchical_reporting"],
+            serde_json::json!("strict")
+        );
+        assert_eq!(
+            diagnostics["effective_hierarchical_entrapment_validation"],
+            serde_json::json!(true)
+        );
+        assert_eq!(
+            diagnostics["resolved_scientific_configuration_sha256"],
+            serde_json::json!(
+                stage
+                    .resolved_production_configuration
+                    .as_ref()
+                    .unwrap()
+                    .resolved_configuration_sha256
+            )
+        );
+
+        // These compact values remain self-contained after the optional
+        // heavyweight trial directory has been pruned.
+        std::fs::remove_dir_all(directory).unwrap();
+        assert!(diagnostics["resolved_effective_fdr_settings"].is_object());
     }
 
     #[test]
@@ -11184,6 +11526,7 @@ mod tests {
         optimizer.schema_version = 4;
         optimizer.execution_mode = OptimizerExecutionMode::OptimizationOnly;
         manifest.parameter_optimizer = Some(optimizer);
+        manifest.validation.null_window_validation_scope = NullWindowValidationScope::RawQ;
         write_json_atomic(&manifest_path, &manifest).unwrap();
         let state = execute_workflow(&manifest_path, &directory, 1, true).unwrap();
         let dependency = state.optimizer_dependency_preflight.as_ref().unwrap();
