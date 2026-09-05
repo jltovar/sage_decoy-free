@@ -3420,111 +3420,7 @@ fn resolved_expert_window_from_settings(
     Some(NullWindow { min_rank, max_rank })
 }
 
-fn artifact_contains_model(
-    artifacts: &sage_core::decoy_free_fdr::DfRunArtifacts,
-    model: &ModelFit,
-) -> bool {
-    let valid_skew_normal = |model: &sage_core::ml::skew_normal::SkewNormal| {
-        model.location.is_finite()
-            && model.scale.is_finite()
-            && model.scale > 0.0
-            && model.shape.is_finite()
-    };
-    match model {
-        ModelFit::Moments => artifacts.moments.as_ref().is_some_and(|artifact| {
-            artifact.schema_version == 1
-                && artifact.model_version == "sage-moments-gumbel-v1"
-                && artifact.min_rank > 1
-                && artifact.max_rank >= artifact.min_rank
-                && artifact.mu.is_finite()
-                && artifact.beta.is_finite()
-                && artifact.beta > 0.0
-        }),
-        ModelFit::Mle => artifacts.mle.as_ref().is_some_and(|artifact| {
-            artifact.schema_version == 1
-                && artifact.model_version == "sage-mle-gumbel-v1"
-                && artifact.min_rank > 1
-                && artifact.max_rank >= artifact.min_rank
-                && artifact.mu.is_finite()
-                && artifact.beta.is_finite()
-                && artifact.beta > 0.0
-        }),
-        ModelFit::LowerOrder => artifacts.lower_order.as_ref().is_some_and(|artifact| {
-            sage_core::ml::lower_order::LowerOrderModel::from_artifact(artifact).is_ok()
-        }),
-        ModelFit::Msfdr => {
-            artifacts.msfdr_seeded.as_ref().is_some_and(|model| {
-                model.null_loc.is_finite()
-                    && model.null_scale.is_finite()
-                    && model.null_scale > 0.0
-                    && model.target_mean.is_finite()
-                    && model.target_std.is_finite()
-                    && model.target_std > 0.0
-                    && model.target_alpha.is_finite()
-                    && model.pi.is_finite()
-                    && (0.0..=1.0).contains(&model.pi)
-            }) && artifacts
-                .msfdr_seeded_metadata
-                .as_ref()
-                .is_some_and(|metadata| {
-                    metadata.schema_version == 1
-                        && metadata.model_version == "sage-msfdr-seeded-v1"
-                        && !metadata.rank1_only
-                        && metadata.min_null_rank.is_some_and(|rank| rank > 1)
-                        && metadata
-                            .max_null_rank
-                            .zip(metadata.min_null_rank)
-                            .is_some_and(|(max, min)| max >= min)
-                })
-        }
-        ModelFit::Msfdr1Smix => {
-            artifacts.msfdr_1smix.as_ref().is_some_and(|model| {
-                valid_skew_normal(&model.correct)
-                    && valid_skew_normal(&model.incorrect1)
-                    && model.a.is_finite()
-                    && (0.0..=1.0).contains(&model.a)
-            }) && artifacts
-                .msfdr_1smix_metadata
-                .as_ref()
-                .is_some_and(|metadata| {
-                    metadata.schema_version == 1
-                        && metadata.model_version == "sage-msfdr-1smix-v1"
-                        && metadata.rank1_only
-                        && metadata.min_null_rank.is_none()
-                        && metadata.max_null_rank.is_none()
-                })
-        }
-        ModelFit::Msfdr2Smix => {
-            artifacts.msfdr_2smix.as_ref().is_some_and(|model| {
-                valid_skew_normal(&model.correct)
-                    && valid_skew_normal(&model.incorrect1)
-                    && valid_skew_normal(&model.incorrect2)
-                    && model.a.is_finite()
-                    && model.b.is_finite()
-                    && (0.0..=1.0).contains(&model.a)
-                    && (0.0..=1.0).contains(&model.b)
-                    && model.a + model.b <= 1.0 + f64::EPSILON
-            }) && artifacts
-                .msfdr_2smix_metadata
-                .as_ref()
-                .is_some_and(|metadata| {
-                    metadata.schema_version == 1
-                        && metadata.model_version == "sage-msfdr-2smix-v1"
-                        && !metadata.rank1_only
-                        && metadata.min_null_rank.is_some_and(|rank| rank > 1)
-                        && metadata
-                            .max_null_rank
-                            .zip(metadata.min_null_rank)
-                            .is_some_and(|(max, min)| max >= min)
-                })
-        }
-        ModelFit::Nokoi => artifacts
-            .nokoi
-            .as_ref()
-            .is_some_and(|artifact| artifact.validate_portable().is_ok()),
-        ModelFit::Ensemble => false,
-    }
-}
+use sage_core::decoy_free_fdr::artifact_contains_model;
 
 fn fitted_external_profile_identity(
     artifacts: &DfRunArtifacts,
@@ -5648,6 +5544,58 @@ fn stage_output_hashes_match(record: &StageRecord) -> Result<bool> {
         && sha256_file(&record.config_snapshot)? == record.config_snapshot_sha256)
 }
 
+fn install_null_window_policy(
+    fdr: &mut FdrOptions,
+    model: &ModelWorkflow,
+    manifest: &WorkflowManifest,
+    entrapment_selection: Option<&EntrapmentSelectionView>,
+) {
+    let (strategy, bounds, adaptive) = model
+        .window_optimizer
+        .as_ref()
+        .map(|search| {
+            (
+                search.strategy,
+                Some(search.bounds()),
+                search.adaptive.clone(),
+            )
+        })
+        .unwrap_or((
+            NullWindowSearchStrategy::Explicit,
+            None,
+            AdaptiveNullWindowSearchOptions::default(),
+        ));
+    fdr.null_window_optimizer = Some(NullWindowOptimizerOptions {
+        candidates: model
+            .candidate_windows
+            .iter()
+            .map(|window| NullWindowCandidate {
+                min_rank: window.min_rank,
+                max_rank: window.max_rank,
+            })
+            .collect(),
+        strategy,
+        bounds,
+        adaptive,
+        validation_scope: manifest.validation.null_window_validation_scope,
+        fdr_threshold: manifest.validation.fdr_threshold,
+        psm_entrapment_ratio: manifest.validation.effective_ratios.psm,
+        peptide_entrapment_ratio: manifest.validation.effective_ratios.peptide,
+        protein_entrapment_ratio: manifest.validation.effective_ratios.protein,
+        maximum_entrapment_fdp: manifest.validation.fdr_threshold,
+        minimum_entrapment_count_for_stable_estimate: 3,
+        selection_entrapment_proteins: entrapment_selection.map(|partition| {
+            let mut proteins = partition.selection_proteins.clone();
+            proteins.sort();
+            proteins
+        }),
+        verbose_diagnostics: false,
+    });
+}
+
+mod null_window_diagnostic;
+pub use null_window_diagnostic::diagnose_null_window_trial;
+
 fn run_search_stage(
     manifest: &WorkflowManifest,
     dataset: &DatasetIdentity,
@@ -5882,47 +5830,7 @@ fn run_search_stage(
     if matches!(stage, "optimized" | "parameter_optimizer_trial")
         && (!model.candidate_windows.is_empty() || model.window_optimizer.is_some())
     {
-        let (strategy, bounds, adaptive) = model
-            .window_optimizer
-            .as_ref()
-            .map(|search| {
-                (
-                    search.strategy,
-                    Some(search.bounds()),
-                    search.adaptive.clone(),
-                )
-            })
-            .unwrap_or((
-                NullWindowSearchStrategy::Explicit,
-                None,
-                AdaptiveNullWindowSearchOptions::default(),
-            ));
-        fdr.null_window_optimizer = Some(NullWindowOptimizerOptions {
-            candidates: model
-                .candidate_windows
-                .iter()
-                .map(|window| NullWindowCandidate {
-                    min_rank: window.min_rank,
-                    max_rank: window.max_rank,
-                })
-                .collect(),
-            strategy,
-            bounds,
-            adaptive,
-            validation_scope: manifest.validation.null_window_validation_scope,
-            fdr_threshold: manifest.validation.fdr_threshold,
-            psm_entrapment_ratio: manifest.validation.effective_ratios.psm,
-            peptide_entrapment_ratio: manifest.validation.effective_ratios.peptide,
-            protein_entrapment_ratio: manifest.validation.effective_ratios.protein,
-            maximum_entrapment_fdp: manifest.validation.fdr_threshold,
-            minimum_entrapment_count_for_stable_estimate: 3,
-            selection_entrapment_proteins: entrapment_selection.map(|partition| {
-                let mut proteins = partition.selection_proteins.clone();
-                proteins.sort();
-                proteins
-            }),
-            verbose_diagnostics: false,
-        });
+        install_null_window_policy(fdr, model, manifest, entrapment_selection);
     }
     let resolved_production_configuration =
         build_resolved_expert_configuration(&model.model, fdr.clone())?;
@@ -6574,10 +6482,30 @@ impl TrialEvaluator for WorkflowTrialEvaluator<'_> {
                 ]);
                 compact_diagnostics
                     .extend(self.preserved_trial_configuration_diagnostics(&output, &model)?);
+                let (status, technical_reason, empirical_reason) =
+                    classify_window_stage_error(&error);
+                if let Some(failure) =
+                    error.downcast_ref::<sage_core::decoy_free_fdr::NullWindowFailure>()
+                {
+                    compact_diagnostics.remove("fallback_used");
+                    compact_diagnostics.insert(
+                        "fallback_status".into(),
+                        serde_json::json!("recorded_individually_per_window_and_q_level"),
+                    );
+                    compact_diagnostics
+                        .insert("null_window_failure".into(), serde_json::to_value(failure)?);
+                }
+                let stage_path = output.join("workflow.stage.json");
+                if stage_path.is_file() {
+                    let mut record: StageRecord =
+                        serde_json::from_slice(&std::fs::read(&stage_path)?)?;
+                    record.status = "failed".into();
+                    write_json_atomic(&stage_path, &record)?;
+                }
                 return Ok(TrialEvaluation {
-                    status: TrialStatus::TechnicalFailure,
-                    technical_reason: Some(format!("{error:#}")),
-                    empirical_reason: None,
+                    status,
+                    technical_reason,
+                    empirical_reason,
                     metrics: None,
                     development_selection_eligible: false,
                     empirical_point_estimate_within_limit: None,
@@ -7515,7 +7443,10 @@ fn completed_optimizer_expert(
     })
 }
 
-fn prune_nonwinner_trial_payloads(root: &Path, result: &OptimizerRunResult) -> Result<()> {
+pub(crate) fn prune_nonwinner_trial_payloads(
+    root: &Path,
+    result: &OptimizerRunResult,
+) -> Result<()> {
     let winners = result
         .block_winners
         .values()
@@ -7530,10 +7461,54 @@ fn prune_nonwinner_trial_payloads(root: &Path, result: &OptimizerRunResult) -> R
         if entry.file_type()?.is_dir()
             && !winners.contains(entry.file_name().to_string_lossy().as_ref())
         {
+            // Failed/interrupted windows must remain independently diagnosable.
+            // Retain their settings, stage provenance, checkpoints and payloads;
+            // no inference from an outer terminal status can replace them.
+            let has_window_evidence = entry
+                .path()
+                .join("null_window_optimizer.checkpoint.json")
+                .exists()
+                || entry
+                    .path()
+                    .join("null_window_optimizer.failure.json")
+                    .exists()
+                || entry
+                    .path()
+                    .join("null_window_optimizer.settings.json")
+                    .exists();
+            let failed = result.trials.iter().any(|trial| {
+                trial.request.trial_id == entry.file_name().to_string_lossy()
+                    && trial.evaluation.status != TrialStatus::Feasible
+            });
+            if has_window_evidence || failed {
+                continue;
+            }
             std::fs::remove_dir_all(entry.path())?;
         }
     }
     Ok(())
+}
+
+pub(crate) fn classify_window_stage_error(
+    error: &anyhow::Error,
+) -> (TrialStatus, Option<String>, Option<String>) {
+    if let Some(failure) = error.downcast_ref::<sage_core::decoy_free_fdr::NullWindowFailure>() {
+        let status = match failure.classification.as_str() {
+            "empirically_infeasible" => TrialStatus::EmpiricallyInfeasible,
+            "unavailable_empirical_metrics" | "mixed_window_outcomes" => TrialStatus::NotEvaluable,
+            _ => TrialStatus::TechnicalFailure,
+        };
+        return (
+            status.clone(),
+            (status == TrialStatus::TechnicalFailure).then(|| failure.to_string()),
+            (status != TrialStatus::TechnicalFailure).then(|| failure.to_string()),
+        );
+    }
+    (
+        TrialStatus::TechnicalFailure,
+        Some(format!("{error:#}")),
+        None,
+    )
 }
 
 fn adjusted_fdp_interval_95(

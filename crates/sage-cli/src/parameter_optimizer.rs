@@ -7402,6 +7402,61 @@ mod tests {
         calls: usize,
     }
 
+    #[test]
+    fn structured_empirical_window_error_remains_empirical_through_outer_optimizer_and_replay() {
+        struct WindowEvaluator {
+            calls: usize,
+        }
+        impl TrialEvaluator for WindowEvaluator {
+            fn evaluate(&mut self, request: &TrialRequest) -> Result<TrialEvaluation> {
+                self.calls += 1;
+                let failure = sage_core::decoy_free_fdr::NullWindowFailure {
+                    schema_version: 1,
+                    message: "no feasible evaluated window".into(),
+                    classification: "empirically_infeasible".into(),
+                    search_completed: true,
+                    candidate_universe_size: 3,
+                    adaptive_mode: None,
+                    adaptive_mode_reason: None,
+                    global_optimum_guaranteed: true,
+                    evaluations: Vec::new(),
+                };
+                let (status, technical_reason, empirical_reason) =
+                    crate::workflow::classify_window_stage_error(&anyhow::Error::new(failure));
+                let mut synthetic = StatusEvaluator { status, calls: 0 };
+                let mut result = synthetic.evaluate(request)?;
+                result.technical_reason = technical_reason;
+                result.empirical_reason = empirical_reason;
+                Ok(result)
+            }
+        }
+        let path = temp("empirical-window-outcome");
+        std::fs::create_dir_all(&path).unwrap();
+        let mut evaluator = WindowEvaluator { calls: 0 };
+        let checkpoint = path.join("checkpoint.json");
+        let result = run_optimizer(&config(), &identity(), &checkpoint, &mut evaluator).unwrap();
+        assert_eq!(
+            result.outcome,
+            OptimizerOutcome::NoEmpiricallyFeasibleSolution
+        );
+        assert!(result.winner_trial_id.is_none());
+        assert!(result.trials.iter().all(|t| t.evaluation.status
+            == TrialStatus::EmpiricallyInfeasible
+            && t.evaluation.technical_reason.is_none()));
+        let calls = evaluator.calls;
+        let failed_directory = path.join("trials").join(&result.trials[0].request.trial_id);
+        std::fs::create_dir_all(&failed_directory).unwrap();
+        let durable = failed_directory.join("null_window_optimizer.checkpoint.json");
+        std::fs::write(&durable, b"{\"schema\":\"synthetic-window-checkpoint\"}").unwrap();
+        let before = std::fs::read(&durable).unwrap();
+        crate::workflow::prune_nonwinner_trial_payloads(&path, &result).unwrap();
+        assert_eq!(std::fs::read(&durable).unwrap(), before);
+        let replay = run_optimizer(&config(), &identity(), &checkpoint, &mut evaluator).unwrap();
+        assert_eq!(replay.outcome, result.outcome);
+        assert_eq!(evaluator.calls, calls);
+        std::fs::remove_dir_all(path).unwrap();
+    }
+
     impl TrialEvaluator for StatusEvaluator {
         fn evaluate(&mut self, request: &TrialRequest) -> Result<TrialEvaluation> {
             self.calls += 1;

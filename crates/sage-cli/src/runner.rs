@@ -38,15 +38,45 @@ use std::time::Instant;
 struct NullWindowOptimizerCheckpoint {
     schema: String,
     fingerprint: String,
+    search_fingerprint: String,
     evaluations: Vec<sage_core::decoy_free_fdr::NullWindowEvaluation>,
+}
+
+fn write_window_evidence<T: serde::Serialize>(
+    path: &std::path::Path,
+    value: &T,
+) -> anyhow::Result<()> {
+    crate::provenance::write_json_atomic(path, value)?;
+    std::fs::File::open(path)?.sync_all()?;
+    let bytes = std::fs::read(path)?;
+    anyhow::ensure!(
+        bytes == serde_json::to_vec_pretty(value)?,
+        "window evidence read-back mismatch"
+    );
+    let _: serde_json::Value = serde_json::from_slice(&bytes)?;
+    crate::provenance::write_json_atomic(
+        &path.with_extension("json.sha256"),
+        &format!("{:x}", Sha256::digest(&bytes)),
+    )?;
+    std::fs::File::open(path.with_extension("json.sha256"))?.sync_all()?;
+    if let Some(parent) = path.parent() {
+        std::fs::File::open(parent)?.sync_all()?;
+    }
+    Ok(())
 }
 
 fn null_window_checkpoint_fingerprint(
     features: &[DfFeature],
     settings: &sage_core::input::FdrSettings,
+    search_identity: &str,
 ) -> anyhow::Result<String> {
     let mut hasher = Sha256::new();
-    hasher.update(b"sage-null-window-checkpoint-v1\0");
+    hasher.update(b"sage-null-window-checkpoint-v2\0");
+    hasher.update((search_identity.len() as u64).to_le_bytes());
+    hasher.update(search_identity.as_bytes());
+    hasher.update(
+        crate::parameter_optimizer::PARAMETER_OPTIMIZER_IMPLEMENTATION_SOURCE_SHA256.as_bytes(),
+    );
     hasher.update(serde_json::to_vec(settings)?);
     hasher.update((features.len() as u64).to_le_bytes());
     for feature in features {
@@ -464,6 +494,80 @@ impl Runner {
     /// Read-only strict candidate-pool preflight. It validates the complete
     /// manifest, compressed payload, stable IDs, count, schema, and rank depth
     /// without searching spectra or writing workflow state.
+    pub(crate) fn diagnose_native_null_windows(
+        &self,
+        request: &CandidatePoolRequest,
+        settings: &sage_core::input::FdrSettings,
+        output: &std::path::Path,
+    ) -> anyhow::Result<serde_json::Value> {
+        anyhow::ensure!(
+            request.require_existing
+                && self.decoy_free_mode
+                && settings.null_window_optimizer.is_some(),
+            "diagnostic requires an exact existing pool and a declared native window search"
+        );
+        let (usage, candidates) = self.preflight_existing_candidate_pool(request)?;
+        let features = candidates
+            .into_par_iter()
+            .filter(|f| f.label != -1)
+            .map(|f| f.to_df())
+            .collect::<Vec<_>>();
+        let fingerprint =
+            null_window_checkpoint_fingerprint(&features, settings, &usage.search_fingerprint)?;
+        write_window_evidence(&output.join("candidate_pool.usage.json"), &usage)?;
+        write_window_evidence(
+            &output.join("null_window_optimizer.settings.json"),
+            settings,
+        )?;
+        write_window_evidence(
+            &output.join("null_window_optimizer.checkpoint.json"),
+            &NullWindowOptimizerCheckpoint {
+                schema: "sage-null-window-checkpoint-v2".into(),
+                fingerprint: fingerprint.clone(),
+                search_fingerprint: usage.search_fingerprint.clone(),
+                evaluations: Vec::new(),
+            },
+        )?;
+        log::info!(
+            "native null-window diagnostic: candidate_pool.reused=true candidates={} checkpoint={}",
+            features.len(),
+            fingerprint
+        );
+        let result = sage_core::decoy_free_fdr::optimize_null_window_resumable_detailed(
+            &features,
+            settings,
+            &self.database,
+            Vec::new(),
+            |evaluations| {
+                write_window_evidence(
+                    &output.join("null_window_optimizer.checkpoint.json"),
+                    &NullWindowOptimizerCheckpoint {
+                        schema: "sage-null-window-checkpoint-v2".into(),
+                        fingerprint: fingerprint.clone(),
+                        search_fingerprint: usage.search_fingerprint.clone(),
+                        evaluations: evaluations.to_vec(),
+                    },
+                )
+                .map_err(|error| error.to_string())
+            },
+        );
+        let report = match result {
+            Ok(result) => {
+                serde_json::json!({"schema_version": 1, "status": "diagnostic_feasible_evaluated_window", "report": result.report, "evaluations": result.evaluations, "selected_artifacts": result.artifacts})
+            }
+            Err(failure) => {
+                serde_json::json!({"schema_version": 1, "status": "diagnostic_no_winner", "failure": failure})
+            }
+        };
+        write_window_evidence(
+            &output.join("null_window_optimizer.diagnostic.json"),
+            &report,
+        )?;
+        // Explicit stop: no raw-feature join/calibration, trial ranking,
+        // production winner, audit, target-only, or result-table path exists.
+        Ok(report)
+    }
+
     pub(crate) fn preflight_existing_candidate_pool(
         &self,
         request: &CandidatePoolRequest,
@@ -1250,8 +1354,12 @@ impl Runner {
             if fdr_settings.null_window_optimizer.is_some() {
                 let checkpoint_path = self.make_path("null_window_optimizer.checkpoint.json");
                 optimizer_checkpoint_path = Some(checkpoint_path.clone());
+                let search_identity = match pool_usage.as_ref() {
+                    Some(usage) => usage.search_fingerprint.clone(),
+                    None => search_fingerprint(&self.parameters)?.digest,
+                };
                 let checkpoint_fingerprint =
-                    null_window_checkpoint_fingerprint(&features, &fdr_settings)?;
+                    null_window_checkpoint_fingerprint(&features, &fdr_settings, &search_identity)?;
                 let prior_evaluations = checkpoint_path
                     .to_file_path()
                     .ok()
@@ -1260,42 +1368,63 @@ impl Runner {
                         let checkpoint: NullWindowOptimizerCheckpoint =
                             serde_json::from_slice(&std::fs::read(&path)?)
                                 .with_context(|| format!("invalid optimizer checkpoint {}", path.display()))?;
-                        if checkpoint.schema != "sage-null-window-checkpoint-v1" {
+                        let expected_hash: String = serde_json::from_slice(&std::fs::read(path.with_extension("json.sha256"))?)?;
+                        anyhow::ensure!(sha256_file(&path)? == expected_hash, "null-window checkpoint content hash mismatch");
+                        anyhow::ensure!(checkpoint.evaluations.iter().all(|row| row.evidence.as_ref().is_some_and(|e| e.schema_version == 1)), "null-window checkpoint lacks supported per-window evidence");
+                        if checkpoint.schema != "sage-null-window-checkpoint-v2" {
                             anyhow::bail!(
                                 "unsupported optimizer checkpoint schema in {}",
                                 path.display()
                             );
                         }
-                        if checkpoint.fingerprint == checkpoint_fingerprint {
+                        if checkpoint.fingerprint == checkpoint_fingerprint && checkpoint.search_fingerprint == search_identity {
                             log::info!(
                                 "DF null-window optimizer: resuming {} cached evaluations",
                                 checkpoint.evaluations.len()
                             );
                             Ok(checkpoint.evaluations)
                         } else {
-                            log::info!(
-                                "DF null-window optimizer: checkpoint fingerprint changed; starting a new optimization"
-                            );
-                            Ok(Vec::new())
+                            anyhow::bail!("null-window checkpoint fingerprint mismatch; preserve it and use a distinct output directory")
                         }
                     })
                     .transpose()?
                     .unwrap_or_default();
+                let settings_path = self
+                    .make_path("null_window_optimizer.settings.json")
+                    .to_file_path()
+                    .map_err(|_| {
+                        anyhow::anyhow!("durable window evidence requires local output")
+                    })?;
+                write_window_evidence(&settings_path, &fdr_settings)?;
+                if let Ok(path) = checkpoint_path.to_file_path() {
+                    if !path.exists() {
+                        write_window_evidence(
+                            &path,
+                            &NullWindowOptimizerCheckpoint {
+                                schema: "sage-null-window-checkpoint-v2".into(),
+                                fingerprint: checkpoint_fingerprint.clone(),
+                                search_fingerprint: search_identity.clone(),
+                                evaluations: Vec::new(),
+                            },
+                        )?;
+                    }
+                }
                 let checkpoint_url = checkpoint_path.clone();
                 let checkpoint_fingerprint_for_write = checkpoint_fingerprint.clone();
-                let optimized = sage_core::decoy_free_fdr::optimize_null_window_resumable(
+                let optimized = sage_core::decoy_free_fdr::optimize_null_window_resumable_detailed(
                     &features,
                     &fdr_settings,
                     &self.database,
                     prior_evaluations,
                     move |evaluations| {
                         let checkpoint = NullWindowOptimizerCheckpoint {
-                            schema: "sage-null-window-checkpoint-v1".to_string(),
+                            schema: "sage-null-window-checkpoint-v2".to_string(),
                             fingerprint: checkpoint_fingerprint_for_write.clone(),
+                            search_fingerprint: search_identity.clone(),
                             evaluations: evaluations.to_vec(),
                         };
                         if let Ok(local_path) = checkpoint_url.to_file_path() {
-                            return crate::provenance::write_json_atomic(&local_path, &checkpoint)
+                            return write_window_evidence(&local_path, &checkpoint)
                                 .map_err(|error| error.to_string());
                         }
                         let bytes = serde_json::to_vec_pretty(&checkpoint)
@@ -1303,8 +1432,20 @@ impl Runner {
                         sage_cloudpath::write_bytes_sync(&checkpoint_url, bytes)
                             .map_err(|error| error.to_string())
                     },
-                )
-                .map_err(anyhow::Error::msg)?;
+                );
+                let optimized = match optimized {
+                    Ok(optimized) => optimized,
+                    Err(failure) => {
+                        let path = self
+                            .make_path("null_window_optimizer.failure.json")
+                            .to_file_path()
+                            .map_err(|_| {
+                                anyhow::anyhow!("durable window evidence requires local output")
+                            })?;
+                        write_window_evidence(&path, &failure)?;
+                        return Err(anyhow::Error::new(*failure));
+                    }
+                };
                 features = optimized.features;
                 fdr_settings = optimized.settings;
                 fitted_artifacts = optimized.artifacts;
