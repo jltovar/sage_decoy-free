@@ -1,5 +1,11 @@
 # Null-window failure and single-trial diagnostic contract
 
+The hard empirical acceptance rules below describe `strict_v1`, retained for
+historical reproduction. The explicitly versioned
+[reporting-guided policy](NULL_WINDOW_SELECTION_POLICY.md) separates empirical
+reference results from development selection eligibility; it does not rewrite
+historical failures or change fit validity and Level-4 reporting.
+
 ## Failure lifecycle
 
 `WorkflowTrialEvaluator` invokes `run_search_stage`, which installs the model-local

@@ -798,6 +798,14 @@ mod tests {
         let search_id = search_fingerprint(&search).unwrap();
         let analysis_id = analysis_fingerprint(&search, &search_id).unwrap();
 
+        let mut guided = search.clone();
+        guided.fdr.null_window_optimizer=Some(serde_json::from_value(serde_json::json!({"selection_policy":"reporting_guided_v1","fdp_references":{"psm":0.01,"peptide":0.01,"protein":0.01}})).unwrap());
+        assert_eq!(search_id, search_fingerprint(&guided).unwrap());
+        assert_ne!(
+            analysis_id.digest,
+            analysis_fingerprint(&guided, &search_id).unwrap().digest
+        );
+
         let mut changed = search.clone();
         changed.fdr.peptide_fdr = 0.02;
         changed.protein_grouping = !changed.protein_grouping;

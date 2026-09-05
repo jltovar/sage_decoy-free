@@ -158,8 +158,12 @@ use std::sync::Arc;
 use std::time::Instant;
 
 mod window_evidence;
+mod window_selection;
 pub use window_evidence::{
     artifact_contains_model, FdpPredicateEvidence, NullWindowEvidence, NullWindowFailure,
+};
+pub use window_selection::{
+    rank_null_window_evidence, window_selection_decision, WindowSelectionReport,
 };
 
 #[derive(Clone, Debug, Serialize, Deserialize)]
@@ -197,6 +201,8 @@ pub struct NullWindowOptimizationResult {
 
 #[derive(Clone, Debug, Serialize, Deserialize)]
 pub struct NullWindowOptimizationReport {
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub selection: Option<WindowSelectionReport>,
     pub schema: String,
     pub algorithm_version: String,
     pub strategy: NullWindowSearchStrategy,
@@ -1106,10 +1112,27 @@ pub fn calculate_entrapment_counts_df(
     counts
 }
 
+#[cfg(test)]
 fn accepted_target_entrapment_counts(
     features: &[DfFeature],
     db: &IndexedDatabase,
     threshold: f64,
+    validation_scope: NullWindowValidationScope,
+    selection_entrapment_proteins: Option<&[String]>,
+) -> ((usize, usize), (usize, usize), (usize, usize)) {
+    accepted_target_entrapment_counts_with_thresholds(
+        features,
+        db,
+        [threshold; 3],
+        validation_scope,
+        selection_entrapment_proteins,
+    )
+}
+
+fn accepted_target_entrapment_counts_with_thresholds(
+    features: &[DfFeature],
+    db: &IndexedDatabase,
+    thresholds: [f64; 3],
     validation_scope: NullWindowValidationScope,
     selection_entrapment_proteins: Option<&[String]>,
 ) -> ((usize, usize), (usize, usize), (usize, usize)) {
@@ -1181,21 +1204,21 @@ fn accepted_target_entrapment_counts(
             || feature
                 .decoy_free_protein_supported_peptide
                 .unwrap_or(false);
-        if feature.decoy_free_q_value.unwrap_or(1.0) <= threshold && psm_supported {
+        if feature.decoy_free_q_value.unwrap_or(1.0) <= thresholds[0] && psm_supported {
             if entrapment {
                 entrapment_psms += 1
             } else {
                 target_psms += 1
             }
         }
-        if feature.decoy_free_peptide_q.unwrap_or(1.0) <= threshold && peptide_supported {
+        if feature.decoy_free_peptide_q.unwrap_or(1.0) <= thresholds[1] && peptide_supported {
             if entrapment {
                 entrapment_peptides.insert(peptide_key.clone());
             } else {
                 target_peptides.insert(peptide_key.clone());
             }
         }
-        if feature.decoy_free_protein_q.unwrap_or(1.0) <= threshold {
+        if feature.decoy_free_protein_q.unwrap_or(1.0) <= thresholds[2] {
             if let Some(key) = df_inferred_protein_key_for_feature(feature, db) {
                 if is_entrapment_str(&key) {
                     entrapment_proteins.insert(key.into_owned());
@@ -1257,9 +1280,11 @@ fn settings_for_null_window(
     let mut candidate_settings = settings.clone();
     candidate_settings.lower_order_frozen_artifact = None;
     candidate_settings.null_window_optimizer = None;
-    candidate_settings.precursor_fdr = optimizer.fdr_threshold as f32;
-    candidate_settings.peptide_fdr = optimizer.fdr_threshold as f32;
-    candidate_settings.protein_fdr = optimizer.fdr_threshold as f32;
+    if optimizer.selection_policy.is_strict() {
+        candidate_settings.precursor_fdr = optimizer.fdr_threshold as f32;
+        candidate_settings.peptide_fdr = optimizer.fdr_threshold as f32;
+        candidate_settings.protein_fdr = optimizer.fdr_threshold as f32;
+    }
     match candidate_settings.model_fit {
         ModelFit::Moments => {
             candidate_settings.moments_min_null_rank = window.min_rank;
@@ -1317,35 +1342,50 @@ fn evaluate_null_window(
     apply_peptide_q_to_psm_reporting_df(&mut features, &candidate_settings);
     let _ = calculate_protein_q_df(&mut features, db, &candidate_settings);
     let _ = apply_hierarchical_reporting_df(&mut features, db, &candidate_settings);
-    let (psm, peptide, protein) = accepted_target_entrapment_counts(
+    let (psm, peptide, protein) = accepted_target_entrapment_counts_with_thresholds(
         &features,
         db,
-        optimizer.fdr_threshold,
+        null_window_reporting_thresholds(&candidate_settings, optimizer),
         optimizer.validation_scope,
         optimizer.selection_entrapment_proteins.as_deref(),
     );
     let psm_fdp = entrapment_fdp(psm.0, psm.1, optimizer.psm_entrapment_ratio);
     let peptide_fdp = entrapment_fdp(peptide.0, peptide.1, optimizer.peptide_entrapment_ratio);
     let protein_fdp = entrapment_fdp(protein.0, protein.1, optimizer.protein_entrapment_ratio);
-    let feasible = [psm_fdp, peptide_fdp, protein_fdp]
-        .into_iter()
-        .all(|fdp| fdp.is_some_and(|x| x <= optimizer.maximum_entrapment_fdp));
+    let references = optimizer.resolved_references();
+    let feasible = [
+        (psm_fdp, references.psm),
+        (peptide_fdp, references.peptide),
+        (protein_fdp, references.protein),
+    ]
+    .into_iter()
+    .all(|(fdp, limit)| fdp.is_some_and(|x| x <= limit));
     let low_count_warning = [psm.1, peptide.1, protein.1]
         .into_iter()
         .any(|count| count < optimizer.minimum_entrapment_count_for_stable_estimate);
     let predicates = [
-        ("psm", psm, optimizer.psm_entrapment_ratio),
-        ("peptide", peptide, optimizer.peptide_entrapment_ratio),
-        ("protein", protein, optimizer.protein_entrapment_ratio),
+        ("psm", psm, optimizer.psm_entrapment_ratio, references.psm),
+        (
+            "peptide",
+            peptide,
+            optimizer.peptide_entrapment_ratio,
+            references.peptide,
+        ),
+        (
+            "protein",
+            protein,
+            optimizer.protein_entrapment_ratio,
+            references.protein,
+        ),
     ]
     .into_iter()
-    .map(|(level, (target, entrapment), ratio)| {
+    .map(|(level, (target, entrapment), ratio, reference)| {
         FdpPredicateEvidence::new(
             level,
             target,
             entrapment,
             ratio,
-            optimizer.maximum_entrapment_fdp,
+            reference,
             optimizer.minimum_entrapment_count_for_stable_estimate,
         )
     })
@@ -1389,6 +1429,30 @@ fn validate_null_window_bounds(bounds: NullWindowSearchBounds) -> Result<(), Str
         return Err(format!("invalid null-window search bounds: {bounds:?}"));
     }
     Ok(())
+}
+
+fn null_window_reporting_thresholds(
+    settings: &FdrSettings,
+    options: &NullWindowOptimizerOptions,
+) -> [f64; 3] {
+    if options.selection_policy.is_strict() {
+        [options.fdr_threshold; 3]
+    } else {
+        // Preserve historical boundary comparisons when the resolved f32 is
+        // the same threshold; do not replace independently resolved values.
+        [
+            settings.precursor_fdr,
+            settings.peptide_fdr,
+            settings.protein_fdr,
+        ]
+        .map(|x| {
+            if x == options.fdr_threshold as f32 {
+                options.fdr_threshold
+            } else {
+                x as f64
+            }
+        })
+    }
 }
 
 fn exhaustive_null_windows(bounds: NullWindowSearchBounds) -> Vec<NullWindowCandidate> {
@@ -1510,17 +1574,31 @@ impl<'a> NullWindowEvaluator<'a> {
     }
 
     fn is_navigation_eligible(&self, index: usize) -> bool {
+        if !self.optimizer.selection_policy.is_strict() {
+            return window_selection_decision(
+                &self.evaluations[index],
+                self.optimizer.selection_policy,
+                self.optimizer.resolved_references(),
+            )
+            .selection_eligible;
+        }
         self.evaluations[index]
             .protein_fdp
-            .is_some_and(|fdp| fdp <= self.optimizer.maximum_entrapment_fdp)
+            .is_some_and(|fdp| fdp <= self.optimizer.resolved_references().protein)
     }
 
     fn best_index(&self) -> Option<usize> {
         self.evaluations
             .iter()
             .enumerate()
-            .filter(|(index, _)| self.touched.contains(index))
-            .max_by(|(_, left), (_, right)| compare_visited_null_window_evaluations(left, right))
+            .filter(|(index, _)| {
+                self.touched.contains(index)
+                    && (self.optimizer.selection_policy.is_strict()
+                        || self.is_navigation_eligible(*index))
+            })
+            .max_by(|(_, left), (_, right)| {
+                window_selection::compare_for_policy(left, right, self.optimizer)
+            })
             .map(|(index, _)| index)
     }
 }
@@ -1587,10 +1665,17 @@ fn run_adaptive_null_window_search(
     } else {
         "boundary"
     };
-    let reason = format!(
+    let reason = if evaluator.optimizer.selection_policy.is_strict() {
+        format!(
         "sparse probe found {sparse_eligible}/{sparse_total} protein-FDP-eligible probes ({eligible_fraction:.3}); threshold={:.3}",
         options.sparse_eligible_fraction_for_hill
-    );
+    )
+    } else {
+        format!(
+        "sparse probe found {sparse_eligible}/{sparse_total} navigation-eligible probes ({eligible_fraction:.3}); threshold={:.3}; policy={:?}; bounded local search, no claim about unvisited zero-entrapment windows",
+        options.sparse_eligible_fraction_for_hill, evaluator.optimizer.selection_policy
+    )
+    };
 
     if mode == "boundary" {
         let mut dead_rows = 0usize;
@@ -1669,9 +1754,10 @@ fn run_adaptive_null_window_search(
                     }
                     if let Some(index) = evaluator.evaluate(min_rank as u32, max_rank as u32)? {
                         if evaluator.is_navigation_eligible(index)
-                            && compare_visited_null_window_evaluations(
+                            && window_selection::compare_for_policy(
                                 &evaluator.evaluations[index],
                                 &evaluator.evaluations[best_neighbor],
+                                evaluator.optimizer,
                             ) == Ordering::Greater
                         {
                             best_neighbor = index;
@@ -2238,6 +2324,7 @@ pub fn optimize_null_window_resumable_detailed(
         prior_evaluations,
         &mut checkpoint,
     )?;
+    rank_null_window_evidence(&[], optimizer)?;
     let (adaptive_mode, adaptive_mode_reason, global_optimum_guaranteed) = match optimizer.strategy
     {
         NullWindowSearchStrategy::Explicit => {
@@ -2270,16 +2357,29 @@ pub fn optimize_null_window_resumable_detailed(
             (Some(mode), Some(reason), false)
         }
         NullWindowSearchStrategy::LandscapeAdaptive => {
-            let outcome = run_landscape_adaptive_null_window_search(
-                &mut evaluator,
-                optimizer.bounds.expect("validated bounds"),
-                &optimizer.adaptive,
-            )?;
-            (
-                Some(outcome.mode),
-                Some(outcome.reason),
-                outcome.global_optimum_guaranteed,
-            )
+            if !optimizer.selection_policy.is_strict() {
+                let (mode, reason) = run_adaptive_null_window_search(
+                    &mut evaluator,
+                    optimizer.bounds.expect("validated bounds"),
+                    &optimizer.adaptive,
+                )?;
+                (
+                    Some(format!("reporting_guided_sparse_{mode}_v1")),
+                    Some(reason),
+                    evaluator.evaluations.len() == candidate_universe_size,
+                )
+            } else {
+                let outcome = run_landscape_adaptive_null_window_search(
+                    &mut evaluator,
+                    optimizer.bounds.expect("validated bounds"),
+                    &optimizer.adaptive,
+                )?;
+                (
+                    Some(outcome.mode),
+                    Some(outcome.reason),
+                    outcome.global_optimum_guaranteed,
+                )
+            }
         }
     };
 
@@ -2295,8 +2395,17 @@ pub fn optimize_null_window_resumable_detailed(
         .evaluations
         .iter()
         .enumerate()
-        .filter(|(_, evaluation)| evaluation.feasible)
-        .max_by(|(_, left), (_, right)| compare_null_window_evaluations(left, right))
+        .filter(|(_, evaluation)| {
+            window_selection_decision(
+                evaluation,
+                optimizer.selection_policy,
+                optimizer.resolved_references(),
+            )
+            .selection_eligible
+        })
+        .max_by(|(_, left), (_, right)| {
+            window_selection::compare_for_policy(left, right, optimizer)
+        })
         .map(|(index, _)| index);
     let Some(selected) = selected else {
         return Err(Box::new(NullWindowFailure::no_feasible(
@@ -2328,10 +2437,10 @@ pub fn optimize_null_window_resumable_detailed(
     apply_peptide_q_to_psm_reporting_df(&mut features, &selected_settings);
     let _ = calculate_protein_q_df(&mut features, db, &selected_settings);
     let _ = apply_hierarchical_reporting_df(&mut features, db, &selected_settings);
-    let rematerialized = accepted_target_entrapment_counts(
+    let rematerialized = accepted_target_entrapment_counts_with_thresholds(
         &features,
         db,
-        optimizer.fdr_threshold,
+        null_window_reporting_thresholds(&selected_settings, optimizer),
         optimizer.validation_scope,
         optimizer.selection_entrapment_proteins.as_deref(),
     );
@@ -2359,6 +2468,9 @@ pub fn optimize_null_window_resumable_detailed(
         .map(|row| row.elapsed_milliseconds)
         .sum::<u64>();
     let report = NullWindowOptimizationReport {
+        selection: (!optimizer.selection_policy.is_strict())
+            .then(|| rank_null_window_evidence(&evaluations, optimizer))
+            .transpose()?,
         schema: "sage-null-window-optimization-v1".to_string(),
         algorithm_version: "native-window-search-v2".to_string(),
         strategy: optimizer.strategy,
@@ -14358,6 +14470,8 @@ mod tests {
             NullWindowOptimizerOptions,
         };
         let optimizer = |validation_scope| NullWindowOptimizerOptions {
+            selection_policy: Default::default(),
+            fdp_references: None,
             candidates: Vec::new(),
             strategy: NullWindowSearchStrategy::Explicit,
             bounds: None,
@@ -14444,6 +14558,8 @@ mod tests {
             max_rank_max: 25,
         };
         let optimizer = NullWindowOptimizerOptions {
+            selection_policy: Default::default(),
+            fdp_references: None,
             candidates: Vec::new(),
             strategy: NullWindowSearchStrategy::Adaptive,
             bounds: Some(bounds),
@@ -14541,6 +14657,8 @@ mod tests {
 
     fn landscape_optimizer(bounds: NullWindowSearchBounds) -> NullWindowOptimizerOptions {
         NullWindowOptimizerOptions {
+            selection_policy: Default::default(),
+            fdp_references: None,
             candidates: Vec::new(),
             strategy: NullWindowSearchStrategy::LandscapeAdaptive,
             bounds: Some(bounds),

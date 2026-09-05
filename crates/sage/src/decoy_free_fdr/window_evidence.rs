@@ -518,6 +518,8 @@ mod tests {
             ..Default::default()
         });
         settings.null_window_optimizer = Some(NullWindowOptimizerOptions {
+            selection_policy: Default::default(),
+            fdp_references: None,
             candidates: (2..=3)
                 .map(|rank| NullWindowCandidate {
                     min_rank: rank,
@@ -547,6 +549,82 @@ mod tests {
             "{failure:?}"
         );
         assert_eq!(failure.evaluations.len(), 2);
+        // Same synthetic stream, fitting, hierarchy and q thresholds. Only
+        // selection policy changes; empirical failure no longer prevents a
+        // materialized result, but no count or fitted state is altered.
+        settings
+            .null_window_optimizer
+            .as_mut()
+            .unwrap()
+            .selection_policy = crate::input::NullWindowSelectionPolicy::ReportingGuidedV1;
+        let guided =
+            optimize_null_window_resumable_detailed(&features, &settings, &db, Vec::new(), |_| {
+                Ok(())
+            })
+            .unwrap();
+        assert!(guided.report.selection.is_some());
+        let mut legacy_options = settings.null_window_optimizer.clone().unwrap();
+        legacy_options.selection_policy = Default::default();
+        let legacy_settings = settings_for_null_window(
+            &settings,
+            &legacy_options,
+            NullWindowCandidate {
+                min_rank: guided.settings.moments_min_null_rank,
+                max_rank: guided.settings.moments_max_null_rank,
+            },
+        )
+        .unwrap();
+        assert_eq!(
+            serde_json::to_value(&legacy_settings).unwrap(),
+            serde_json::to_value(&guided.settings).unwrap()
+        );
+        let mut same_stream = guided.features.clone();
+        apply_hierarchical_reporting_df(&mut same_stream, &db, &legacy_settings);
+        let accepted = |rows: &[DfFeature]| {
+            rows.iter()
+                .map(|f| {
+                    (
+                        f.core.psm_id,
+                        f.decoy_free_peptide_supported_psm,
+                        f.decoy_free_protein_supported_peptide,
+                        f.decoy_free_q_value,
+                        f.decoy_free_peptide_q,
+                        f.decoy_free_protein_q,
+                    )
+                })
+                .collect::<Vec<_>>()
+        };
+        assert_eq!(accepted(&same_stream), accepted(&guided.features));
+        assert_eq!(guided.evaluations.len(), failure.evaluations.len());
+        for (old, new) in failure.evaluations.iter().zip(&guided.evaluations) {
+            assert_eq!(
+                (
+                    old.target_psms,
+                    old.entrapment_psms,
+                    old.target_peptides,
+                    old.entrapment_peptides,
+                    old.target_proteins,
+                    old.entrapment_proteins
+                ),
+                (
+                    new.target_psms,
+                    new.entrapment_psms,
+                    new.target_peptides,
+                    new.entrapment_peptides,
+                    new.target_proteins,
+                    new.entrapment_proteins
+                )
+            );
+            assert_eq!(
+                (old.psm_fdp, old.peptide_fdp, old.protein_fdp),
+                (new.psm_fdp, new.peptide_fdp, new.protein_fdp)
+            );
+            assert_eq!(
+                old.evidence.as_ref().unwrap().fitted_artifact,
+                new.evidence.as_ref().unwrap().fitted_artifact
+            );
+            assert!(!new.feasible); // above reference is never relabeled passing
+        }
         for row in &failure.evaluations {
             let evidence = row.evidence.as_ref().unwrap();
             assert!(evidence.numerical_fit_valid);
@@ -622,6 +700,8 @@ mod tests {
     fn complete_rejected_window_replay_never_reevaluates_and_retains_mixed_reasons() {
         let mut settings = FdrSettings::from(crate::input::FdrOptions::default());
         settings.null_window_optimizer = Some(NullWindowOptimizerOptions {
+            selection_policy: Default::default(),
+            fdp_references: None,
             candidates: (2..=4)
                 .map(|rank| NullWindowCandidate {
                     min_rank: rank,
