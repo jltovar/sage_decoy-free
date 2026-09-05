@@ -23,10 +23,13 @@ fn main() {
     let optimizer_sources = [
         "src/parameter_optimizer.rs",
         "src/workflow.rs",
+        "src/workflow/null_window_diagnostic.rs",
+        "src/runner.rs",
         "src/entrapment.rs",
         "src/validation.rs",
         "../sage/src/input.rs",
         "../sage/src/decoy_free_fdr.rs",
+        "../sage/src/decoy_free_fdr/window_evidence.rs",
     ];
     let mut optimizer_hasher = Sha256::new();
     optimizer_hasher.update(b"sage-parameter-optimizer-source-v1\0");

@@ -143,6 +143,15 @@ fn main() -> anyhow::Result<()> {
                 ),
         )
         .subcommand(
+            Command::new("diagnose-null-window-trial")
+                .about("Diagnose one immutable historical trial's native null-window search; never run the parameter optimizer or external feature join")
+                .arg(Arg::new("manifest").required(true))
+                .arg(Arg::new("checkpoint").long("checkpoint").required(true))
+                .arg(Arg::new("checkpoint-sha256").long("checkpoint-sha256").required(true))
+                .arg(Arg::new("trial-id").long("trial-id").required(true))
+                .arg(Arg::new("output").long("output").required(true)),
+        )
+        .subcommand(
             Command::new("candidate-pool-only")
                 .about("Construct and verify one immutable candidate pool, then stop before every statistical or annotation stage")
                 .arg(
@@ -598,6 +607,23 @@ fn main() -> anyhow::Result<()> {
         return Ok(());
     }
 
+    if let Some(("diagnose-null-window-trial", diagnostic)) = matches.subcommand() {
+        let value = |key| {
+            diagnostic
+                .get_one::<String>(key)
+                .expect("required diagnostic argument")
+        };
+        let report = sage_cli::workflow::diagnose_null_window_trial(
+            std::path::Path::new(value("manifest")),
+            std::path::Path::new(value("checkpoint")),
+            value("checkpoint-sha256"),
+            value("trial-id"),
+            std::path::Path::new(value("output")),
+            parallel,
+        )?;
+        println!("diagnostic terminal status: {}", report["status"]);
+        return Ok(());
+    }
     if let Some(("workflow", workflow_matches)) = matches.subcommand() {
         let manifest = workflow_matches
             .get_one::<String>("manifest")

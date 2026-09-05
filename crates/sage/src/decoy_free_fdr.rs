@@ -157,8 +157,15 @@ use std::collections::{BTreeMap, HashMap};
 use std::sync::Arc;
 use std::time::Instant;
 
+mod window_evidence;
+pub use window_evidence::{
+    artifact_contains_model, FdpPredicateEvidence, NullWindowEvidence, NullWindowFailure,
+};
+
 #[derive(Clone, Debug, Serialize, Deserialize)]
 pub struct NullWindowEvaluation {
+    #[serde(default)]
+    pub evidence: Option<NullWindowEvidence>,
     pub min_rank: u32,
     pub max_rank: u32,
     #[serde(default)]
@@ -1299,7 +1306,8 @@ fn evaluate_null_window(
 ) -> Result<NullWindowEvaluation, String> {
     let evaluation_start = Instant::now();
     let candidate_settings = settings_for_null_window(settings, optimizer, window)?;
-    let (mut features, _artifacts) = run_df_layers_with_artifacts(psms, &candidate_settings, db);
+    let observations = window_evidence::ObservationGuard::start();
+    let (mut features, artifacts) = run_df_layers_with_artifacts(psms, &candidate_settings, db);
     let _ = calculate_peptide_q_df(
         &mut features,
         db,
@@ -1325,7 +1333,33 @@ fn evaluate_null_window(
     let low_count_warning = [psm.1, peptide.1, protein.1]
         .into_iter()
         .any(|count| count < optimizer.minimum_entrapment_count_for_stable_estimate);
+    let predicates = [
+        ("psm", psm, optimizer.psm_entrapment_ratio),
+        ("peptide", peptide, optimizer.peptide_entrapment_ratio),
+        ("protein", protein, optimizer.protein_entrapment_ratio),
+    ]
+    .into_iter()
+    .map(|(level, (target, entrapment), ratio)| {
+        FdpPredicateEvidence::new(
+            level,
+            target,
+            entrapment,
+            ratio,
+            optimizer.maximum_entrapment_fdp,
+            optimizer.minimum_entrapment_count_for_stable_estimate,
+        )
+    })
+    .collect();
+    let evidence = NullWindowEvidence::collect(
+        &candidate_settings,
+        &artifacts,
+        &features,
+        observations.snapshot(),
+        predicates,
+    )?;
+    let feasible = feasible && evidence.numerical_evaluation_valid;
     Ok(NullWindowEvaluation {
+        evidence: Some(evidence),
         min_rank: window.min_rank,
         max_rank: window.max_rank,
         validation_scope: optimizer.validation_scope,
@@ -2097,28 +2131,71 @@ pub fn optimize_null_window_resumable(
     settings: &FdrSettings,
     db: &IndexedDatabase,
     prior_evaluations: Vec<NullWindowEvaluation>,
-    mut checkpoint: impl FnMut(&[NullWindowEvaluation]) -> Result<(), String>,
+    checkpoint: impl FnMut(&[NullWindowEvaluation]) -> Result<(), String>,
 ) -> Result<NullWindowOptimizationResult, String> {
+    optimize_null_window_resumable_detailed(psms, settings, db, prior_evaluations, checkpoint)
+        .map_err(|error| error.to_string())
+}
+
+/// Typed failure boundary. Empirical rejection is not a numerical fit error.
+pub fn optimize_null_window_resumable_detailed(
+    psms: &[DfFeature],
+    settings: &FdrSettings,
+    db: &IndexedDatabase,
+    prior_evaluations: Vec<NullWindowEvaluation>,
+    mut checkpoint: impl FnMut(&[NullWindowEvaluation]) -> Result<(), String>,
+) -> Result<NullWindowOptimizationResult, Box<NullWindowFailure>> {
     let optimizer = settings
         .null_window_optimizer
         .as_ref()
         .ok_or_else(|| "null-window optimizer was not configured".to_string())?;
+    for (field, value) in [
+        ("psm_entrapment_ratio", optimizer.psm_entrapment_ratio),
+        (
+            "peptide_entrapment_ratio",
+            optimizer.peptide_entrapment_ratio,
+        ),
+        (
+            "protein_entrapment_ratio",
+            optimizer.protein_entrapment_ratio,
+        ),
+    ] {
+        if !value.is_finite() || value <= 0.0 {
+            return Err(
+                format!("invalid {field}: measured ratio must be finite and positive").into(),
+            );
+        }
+    }
+    if !optimizer.maximum_entrapment_fdp.is_finite()
+        || !(0.0..=1.0).contains(&optimizer.maximum_entrapment_fdp)
+        || !optimizer.fdr_threshold.is_finite()
+        || !(0.0..=1.0).contains(&optimizer.fdr_threshold)
+    {
+        return Err("invalid null-window FDP limit or reporting threshold"
+            .to_string()
+            .into());
+    }
     if optimizer.validation_scope == NullWindowValidationScope::Level4
         && settings.hierarchical_reporting == HierarchicalReportingMode::Off
     {
         return Err(
             "null-window validation_scope=level4 requires hierarchical_reporting to be enabled"
-                .to_string(),
+                .to_string()
+                .into(),
         );
     }
 
     let (candidate_universe_size, capacity) = match optimizer.strategy {
         NullWindowSearchStrategy::Explicit => {
             if optimizer.candidates.is_empty() {
-                return Err("explicit null-window optimizer has no candidates".to_string());
+                return Err("explicit null-window optimizer has no candidates"
+                    .to_string()
+                    .into());
             }
             if optimizer.bounds.is_some() {
-                return Err("explicit null-window optimizer cannot also declare bounds".to_string());
+                return Err("explicit null-window optimizer cannot also declare bounds"
+                    .to_string()
+                    .into());
             }
             let mut unique = FnvHashSet::default();
             if optimizer
@@ -2126,7 +2203,9 @@ pub fn optimize_null_window_resumable(
                 .iter()
                 .any(|window| !unique.insert((window.min_rank, window.max_rank)))
             {
-                return Err("explicit null-window optimizer contains duplicate windows".to_string());
+                return Err("explicit null-window optimizer contains duplicate windows"
+                    .to_string()
+                    .into());
             }
             (optimizer.candidates.len(), optimizer.candidates.len())
         }
@@ -2136,7 +2215,8 @@ pub fn optimize_null_window_resumable(
             if !optimizer.candidates.is_empty() {
                 return Err(
                     "bounded null-window optimizer cannot also declare explicit candidates"
-                        .to_string(),
+                        .to_string()
+                        .into(),
                 );
             }
             let bounds = optimizer
@@ -2169,7 +2249,8 @@ pub fn optimize_null_window_resumable(
                     return Err(format!(
                         "invalid null window {}..={}",
                         window.min_rank, window.max_rank
-                    ));
+                    )
+                    .into());
                 }
             }
             (None, None, true)
@@ -2205,7 +2286,8 @@ pub fn optimize_null_window_resumable(
     if evaluator.touched.len() != evaluator.evaluations.len() {
         return Err(
             "null-window checkpoint is not a deterministic prefix of this optimizer run"
-                .to_string(),
+                .to_string()
+                .into(),
         );
     }
 
@@ -2215,8 +2297,16 @@ pub fn optimize_null_window_resumable(
         .enumerate()
         .filter(|(_, evaluation)| evaluation.feasible)
         .max_by(|(_, left), (_, right)| compare_null_window_evaluations(left, right))
-        .map(|(index, _)| index)
-        .ok_or_else(|| "no null window satisfied all entrapment FDP constraints".to_string())?;
+        .map(|(index, _)| index);
+    let Some(selected) = selected else {
+        return Err(Box::new(NullWindowFailure::no_feasible(
+            evaluator.evaluations,
+            candidate_universe_size,
+            adaptive_mode,
+            adaptive_mode_reason,
+            global_optimum_guaranteed,
+        )));
+    };
     evaluator.evaluations[selected].selected = true;
     let selected_window = NullWindowCandidate {
         min_rank: evaluator.evaluations[selected].min_rank,
@@ -2261,7 +2351,8 @@ pub fn optimize_null_window_resumable(
         return Err(format!(
             "selected null window {}..={} was not deterministic when rematerialized",
             selected_row.min_rank, selected_row.max_rank
-        ));
+        )
+        .into());
     }
     let total_evaluation_milliseconds = evaluations
         .iter()
@@ -2903,6 +2994,22 @@ fn q_values_from_level_covariates(
     level: QLevel,
     level_name: &str,
 ) -> QValueComputation {
+    let report = q_values_from_level_covariates_unobserved(
+        p_values, p_ref, cov_values, settings, method, level, level_name,
+    );
+    window_evidence::observe_q(level_name, &report);
+    report
+}
+
+fn q_values_from_level_covariates_unobserved(
+    p_values: &[f64],
+    p_ref: &[f64],
+    cov_values: &[Option<f64>],
+    settings: &FdrSettings,
+    method: QMethod,
+    level: QLevel,
+    level_name: &str,
+) -> QValueComputation {
     let effective_method = match method {
         QMethod::Auto => match level {
             QLevel::Psm => effective_psm_q_method(settings),
@@ -2997,8 +3104,10 @@ fn q_values_from_p_values_with_method(
     method: QMethod,
     level_name: &str,
 ) -> Vec<f64> {
-    q_values_from_p_values_with_method_report(p_values, p_ref, settings, method, level_name)
-        .q_values
+    let report =
+        q_values_from_p_values_with_method_report(p_values, p_ref, settings, method, level_name);
+    window_evidence::observe_q(level_name, &report);
+    report.q_values
 }
 
 #[inline]
@@ -3999,7 +4108,13 @@ fn build_rank_null_pool(
         .map(|(idx, _)| idx)
         .collect();
 
+    window_evidence::observe_fit(
+        serde_json::json!({"method": label, "predicate": "purified_null_pool_size", "observations": selected_rows.len(), "minimum": min_null_size}),
+    );
     if selected_rows.len() < min_null_size {
+        window_evidence::observe_fallback(format!(
+            "{label}: purified_null_too_small_using_unpurified_null"
+        ));
         log::warn!(
             "{label}: purified null too small with purification_factor={:.3}; falling back to unpurified null.",
             p_factor
@@ -4396,6 +4511,9 @@ fn fit_engines(
     });
 
     let window_ok = |method: &str, window_min: u32, window_max: u32, count: usize| -> bool {
+        window_evidence::observe_fit(
+            serde_json::json!({"method": method, "predicate": "window_minimum_null_size", "min_rank": window_min, "max_rank": window_max, "observations": count, "minimum": min_null_size, "passed": count >= min_null_size}),
+        );
         if count < min_null_size {
             log::warn!(
                 "{method}: null window [{window_min}..={window_max}] too small \
@@ -4470,6 +4588,12 @@ fn fit_engines(
                 } else {
                     fit_gumbel_moments(&fit_scores)
                 };
+                window_evidence::observe_fit(serde_json::json!({
+                    "method": "moments", "predicate": "finite_location_positive_scale",
+                    "mu": mu.is_finite().then_some(mu), "beta": beta.is_finite().then_some(beta),
+                    "mu_finite": mu.is_finite(), "beta_finite": beta.is_finite(),
+                    "passed": mu.is_finite() && beta.is_finite() && beta > 0.0,
+                }));
                 if mu.is_finite() && beta.is_finite() && beta > 0.0 {
                     Some((mu, beta))
                 } else {
@@ -14019,6 +14143,33 @@ mod tests {
         assert_eq!(full.0, (1, 2));
         assert_eq!(full.1, (1, 2));
         assert_eq!(full.2, (1, 2));
+        let mut supported = features.clone();
+        for row in &mut supported {
+            row.decoy_free_peptide_supported_psm = Some(true);
+            row.decoy_free_protein_supported_peptide = Some(true);
+        }
+        let level4 = accepted_target_entrapment_counts(
+            &supported,
+            &db,
+            0.01,
+            NullWindowValidationScope::Level4,
+            Some(&selection),
+        );
+        assert_eq!(level4, (psm, peptide, protein));
+        // Audit evidence changes neither empirical numerator nor denominator.
+        supported[2].decoy_free_q_value = Some(1.0);
+        supported[2].decoy_free_protein_q = Some(1.0);
+        assert_eq!(
+            accepted_target_entrapment_counts(
+                &supported,
+                &db,
+                0.01,
+                NullWindowValidationScope::Level4,
+                Some(&selection)
+            ),
+            level4
+        );
+        assert_eq!(entrapment_fdp(psm.0, psm.1, 0.5), Some(1.0));
     }
 
     #[test]
@@ -14158,6 +14309,7 @@ mod tests {
         let evaluation =
             |min_rank, max_rank, proteins, peptides, psms, protein_fdp, peptide_fdp, psm_fdp| {
                 NullWindowEvaluation {
+                    evidence: None,
                     min_rank,
                     max_rank,
                     validation_scope: NullWindowValidationScope::Level4,
@@ -14312,6 +14464,7 @@ mod tests {
                 let distance = window.min_rank.abs_diff(9) + window.max_rank.abs_diff(18);
                 let proteins = 1_000usize - distance as usize;
                 NullWindowEvaluation {
+                    evidence: None,
                     min_rank: window.min_rank,
                     max_rank: window.max_rank,
                     validation_scope: NullWindowValidationScope::RawQ,
@@ -14366,6 +14519,7 @@ mod tests {
         let proteins = 1_000usize - distance as usize;
         let fdp = if feasible { 0.0 } else { 0.02 };
         NullWindowEvaluation {
+            evidence: None,
             min_rank: window.min_rank,
             max_rank: window.max_rank,
             validation_scope: NullWindowValidationScope::RawQ,

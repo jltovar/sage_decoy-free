@@ -1413,6 +1413,10 @@ release state.
 
 ### 2. Additional null-window diagnostics
 
+Nested-window failures now retain typed empirical, unavailable-metric, and
+technical outcomes, fitted-state/fallback observations, per-level FDP arithmetic,
+and durable window checkpoints. See [null-window failure and diagnostic contract](NULL_WINDOW_FAILURE_CONTRACT.md).
+
 The native workflow now searches compact bounds adaptively, exhaustively, or by exact explicit
 replay without rereading spectra, then selects the highest-yield visited window satisfying PSM,
 peptide, and protein entrapment-FDP constraints. Further diagnostics can still be added, such as:
