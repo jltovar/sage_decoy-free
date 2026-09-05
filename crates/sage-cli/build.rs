@@ -30,6 +30,8 @@ fn main() {
         "../sage/src/input.rs",
         "../sage/src/decoy_free_fdr.rs",
         "../sage/src/decoy_free_fdr/window_evidence.rs",
+        "../sage/src/decoy_free_fdr/window_selection.rs",
+        "src/window_reranking.rs",
     ];
     let mut optimizer_hasher = Sha256::new();
     optimizer_hasher.update(b"sage-parameter-optimizer-source-v1\0");

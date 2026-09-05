@@ -49,8 +49,8 @@ use sage_core::decoy_free_fdr::{DfRunArtifacts, FittedArtifactProvenance};
 use sage_core::input::{
     AdaptiveNullWindowSearchOptions, EnsembleExpertOptions, EnsemblePCombiner, EnsemblePepCombiner,
     ExpertIdentity, FdrMode, FdrOptions, FdrSettings, ModelFit, NullWindowCandidate,
-    NullWindowOptimizerOptions, NullWindowSearchBounds, NullWindowSearchStrategy,
-    NullWindowValidationScope,
+    NullWindowFdpReferences, NullWindowOptimizerOptions, NullWindowSearchBounds,
+    NullWindowSearchStrategy, NullWindowSelectionPolicy, NullWindowValidationScope,
 };
 use serde::{Deserialize, Serialize};
 use sha2::{Digest, Sha256};
@@ -198,6 +198,17 @@ pub struct BaselineWorkflow {
 
 #[derive(Clone, Debug, Serialize, Deserialize)]
 pub struct ValidationWorkflow {
+    #[serde(default, skip_serializing_if = "NullWindowSelectionPolicy::is_strict")]
+    pub null_window_selection_policy: NullWindowSelectionPolicy,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub null_window_fdp_references: Option<NullWindowFdpReferences>,
+    #[serde(
+        default,
+        skip_serializing_if = "BTreeMap::is_empty",
+        deserialize_with = "sage_core::input::deserialize_expert_map",
+        serialize_with = "sage_core::input::serialize_expert_map"
+    )]
+    pub null_window_fdp_references_by_expert: BTreeMap<ExpertIdentity, NullWindowFdpReferences>,
     #[serde(default)]
     pub effective_ratios: EffectiveRatios,
     #[serde(default)]
@@ -389,7 +400,11 @@ fn normalized_proposal_space_optimizer(
     // legacy roots to the current proposal schema so an immutable v4
     // preregistration and its mechanically amended v5 execution manifest
     // resolve to one scientific proposal-space identity.
-    normalized.schema_version = crate::parameter_optimizer::PARAMETER_OPTIMIZER_SCHEMA_VERSION;
+    normalized.schema_version = if normalized.empirical_selection_policy.is_strict() {
+        crate::parameter_optimizer::PARAMETER_OPTIMIZER_SCHEMA_VERSION
+    } else {
+        6
+    };
     normalized.selected_experts.sort_by_key(|expert| {
         let identity = ExpertIdentity::from(*expert);
         (identity == ExpertIdentity::Ensemble, identity)
@@ -2156,6 +2171,32 @@ impl WorkflowManifest {
     }
 
     fn validate_impl(&self, validate_resource_paths: bool) -> Result<()> {
+        for references in self.validation.null_window_fdp_references.iter().chain(
+            self.validation
+                .null_window_fdp_references_by_expert
+                .values(),
+        ) {
+            anyhow::ensure!(
+                [references.psm, references.peptide, references.protein]
+                    .iter()
+                    .all(|x| x.is_finite() && (0.0..=1.0).contains(x)),
+                "invalid null-window empirical reference"
+            );
+        }
+        anyhow::ensure!(
+            self.validation
+                .null_window_fdp_references_by_expert
+                .keys()
+                .all(|expert| expert.is_individual()),
+            "Ensemble has no null-window reference override"
+        );
+        if let Some(config) = self
+            .parameter_optimizer
+            .as_ref()
+            .filter(|config| config.enabled)
+        {
+            anyhow::ensure!(config.empirical_selection_policy == self.validation.null_window_selection_policy, "outer empirical selection policy must explicitly match null-window selection policy");
+        }
         anyhow::ensure!(self.schema_version == 1, "unsupported workflow schema");
         anyhow::ensure!(
             !(self.require_existing_annotation_cache
@@ -5544,6 +5585,33 @@ fn stage_output_hashes_match(record: &StageRecord) -> Result<bool> {
         && sha256_file(&record.config_snapshot)? == record.config_snapshot_sha256)
 }
 
+fn effective_reporting_thresholds(snapshot: &Path, legacy_threshold: f64) -> Result<[f64; 3]> {
+    let snapshot: serde_json::Value = serde_json::from_slice(&std::fs::read(snapshot)?)?;
+    let fdr = snapshot
+        .get("fdr")
+        .context("trial reporting settings missing")?;
+    let mut values = [0.0; 3];
+    for (i, key) in ["precursor_fdr", "peptide_fdr", "protein_fdr"]
+        .iter()
+        .enumerate()
+    {
+        let value = fdr
+            .get(key)
+            .and_then(serde_json::Value::as_f64)
+            .context("missing effective reporting threshold")?;
+        anyhow::ensure!(
+            value.is_finite() && (0.0..=1.0).contains(&value),
+            "invalid effective reporting threshold"
+        );
+        values[i] = if value as f32 == legacy_threshold as f32 {
+            legacy_threshold
+        } else {
+            value as f32 as f64
+        };
+    }
+    Ok(values)
+}
+
 fn install_null_window_policy(
     fdr: &mut FdrOptions,
     model: &ModelWorkflow,
@@ -5566,6 +5634,13 @@ fn install_null_window_policy(
             AdaptiveNullWindowSearchOptions::default(),
         ));
     fdr.null_window_optimizer = Some(NullWindowOptimizerOptions {
+        selection_policy: manifest.validation.null_window_selection_policy,
+        fdp_references: manifest
+            .validation
+            .null_window_fdp_references_by_expert
+            .get(&ExpertIdentity::from(&model.model))
+            .copied()
+            .or(manifest.validation.null_window_fdp_references),
         candidates: model
             .candidate_windows
             .iter()
@@ -6600,7 +6675,25 @@ impl TrialEvaluator for WorkflowTrialEvaluator<'_> {
             target_only_calibration_policy: None,
             release_candidate: false,
         };
-        let summaries = if let Some(partition) = self.entrapment_selection {
+        let summaries = if !self
+            .manifest
+            .validation
+            .null_window_selection_policy
+            .is_strict()
+        {
+            let allowed = self
+                .entrapment_selection
+                .map(|partition| partition.selection_protein_set());
+            crate::validation::summarize_run_with_thresholds(
+                &validation_run,
+                &self.manifest.validation.effective_ratios,
+                effective_reporting_thresholds(
+                    &stage.config_snapshot,
+                    self.manifest.validation.fdr_threshold,
+                )?,
+                allowed.as_ref(),
+            )?
+        } else if let Some(partition) = self.entrapment_selection {
             summarize_run_for_entrapment_partition(
                 &validation_run,
                 &self.manifest.validation.effective_ratios,
@@ -7635,12 +7728,36 @@ fn evaluate_frozen_optimizer_winner_once(
         peptide: partition.audit_ratios.peptide_ratio,
         protein: partition.audit_ratios.protein_ratio,
     };
-    let summaries = summarize_run_for_entrapment_partition(
-        &run,
-        &ratios,
-        manifest.validation.fdr_threshold,
-        &partition.audit_protein_set(),
-    )?;
+    let summaries = if !manifest.validation.null_window_selection_policy.is_strict() {
+        let snapshot = run
+            .results
+            .parent()
+            .context("winner result directory missing")?
+            .join("workflow.search.resolved.json");
+        let expected = winner
+            .evaluation
+            .compact_diagnostics
+            .get("production_config_snapshot_sha256")
+            .and_then(serde_json::Value::as_str)
+            .context("winner reporting configuration identity missing")?;
+        anyhow::ensure!(
+            sha256_file(&snapshot)? == expected,
+            "winner reporting configuration changed before audit"
+        );
+        crate::validation::summarize_run_with_thresholds(
+            &run,
+            &ratios,
+            effective_reporting_thresholds(&snapshot, manifest.validation.fdr_threshold)?,
+            Some(&partition.audit_protein_set()),
+        )?
+    } else {
+        summarize_run_for_entrapment_partition(
+            &run,
+            &ratios,
+            manifest.validation.fdr_threshold,
+            &partition.audit_protein_set(),
+        )?
+    };
     let level4 = summaries
         .iter()
         .find(|summary| summary.layer == "level4")
@@ -9625,6 +9742,7 @@ mod tests {
 
     fn test_optimizer_config() -> ParameterOptimizerConfig {
         ParameterOptimizerConfig {
+            empirical_selection_policy: Default::default(),
             schema_version: 1,
             enabled: true,
             classification: crate::parameter_optimizer::OptimizationClassification::DevelopmentOnly,
@@ -9861,6 +9979,65 @@ mod tests {
             }
         }
         manifest
+    }
+
+    #[test]
+    fn reporting_guided_proposal_identity_and_reference_precedence() {
+        let directory = test_directory("guided-proposal");
+        let mut manifest = adaptive_seven_expert_proposal_manifest(&directory);
+        let old = resolve_optimizer_proposal_space_from_manifest(&manifest).unwrap();
+        manifest.validation.null_window_selection_policy =
+            NullWindowSelectionPolicy::ReportingGuidedV1;
+        let error = manifest
+            .validate_before_resource_access()
+            .unwrap_err()
+            .to_string();
+        assert!(error.contains("outer empirical selection policy"));
+        let optimizer = manifest.parameter_optimizer.as_mut().unwrap();
+        optimizer.schema_version = 6;
+        optimizer.empirical_selection_policy = NullWindowSelectionPolicy::ReportingGuidedV1;
+        let new = resolve_optimizer_proposal_space_from_manifest(&manifest).unwrap();
+        assert_ne!(old.proposal_space_sha256, new.proposal_space_sha256);
+        let global = NullWindowFdpReferences {
+            psm: 0.01,
+            peptide: 0.02,
+            protein: 0.03,
+        };
+        let local = NullWindowFdpReferences {
+            psm: 0.04,
+            peptide: 0.05,
+            protein: 0.06,
+        };
+        manifest.validation.null_window_fdp_references = Some(global);
+        manifest
+            .validation
+            .null_window_fdp_references_by_expert
+            .insert(ExpertIdentity::Moments, local);
+        for model in manifest
+            .models
+            .iter()
+            .filter(|m| m.model == ModelFit::Moments || m.model == ModelFit::Mle)
+        {
+            let mut fdr = FdrOptions::default();
+            install_null_window_policy(&mut fdr, model, &manifest, None);
+            assert_eq!(
+                fdr.null_window_optimizer.unwrap().resolved_references(),
+                if model.model == ModelFit::Moments {
+                    local
+                } else {
+                    global
+                }
+            );
+        }
+        manifest
+            .validation
+            .null_window_fdp_references_by_expert
+            .insert(ExpertIdentity::Ensemble, global);
+        assert!(manifest
+            .validate_before_resource_access()
+            .unwrap_err()
+            .to_string()
+            .contains("Ensemble has no null-window"));
     }
 
     #[test]
@@ -10933,6 +11110,9 @@ mod tests {
             }],
             baseline: None,
             validation: ValidationWorkflow {
+                null_window_selection_policy: Default::default(),
+                null_window_fdp_references: None,
+                null_window_fdp_references_by_expert: BTreeMap::new(),
                 effective_ratios: EffectiveRatios::default(),
                 null_window_validation_scope: NullWindowValidationScope::Level4,
                 use_generated_entrapment_ratios: true,
@@ -12842,6 +13022,9 @@ mod tests {
             ],
             baseline: None,
             validation: ValidationWorkflow {
+                null_window_selection_policy: Default::default(),
+                null_window_fdp_references: None,
+                null_window_fdp_references_by_expert: BTreeMap::new(),
                 effective_ratios: EffectiveRatios::default(),
                 null_window_validation_scope: NullWindowValidationScope::Level4,
                 use_generated_entrapment_ratios: false,

@@ -532,7 +532,7 @@ pub fn summarize_run(
     ratios: &EffectiveRatios,
     fdr_threshold: f64,
 ) -> Result<Vec<RunValidationSummary>> {
-    summarize_run_with_entrapment_partition(run, ratios, fdr_threshold, None)
+    summarize_run_with_thresholds(run, ratios, [fdr_threshold; 3], None)
 }
 
 /// Summarize one immutable result table while exposing only one preregistered
@@ -545,15 +545,21 @@ pub fn summarize_run_for_entrapment_partition(
     fdr_threshold: f64,
     allowed: &BTreeSet<String>,
 ) -> Result<Vec<RunValidationSummary>> {
-    summarize_run_with_entrapment_partition(run, ratios, fdr_threshold, Some(allowed))
+    summarize_run_with_thresholds(run, ratios, [fdr_threshold; 3], Some(allowed))
 }
 
-fn summarize_run_with_entrapment_partition(
+pub fn summarize_run_with_thresholds(
     run: &ValidationRun,
     ratios: &EffectiveRatios,
-    fdr_threshold: f64,
+    thresholds: [f64; 3],
     allowed_entrapments: Option<&BTreeSet<String>>,
 ) -> Result<Vec<RunValidationSummary>> {
+    anyhow::ensure!(
+        thresholds
+            .iter()
+            .all(|x| x.is_finite() && (0.0..=1.0).contains(x)),
+        "invalid reporting thresholds"
+    );
     if !run.results.is_file() {
         return Ok(Vec::new());
     }
@@ -700,9 +706,9 @@ fn summarize_run_with_entrapment_partition(
             }
         };
 
-        let raw_psm = parse_f64(row.get(psm_q)).is_some_and(|q| q <= fdr_threshold);
-        let raw_peptide = parse_f64(row.get(peptide_q)).is_some_and(|q| q <= fdr_threshold);
-        let raw_protein = parse_f64(row.get(protein_q)).is_some_and(|q| q <= fdr_threshold);
+        let raw_psm = parse_f64(row.get(psm_q)).is_some_and(|q| q <= thresholds[0]);
+        let raw_peptide = parse_f64(row.get(peptide_q)).is_some_and(|q| q <= thresholds[1]);
+        let raw_protein = parse_f64(row.get(protein_q)).is_some_and(|q| q <= thresholds[2]);
         insert(&mut raw, raw_psm, raw_peptide, raw_protein);
 
         if has_level4 {

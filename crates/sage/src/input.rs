@@ -419,6 +419,10 @@ pub enum NullWindowValidationScope {
 
 #[derive(Clone, Serialize, Deserialize, Debug)]
 pub struct NullWindowOptimizerOptions {
+    #[serde(default, skip_serializing_if = "NullWindowSelectionPolicy::is_strict")]
+    pub selection_policy: NullWindowSelectionPolicy,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub fdp_references: Option<NullWindowFdpReferences>,
     #[serde(default)]
     pub candidates: Vec<NullWindowCandidate>,
     #[serde(default)]
@@ -452,6 +456,39 @@ pub struct NullWindowOptimizerOptions {
     /// normally by the runner.
     #[serde(default)]
     pub verbose_diagnostics: bool,
+}
+
+/// Versioned selection semantics. Absence preserves the historical hard gate.
+#[derive(Clone, Copy, Debug, Default, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(rename_all = "snake_case")]
+pub enum NullWindowSelectionPolicy {
+    #[default]
+    StrictV1,
+    ReportingGuidedV1,
+}
+
+impl NullWindowSelectionPolicy {
+    pub fn is_strict(&self) -> bool {
+        *self == Self::StrictV1
+    }
+}
+
+#[derive(Clone, Copy, Debug, Serialize, Deserialize, PartialEq)]
+#[serde(deny_unknown_fields)]
+pub struct NullWindowFdpReferences {
+    pub psm: f64,
+    pub peptide: f64,
+    pub protein: f64,
+}
+
+impl NullWindowOptimizerOptions {
+    pub fn resolved_references(&self) -> NullWindowFdpReferences {
+        self.fdp_references.unwrap_or(NullWindowFdpReferences {
+            psm: self.maximum_entrapment_fdp,
+            peptide: self.maximum_entrapment_fdp,
+            protein: self.maximum_entrapment_fdp,
+        })
+    }
 }
 
 fn default_sparse_row_step() -> u32 {

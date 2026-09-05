@@ -11,4 +11,5 @@ pub mod provenance;
 pub mod runner;
 pub mod telemetry;
 pub mod validation;
+pub mod window_reranking;
 pub mod workflow;

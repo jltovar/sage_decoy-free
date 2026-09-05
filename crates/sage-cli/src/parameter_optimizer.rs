@@ -2897,6 +2897,11 @@ fn default_true() -> bool {
 
 #[derive(Clone, Debug, Serialize, Deserialize)]
 pub struct ParameterOptimizerConfig {
+    #[serde(
+        default,
+        skip_serializing_if = "sage_core::input::NullWindowSelectionPolicy::is_strict"
+    )]
+    pub empirical_selection_policy: sage_core::input::NullWindowSelectionPolicy,
     pub schema_version: u32,
     pub enabled: bool,
     pub classification: OptimizationClassification,
@@ -3133,13 +3138,15 @@ impl ParameterOptimizerConfig {
 
     pub fn validate(&self) -> Result<()> {
         anyhow::ensure!(
-            (1..=PARAMETER_OPTIMIZER_SCHEMA_VERSION).contains(&self.schema_version),
+            (1..=6).contains(&self.schema_version),
             "unsupported parameter_optimizer schema {}",
             self.schema_version
         );
         if !self.enabled {
             return Ok(());
         }
+        anyhow::ensure!(self.empirical_selection_policy.is_strict() || self.schema_version >= 6,
+            "reporting_guided_v1 requires explicit parameter_optimizer config schema 6; checkpoint layout remains v5 with a policy-bound fingerprint");
         anyhow::ensure!(
             self.classification == OptimizationClassification::DevelopmentOnly,
             "parameter optimizer must be development_only"
@@ -4048,6 +4055,7 @@ pub enum StatisticalValidationStatus {
     NotEvaluableUnderpowered,
     EmpiricallyEvaluable,
     EmpiricallyInfeasible,
+    AboveSelectionReference,
 }
 
 #[derive(Clone, Copy, Debug, Default, Serialize, Deserialize, PartialEq, Eq)]
@@ -4656,7 +4664,9 @@ pub fn run_optimizer<E: TrialEvaluator>(
         OptimizerOutcome::NoTechnicallyValidSolution
     } else if !any_empirical {
         OptimizerOutcome::NoEmpiricallyFeasibleSolution
-    } else if config.underpowered_trial_policy == UnderpoweredTrialPolicy::DevelopmentEligible {
+    } else if config.underpowered_trial_policy == UnderpoweredTrialPolicy::DevelopmentEligible
+        || !config.empirical_selection_policy.is_strict()
+    {
         let winner_is_underpowered = payload
             .winner_trial_id
             .as_ref()
@@ -5249,6 +5259,8 @@ fn apply_empirical_constraints(
     evaluation.development_selection_eligible = true;
     let mut underpowered = false;
     let mut adequately_powered = false;
+    let guided = !config.empirical_selection_policy.is_strict();
+    let mut reference_failures = Vec::new();
     for constraint in &config.empirical_entrapment_constraints {
         let count = metrics
             .entrapment_count_by_level
@@ -5292,6 +5304,10 @@ fn apply_empirical_constraints(
             adequately_powered = true;
         }
         if fdp > constraint.maximum_adjusted_fdp {
+            if guided {
+                reference_failures.push(serde_json::json!({"level":constraint.level,"fdp":fdp,"reference":constraint.maximum_adjusted_fdp,"excess":fdp-constraint.maximum_adjusted_fdp}));
+                continue;
+            }
             evaluation.status = TrialStatus::EmpiricallyInfeasible;
             evaluation.development_selection_eligible = false;
             evaluation.empirical_point_estimate_within_limit = Some(false);
@@ -5316,7 +5332,7 @@ fn apply_empirical_constraints(
             StatisticalValidationStatus::NotEvaluableUnderpowered;
         evaluation.empirical_reason =
             Some("empirical entrapment evidence is below the declared power threshold".into());
-        if config.underpowered_trial_policy == UnderpoweredTrialPolicy::NotEvaluable {
+        if config.underpowered_trial_policy == UnderpoweredTrialPolicy::NotEvaluable && !guided {
             evaluation.status = TrialStatus::NotEvaluable;
             evaluation.development_selection_eligible = false;
         }
@@ -5324,6 +5340,26 @@ fn apply_empirical_constraints(
         evaluation.empirical_calibration_power = EmpiricalCalibrationPower::AdequatelyPowered;
         evaluation.statistical_validation_status =
             StatisticalValidationStatus::EmpiricallyEvaluable;
+    }
+    if guided {
+        evaluation.empirical_point_estimate_within_limit =
+            (!config.empirical_entrapment_constraints.is_empty())
+                .then_some(reference_failures.is_empty());
+        if !reference_failures.is_empty() {
+            if !underpowered {
+                evaluation.statistical_validation_status =
+                    StatisticalValidationStatus::AboveSelectionReference;
+            }
+            evaluation.empirical_reason = Some("above empirical selection reference; development selection remains eligible, not statistically validated".into());
+        }
+        evaluation.compact_diagnostics.insert(
+            "empirical_selection_policy".into(),
+            serde_json::json!(config.empirical_selection_policy),
+        );
+        evaluation.compact_diagnostics.insert(
+            "empirical_reference_failures".into(),
+            serde_json::json!(reference_failures),
+        );
     }
 }
 
@@ -5508,6 +5544,7 @@ mod tests {
 
     fn config() -> ParameterOptimizerConfig {
         ParameterOptimizerConfig {
+            empirical_selection_policy: Default::default(),
             schema_version: 1,
             enabled: true,
             classification: OptimizationClassification::DevelopmentOnly,
@@ -7736,6 +7773,91 @@ mod tests {
 
     struct Step4MomentsEvaluator {
         calls: usize,
+    }
+
+    #[test]
+    fn reporting_guided_above_reference_progresses_to_q_block_and_replays() {
+        struct Above {
+            calls: usize,
+        }
+        impl TrialEvaluator for Above {
+            fn evaluate(&mut self, _: &TrialRequest) -> Result<TrialEvaluation> {
+                self.calls += 1;
+                Ok(empirical_evaluation(5, 0.03))
+            }
+        }
+        let path = temp("reporting-guided-progression");
+        std::fs::create_dir_all(&path).unwrap();
+        let checkpoint = path.join("checkpoint.json");
+        let mut cfg = empirical_constraint_config(UnderpoweredTrialPolicy::NotEvaluable);
+        cfg.schema_version = 6;
+        cfg.empirical_selection_policy =
+            sage_core::input::NullWindowSelectionPolicy::ReportingGuidedV1;
+        cfg.maximum_optimization_passes = 1;
+        let mut later = cfg.blocks[0].clone();
+        later.id = "q_calibration".into();
+        later.structural_comparison = true;
+        later.space = BTreeMap::from([(
+            "psm_q_method".into(),
+            vec![
+                ParameterValue::String("bh".into()),
+                ParameterValue::String("storey".into()),
+            ],
+        )]);
+        cfg.block_order.push(later.id.clone());
+        cfg.blocks.push(later);
+        cfg.proposal_space_artifact = Some(path.join("proposal-space.json"));
+        cfg.expected_proposal_space_sha256 = Some("a".repeat(64));
+        let mut identity = identity();
+        identity.root_proposal_space_sha256 = cfg.expected_proposal_space_sha256.clone();
+        let mut evaluator = Above { calls: 0 };
+        let result = run_optimizer(&cfg, &identity, &checkpoint, &mut evaluator).unwrap();
+        assert!(result.winner_trial_id.is_some());
+        assert!(result
+            .trials
+            .iter()
+            .any(|t| t.request.block_id == "q_calibration"));
+        assert!(result
+            .trials
+            .iter()
+            .all(|t| t.evaluation.development_selection_eligible
+                && t.evaluation.empirical_point_estimate_within_limit == Some(false)
+                && t.evaluation.statistical_validation_status
+                    == StatisticalValidationStatus::AboveSelectionReference));
+        let mut replay = Above { calls: 0 };
+        let reused = run_optimizer(&cfg, &identity, &checkpoint, &mut replay).unwrap();
+        assert_eq!(replay.calls, 0);
+        assert_eq!(reused.winner_trial_id, result.winner_trial_id);
+        assert_eq!(
+            reused.scientific_result_sha256,
+            result.scientific_result_sha256
+        );
+        let mut legacy = cfg.clone();
+        legacy.empirical_selection_policy = Default::default();
+        assert_ne!(
+            optimizer_fingerprint(&identity, &cfg).unwrap(),
+            optimizer_fingerprint(&identity, &legacy).unwrap()
+        );
+        assert!(run_optimizer(&legacy, &identity, &checkpoint, &mut replay).is_err());
+    }
+
+    #[test]
+    fn reporting_guided_underpower_and_empty_results_remain_distinct() {
+        let mut cfg = empirical_constraint_config(UnderpoweredTrialPolicy::NotEvaluable);
+        cfg.schema_version = 6;
+        cfg.empirical_selection_policy =
+            sage_core::input::NullWindowSelectionPolicy::ReportingGuidedV1;
+        let mut evaluation = empirical_evaluation(0, 0.0);
+        apply_empirical_constraints(&cfg, &mut evaluation);
+        assert!(evaluation.development_selection_eligible);
+        assert_eq!(
+            evaluation.statistical_validation_status,
+            StatisticalValidationStatus::NotEvaluableUnderpowered
+        );
+        evaluation.metrics.as_mut().unwrap().level4_proteins = 0;
+        apply_empirical_constraints(&cfg, &mut evaluation);
+        assert!(!evaluation.development_selection_eligible);
+        assert_eq!(evaluation.status, TrialStatus::NotEvaluable);
     }
 
     impl TrialEvaluator for Step4MomentsEvaluator {

@@ -244,6 +244,14 @@ historical blocking behavior. `development_eligible` may be requested only for d
 runs: a technically valid, within-ceiling zero/sparse-entrapment trial may enter the unchanged
 development objective, but remains `not_evaluable_underpowered` for empirical validation and
 `not_evaluated` for statistical-default eligibility.
+Schema v6 adds opt-in `reporting_guided_v1` null-window selection with independent
+empirical references and a zero-observed-selection-protein-entrapment preference.
+References guide ranking, not numerical validity or q-value reporting. Above-reference
+development results can advance to later blocks without being called calibrated.
+See [selection policy, JSON and saved-evidence reranking](NULL_WINDOW_SELECTION_POLICY.md).
+Omitted policy remains `strict_v1`; old manifests/checkpoints are not reinterpreted.
+Level 4 itself does **not** require zero entrapment proteins.
+
 Schema v4 adds dataset-local `entrapment_validation`. The backward-compatible
 `full_population_development` mode exposes the complete entrapment population to development
 selection and makes no independent calibration claim. The prospective `selection_audit` mode

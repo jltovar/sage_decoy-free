@@ -152,6 +152,15 @@ fn main() -> anyhow::Result<()> {
                 .arg(Arg::new("output").long("output").required(true)),
         )
         .subcommand(
+            Command::new("rerank-null-window-evidence")
+                .about("Rank hash-bound saved window measurements only; no fits, resources, external processes or production winner")
+                .arg(Arg::new("checkpoint").required(true))
+                .arg(Arg::new("checkpoint-sha256").long("checkpoint-sha256").required(true))
+                .arg(Arg::new("policy").long("policy").required(true))
+                .arg(Arg::new("policy-sha256").long("policy-sha256").required(true))
+                .arg(Arg::new("output").long("output").required(true)),
+        )
+        .subcommand(
             Command::new("candidate-pool-only")
                 .about("Construct and verify one immutable candidate pool, then stop before every statistical or annotation stage")
                 .arg(
@@ -607,6 +616,24 @@ fn main() -> anyhow::Result<()> {
         return Ok(());
     }
 
+    if let Some(("rerank-null-window-evidence", args)) = matches.subcommand() {
+        let value = |key| {
+            args.get_one::<String>(key)
+                .expect("required reranking argument")
+        };
+        let report = sage_cli::window_reranking::rerank(
+            std::path::Path::new(value("checkpoint")),
+            value("checkpoint-sha256"),
+            std::path::Path::new(value("policy")),
+            value("policy-sha256"),
+            std::path::Path::new(value("output")),
+        )?;
+        println!(
+            "saved-evidence windows ranked: {}",
+            report["evaluated_windows"]
+        );
+        return Ok(());
+    }
     if let Some(("diagnose-null-window-trial", diagnostic)) = matches.subcommand() {
         let value = |key| {
             diagnostic
