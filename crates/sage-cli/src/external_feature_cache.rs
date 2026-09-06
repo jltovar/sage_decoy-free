@@ -24,7 +24,8 @@ const RAW_EXTERNAL_PREDICTION_FINGERPRINT_SCHEMA: &str =
     "sage-raw-external-prediction-fingerprint-v3-layered-provenance";
 pub const RAW_GENERATOR_EXECUTION_SETTINGS_SCHEMA: &str =
     "sage-raw-generator-execution-settings-v1";
-pub const RAW_CACHE_FINALIZER_IDENTITY_SCHEMA: &str = "sage-raw-cache-finalizer-identity-v1";
+pub const RAW_CACHE_FINALIZER_IDENTITY_SCHEMA: &str =
+    "sage-raw-cache-finalizer-identity-v2-scoped-source";
 pub const RAW_CACHE_PARSER_SCHEMA: &str = "sage-raw-tsv-parser-v2-whole-lane-empty";
 pub const RAW_GENERATOR_RUN_PROVENANCE_SCHEMA_V1: &str = "sage-raw-generator-run-v1";
 pub const RAW_GENERATOR_RUN_PROVENANCE_SCHEMA_V2: &str =
@@ -45,6 +46,7 @@ pub struct ModelComponentIdentity {
 
 #[derive(Clone, Debug)]
 pub struct ExternalAnnotationCacheRequest {
+    pub existing_raw_cache: Option<crate::raw_cache_compatibility::ExistingRawCacheReference>,
     pub root: PathBuf,
     /// Require a complete compatible cache and prohibit every annotation
     /// generation path. This execution control is excluded from cache identity.
@@ -263,6 +265,8 @@ struct ExternalAnnotationPayload {
 
 #[derive(Clone, Debug, Serialize, Deserialize)]
 pub struct ExternalAnnotationCacheUsage {
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub verified_use: Option<crate::raw_cache_compatibility::RawCacheVerifiedUse>,
     pub annotation_fingerprint: String,
     pub search_fingerprint: String,
     pub manifest: PathBuf,
@@ -1278,7 +1282,7 @@ pub fn current_raw_cache_finalizer_identity() -> RawCacheFinalizerIdentity {
     }
     hasher.update(RAW_EXTERNAL_PREDICTION_CACHE_SCHEMA_VERSION.to_le_bytes());
     RawCacheFinalizerIdentity {
-        schema_version: 1,
+        schema_version: 2,
         digest: format!("{:x}", hasher.finalize()),
         sage_version: env!("CARGO_PKG_VERSION").into(),
         rust_source_sha256: env!("SAGE_EXTERNAL_CACHE_SOURCE_SHA256").into(),
@@ -2216,6 +2220,7 @@ pub fn raw_cache_usage(
     request: &ExternalAnnotationCacheRequest,
 ) -> ExternalAnnotationCacheUsage {
     ExternalAnnotationCacheUsage {
+        verified_use: None,
         annotation_fingerprint: calibration
             .as_ref()
             .map(|identity| identity.digest.clone())
@@ -2251,6 +2256,7 @@ pub fn usage(
     request: &ExternalAnnotationCacheRequest,
 ) -> ExternalAnnotationCacheUsage {
     ExternalAnnotationCacheUsage {
+        verified_use: None,
         annotation_fingerprint: manifest.identity.digest.clone(),
         search_fingerprint: manifest.identity.search_fingerprint.clone(),
         manifest: cache_manifest_path(directory),
@@ -2275,6 +2281,15 @@ pub fn usage(
 }
 
 pub fn verify_usage(usage: &ExternalAnnotationCacheUsage) -> Result<()> {
+    if let Some(verified) = &usage.verified_use {
+        verified.verify_record(&usage.manifest, &usage.payload)?;
+        anyhow::ensure!(
+            verified.reference.fingerprint == usage.raw_prediction_cache_fingerprint
+                && usage.reused
+                && !usage.generation_allowed,
+            "historical raw-cache verified-use identity is inconsistent with usage"
+        );
+    }
     if !usage.raw_prediction_cache_fingerprint.is_empty() {
         let manifest: RawExternalPredictionCacheManifest =
             serde_json::from_slice(&std::fs::read(&usage.manifest)?).with_context(|| {
@@ -2417,8 +2432,18 @@ pub fn preflight_existing_cache_root(
             request.root.display(), request.search_space, search_fingerprint
         )
     })?;
-    let directory = raw_cache_directory(&request.root, &identity);
-    let (manifest, records) = load_raw_cache(&directory, &identity)?
+    let (directory, manifest, records, verified_use) = if request.existing_raw_cache.is_some() {
+        let verified =
+            crate::raw_cache_compatibility::load_pinned_cache(request, settings, &identity)?;
+        (
+            verified.directory,
+            verified.manifest,
+            verified.records,
+            Some(verified.verified_use),
+        )
+    } else {
+        let directory = raw_cache_directory(&request.root, &identity);
+        let (manifest, records) = load_raw_cache(&directory, &identity)?
         .with_context(|| {
             format!(
                 "strict raw-prediction-cache preflight failed: classification=missing_exact root={} search_space={} candidate_population={} expected_raw_fingerprint={} expected_schema={} generation_prohibited=true",
@@ -2429,6 +2454,8 @@ pub fn preflight_existing_cache_root(
                 RAW_EXTERNAL_PREDICTION_CACHE_SCHEMA_VERSION
             )
         })?;
+        (directory, manifest, records, None)
+    };
     let joined_ids = records
         .iter()
         .map(|record| record.stable_id.clone())
@@ -2438,13 +2465,13 @@ pub fn preflight_existing_cache_root(
         "strict raw-prediction-cache preflight failed: classification=candidate_population_mismatch root={} search_space={} expected={} actual={} generation_prohibited=true",
         request.root.display(), request.search_space, candidate_ids.len(), joined_ids.len()
     );
-    Ok(vec![raw_cache_usage(
-        &directory, &manifest, None, true, request,
-    )])
+    let mut usage = raw_cache_usage(&directory, &manifest, None, true, request);
+    usage.verified_use = verified_use;
+    Ok(vec![usage])
 }
 
 #[cfg(test)]
-mod tests {
+pub(crate) mod tests {
     use super::*;
 
     fn layered_settings() -> ExternalFeatureGenerationSettings {
@@ -2454,7 +2481,7 @@ mod tests {
         }
     }
 
-    fn write_empty_probe(root: &Path, settings: &ExternalFeatureGenerationSettings) {
+    pub(crate) fn write_empty_probe(root: &Path, settings: &ExternalFeatureGenerationSettings) {
         let probe_key = generator_probe_key(settings).unwrap();
         let path = root
             .join("generator_identity_probes")
@@ -2488,7 +2515,7 @@ mod tests {
         }
     }
 
-    fn complete_features() -> ExternalPsmFeatures {
+    pub(crate) fn complete_features() -> ExternalPsmFeatures {
         ExternalPsmFeatures {
             ms2rescore_ms2pip_pcc: 0.8,
             ms2rescore_spectral_angle: 0.7,
@@ -2583,6 +2610,7 @@ mod tests {
             search_space: "+entrapment".into(),
             stage: "legacy".into(),
             analysis_fingerprint: "legacy".into(),
+            existing_raw_cache: None,
             migration_only: false,
         };
         let recorded_usage = usage(&directory, &written, false, &request);
@@ -2684,6 +2712,7 @@ mod tests {
             search_space: "+entrapment".into(),
             stage: "moments:ms2rescore".into(),
             analysis_fingerprint: "analysis-a".into(),
+            existing_raw_cache: None,
             migration_only: false,
         };
         let request_b = ExternalAnnotationCacheRequest {
@@ -2951,6 +2980,7 @@ mod tests {
             search_space: "+entrapment".into(),
             stage: "static_preflight".into(),
             analysis_fingerprint: "search-digest".into(),
+            existing_raw_cache: None,
             migration_only: false,
         };
         let candidate_ids = ["candidate".to_string()].into_iter().collect();
@@ -2994,6 +3024,7 @@ mod tests {
             search_space: "target_only".into(),
             stage: "static_preflight".into(),
             analysis_fingerprint: "search".into(),
+            existing_raw_cache: None,
             migration_only: false,
         };
         let error = preflight_existing_cache_root(
@@ -3020,6 +3051,7 @@ mod tests {
             search_space: "+entrapment".into(),
             stage: "moments:ms2rescore".into(),
             analysis_fingerprint: "analysis".into(),
+            existing_raw_cache: None,
             migration_only: false,
         };
         let strict = ExternalAnnotationCacheRequest {
@@ -3028,6 +3060,7 @@ mod tests {
             search_space: "+entrapment".into(),
             stage: "moments:ms2rescore".into(),
             analysis_fingerprint: "analysis".into(),
+            existing_raw_cache: None,
             migration_only: false,
         };
         assert_eq!(

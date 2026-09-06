@@ -38,6 +38,13 @@ before scientific use.
 
 ## Required validation-first workflow
 
+External-feature calibration profiles use exact sorting/counting AUC,
+not quadratic pair enumeration. Only temporary numeric sorts use the existing
+Rayon pool; fitting, profile decisions, row updates, and optimizer transitions
+retain their execution order. `RAYON_NUM_THREADS` controls runtime workers and
+Sage logs the actual pool size. See [external AUC performance](EXTERNAL_AUC_PERFORMANCE.md)
+for exact tie/filtering semantics, bounded benchmarks, and resource guidance.
+
 Decoy-Free FDR estimation is model- and dataset-dependent. There is no universal null-rank window,
 fitted artifact, or model choice that can safely be copied between datasets. Every dataset and every
 model must optimize its own window using that dataset's active entrapment FASTA and measured ratios.

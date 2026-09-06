@@ -1730,6 +1730,12 @@ pub struct WorkflowManifest {
     /// target-only caches are stored separately.
     #[serde(default)]
     pub target_only_annotation_cache_root: Option<PathBuf>,
+    /// Explicit hash-pinned reuse; never discovers or migrates historical caches.
+    #[serde(default)]
+    pub existing_raw_cache: Option<crate::raw_cache_compatibility::ExistingRawCacheReference>,
+    #[serde(default)]
+    pub target_only_existing_raw_cache:
+        Option<crate::raw_cache_compatibility::ExistingRawCacheReference>,
     pub entrapment: EntrapmentWorkflow,
     pub models: Vec<ModelWorkflow>,
     #[serde(default)]
@@ -2216,6 +2222,16 @@ fn allow_target_candidate_pool_reuse(annotate_target_matches: bool, policy_index
 }
 
 impl WorkflowManifest {
+    fn resolved_existing_raw_cache(
+        &self,
+        target_only: bool,
+    ) -> Option<crate::raw_cache_compatibility::ExistingRawCacheReference> {
+        if target_only {
+            self.target_only_existing_raw_cache.clone()
+        } else {
+            self.existing_raw_cache.clone()
+        }
+    }
     fn resolved_candidate_pool_root(&self) -> PathBuf {
         self.candidate_pool_root
             .clone()
@@ -2259,6 +2275,20 @@ impl WorkflowManifest {
     }
 
     fn validate_impl(&self, validate_resource_paths: bool) -> Result<()> {
+        for reference in [
+            &self.existing_raw_cache,
+            &self.target_only_existing_raw_cache,
+        ]
+        .into_iter()
+        .flatten()
+        {
+            reference.validate()?;
+            anyhow::ensure!(
+                self.require_existing_annotation_cache
+                    && !self.migrate_schema_v2_annotation_cache_only,
+                "hash-pinned raw-cache reuse requires strict existing mode without migration"
+            );
+        }
         for references in self.validation.null_window_fdp_references.iter().chain(
             self.validation
                 .null_window_fdp_references_by_expert
@@ -3417,6 +3447,7 @@ fn strict_resource_preflight(
                 .unwrap_or(runner.parameters.report_psms as u32);
             let catalog_fingerprints = if manifest.require_existing_annotation_cache {
                 let cache_request = ExternalAnnotationCacheRequest {
+                    existing_raw_cache: manifest.resolved_existing_raw_cache(target_only),
                     root: cache_root.clone(),
                     require_existing: true,
                     search_space: search_space.into(),
@@ -5590,7 +5621,9 @@ fn hash_stage(
     entrapment_selection: Option<&EntrapmentSelectionView>,
 ) -> Result<String> {
     let mut hasher = Sha256::new();
-    hasher.update(b"sage-workflow-stage-v6-external-profile-and-required-pool\0");
+    hasher.update(b"sage-workflow-stage-v7-external-implementation\0");
+    hasher.update(env!("SAGE_EXTERNAL_ANALYSIS_SOURCE_SHA256").as_bytes());
+    hasher.update(env!("SAGE_RAW_CACHE_READER_SHA256").as_bytes());
     hasher.update(serde_json::to_vec(manifest)?);
     hasher.update(serde_json::to_vec(model)?);
     hasher.update(dataset.fingerprint.as_bytes());
@@ -6248,6 +6281,7 @@ fn run_search_stage(
         }
     });
     let annotation_cache = external.then(|| ExternalAnnotationCacheRequest {
+        existing_raw_cache: manifest.resolved_existing_raw_cache(target_only.is_some()),
         root: manifest.resolved_annotation_cache_root(target_only.is_some()),
         require_existing: manifest.require_existing_annotation_cache,
         search_space: if target_only.is_some() {
@@ -11172,6 +11206,8 @@ mod tests {
             candidate_pool_root: None,
             annotation_cache_root: None,
             target_only_annotation_cache_root: None,
+            existing_raw_cache: None,
+            target_only_existing_raw_cache: None,
             entrapment: EntrapmentWorkflow {
                 database_mode: EntrapmentDatabaseMode::NativeGenerated,
                 foreign_fastas: vec![directory.join("foreign.fasta")],
@@ -13183,6 +13219,8 @@ mod tests {
             candidate_pool_root: None,
             annotation_cache_root: None,
             target_only_annotation_cache_root: None,
+            existing_raw_cache: None,
+            target_only_existing_raw_cache: None,
             entrapment: EntrapmentWorkflow {
                 database_mode: EntrapmentDatabaseMode::NativeGenerated,
                 foreign_fastas: Vec::new(),

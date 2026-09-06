@@ -1137,6 +1137,29 @@ fn add_external_features_inner(
                     request.root.display(), request.search_space, search_fingerprint, request.require_existing
                 )
             })?;
+            if request.existing_raw_cache.is_some() {
+                let verified = crate::raw_cache_compatibility::load_pinned_cache(
+                    request,
+                    settings,
+                    &raw_identity,
+                )?;
+                let calibration =
+                    stage_calibration_identity(&verified.manifest.identity, &inputs, request)?;
+                apply_cached_raw_predictions(features, &candidate_indices, verified.records)?;
+                log::info!("raw MS2Rescore prediction cache: reused {}/{} predictions via verified historical contract (raw_fingerprint={}, current_reader={})",
+                    verified.manifest.joined_prediction_count, verified.manifest.prediction_count,
+                    verified.manifest.identity.digest, verified.verified_use.current_reader_source_sha256);
+                let mut usage = raw_cache_usage(
+                    &verified.directory,
+                    &verified.manifest,
+                    Some(calibration),
+                    true,
+                    request,
+                );
+                usage.verified_use = Some(verified.verified_use);
+                log_external_feature_local_separation(features, db);
+                return Ok(Some(usage));
+            }
             let calibration_identity = stage_calibration_identity(&raw_identity, &inputs, request)?;
             let directory = raw_cache_directory(&request.root, &raw_identity);
             match load_raw_cache(&directory, &raw_identity) {
@@ -2064,245 +2087,6 @@ fn join_features(
     Ok(())
 }
 
-fn log_external_feature_local_separation(features: &[DfFeature], db: &IndexedDatabase) {
-    let joined = features
-        .iter()
-        .filter(|f| f.core.external_features.ms2rescore_feature_joined)
-        .count();
-
-    if joined == 0 {
-        log::warn!("external feature local diagnostics skipped: no joined features");
-        return;
-    }
-
-    log::info!(
-        "external feature local diagnostics: joined_features={}/{}",
-        joined,
-        features.len()
-    );
-
-    log_external_feature_one_global(features, db, "ms2rescore_ms2pip_pcc", true, |f| {
-        f.core.external_features.ms2rescore_ms2pip_pcc as f64
-    });
-
-    log_external_feature_one_global(features, db, "ms2rescore_spectral_angle", true, |f| {
-        f.core.external_features.ms2rescore_spectral_angle as f64
-    });
-
-    log_external_feature_one_global(features, db, "ms2rescore_deeplc_abs_rt_error", false, |f| {
-        f.core.external_features.ms2rescore_deeplc_abs_rt_error as f64
-    });
-
-    log_external_feature_one_global(features, db, "tims2rescore_abs_ccs_error", false, |f| {
-        f.core.external_features.tims2rescore_abs_ccs_error as f64
-    });
-
-    log_external_feature_one_global(features, db, "tims2rescore_pct_ccs_error", false, |f| {
-        f.core.external_features.tims2rescore_pct_ccs_error as f64
-    });
-
-    log_external_feature_by_matched_peaks_bin(
-        features,
-        db,
-        "ms2rescore_deeplc_abs_rt_error",
-        false,
-        |f| f.core.external_features.ms2rescore_deeplc_abs_rt_error as f64,
-    );
-
-    log_external_feature_by_matched_peaks_bin(
-        features,
-        db,
-        "tims2rescore_pct_ccs_error",
-        false,
-        |f| f.core.external_features.tims2rescore_pct_ccs_error as f64,
-    );
-
-    log_external_feature_by_matched_peaks_bin(features, db, "ms2rescore_ms2pip_pcc", true, |f| {
-        f.core.external_features.ms2rescore_ms2pip_pcc as f64
-    });
-}
-
-fn log_external_feature_one_global<F>(
-    features: &[DfFeature],
-    db: &IndexedDatabase,
-    name: &str,
-    higher_is_better: bool,
-    getter: F,
-) where
-    F: Fn(&DfFeature) -> f64,
-{
-    let mut reference = Vec::new();
-    let mut entrapment = Vec::new();
-
-    for f in features
-        .iter()
-        .filter(|f| f.core.rank == 1 && f.core.external_features.ms2rescore_feature_joined)
-    {
-        let x = getter(f);
-        if !x.is_finite() {
-            continue;
-        }
-
-        let proteins = db[f.core.peptide_idx].proteins(&db.decoy_tag, db.generate_decoys);
-        if external_feature_is_entrapment(&proteins) {
-            entrapment.push(x);
-        } else {
-            reference.push(x);
-        }
-    }
-
-    if reference.len() < 10 || entrapment.len() < 10 {
-        log::info!(
-            "external feature diagnostic {name}: insufficient rank1 reference/entrapment values reference={} entrapment={}",
-            reference.len(),
-            entrapment.len()
-        );
-        return;
-    }
-
-    let auc = external_feature_auc(&reference, &entrapment, higher_is_better);
-
-    log::info!(
-        "external feature diagnostic {name}: reference_n={} entrapment_n={} reference_median={:.6} entrapment_median={:.6} auc_ref_vs_ent={:.4} higher_is_better={}",
-        reference.len(),
-        entrapment.len(),
-        external_feature_median(reference),
-        external_feature_median(entrapment),
-        auc,
-        higher_is_better
-    );
-}
-
-fn log_external_feature_by_matched_peaks_bin<F>(
-    features: &[DfFeature],
-    db: &IndexedDatabase,
-    name: &str,
-    higher_is_better: bool,
-    getter: F,
-) where
-    F: Fn(&DfFeature) -> f64,
-{
-    let bins: &[(u32, u32, &str)] = &[
-        (0, 4, "matched_peaks_0_4"),
-        (5, 7, "matched_peaks_5_7"),
-        (8, 12, "matched_peaks_8_12"),
-        (13, u32::MAX, "matched_peaks_13_plus"),
-    ];
-
-    for &(lo, hi, label) in bins {
-        let mut reference = Vec::new();
-        let mut entrapment = Vec::new();
-
-        for f in features
-            .iter()
-            .filter(|f| f.core.rank == 1 && f.core.external_features.ms2rescore_feature_joined)
-        {
-            let mp = f.core.matched_peaks;
-            if mp < lo || mp > hi {
-                continue;
-            }
-
-            let x = getter(f);
-            if !x.is_finite() {
-                continue;
-            }
-
-            let proteins = db[f.core.peptide_idx].proteins(&db.decoy_tag, db.generate_decoys);
-            if external_feature_is_entrapment(&proteins) {
-                entrapment.push(x);
-            } else {
-                reference.push(x);
-            }
-        }
-
-        if reference.len() < 10 || entrapment.len() < 10 {
-            log::info!(
-                "external feature diagnostic {name} bin={label}: insufficient values reference={} entrapment={}",
-                reference.len(),
-                entrapment.len()
-            );
-            continue;
-        }
-
-        let auc = external_feature_auc(&reference, &entrapment, higher_is_better);
-
-        log::info!(
-            "external feature diagnostic {name} bin={label}: reference_n={} entrapment_n={} reference_median={:.6} entrapment_median={:.6} auc_ref_vs_ent={:.4} higher_is_better={}",
-            reference.len(),
-            entrapment.len(),
-            external_feature_median(reference),
-            external_feature_median(entrapment),
-            auc,
-            higher_is_better
-        );
-    }
-}
-
-fn external_feature_is_entrapment(proteins: &str) -> bool {
-    let u = proteins.to_ascii_uppercase();
-
-    u.contains("ENTRAP")
-        || u.contains("FOREIGN")
-        || u.contains("ARATH")
-        || u.contains("YEAST")
-        || u.contains("CAEEL")
-        || u.contains("DROME")
-        || u.contains("ECOLI")
-        || u.contains("HUMAN")
-        || u.contains("RAT")
-}
-
-fn external_feature_median(mut xs: Vec<f64>) -> f64 {
-    xs.retain(|x| x.is_finite());
-    if xs.is_empty() {
-        return f64::NAN;
-    }
-
-    xs.sort_by(|a, b| a.total_cmp(b));
-    xs[xs.len() / 2]
-}
-
-fn external_feature_auc(reference: &[f64], entrapment: &[f64], higher_is_better: bool) -> f64 {
-    if reference.is_empty() || entrapment.is_empty() {
-        return f64::NAN;
-    }
-
-    let mut wins = 0.0f64;
-    let mut total = 0.0f64;
-
-    for &r in reference {
-        if !r.is_finite() {
-            continue;
-        }
-
-        for &e in entrapment {
-            if !e.is_finite() {
-                continue;
-            }
-
-            total += 1.0;
-
-            if higher_is_better {
-                if r > e {
-                    wins += 1.0;
-                } else if r == e {
-                    wins += 0.5;
-                }
-            } else if r < e {
-                wins += 1.0;
-            } else if r == e {
-                wins += 0.5;
-            }
-        }
-    }
-
-    if total <= 0.0 {
-        f64::NAN
-    } else {
-        wins / total
-    }
-}
-
 #[cfg(test)]
 mod cache_tests {
     use super::*;
@@ -2324,6 +2108,92 @@ mod cache_tests {
             ms2rescore_feature_joined: true,
             ..ExternalPsmFeatures::default()
         }
+    }
+
+    #[test]
+    fn historical_runtime_reuse_never_exports_or_generates_and_retains_unavailable_lanes() {
+        let root = std::env::temp_dir().join(format!(
+            "sage-historical-runtime-{}-{}",
+            std::process::id(),
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .unwrap()
+                .as_nanos()
+        ));
+        let database = IndexedDatabase {
+            peptides: vec![Peptide {
+                sequence: std::sync::Arc::from(&b"PEPTIDE"[..]),
+                ..Default::default()
+            }],
+            ..Default::default()
+        };
+        let core = FeatureCore {
+            peptide_idx: PeptideIx(0),
+            spec_id: "scan=1".into(),
+            rank: 1,
+            charge: 2,
+            ..Default::default()
+        };
+        let mut features = vec![core.to_df()];
+        let settings = ExternalFeatureGenerationSettings {
+            enabled: true,
+            max_rank: Some(1),
+            deeplc_calibration_set_size: Some(10),
+            temp_directory: Some(root.join("must-not-exist").display().to_string()),
+            ..Default::default()
+        };
+        let (inputs, _) = annotation_inputs(&features, &database, "search", 1);
+        let mut annotation = complete_annotation();
+        annotation.ms2rescore_ms2pip_pcc = f32::NAN;
+        annotation.ms2rescore_spectral_angle = f32::NAN;
+        annotation.ms2rescore_fragment_intensity_agreement = f32::NAN;
+        let records = vec![raw_record(inputs[0].stable_id.clone(), annotation).unwrap()];
+        let (request, _) = crate::raw_cache_compatibility::tests::install_historical(
+            &root, &settings, &inputs, records,
+        );
+        let first = add_external_features_inner(
+            &mut features,
+            &settings,
+            &[],
+            &database,
+            Some("search"),
+            Some(&request),
+        )
+        .unwrap()
+        .unwrap();
+        assert!(first.reused && !first.generation_allowed);
+        assert!(first.verified_use.is_some());
+        assert_eq!(features.len(), 1);
+        assert!(features[0]
+            .core
+            .external_features
+            .ms2rescore_ms2pip_pcc
+            .is_nan());
+        assert_eq!(
+            features[0]
+                .core
+                .external_features
+                .ms2rescore_deeplc_predicted_rt,
+            annotation.ms2rescore_deeplc_predicted_rt
+        );
+        let bytes = bincode::serialize(&features[0].core.external_features).unwrap();
+        let second = add_external_features_inner(
+            &mut features,
+            &settings,
+            &[],
+            &database,
+            Some("search"),
+            Some(&request),
+        )
+        .unwrap()
+        .unwrap();
+        assert_eq!(first.verified_use, second.verified_use);
+        assert_eq!(
+            bytes,
+            bincode::serialize(&features[0].core.external_features).unwrap()
+        );
+        assert!(!root.join("must-not-exist").exists());
+        std::fs::remove_dir_all(root).unwrap();
     }
 
     #[test]
@@ -2476,6 +2346,7 @@ mod cache_tests {
             search_space: "+entrapment".into(),
             stage: "moments:ms2rescore".into(),
             analysis_fingerprint: "analysis".into(),
+            existing_raw_cache: None,
             migration_only: false,
         };
         let error = add_external_features_inner(
@@ -2549,6 +2420,7 @@ mod cache_tests {
             search_space: "+entrapment".into(),
             stage: "moments:ms2rescore".into(),
             analysis_fingerprint: "analysis".into(),
+            existing_raw_cache: None,
             migration_only: false,
         };
         let usage = add_external_features_inner(
@@ -2626,6 +2498,7 @@ mod cache_tests {
             search_space: "+entrapment".into(),
             stage: "moments:ms2rescore".into(),
             analysis_fingerprint: "moments-analysis".into(),
+            existing_raw_cache: None,
             migration_only: true,
         };
         let first = add_external_features_inner(
@@ -3470,3 +3343,4 @@ mod path_tests {
         std::fs::remove_dir_all(root).unwrap();
     }
 }
+use crate::external_feature_diagnostics::log_external_feature_local_separation;

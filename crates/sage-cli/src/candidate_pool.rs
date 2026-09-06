@@ -15,7 +15,7 @@ use std::path::{Path, PathBuf};
 pub const CANDIDATE_POOL_SCHEMA_VERSION: u32 = 1;
 pub const CANDIDATE_ID_SCHEMA: &str = "sage-candidate-id-v1";
 const SEARCH_FINGERPRINT_SCHEMA: &str = "sage-search-fingerprint-v1";
-const ANALYSIS_FINGERPRINT_SCHEMA: &str = "sage-analysis-fingerprint-v1";
+const ANALYSIS_FINGERPRINT_SCHEMA: &str = "sage-analysis-fingerprint-v2-external-implementation";
 
 #[derive(Clone, Debug, Serialize, Deserialize, PartialEq, Eq)]
 pub struct SpectrumFingerprint {
@@ -48,6 +48,8 @@ pub struct AnalysisFingerprint {
     pub schema_version: u32,
     pub digest: String,
     pub search_fingerprint: String,
+    #[serde(default)]
+    pub external_analysis_source_sha256: String,
 }
 
 #[derive(Clone, Debug, Serialize, Deserialize, PartialEq, Eq)]
@@ -303,6 +305,7 @@ pub fn analysis_fingerprint(
         "external_features": &search.external_features,
         "protein_grouping": search.protein_grouping,
         "protein_grouping_peptide_fdr": search.protein_grouping_peptide_fdr,
+        "external_analysis_source_sha256": env!("SAGE_EXTERNAL_ANALYSIS_SOURCE_SHA256"),
     });
     let mut hasher = Sha256::new();
     hasher.update(ANALYSIS_FINGERPRINT_SCHEMA.as_bytes());
@@ -311,9 +314,10 @@ pub fn analysis_fingerprint(
     hasher.update(b"\0");
     hasher.update(serde_json::to_vec(&value)?);
     Ok(AnalysisFingerprint {
-        schema_version: CANDIDATE_POOL_SCHEMA_VERSION,
+        schema_version: 2,
         digest: format!("{:x}", hasher.finalize()),
         search_fingerprint: search_fingerprint.digest.clone(),
+        external_analysis_source_sha256: env!("SAGE_EXTERNAL_ANALYSIS_SOURCE_SHA256").into(),
     })
 }
 
