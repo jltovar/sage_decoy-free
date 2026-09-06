@@ -12134,10 +12134,10 @@ pub fn run_df_layers(
     run_df_layers_with_artifacts(psms, settings, db).0
 }
 
-pub fn apply_external_ms2rescore_bounded_experts(
-    features: &mut [DfFeature],
-    settings: &FdrSettings,
-) -> Result<ExternalMs2RescoreProfiles, String> {
+/// Configuration-only dependencies of the external empirical scoring stage.
+/// Native RT/IMS rescue switches are intentionally irrelevant here. Call this
+/// before resource access, and again at application as defense in depth.
+pub fn validate_external_bounded_configuration(settings: &FdrSettings) -> Result<(), String> {
     let calibration = &settings.external_profile_calibration;
     if calibration.min_null_rank <= 1
         || calibration.max_null_rank < calibration.min_null_rank
@@ -12157,6 +12157,51 @@ pub fn apply_external_ms2rescore_bounded_experts(
             return Err("external bounded DF experts require physical_rescue.bounded_cfg".into());
         }
     };
+    match cfg.update_space {
+        BoundedAuxUpdateSpace::LogitConfidence => {}
+    }
+    for (field, value) in [
+        ("max_rescue_shift", cfg.max_rescue_shift),
+        ("max_penalty_shift", cfg.max_penalty_shift),
+    ] {
+        if !value.is_finite() || value < 0.0 {
+            return Err(format!(
+                "physical_rescue.bounded_cfg.{field} must be finite and nonnegative"
+            ));
+        }
+    }
+    for (field, value) in [
+        ("anchor_max_q", settings.physical_rescue.anchor_max_q),
+        ("anchor_max_pep", settings.physical_rescue.anchor_max_pep),
+    ] {
+        if !value.is_finite() || !(0.0..=1.0).contains(&value) {
+            return Err(format!(
+                "physical_rescue.{field} must be a finite probability in [0,1]"
+            ));
+        }
+    }
+    if let Some(profiles) = settings.external_ms2rescore_frozen_profiles.as_ref() {
+        if profiles.schema_version != 2
+            || profiles.model_version != "sage-external-ms2rescore-profiles-v2-explicit-window"
+            || profiles.calibration != *calibration
+        {
+            return Err("external_ms2rescore_frozen_profiles schema/version/calibration does not match resolved external_profile_calibration".into());
+        }
+    }
+    Ok(())
+}
+
+pub fn apply_external_ms2rescore_bounded_experts(
+    features: &mut [DfFeature],
+    settings: &FdrSettings,
+) -> Result<ExternalMs2RescoreProfiles, String> {
+    validate_external_bounded_configuration(settings)?;
+    let calibration = &settings.external_profile_calibration;
+    let cfg = settings
+        .physical_rescue
+        .bounded_cfg
+        .as_ref()
+        .expect("bounded configuration validated above");
 
     let joined_rank1 = features
         .iter()
@@ -13943,6 +13988,101 @@ mod tests {
             max_penalty_shift: 0.25,
         });
         settings
+    }
+
+    #[test]
+    fn bounded_configuration_validates_all_consumed_configuration_without_features() {
+        let valid = bounded_external_settings(true);
+        assert_eq!(
+            valid.physical_rescue.rt_mode,
+            crate::input::PhysicalRescueMode::Off
+        );
+        assert_eq!(
+            valid.physical_rescue.ims_mode,
+            crate::input::PhysicalRescueMode::Off
+        );
+        validate_external_bounded_configuration(&valid).unwrap();
+        let mut missing = valid.clone();
+        missing.physical_rescue.bounded_cfg = None;
+        assert!(validate_external_bounded_configuration(&missing)
+            .unwrap_err()
+            .contains("bounded_cfg"));
+        for value in [f64::NAN, f64::INFINITY, f64::NEG_INFINITY, -0.1] {
+            for rescue in [true, false] {
+                let mut invalid = valid.clone();
+                let cfg = invalid.physical_rescue.bounded_cfg.as_mut().unwrap();
+                if rescue {
+                    cfg.max_rescue_shift = value;
+                } else {
+                    cfg.max_penalty_shift = value;
+                }
+                assert!(validate_external_bounded_configuration(&invalid).is_err());
+            }
+        }
+        for value in [f64::NAN, -0.1, 1.1] {
+            let mut invalid = valid.clone();
+            invalid.physical_rescue.anchor_max_q = value;
+            assert!(validate_external_bounded_configuration(&invalid).is_err());
+            invalid = valid.clone();
+            invalid.physical_rescue.anchor_max_pep = value;
+            assert!(validate_external_bounded_configuration(&invalid).is_err());
+        }
+        assert!(
+            serde_json::from_value::<crate::input::BoundedAuxConfig>(serde_json::json!({
+                "update_space":"unsupported", "max_rescue_shift":0.5, "max_penalty_shift":0.25
+            }))
+            .is_err()
+        );
+        let mut features = external_profile_fixture();
+        let before = features.len();
+        let profiles = apply_external_ms2rescore_bounded_experts(&mut features, &valid).unwrap();
+        assert!(profiles.ms2pip_pcc.enabled && profiles.deeplc_abs_rt_error.enabled);
+        assert_eq!(before, features.len());
+        assert!(features
+            .iter()
+            .filter(|f| f.core.rank == 1)
+            .all(|f| f.decoy_free_q_value.is_some_and(|q| q.is_finite())));
+    }
+
+    #[test]
+    fn bounded_configuration_augmented_stream_reaches_strict_level4_reporting() {
+        let (db, _) = indistinguishable_group_fixture();
+        let mut features = external_profile_fixture();
+        for feature in &mut features {
+            feature.core.peptide_idx = PeptideIx(0);
+            feature.core.label = 1;
+        }
+        let mut settings = bounded_external_settings(true);
+        settings.hierarchical_reporting = HierarchicalReportingMode::Strict;
+        settings.hierarchical_entrapment_validation = true;
+        let count = features.len();
+        apply_external_ms2rescore_bounded_experts(&mut features, &settings).unwrap();
+        calculate_peptide_q_df(&mut features, &db, &settings, settings.peptide_fdr);
+        apply_peptide_q_to_psm_reporting_df(&mut features, &settings);
+        calculate_protein_q_df(&mut features, &db, &settings);
+        let before = features
+            .iter()
+            .map(|f| f.decoy_free_q_value)
+            .collect::<Vec<_>>();
+        let mut control = features.clone();
+        let reporting = apply_hierarchical_reporting_df(&mut features, &db, &settings);
+        assert_eq!(
+            reporting,
+            apply_hierarchical_reporting_df(&mut control, &db, &settings)
+        );
+        assert_eq!(features.len(), count);
+        assert_eq!(
+            before,
+            features
+                .iter()
+                .map(|f| f.decoy_free_q_value)
+                .collect::<Vec<_>>()
+        );
+        assert!(features
+            .iter()
+            .filter(|f| f.core.rank == 1)
+            .all(|f| f.decoy_free_peptide_q.is_some_and(f64::is_finite)
+                && f.decoy_free_protein_q.is_some_and(f64::is_finite)));
     }
 
     #[test]

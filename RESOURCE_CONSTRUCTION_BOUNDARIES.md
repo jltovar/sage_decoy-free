@@ -168,3 +168,51 @@ Raw annotation construction consumes the exact pre-FDR population and excludes p
 values from its export and identity, so it cannot select model windows or winners. The reports make
 the stopping claim machine-inspectable, but downstream workflow authorization remains a separate
 operator gate.
+# Bounded external scoring configuration
+
+`external_features.use_mode = "bounded_df_experts"` applies empirical external
+MS2PIP, DeepLC and CCS evidence **after** native fitting and raw-feature joining.
+It is distinct from the optional native RT/IMS rescue stages. Native `rt_mode`
+and `ims_mode` may both remain `off`.
+
+Scoring workflows must explicitly supply `fdr.physical_rescue.bounded_cfg`:
+
+```json
+{"update_space":"logit_confidence","max_rescue_shift":0.5,"max_penalty_shift":0.25}
+```
+
+These are example fixed limits, not defaults. Add this field to the workflow's
+existing effective physical configuration; do not replace its other settings.
+Limits must be finite and nonnegative. The same stage consumes `anchor_max_q`
+and `anchor_max_pep` (finite probabilities), and the independently resolved
+external profile calibration window (valid ranks above one, covered by retained
+annotations). Unknown update spaces fail JSON deserialization. Supplied frozen
+profiles must match the supported schema and resolved calibration contract.
+Runtime population/profile gates remain unchanged.
+
+Strict workflow/proposal preflight resolves model ownership and scoped fixed
+overrides before scientific resource access. Execution repeats the same shared
+configuration check before fitting and again on score application. Errors name
+the model, stage, mode, configuration source and invalid field. Candidate-pool-only,
+raw-cache-only and native-only diagnostic paths do not require unused scoring
+configuration. Search, candidate IDs and raw-prediction identity are unaffected;
+analysis/proposal identities change when these scientific scoring settings change.
+
+For an explicitly authorized **single** augmented compatibility evaluation:
+
+```text
+sage verify-fixed-augmented-trial AMENDED_WORKFLOW.json \
+  --checkpoint HISTORICAL_CHECKPOINT.json --checkpoint-sha256 SHA256 \
+  --trial-id TRIAL_ID --min-rank MIN --max-rank MAX --output NEW_DIRECTORY
+```
+
+This boundary verifies the current proposal/resource provenance and reads the
+hash-verified historical trial's parameter assignment, then executes only the
+ordinary augmented production stage at the explicitly supplied fixed window.
+The amended workflow supplies fixed method configuration; it is not an exact
+checkpoint resume. Existing candidate pool, raw cache and selection/audit
+partition are mandatory. No window search, parameter optimizer, audit evaluation,
+winner lock, target-only or TDC is called. The output must be new; failures retain
+their stage evidence. Results are compatibility evidence, not production winners.
+Add `--inputs-only` to freeze the complete effective configuration from configuration
+and the historical checkpoint only, before any scientific resource or fit access.

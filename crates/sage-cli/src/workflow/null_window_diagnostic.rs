@@ -3,6 +3,177 @@
 //! production winner. Historical checkpoints are read, never resumed/written.
 use super::*;
 
+/// One explicitly fixed augmented compatibility evaluation. Historical trial
+/// parameters are read from a hash-verified checkpoint, never resumed. The
+/// amended workflow supplies fixed method settings; no optimizer or audit runs.
+#[allow(clippy::too_many_arguments)]
+pub fn verify_fixed_augmented_trial(
+    manifest_path: &Path,
+    checkpoint_path: &Path,
+    checkpoint_sha256: &str,
+    trial_id: &str,
+    window: NullWindow,
+    output: &Path,
+    parallel: usize,
+    inputs_only: bool,
+) -> Result<serde_json::Value> {
+    anyhow::ensure!(
+        !output.exists(),
+        "verification output must be new; no resume or overwrite"
+    );
+    anyhow::ensure!(
+        window.min_rank > 1 && window.max_rank >= window.min_rank,
+        "fixed augmented verification requires a valid explicit null window above rank 1"
+    );
+    let mut manifest = WorkflowManifest::load_before_resource_access(manifest_path)?;
+    validate_workflow_external_scoring(&manifest)?;
+    prepare_optimizer_proposal_space_preflight(&manifest)?;
+    anyhow::ensure!(
+        manifest.require_existing_candidate_pool && manifest.require_existing_annotation_cache,
+        "augmented verification requires existing resources without fallback"
+    );
+    let config = manifest
+        .parameter_optimizer
+        .as_ref()
+        .context("optimizer provenance required")?;
+    anyhow::ensure!(
+        config.optimization_only()
+            && config.entrapment_validation.require_existing_partition
+            && config.entrapment_validation.mode == EntrapmentValidationMode::SelectionAudit,
+        "verification requires optimization-only selection/audit provenance"
+    );
+    anyhow::ensure!(
+        sha256_file(checkpoint_path)? == checkpoint_sha256,
+        "historical checkpoint hash mismatch"
+    );
+    let checkpoint: crate::parameter_optimizer::OptimizerCheckpoint =
+        serde_json::from_slice(&std::fs::read(checkpoint_path)?)?;
+    let payload = crate::parameter_optimizer::load_checkpoint(
+        checkpoint_path,
+        &checkpoint.payload.optimizer_fingerprint,
+    )?;
+    let trial = payload
+        .completed_trials
+        .get(trial_id)
+        .context("historical trial missing")?;
+    anyhow::ensure!(
+        trial.request.trial_id == trial_id
+            && trial.request.use_external_features
+            && !trial.request.target_only_outcomes_allowed,
+        "historical trial is not augmented selection-only"
+    );
+    let expert = trial.request.expert.context("individual expert required")?;
+    anyhow::ensure!(
+        expert != OptimizerExpert::Ensemble,
+        "Ensemble is outside fixed augmented verification"
+    );
+    let mut model = manifest
+        .models
+        .iter()
+        .find(|m| m.enabled && optimizer_expert(&m.model) == expert)
+        .cloned()
+        .context("historical expert not present in amended workflow")?;
+    model.window = Some(window);
+    model.window_optimizer = None;
+    model.candidate_windows.clear();
+    let mut options = resolved_fdr_options(&manifest.search_config)?;
+    options.mode = Some(FdrMode::DecoyFree);
+    options.model_fit = Some(model.model.clone());
+    apply_fdr_overrides(&mut options, &trial.request.parameters)?;
+    apply_window(&mut options, &model.model, &model.window);
+    anyhow::ensure!(
+        options.null_window_optimizer.is_none(),
+        "fixed verification cannot run window optimization"
+    );
+    let configuration = build_resolved_expert_configuration(&model.model, options)?;
+    let external_input = Input::load(manifest.search_config.to_string_lossy().as_ref())?;
+    let mut external =
+        crate::input::ExternalFeatureGenerationSettings::from(external_input.external_features);
+    external.enabled = true;
+    crate::runner::validate_external_scoring_configuration(
+        &FdrSettings::from(configuration.effective_fdr_options.clone()),
+        &external,
+        "fixed_augmented_verification",
+        "amended search + hash-bound historical trial + explicit fixed window",
+    )?;
+    if inputs_only {
+        let report = serde_json::json!({
+            "schema_version":1, "scope":"fixed_augmented_configuration_only", "status":"resolved",
+            "manifest_sha256":sha256_file(manifest_path)?, "checkpoint_sha256":checkpoint_sha256,
+            "historical_trial_request":trial.request, "fixed_configuration":configuration,
+            "binary_sha256":sha256_file(&std::env::current_exe()?)?,
+            "implementation_source_sha256":env!("SAGE_PARAMETER_OPTIMIZER_SOURCE_SHA256"),
+            "scientific_resource_access":false, "evaluation_performed":false,
+        });
+        std::fs::create_dir_all(output)?;
+        write_json_atomic(&output.join("verification.input.json"), &report)?;
+        return Ok(report);
+    }
+    let resources = strict_resource_preflight(&manifest, parallel)?;
+    validate_native_diagnostic_resources(&resources)?;
+    let partition_path = manifest
+        .entrapment
+        .partition_artifact
+        .as_ref()
+        .context("partition missing")?;
+    let partition: EntrapmentPartitionArtifact =
+        serde_json::from_slice(&std::fs::read(partition_path)?)?;
+    let mut selection = partition.selection_view();
+    selection.exact_artifact_sha256 = sha256_file(partition_path)?;
+    selection.scientific_content_sha256 =
+        crate::entrapment::entrapment_partition_scientific_content_sha256(&partition)?;
+    manifest.validation.effective_ratios = EffectiveRatios {
+        psm: selection.selection_ratios.peptidoform_ratio,
+        peptide: selection.selection_ratios.peptide_ratio,
+        protein: selection.selection_ratios.protein_ratio,
+    };
+    manifest.resume = false;
+    let dataset = compute_dataset_identity(&manifest)?;
+    let fasta = strict_preflight_fasta(&manifest)?;
+    std::fs::create_dir_all(output)?;
+    write_json_atomic(
+        &output.join("verification.input.json"),
+        &serde_json::json!({
+            "schema_version":1, "scope":"fixed_augmented_compatibility_only",
+            "manifest_sha256":sha256_file(manifest_path)?, "checkpoint_sha256":checkpoint_sha256,
+            "historical_trial_request":trial.request, "fixed_configuration":configuration,
+            "binary_sha256":sha256_file(&std::env::current_exe()?)?,
+            "implementation_source_sha256":env!("SAGE_PARAMETER_OPTIMIZER_SOURCE_SHA256"),
+            "resources":resources, "production_winner_allowed":false, "audit_evaluation_allowed":false,
+        }),
+    )?;
+    let result = run_search_stage(
+        &manifest,
+        &dataset,
+        &model,
+        "ms2rescore",
+        &fasta,
+        &output.join("evaluation"),
+        true,
+        false,
+        parallel,
+        false,
+        None,
+        None,
+        None,
+        Some(&trial.request.parameters),
+        None,
+        Some(&selection),
+        &mut WorkflowRuntime::default(),
+    );
+    let report = match &result {
+        Ok(stage) => {
+            serde_json::json!({"scope":"fixed_augmented_compatibility_only", "status":"complete", "stage":stage})
+        }
+        Err(error) => {
+            serde_json::json!({"scope":"fixed_augmented_compatibility_only", "status":"failed", "error":format!("{error:#}")})
+        }
+    };
+    write_json_atomic(&output.join("verification.report.json"), &report)?;
+    result?;
+    Ok(report)
+}
+
 fn validate_native_diagnostic_resources(resources: &[ResourcePreflightReport]) -> Result<()> {
     for required in [
         "entrapment_partition",
@@ -230,6 +401,48 @@ pub fn diagnose_null_window_trial(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn fixed_augmented_verification_rejects_resume_and_adaptive_rank_before_access() {
+        let root = std::env::temp_dir().join(format!(
+            "sage-fixed-augmented-boundary-{}",
+            std::process::id()
+        ));
+        std::fs::create_dir_all(&root).unwrap();
+        let error = verify_fixed_augmented_trial(
+            Path::new("missing"),
+            Path::new("missing"),
+            "hash",
+            "trial",
+            NullWindow {
+                min_rank: 2,
+                max_rank: 4,
+            },
+            &root,
+            1,
+            false,
+        )
+        .unwrap_err();
+        assert!(error.to_string().contains("output must be new"));
+        let output = root.join("must-not-create");
+        let error = verify_fixed_augmented_trial(
+            Path::new("missing"),
+            Path::new("missing"),
+            "hash",
+            "trial",
+            NullWindow {
+                min_rank: 0,
+                max_rank: 0,
+            },
+            &output,
+            1,
+            false,
+        )
+        .unwrap_err();
+        assert!(error.to_string().contains("explicit null window"));
+        assert!(!output.exists());
+        std::fs::remove_dir_all(root).unwrap();
+    }
 
     #[test]
     fn raw_resources_are_required_but_post_native_calibration_remains_deferred() {

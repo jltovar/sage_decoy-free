@@ -1672,3 +1672,11 @@ If you use Sage in a scientific publication, cite:
 
 [Sage: An Open-Source Tool for Fast Proteomics Searching and Quantification at
 Scale](https://doi.org/10.1021/acs.jproteome.3c00486).
+# Explicit bounded external-evidence configuration
+
+Augmented Decoy-Free workflows using `external_features.use_mode=bounded_df_experts`
+must explicitly configure `fdr.physical_rescue.bounded_cfg`, even when native
+RT/IMS rescue is off. Strict preflight checks this scoring dependency before
+data access; resource-only construction does not require unused scoring settings.
+See [resource boundaries](RESOURCE_CONSTRUCTION_BOUNDARIES.md#bounded-external-scoring-configuration)
+for the configuration contract and single fixed-window compatibility verification.

@@ -681,6 +681,7 @@ pub fn resolve_optimizer_proposal_space(
     output_path: &Path,
 ) -> Result<OptimizerProposalSpaceResolution> {
     let manifest = WorkflowManifest::load_before_resource_access(manifest_path)?;
+    validate_workflow_external_scoring(&manifest)?;
     let artifact = resolve_optimizer_proposal_space_from_manifest(&manifest)?;
     write_optimizer_proposal_space_atomic(output_path, &artifact)?;
     let reopened: OptimizerProposalSpaceResolution =
@@ -1476,7 +1477,9 @@ pub fn resolve_frozen_expert_configurations(
     manifest_path: &Path,
     output_path: &Path,
 ) -> Result<FrozenExpertConfigurationResolution> {
-    let manifest = WorkflowManifest::load(manifest_path)?;
+    let manifest = WorkflowManifest::load_before_resource_access(manifest_path)?;
+    validate_workflow_external_scoring(&manifest)?;
+    manifest.validate()?;
     let config = manifest
         .parameter_optimizer
         .as_ref()
@@ -1566,6 +1569,91 @@ fn validate_optimizer_reporting_compatibility(manifest: &WorkflowManifest) -> Re
             && settings.hierarchical_entrapment_validation,
         "null-window validation_scope=level4 requires fixed hierarchical_inference enabled=true, mode=protein_anchored, and entrapment_validation=true"
     );
+    Ok(())
+}
+
+/// Validate only stages which can apply bounded external scoring. Physical
+/// configuration dimensions are dependency-pruned by the production catalog;
+/// fixed settings still follow the same scope/owner/default precedence as trials.
+fn validate_workflow_external_scoring(manifest: &WorkflowManifest) -> Result<()> {
+    let models = manifest
+        .models
+        .iter()
+        .filter(|model| {
+            model.enabled
+                && (!matches!(model.ms2rescore, Ms2RescorePolicy::Never)
+                    || manifest.parameter_optimizer.as_ref().is_some_and(|config| {
+                        config.enabled
+                            && config.blocks.iter().any(|block| {
+                                block.enabled
+                                    && block.use_external_features
+                                    && (block.expert.is_none()
+                                        || block.expert == Some(optimizer_expert(&model.model)))
+                            })
+                    }))
+        })
+        .collect::<Vec<_>>();
+    if models.is_empty() {
+        return Ok(());
+    }
+    let value: serde_json::Value =
+        serde_json::from_slice(&std::fs::read(&manifest.search_config)?)?;
+    let external_options: Option<crate::input::ExternalFeatureGenerationOptions> =
+        serde_json::from_value(value.get("external_features").cloned().unwrap_or_default())?;
+    let mut external = crate::input::ExternalFeatureGenerationSettings::from(external_options);
+    // Workflow stage projection, not the search JSON's convenience enabled flag,
+    // controls whether annotations are applied.
+    external.enabled = true;
+    if external.max_rank.is_none() {
+        // Input::build retains at least ten ranks for Decoy-Free. This is a
+        // validation-only resolution of the existing fallback, not an override.
+        external.max_rank = Some(u32::try_from(
+            value
+                .get("report_psms")
+                .and_then(serde_json::Value::as_u64)
+                .unwrap_or(1)
+                .max(10),
+        )?);
+    }
+    for model in models {
+        let mut options = resolved_fdr_options(&manifest.search_config).with_context(|| format!(
+            "model={:?} stage=augmented_workflow external_features.use_mode={:?} resolved_source={}",
+            model.model, external.use_mode, manifest.search_config.display()
+        ))?;
+        options.mode = Some(FdrMode::DecoyFree);
+        options.model_fit = Some(model.model.clone());
+        let validate = |mut options: FdrOptions, source: String| {
+            apply_window(&mut options, &model.model, &model.window);
+            crate::runner::validate_external_scoring_configuration(
+                &FdrSettings::from(options),
+                &external,
+                "augmented_workflow",
+                &source,
+            )
+        };
+        if let Some(config) = manifest.parameter_optimizer.as_ref().filter(|c| c.enabled) {
+            for block in config.blocks.iter().filter(|b| {
+                b.enabled
+                    && (b.expert.is_none() || b.expert == Some(optimizer_expert(&model.model)))
+            }) {
+                let mut effective = options.clone();
+                let mut values =
+                    crate::parameter_optimizer::resolve_baseline_for_block(config, block);
+                values.extend(block.fixed.clone());
+                apply_fdr_overrides(&mut effective, &values)?;
+                validate(
+                    effective,
+                    format!(
+                        "{} + scoped defaults/fixed overrides block={}",
+                        manifest.search_config.display(),
+                        block.id
+                    ),
+                )?;
+            }
+        } else {
+            validate(options, manifest.search_config.display().to_string())?;
+        }
+    }
     Ok(())
 }
 
@@ -5670,6 +5758,7 @@ fn install_null_window_policy(
 
 mod null_window_diagnostic;
 pub use null_window_diagnostic::diagnose_null_window_trial;
+pub use null_window_diagnostic::verify_fixed_augmented_trial;
 
 fn run_search_stage(
     manifest: &WorkflowManifest,
@@ -6005,6 +6094,14 @@ fn run_search_stage(
         );
     }
     let parameters = input.build()?;
+    crate::runner::validate_scoring_search_configuration(
+        &parameters,
+        stage,
+        &format!(
+            "{} + model/window/parameter overrides",
+            manifest.search_config.display()
+        ),
+    )?;
     write_json_atomic(&config_snapshot, &parameters)?;
 
     let mut record = StageRecord {
@@ -7955,6 +8052,7 @@ pub fn execute_workflow(
     plan_only: bool,
 ) -> Result<WorkflowState> {
     let mut manifest = WorkflowManifest::load_before_resource_access(manifest_path)?;
+    validate_workflow_external_scoring(&manifest)?;
     let manifest_hash = sha256_file(manifest_path)?;
     // Schema-v5 optimization roots bind the complete unresolved proposal
     // space before any dataset, partition, pool, cache, fit, or checkpoint
@@ -11164,6 +11262,105 @@ mod tests {
             .unwrap(),
         )
         .unwrap();
+    }
+
+    #[test]
+    fn bounded_configuration_preflight_is_early_scoped_and_override_aware() {
+        let directory = test_directory("bounded-configuration-preflight");
+        let mut manifest = minimal_manifest(&directory, ValidationDatasetRole::Development);
+        let mut search = serde_json::json!({
+            "fdr": {"mode":"decoy_free", "external_profile_min_null_rank":9,
+                "external_profile_max_null_rank":18},
+            "external_features": {"enabled":true,"use_mode":"bounded_df_experts","max_rank":50}
+        });
+        write_json_atomic(&manifest.search_config, &search).unwrap();
+        let error = validate_workflow_external_scoring(&manifest)
+            .unwrap_err()
+            .to_string();
+        assert!(
+            error.contains("Moments")
+                && error.contains("augmented_workflow")
+                && error.contains("bounded_df_experts")
+                && error.contains("bounded_cfg")
+                && error.contains("resolved_source="),
+            "{error}"
+        );
+        let path = directory.join("workflow.json");
+        write_json_atomic(&path, &manifest).unwrap();
+        let error = execute_workflow(&path, &directory, 1, true)
+            .unwrap_err()
+            .to_string();
+        assert!(error.contains("bounded_cfg"), "{error}");
+        assert!(!manifest.output_root.exists());
+        manifest.models[0].ms2rescore = Ms2RescorePolicy::Never;
+        validate_workflow_external_scoring(&manifest).unwrap();
+        let mut augmented = test_optimizer_config();
+        for block in &mut augmented.blocks {
+            block.use_external_features = true;
+        }
+        manifest.parameter_optimizer = Some(augmented);
+        assert!(validate_workflow_external_scoring(&manifest)
+            .unwrap_err()
+            .to_string()
+            .contains("bounded_cfg"));
+        manifest.parameter_optimizer = None;
+        manifest.models[0].ms2rescore = Ms2RescorePolicy::Measure;
+        let mut physical = FdrSettings::from(FdrOptions::default()).physical_rescue;
+        physical.bounded_cfg = Some(sage_core::input::BoundedAuxConfig {
+            update_space: sage_core::input::BoundedAuxUpdateSpace::LogitConfidence,
+            max_rescue_shift: 0.5,
+            max_penalty_shift: 0.25,
+        });
+        search["fdr"]["physical_rescue"] = serde_json::to_value(&physical).unwrap();
+        write_json_atomic(&manifest.search_config, &search).unwrap();
+        validate_workflow_external_scoring(&manifest).unwrap();
+        // Preflight must resolve fixed overrides through the same catalog and
+        // scope/ownership projection as production, not validate the base alone.
+        let mut config = test_optimizer_config();
+        config
+            .blocks
+            .retain(|b| b.expert == Some(OptimizerExpert::Moments));
+        for block in &mut config.blocks {
+            block.fixed.insert(
+                "physical_rescue.anchor_max_q".into(),
+                ParameterValue::Float(0.01),
+            );
+        }
+        manifest.parameter_optimizer = Some(config);
+        search["fdr"]["physical_rescue"]["anchor_max_q"] = serde_json::json!(-0.1);
+        write_json_atomic(&manifest.search_config, &search).unwrap();
+        validate_workflow_external_scoring(&manifest).unwrap();
+        manifest.parameter_optimizer.as_mut().unwrap().blocks[0]
+            .fixed
+            .insert(
+                "physical_rescue.anchor_max_q".into(),
+                ParameterValue::Float(1.1),
+            );
+        assert!(validate_workflow_external_scoring(&manifest)
+            .unwrap_err()
+            .to_string()
+            .contains("anchor_max_q"));
+        manifest.parameter_optimizer = None;
+        search["fdr"]["physical_rescue"] = serde_json::to_value(physical).unwrap();
+        search["external_features"]["max_rank"] = serde_json::json!(4);
+        write_json_atomic(&manifest.search_config, &search).unwrap();
+        assert!(validate_workflow_external_scoring(&manifest)
+            .unwrap_err()
+            .to_string()
+            .contains("max_rank"));
+        search["external_features"]
+            .as_object_mut()
+            .unwrap()
+            .remove("max_rank");
+        write_json_atomic(&manifest.search_config, &search).unwrap();
+        assert!(validate_workflow_external_scoring(&manifest)
+            .unwrap_err()
+            .to_string()
+            .contains("max_rank"));
+        search["report_psms"] = serde_json::json!(50);
+        write_json_atomic(&manifest.search_config, &search).unwrap();
+        validate_workflow_external_scoring(&manifest).unwrap();
+        std::fs::remove_dir_all(directory).unwrap();
     }
 
     #[test]
