@@ -4703,7 +4703,7 @@ fn resolve_baseline(config: &ParameterOptimizerConfig) -> BTreeMap<String, Param
     values
 }
 
-fn resolve_baseline_for_block(
+pub(crate) fn resolve_baseline_for_block(
     config: &ParameterOptimizerConfig,
     block: &OptimizerBlock,
 ) -> BTreeMap<String, ParameterValue> {

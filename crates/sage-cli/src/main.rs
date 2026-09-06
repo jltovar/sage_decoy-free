@@ -152,6 +152,18 @@ fn main() -> anyhow::Result<()> {
                 .arg(Arg::new("output").long("output").required(true)),
         )
         .subcommand(
+            Command::new("verify-fixed-augmented-trial")
+                .about("One fixed-window augmented compatibility evaluation from a preserved trial; no optimizer, audit, search or annotation generation")
+                .arg(Arg::new("manifest").required(true))
+                .arg(Arg::new("checkpoint").long("checkpoint").required(true))
+                .arg(Arg::new("checkpoint-sha256").long("checkpoint-sha256").required(true))
+                .arg(Arg::new("trial-id").long("trial-id").required(true))
+                .arg(Arg::new("min-rank").long("min-rank").required(true).value_parser(value_parser!(u32)))
+                .arg(Arg::new("max-rank").long("max-rank").required(true).value_parser(value_parser!(u32)))
+                .arg(Arg::new("inputs-only").long("inputs-only").action(clap::ArgAction::SetTrue))
+                .arg(Arg::new("output").long("output").required(true)),
+        )
+        .subcommand(
             Command::new("rerank-null-window-evidence")
                 .about("Rank hash-bound saved window measurements only; no fits, resources, external processes or production winner")
                 .arg(Arg::new("checkpoint").required(true))
@@ -651,6 +663,28 @@ fn main() -> anyhow::Result<()> {
         println!("diagnostic terminal status: {}", report["status"]);
         return Ok(());
     }
+    if let Some(("verify-fixed-augmented-trial", diagnostic)) = matches.subcommand() {
+        let value = |key| {
+            diagnostic
+                .get_one::<String>(key)
+                .expect("required verification argument")
+        };
+        let report = sage_cli::workflow::verify_fixed_augmented_trial(
+            std::path::Path::new(value("manifest")),
+            std::path::Path::new(value("checkpoint")),
+            value("checkpoint-sha256"),
+            value("trial-id"),
+            sage_cli::workflow::NullWindow {
+                min_rank: *diagnostic.get_one::<u32>("min-rank").unwrap(),
+                max_rank: *diagnostic.get_one::<u32>("max-rank").unwrap(),
+            },
+            std::path::Path::new(value("output")),
+            parallel,
+            diagnostic.get_flag("inputs-only"),
+        )?;
+        println!("fixed augmented verification: {}", report["status"]);
+        return Ok(());
+    }
     if let Some(("workflow", workflow_matches)) = matches.subcommand() {
         let manifest = workflow_matches
             .get_one::<String>("manifest")
@@ -724,7 +758,7 @@ fn main() -> anyhow::Result<()> {
 
     let runner = input
         .build()
-        .and_then(|parameters| Runner::new(parameters, parallel))?;
+        .and_then(|parameters| Runner::new_for_scoring(parameters, parallel))?;
 
     let tel = runner.run(parallel, parquet)?;
 

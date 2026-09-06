@@ -34,6 +34,54 @@ use std::collections::{HashMap, HashSet};
 use std::sync::Arc;
 use std::time::Instant;
 
+/// Shared, configuration-only guard for stages that actually apply external
+/// scores. Resource constructors deliberately do not call this function.
+pub(crate) fn validate_external_scoring_configuration(
+    settings: &sage_core::input::FdrSettings,
+    external: &crate::input::ExternalFeatureGenerationSettings,
+    stage: &str,
+    source: &str,
+) -> anyhow::Result<()> {
+    if !matches!(settings.mode, FdrMode::DecoyFree)
+        || !external.enabled
+        || !matches!(external.use_mode, ExternalFeatureUseMode::BoundedDfExperts)
+    {
+        return Ok(());
+    }
+    let context = format!(
+        "model={:?} stage={stage} external_features.use_mode=bounded_df_experts resolved_source={source}",
+        settings.model_fit,
+    );
+    sage_core::decoy_free_fdr::validate_external_bounded_configuration(settings)
+        .map_err(|error| anyhow::anyhow!("{context}: {error}"))?;
+    anyhow::ensure!(
+        external.feature_only,
+        "{context}: external_features.feature_only must be true"
+    );
+    if let Some(max_rank) = external.max_rank {
+        anyhow::ensure!(
+            max_rank >= settings.external_profile_calibration.max_null_rank,
+            "{context}: external_features.max_rank does not cover external_profile_calibration.max_null_rank"
+        );
+    }
+    Ok(())
+}
+
+pub(crate) fn validate_scoring_search_configuration(
+    parameters: &Search,
+    stage: &str,
+    source: &str,
+) -> anyhow::Result<()> {
+    let mut external = parameters.external_features.clone();
+    if external.max_rank.is_none() {
+        external.max_rank = Some(
+            u32::try_from(parameters.report_psms)
+                .context("report_psms cannot represent annotation rank depth")?,
+        );
+    }
+    validate_external_scoring_configuration(&parameters.fdr, &external, stage, source)
+}
+
 #[derive(serde::Serialize, serde::Deserialize)]
 struct NullWindowOptimizerCheckpoint {
     schema: String,
@@ -611,6 +659,13 @@ impl Runner {
         ))
     }
 
+    /// Scoring entry point: unlike resource-only construction, validate the
+    /// resolved scoring dependencies before opening FASTA or any other data.
+    pub fn new_for_scoring(parameters: Search, parallel: usize) -> anyhow::Result<Self> {
+        validate_scoring_search_configuration(&parameters, "scoring", "resolved Search")?;
+        Self::new(parameters, parallel)
+    }
+
     pub fn new(parameters: Search, parallel: usize) -> anyhow::Result<Self> {
         let mut parameters = parameters.clone();
         let start = Instant::now();
@@ -1114,6 +1169,11 @@ impl Runner {
         Option<CandidatePoolUsage>,
         Option<ExternalAnnotationCacheUsage>,
     )> {
+        validate_scoring_search_configuration(
+            &self.parameters,
+            "run_with_workflow_caches",
+            "resolved Search",
+        )?;
         let scorer = Scorer {
             db: &self.database,
             precursor_tol: self.parameters.precursor_tol,
