@@ -12585,44 +12585,7 @@ impl ExternalEmpiricalFeatureProfile {
 }
 
 fn external_empirical_auc(good: &[f64], null: &[f64], higher_is_better: bool) -> f64 {
-    if good.is_empty() || null.is_empty() {
-        return f64::NAN;
-    }
-
-    let mut wins = 0.0f64;
-    let mut total = 0.0f64;
-
-    for &g in good {
-        if !g.is_finite() {
-            continue;
-        }
-
-        for &n in null {
-            if !n.is_finite() {
-                continue;
-            }
-
-            total += 1.0;
-
-            if higher_is_better {
-                if g > n {
-                    wins += 1.0;
-                } else if g == n {
-                    wins += 0.5;
-                }
-            } else if g < n {
-                wins += 1.0;
-            } else if g == n {
-                wins += 0.5;
-            }
-        }
-    }
-
-    if total <= 0.0 {
-        f64::NAN
-    } else {
-        wins / total
-    }
+    crate::ml::external_auc::exact_external_auc(good, null, higher_is_better)
 }
 
 fn external_empirical_median(xs: &[f64]) -> f64 {
@@ -14083,6 +14046,98 @@ mod tests {
             .filter(|f| f.core.rank == 1)
             .all(|f| f.decoy_free_peptide_q.is_some_and(f64::is_finite)
                 && f.decoy_free_protein_q.is_some_and(f64::is_finite)));
+    }
+
+    #[test]
+    fn external_auc_workers_preserve_profiles_every_psm_and_level4_observations() {
+        let (db, _) = indistinguishable_group_fixture();
+        let mut input = external_profile_fixture();
+        for (i, feature) in input.iter_mut().enumerate() {
+            feature.core.peptide_idx = PeptideIx(0);
+            feature.core.label = 1;
+            // Include ties, unavailable values, and both score directions.
+            feature.core.external_features.ms2rescore_ms2pip_pcc += (i % 7) as f32 * 0.01;
+            feature.core.external_features.tims2rescore_pct_ccs_error =
+                if i < 30 { 1.0 } else { 3.0 };
+            feature.core.external_features.tims2rescore_abs_ccs_error =
+                if i < 30 { 2.0 } else { 7.0 };
+            if i == 0 || i == 33 {
+                feature.core.external_features.ms2rescore_spectral_angle = f32::NAN;
+            }
+        }
+        let mut settings = bounded_external_settings(true);
+        settings.hierarchical_reporting = HierarchicalReportingMode::Strict;
+        settings.hierarchical_entrapment_validation = true;
+        let evaluate = || {
+            let observation = window_evidence::ObservationGuard::start();
+            let mut features = input.clone();
+            let profiles =
+                apply_external_ms2rescore_bounded_experts(&mut features, &settings).unwrap();
+            calculate_peptide_q_df(&mut features, &db, &settings, settings.peptide_fdr);
+            apply_peptide_q_to_psm_reporting_df(&mut features, &settings);
+            calculate_protein_q_df(&mut features, &db, &settings);
+            let reporting = apply_hierarchical_reporting_df(&mut features, &db, &settings);
+            (
+                serde_json::to_value(profiles).unwrap(),
+                serde_json::to_value(features).unwrap(),
+                reporting,
+                serde_json::to_value(observation.snapshot()).unwrap(),
+            )
+        };
+        let expected = rayon::ThreadPoolBuilder::new()
+            .num_threads(1)
+            .build()
+            .unwrap()
+            .install(evaluate);
+        for workers in [2, 4, 8, 16, 32] {
+            let actual = rayon::ThreadPoolBuilder::new()
+                .num_threads(workers)
+                .build()
+                .unwrap()
+                .install(evaluate);
+            assert_eq!(actual, expected, "worker count {workers}");
+        }
+        // Check all six learned AUCs against the bounded historical pairwise
+        // calculation, not just the final counts or an approximate tolerance.
+        let getters: [fn(&DfFeature) -> f64; 6] = [
+            |f| f.core.external_features.ms2rescore_ms2pip_pcc as f64,
+            |f| f.core.external_features.ms2rescore_spectral_angle as f64,
+            |f| {
+                f.core
+                    .external_features
+                    .ms2rescore_fragment_intensity_agreement as f64
+            },
+            |f| f.core.external_features.ms2rescore_deeplc_abs_rt_error as f64,
+            |f| f.core.external_features.tims2rescore_pct_ccs_error as f64,
+            |f| f.core.external_features.tims2rescore_abs_ccs_error as f64,
+        ];
+        for (i, key) in [
+            "ms2pip_pcc",
+            "spectral_angle",
+            "fragment_intensity_agreement",
+            "deeplc_abs_rt_error",
+            "ccs_pct_error",
+            "ccs_abs_error",
+        ]
+        .into_iter()
+        .enumerate()
+        {
+            let good: Vec<_> = input
+                .iter()
+                .filter(|f| f.core.rank == 1)
+                .map(getters[i])
+                .collect();
+            let null: Vec<_> = input
+                .iter()
+                .filter(|f| f.core.rank > 1)
+                .map(getters[i])
+                .collect();
+            let old = crate::ml::external_auc::bounded_pairwise_reference(&good, &null, i < 3);
+            assert_eq!(
+                expected.0[key]["auc"].as_f64().unwrap().to_bits(),
+                old.to_bits()
+            );
+        }
     }
 
     #[test]

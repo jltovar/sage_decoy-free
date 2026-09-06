@@ -414,6 +414,7 @@ fn main() -> anyhow::Result<()> {
         .stack_size(stack_size_bytes)
         .build_global()
         .expect("configure Rayon pool");
+    log::info!("runtime Rayon workers: {}", rayon::current_num_threads());
 
     let parallel = matches
         .get_one::<u16>("batch-size")

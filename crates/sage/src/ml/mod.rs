@@ -1,5 +1,6 @@
 //! Linear Algebra, Machine Learning & FDR refinement
 
+pub mod external_auc;
 pub mod gauss;
 pub mod kde;
 pub mod linear_discriminant;

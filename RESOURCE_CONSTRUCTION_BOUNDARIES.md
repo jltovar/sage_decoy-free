@@ -1,5 +1,10 @@
 # Controlled resource-construction boundaries
 
+External-profile calibration is downstream of raw-cache construction. Its exact
+AUC acceleration and numeric-sort parallelism do not add fitting to either
+resource-construction boundary, change candidate IDs, or regenerate raw
+predictions. See [external AUC performance](EXTERNAL_AUC_PERFORMANCE.md).
+
 Sage exposes two narrow Decoy-Free execution scopes for prospective validation work. They are
 resource constructors, not shortened forms of `sage workflow`: each has a dedicated call graph,
 returns immediately after reopening and verifying its resource, and emits an atomic JSON boundary
@@ -216,3 +221,14 @@ winner lock, target-only or TDC is called. The output must be new; failures reta
 their stage evidence. Results are compatibility evidence, not production winners.
 Add `--inputs-only` to freeze the complete effective configuration from configuration
 and the historical checkpoint only, before any scientific resource or fit access.
+# Historical raw cache reuse after diagnostic-only changes
+
+Workflow `existing_raw_cache` is an explicit, hash-pinned, strict read-only
+compatibility reference. Both preflight and execution validate the same historical
+contract, generator/population components, payload integrity and lane semantics.
+The original manifest, payload and finalizer identity remain immutable; current
+reader/binary verification is recorded separately. Unknown contracts do not fall
+back to generation. Target-only references are separately scoped.
+See [exact AUC and provenance](EXTERNAL_AUC_PERFORMANCE.md) for the JSON contract
+and source-identity boundaries. Resource-only commands do not apply diagnostics
+or downstream calibration, and do not silently opt into historical compatibility.
